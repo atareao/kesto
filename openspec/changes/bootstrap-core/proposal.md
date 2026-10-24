@@ -42,7 +42,7 @@ En este change la salud es **vida**, no **disponibilidad**: no hay base de datos
 
 ## What Changes
 
-1. **`Cargo.toml` estrena dependencias.** Axum 0.8 con el servidor de Tokio, `tokio` con `full`, `tracing` + `tracing-subscriber` (con `env-filter`), `serde`/`serde_json`, `thiserror`, `tower-http` (con `trace`) y `zeroize` para `SecretString`. En dev, `tower` con `util` para el arnés de tests. Las versiones son las que ya están resueltas y cacheadas en esta máquina —axum 0.8.9, tokio 1.50, `tracing-subscriber` 0.3.23, `tower-http` 0.7.1, `zeroize` 1.9.1—, no las que suenen bien.
+1. **`Cargo.toml` estrena dependencias.** Axum 0.8 con el servidor de Tokio, `tokio` con `full`, `tracing` + `tracing-subscriber` (con `env-filter`), `serde`/`serde_json`, `thiserror`, `tower-http` (con `trace`) y `zeroize` para `SecretString`. En dev, `tower` con `util` para el arnés de tests. Las versiones son las que ya están resueltas y cacheadas en esta máquina —axum 0.8.9, `tracing-subscriber` 0.3.23, `tower-http` 0.7.1, `zeroize` 1.9.1—, no las que suenen bien. `tokio` se pide como `"1.50.0"` y Cargo resuelve 1.54.1 por semántica *caret*: es la que está cacheada, y no se fija con `=` porque un pin exacto en el manifiesto es una atadura que no aporta nada aquí.
 
 2. **`Config` se lee del entorno de una sola vez, al arrancar, y falla en alto si no puede.** `Config::from_lookup` tiene la lectura del entorno **inyectada**, y no llama a `std::env::var` por dentro: en `edition = "2024"` `std::env::set_var` es `unsafe`, así que un test que mutase el entorno del proceso sería código inseguro y además no reproducible en paralelo. Con la lectura inyectada, los tests no tocan el entorno de nadie.
 

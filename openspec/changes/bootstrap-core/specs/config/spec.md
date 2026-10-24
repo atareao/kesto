@@ -18,8 +18,8 @@ Las variables que el SRS no declara SHALL llevar prefijo `KESTO_` —o conservar
 
 `RUST_LOG`, `BIND_ADDRESS` y `DATABASE_URL` SHALL tener valor por defecto, y SHALL coincidir con el que el §8 declara, para que un `compose` que las omita se comporte como el que las declara.
 
-#### Scenario: Sin variables, se arranca con los valores del SRS
-- **GIVEN** un entorno vacío
+#### Scenario: Sin esas variables, ganan los valores del SRS
+- **GIVEN** un entorno con `KESTO_MASTER_KEY` y sin `BIND_ADDRESS` ni `DATABASE_URL`
 - **WHEN** se carga la configuración
 - **THEN** la dirección de escucha SHALL ser `0.0.0.0:8080`
 - **AND** la cadena de base de datos SHALL apuntar a `sqlite:///app/data/kesto.db`
@@ -92,7 +92,7 @@ Sin autenticación no hay sesión que firmar, así que `KESTO_SECRET` SHALL ser 
 
 ### Requirement: La lectura del entorno se inyecta
 
-`Config` SHALL obtener sus valores a través de una lectura inyectada y NO SHALL llamar a `std::env::var` en su interior: en `edition = "2024"`, mutar el entorno del proceso es `unsafe`, así que una prueba que lo hiciera sería código inseguro y no reproducible en paralelo.
+`Config` SHALL obtener sus valores a través de una lectura inyectada, y la carga (`Config::from_lookup`) NO SHALL consultar el entorno del proceso: en `edition = "2024"`, mutar el entorno es `unsafe`, así que una prueba que lo hiciera sería código inseguro y no reproducible en paralelo. `Config::from_env` SHALL ser el único punto de contacto con el entorno —el pegamento que lee las variables y delega en la carga— y NO SHALL usarse en ninguna prueba.
 
 #### Scenario: Los valores vienen de la lectura inyectada
 - **GIVEN** una lectura inyectada que devuelve `BIND_ADDRESS=127.0.0.1:1`

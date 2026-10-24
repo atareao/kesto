@@ -54,6 +54,12 @@ Toda respuesta de la API SHALL ser JSON con `{status, message, data}` cuando la 
 - **THEN** el cuerpo SHALL ser JSON con `status` y `message`
 - **AND** `status` SHALL coincidir con el código HTTP
 
+#### Scenario: Un método no declarado contesta con la misma envoltura
+- **GIVEN** el router de la aplicación
+- **WHEN** se pide `POST /api/v1/health`, ruta que solo admite `GET`
+- **THEN** SHALL contestar `405`
+- **AND** el cuerpo SHALL ser JSON con `status` y `message`
+
 ### Requirement: Un error interno no cuenta por qué falló
 
 Una respuesta `5xx` SHALL llevar un mensaje genérico y NO SHALL incluir el texto de la causa. El detalle SHALL registrarse en el log del servidor.
