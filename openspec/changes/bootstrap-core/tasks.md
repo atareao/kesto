@@ -75,6 +75,8 @@ Estas correcciones salen de la auditoría de `rust-reviewer` del 2026-10-24, pos
 - [x] 3.14 `src/api/health.rs`: test de que una credencial débil no impide contestar la salud, que es la segunda mitad de ese escenario.
 - [x] 3.15 `src/config.rs`: el test del valor con formato inválido comprueba que el mensaje no lleva el valor, que es lo que el requisito pide y solo se asertaba en el caso de la variable ausente.
 - [x] 3.16 `src/error.rs`: fuera el clon innecesario del test que precisamente demuestra que no se copia de más, y el registro de `AppError::Config` deja de describirse como error de arranque cuando por construcción solo puede dispararse al atender una petición.
+- [x] 3.17 `src/config.rs`: `RUST_LOG` presente pero en blanco falla en alto nombrando la variable, en vez de dejar el proceso arrancando sin una sola línea de registro. `EnvFilter` interpreta la cadena vacía como «todo apagado», así que la degradación era silenciosa y contradecía el requisito que ya trata un valor presente pero inutilizable como error de arranque. Es el mismo caso que `BIND_ADDRESS=` vacía, que ya fallaba.
+- [x] 3.18 `src/config.rs`: el valor de `RUST_LOG` se usa recortado. La corrección de la 3.17 dejaba fuera los espacios sobrantes, y `EnvFilter` lee `" info "` como el nombre de un destino y no como el nivel, así que el proceso arrancaba ciego con un valor que la validación no podía rechazar por no estar en blanco. Lo encontró la propia implementación al probarla contra el binario, no la auditoría.
 
 ## 4. Verificación manual (operador)
 
@@ -87,8 +89,8 @@ Estas correcciones salen de la auditoría de `rust-reviewer` del 2026-10-24, pos
 
 ## 5. Cierre
 
-- [ ] 5.1 `just spec-validate bootstrap-core` en modo estricto.
-- [ ] 5.2 `AGENTS.md`: la tabla de variables de entorno y el modo de desarrollo.
-- [ ] 5.3 `README.md`: la sección de estado deja de describir `src/main.rs` como un `Hello, world!`.
-- [ ] 5.4 `docs/FEATURE-001-bootstrap-core.md` con lo que realmente quedó construido.
+- [x] 5.1 `just spec-validate bootstrap-core` en modo estricto.
+- [x] 5.2 `AGENTS.md`: la tabla de variables de entorno y el modo de desarrollo.
+- [x] 5.3 `README.md`: la sección de estado deja de describir `src/main.rs` como un `Hello, world!`.
+- [x] 5.4 `docs/FEATURE-001-bootstrap-core.md` con lo que realmente quedó construido.
 - [ ] 5.5 `just plan-done` y `just spec-archive bootstrap-core`.

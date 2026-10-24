@@ -2,7 +2,7 @@
 
 > Implementación del change proposal `openspec/changes/bootstrap-core/`.
 > Aprobado el 2026-10-24. Rama: `feature/bootstrap-core`.
-> Especificación que manda: `openspec/changes/bootstrap-core/specs/` (**15 requisitos, 30 escenarios**).
+> Especificación que manda: `openspec/changes/bootstrap-core/specs/` (**15 requisitos, 32 escenarios**).
 
 ## Objetivo
 
@@ -55,7 +55,7 @@ Tests primero, y que fallen. **22 pasos (1.1–1.22 de `tasks.md`)**, agrupados:
 
 ### Fase 2 — GREEN
 
-Implementación mínima para que los 30 escenarios pasen:
+Implementación mínima para que los 32 escenarios pasen:
 
 1. `SecretString` sobre `zeroize` — redacción en `Debug`/`Display`, acceso explícito, borrado al caer
 2. `AuthMode` — `Oidc(OidcSettings)` / `Disabled`, y el error de arranque para la configuración a medias
@@ -92,7 +92,7 @@ Implementación mínima para que los 30 escenarios pasen:
 ### Fase 5 — Auditoría y cierre
 
 - `rust-reviewer` audita el código contra la especificación
-- Verificación de que los 30 escenarios están implementados y cubiertos
+- Verificación de que los 32 escenarios están implementados y cubiertos
 - `just spec-validate bootstrap-core` y `just spec-archive bootstrap-core`
 - `AGENTS.md`: tabla de variables de entorno y modo de desarrollo
 - `README.md`: la sección de estado deja de decir que `src/main.rs` es un `Hello, world!`

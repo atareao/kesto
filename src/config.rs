@@ -165,9 +165,30 @@ impl Config {
             .get(ENV_DATABASE_URL)
             .unwrap_or_else(|| DEFAULT_DATABASE_URL.to_owned());
 
-        let log_filter = lookup
-            .get(ENV_RUST_LOG)
-            .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
+        // Una `RUST_LOG` presente pero en blanco es un valor presente e
+        // inutilizable: `EnvFilter` interpreta la cadena vacía como «todo
+        // apagado», así que el proceso arrancaría sin una sola línea de registro
+        // y en silencio. Es el artefacto típico de un `compose` que interpola
+        // una variable que no definiste, y degradar a «sin registro» convierte
+        // un error de configuración en un servicio ciego: se falla en alto, como
+        // con `BIND_ADDRESS=` vacío. Solo el blanco puro falla: sobre cualquier
+        // valor con contenido manda el recorte.
+        let log_filter = match lookup.get(ENV_RUST_LOG) {
+            None => DEFAULT_LOG_FILTER.to_owned(),
+            Some(raw) if raw.trim().is_empty() => {
+                return Err(ConfigError::InvalidValue { name: ENV_RUST_LOG });
+            }
+            // El recorte no es cosmética: `EnvFilter` interpreta una palabra
+            // suelta sin `=` como el **nombre de un destino**, no como un nivel,
+            // así que `" info "` se lee como el destino `" info "` —que no
+            // existe— y el filtro resultante no casa nada. `EnvFilter::try_new`
+            // devuelve `Ok` y el proceso arranca mudo, que es justo el desenlace
+            // que la validación de arriba quiere evitar. Recortado, `" info "` se
+            // convierte en `"info"`, que sí es el nivel `INFO`. El operador que
+            // pega una variable con espacios —lo que hace medio mundo al copiar
+            // de un `docker-compose.yml`— no se queda sin registros.
+            Some(raw) => raw.trim().to_owned(),
+        };
 
         let auth = Self::resolve_auth(
             lookup.get(ENV_OIDC_ISSUER_URL),
@@ -401,6 +422,68 @@ mod tests {
         assert!(
             !mensaje.contains("0.0.0.0"),
             "el mensaje publica el valor de la variable: {mensaje}"
+        );
+    }
+
+    #[test]
+    fn un_filtro_de_registro_en_blanco_falla_en_alto() {
+        // Una `RUST_LOG` presente y en blanco es un valor presente pero
+        // inutilizable: `EnvFilter` lo lee como «todo apagado» y el proceso
+        // arrancaría sin una sola línea de registro, sin que nadie se entere.
+        // Los dos casos en blanco fallan igual.
+        for en_blanco in ["", "   "] {
+            let lookup = lookup_from(&[
+                ("KESTO_MASTER_KEY", MASTER_KEY),
+                ("BIND_ADDRESS", BIND),
+                ("RUST_LOG", en_blanco),
+            ]);
+
+            let error = Config::from_lookup(&lookup)
+                .expect_err("un filtro de registro en blanco no puede arrancar");
+            let mensaje = error.to_string();
+
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { name } if *name == "RUST_LOG"),
+                "el error no señala RUST_LOG para {en_blanco:?}: {mensaje}"
+            );
+            assert!(
+                mensaje.contains("RUST_LOG"),
+                "el mensaje no nombra RUST_LOG para {en_blanco:?}: {mensaje}"
+            );
+            // El mensaje nombra la variable, nunca el valor de ninguna otra.
+            assert!(
+                !mensaje.contains(MASTER_KEY),
+                "el mensaje publica el valor de KESTO_MASTER_KEY: {mensaje}"
+            );
+            assert!(
+                !mensaje.contains(BIND),
+                "el mensaje publica el valor de BIND_ADDRESS: {mensaje}"
+            );
+        }
+    }
+
+    #[test]
+    fn un_filtro_con_espacios_alrededor_se_recorta() {
+        // Este test nació fijando lo contrario —que `" info "` se usaba tal
+        // cual— y consagraba un defecto: `EnvFilter` lee una palabra sin `=`
+        // como nombre de destino, así que el valor sin recortar dejaba el
+        // proceso arrancado y mudo. Se corrige la aserción; no se relaja para
+        // que pase el código. No lo «restaures» pensando que era intencional.
+        let lookup = lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY), ("RUST_LOG", " info ")]);
+
+        let config =
+            Config::from_lookup(&lookup).expect("un filtro con contenido no es un caso de error");
+
+        assert_eq!(
+            config.log_filter, "info",
+            "los espacios sobrantes deben recortarse, no colarse en el filtro"
+        );
+        // Y el valor recortado tiene que ser de verdad utilizable: es lo que
+        // distingue un filtro que registra de uno que arranca mudo.
+        assert!(
+            tracing_subscriber::EnvFilter::try_new(&config.log_filter).is_ok(),
+            "el filtro recortado no lo acepta EnvFilter: {:?}",
+            config.log_filter
         );
     }
 

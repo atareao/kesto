@@ -18,6 +18,8 @@ Las variables que el SRS no declara SHALL llevar prefijo `KESTO_` —o conservar
 
 `RUST_LOG`, `BIND_ADDRESS` y `DATABASE_URL` SHALL tener valor por defecto, y SHALL coincidir con el que el §8 declara, para que un `compose` que las omita se comporte como el que las declara.
 
+Una variable **presente pero vacía** NO SHALL confundirse con una ausente: el valor por defecto es para la variable que no está, no para la que está sin valor.
+
 #### Scenario: Sin esas variables, ganan los valores del SRS
 - **GIVEN** un entorno con `KESTO_MASTER_KEY` y sin `BIND_ADDRESS` ni `DATABASE_URL`
 - **WHEN** se carga la configuración
@@ -38,11 +40,19 @@ Cuando falte una variable obligatoria, la aplicación SHALL negarse a arrancar c
 
 Un valor presente pero inutilizable SHALL tratarse como un error de arranque, no como un valor válido degradado, y el mensaje SHALL nombrar la variable.
 
+Un valor presente SHALL usarse recortado de los espacios sobrantes. No es cosmética: `EnvFilter` lee `RUST_LOG=" info "` como el nombre de un destino y no como el nivel `INFO`, así que sin recortar el proceso arrancaría ciego con un valor que no está en blanco y que por tanto no delata el error.
+
 #### Scenario: Una dirección de escucha sin puerto no se acepta
 - **GIVEN** `BIND_ADDRESS=0.0.0.0`, sin puerto
 - **WHEN** se carga la configuración
 - **THEN** SHALL fallar en alto
 - **AND** el mensaje SHALL nombrar `BIND_ADDRESS`
+
+#### Scenario: Un filtro de registro en blanco no deja el proceso mudo
+- **GIVEN** `RUST_LOG` presente pero vacía
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `RUST_LOG`
 
 ### Requirement: El modo de autenticación se deduce de la presencia de las variables OIDC
 
