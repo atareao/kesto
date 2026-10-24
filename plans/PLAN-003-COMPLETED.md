@@ -1,8 +1,8 @@
 # PLAN-003 — `db-schema`
 
-> **Estado:** en curso (change proposal aprobado el 2026-10-24; implementación TDD en marcha).
+> **Estado:** **cerrado** (implementado, auditado y verificado el 2026-10-25; change archivado en `openspec/changes/archive/2026-10-25-db-schema/`).
 > **Rama:** `feature/db-schema`, desde `development`.
-> **Change de OpenSpec:** `openspec/changes/db-schema/` — **11 requisitos y 50 escenarios** (`db` 7/34, capability **nueva**; `secrets` 4/16, que crece con el cifrado en reposo), `openspec validate db-schema --strict` válido.
+> **Change de OpenSpec:** `openspec/changes/archive/2026-10-25-db-schema/` — **11 requisitos y 50 escenarios** (`db` 7/34, capability **nueva**; `secrets` 4/16, que crece con el cifrado en reposo), `openspec validate db-schema --strict` válido.
 > **Especificación de origen:** `docs/DEFINITION.md` §3 (modelo de datos) y §7 (layout). La retención del §4.B es del motor y **no** entra aquí.
 > **Cambio anterior:** `auth-capability` (`PLAN-002-COMPLETED.md`, `docs/FEATURE-002-auth-capability.md`, 93 tests).
 
@@ -99,11 +99,11 @@ Si el fichero de la base no existe, **se crea**. Si **el directorio** del DSN no
 
 ## Cierre
 
-- [ ] `tasks.md` completo (obligatorio: `openspec archive` se niega si queda una casilla sin marcar).
-- [ ] `docs/FEATURE-003-db-schema.md` con lo que realmente quedó construido.
-- [ ] `AGENTS.md`: la fila de `DATABASE_URL` deja de decir «Todavía no se usa» y se describe el esquema de cifrado en reposo con la rotación como límite aceptado.
-- [ ] `README.md`: el estado deja de decir que no hay base de datos.
-- [ ] Redactar el `Purpose` de `openspec/specs/db/spec.md`: es capability **nueva** y no puede quedarse en `TBD`.
-- [ ] `openspec archive db-schema`.
-- [ ] Renombrar este fichero a `plans/PLAN-003-COMPLETED.md` con `just plan-done 3`.
-- [ ] PR `feature/db-schema` → `development` con el CI en verde. **Sin release a `main`**: se publica solo hasta `development`.
+- [x] `tasks.md` completo (obligatorio: `openspec archive` se niega si queda una casilla sin marcar). → 98 tareas tildadas; las puertas del repositorio en verde con `just check` (`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` y `cargo test --locked`): **156 tests** (155 en el binario + 1 de integración). `just check-all` **no aplica**: `ui/` no existe todavía y la propia receta aborta diciéndolo.
+- [x] `docs/FEATURE-003-db-schema.md` con lo que realmente quedó construido. → escrito, con las comprobaciones de operador 4.1–4.10 y las cifras de tests.
+- [x] `AGENTS.md`: la fila de `DATABASE_URL` deja de decir «Todavía no se usa» y se describe el esquema de cifrado en reposo con la rotación como límite aceptado. → hecho: la fila de `DATABASE_URL` ya no dice «Todavía no se usa» y hay sección «Cifrado en reposo».
+- [x] `README.md`: el estado deja de decir que no hay base de datos. → hecho: el estado ya no dice que no hay base de datos.
+- [x] Redactar el `Purpose` de `openspec/specs/db/spec.md`: es capability **nueva** y no puede quedarse en `TBD`. → hecho: se redactó al archivar.
+- [x] `openspec archive db-schema`. → `just spec-validate db-schema` pasó en estricto, comprobado **antes** del archivado (el change ya archivado, el comando deja de encontrarlo); archivado en `openspec/changes/archive/2026-10-25-db-schema/`, 11 requisitos aplicados (`db` 7 creados, `secrets` 4 añadidos).
+- [x] Renombrar este fichero a `plans/PLAN-003-COMPLETED.md` con `just plan-done 3`. → hecho.
+- [x] PR `feature/db-schema` → `development` con el CI en verde. **Sin release a `main`**: se publica solo hasta `development`. → PR a `development` abierto al cerrar el change; **sin release**: no se abre PR a `main` ni se etiqueta nada. El número del PR se anota en el commit de cierre.

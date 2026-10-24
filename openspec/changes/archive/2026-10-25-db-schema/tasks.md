@@ -31,39 +31,39 @@ Cada tarea es una prueba por escenario de `specs/db/spec.md` y `specs/secrets/sp
 - [x] 1.15 `src/db/migrate.rs`: test que fija, con `EXPLAIN QUERY PLAN`, que el borrado de una fila padre **no** recorre la tabla hija entera: el plan SHALL apoyarse en el índice de la clave foránea y NO SHALL contener un `SCAN` de la tabla hija.
 - [x] 1.16 `src/db/migrate.rs`: test que fija, con `EXPLAIN QUERY PLAN`, que el listado de ejecuciones filtrado por estado y ordenado por fecha usa `idx_job_executions_status_started_at`.
 - [x] 1.17 `src/db/migrate.rs`: test que fija, con `EXPLAIN QUERY PLAN`, que el `JOIN` de `job_executions` con `backup_jobs` filtrando por `repository_id` se apoya en los índices de clave foránea.
-- [ ] 1.18 `src/db/entities/repository.rs`: test que fija el alta y la lectura por identificador, con todos los campos.
-- [ ] 1.19 `src/db/entities/repository.rs`: test que fija que el identificador generado se almacena como **`TEXT` con forma canónica con guiones** y **no** como BLOB de 16 bytes, consultando el tipo y la longitud del valor almacenado. **Es el escenario que caza la trampa del `Uuid` como BLOB.**
-- [ ] 1.20 `src/db/entities/repository.rs`: test que fija que leer por un identificador inexistente devuelve «no está» y **no** un error de base.
-- [ ] 1.21 `src/db/entities/repository.rs`: test que fija el listado con tres filas y su orden estable entre dos llamadas seguidas.
-- [ ] 1.22 `src/db/entities/repository.rs`: test que fija la actualización: el campo tocado cambia y los demás conservan su valor.
-- [ ] 1.23 `src/db/entities/repository.rs`: test que fija el borrado por identificador.
-- [ ] 1.24 `src/db/entities/repository.rs`: test que fija que un `created_at` que la base rellenó con `CURRENT_TIMESTAMP` —fila insertada con SQL directo, sin informar la columna— se **descodifica** como la fecha UTC que declara el texto.
-- [ ] 1.25 `src/db/entities/target.rs`: test de alta, lectura, listado, actualización y borrado de `backup_targets`.
-- [ ] 1.26 `src/db/entities/target.rs`: test que fija que un `db_name` informado se lee informado, uno `NULL` se lee `NULL` y **`NULL` no se confunde con la cadena vacía**.
-- [ ] 1.27 `src/db/entities/target.rs`: test que fija que un target de tipo `directory` no necesita `container_name`, ni `db_user`, ni `db_password`, y que su `db_name` es `NULL`.
-- [ ] 1.28 `src/db/entities/job.rs`: test de alta, lectura, listado, actualización y borrado de `backup_jobs`, con sus cuatro `keep_*` y su `enabled`.
-- [ ] 1.29 `src/db/entities/job.rs`: test que fija que `enabled` se almacena como el entero `1` cuando es verdadero y como `0` cuando es falso.
-- [ ] 1.30 `src/db/entities/execution.rs`: test de alta, lectura, listado, actualización y borrado de `job_executions`, con su estado, sus contadores y sus dos fechas.
-- [ ] 1.31 `src/db/entities/execution.rs`: test que fija que una ejecución con `finished_at` a `NULL` se lee como ausencia y no como fecha inventada.
-- [ ] 1.32 `src/db/entities/target.rs`: test que fija que borrar un **target** deja sin `backup_jobs` sus tareas y sin `job_executions` esas tareas, con el repositorio intacto. **Es la cascada de los tres niveles.**
-- [ ] 1.33 `src/db/entities/repository.rs`: test que fija que borrar un **repositorio** deja sin tareas y sin ejecuciones, con el target intacto.
-- [ ] 1.34 `src/db/entities/job.rs`: test que fija que una inserción **huérfana** —una tarea que apunta a un target inexistente, una ejecución que apunta a una tarea inexistente— se rechaza con error tipado y no deja fila.
-- [ ] 1.35 `src/db/entities/repository.rs`: test que fija que un nombre con comillas simples y con la cadena `); DROP TABLE backup_jobs; --` llega íntegro a la fila y que las cuatro tablas siguen existiendo.
-- [ ] 1.36 `src/db/entities/repository.rs`: test que fija que el error tipado de la capa de acceso, traducido a respuesta, lleva el mensaje **genérico** de los fallos del servidor y **no** el texto de la consulta.
-- [ ] 1.37 `src/db/crypto.rs`: test que fija que el valor almacenado empieza por `v1:` y tiene tres partes separadas por `:`.
-- [ ] 1.38 `src/db/crypto.rs`: test que fija que dos cifrados del **mismo** secreto son **distintos**: ni el texto cifrado ni el nonce coinciden. Es lo que demuestra que el nonce es aleatorio por valor.
-- [ ] 1.39 `src/db/crypto.rs`: test que fija que lo que devuelve la lectura por la capa de acceso es el valor original, **sin** el prefijo de versión.
-- [ ] 1.40 `src/db/crypto.rs`: test que fija que un prefijo desconocido (`v2:`, `x:`) devuelve error y **no** un secreto vacío.
-- [ ] 1.41 `src/db/crypto.rs`: test que fija que un nonce de longitud equivocada devuelve error y no un secreto vacío.
-- [ ] 1.42 `src/db/crypto.rs`: test que fija que un texto cifrado con un byte cambiado devuelve error —el AEAD no autentica— y no un secreto parcial.
-- [ ] 1.43 `src/db/crypto.rs`: test que fija que un valor en claro, sin sobre, devuelve error y **no** ese valor como si fuera un secreto legítimo.
-- [ ] 1.44 `src/db/crypto.rs`: test que fija que el mensaje del error de descifrado **no** contiene el valor cifrado, ni el nonce, ni el valor en claro.
-- [ ] 1.45 `src/db/crypto.rs`: test que fija que dos derivaciones con la misma `KESTO_MASTER_KEY` dan la misma clave, y que la etiqueta de derivación es una constante del módulo —cambiarla cambia la clave derivada—.
-- [ ] 1.46 `src/db/crypto.rs`: test que fija que, con otra `KESTO_MASTER_KEY`, un valor cifrado antes **falla** al descifrarse y no devuelve un secreto vacío. Es el escenario que documenta el límite de la rotación.
-- [ ] 1.47 `src/db/mod.rs`: test que fija que el valor de **tres secretos distinguibles** no aparece ni en el fichero `.db` ni en sus ficheros `-wal` y `-shm`, buscándolos **literalmente en los bytes del fichero**. **No** se consulta la capa de acceso: lo que se afirma es una propiedad del fichero.
-- [ ] 1.48 `src/db/entities/repository.rs`: test que fija que el `Debug` de un repositorio y de un target leídos de la base **no** contiene ninguno de los tres secretos, y que el valor solo sale por el método explícito.
-- [ ] 1.49 `src/db/entities/repository.rs`: test que fija que con `RUST_LOG=trace` el alta, la lectura y la actualización no dejan en el log ninguno de los tres secretos, **ni su forma cifrada**, con valores distinguibles que se buscan literalmente en la salida capturada.
-- [ ] 1.50 `src/db/crypto.rs`: test que fija que con `RUST_LOG=trace` no aparece ni el valor de `KESTO_MASTER_KEY` ni el de la clave derivada. Usa el arnés de captura existente por el buffer **por hilo** (`src/test_support.rs`), sin `set_default` ni `with_default`.
+- [x] 1.18 `src/db/entities/repository.rs`: test que fija el alta y la lectura por identificador, con todos los campos.
+- [x] 1.19 `src/db/entities/repository.rs`: test que fija que el identificador generado se almacena como **`TEXT` con forma canónica con guiones** y **no** como BLOB de 16 bytes, consultando el tipo y la longitud del valor almacenado. **Es el escenario que caza la trampa del `Uuid` como BLOB.**
+- [x] 1.20 `src/db/entities/repository.rs`: test que fija que leer por un identificador inexistente devuelve «no está» y **no** un error de base.
+- [x] 1.21 `src/db/entities/repository.rs`: test que fija el listado con tres filas y su orden estable entre dos llamadas seguidas.
+- [x] 1.22 `src/db/entities/repository.rs`: test que fija la actualización: el campo tocado cambia y los demás conservan su valor.
+- [x] 1.23 `src/db/entities/repository.rs`: test que fija el borrado por identificador.
+- [x] 1.24 `src/db/entities/repository.rs`: test que fija que un `created_at` que la base rellenó con `CURRENT_TIMESTAMP` —fila insertada con SQL directo, sin informar la columna— se **descodifica** como la fecha UTC que declara el texto.
+- [x] 1.25 `src/db/entities/target.rs`: test de alta, lectura, listado, actualización y borrado de `backup_targets`.
+- [x] 1.26 `src/db/entities/target.rs`: test que fija que un `db_name` informado se lee informado, uno `NULL` se lee `NULL` y **`NULL` no se confunde con la cadena vacía**.
+- [x] 1.27 `src/db/entities/target.rs`: test que fija que un target de tipo `directory` no necesita `container_name`, ni `db_user`, ni `db_password`, y que su `db_name` es `NULL`.
+- [x] 1.28 `src/db/entities/job.rs`: test de alta, lectura, listado, actualización y borrado de `backup_jobs`, con sus cuatro `keep_*` y su `enabled`.
+- [x] 1.29 `src/db/entities/job.rs`: test que fija que `enabled` se almacena como el entero `1` cuando es verdadero y como `0` cuando es falso.
+- [x] 1.30 `src/db/entities/execution.rs`: test de alta, lectura, listado, actualización y borrado de `job_executions`, con su estado, sus contadores y sus dos fechas.
+- [x] 1.31 `src/db/entities/execution.rs`: test que fija que una ejecución con `finished_at` a `NULL` se lee como ausencia y no como fecha inventada.
+- [x] 1.32 `src/db/entities/target.rs`: test que fija que borrar un **target** deja sin `backup_jobs` sus tareas y sin `job_executions` esas tareas, con el repositorio intacto. **Es la cascada de los tres niveles.**
+- [x] 1.33 `src/db/entities/repository.rs`: test que fija que borrar un **repositorio** deja sin tareas y sin ejecuciones, con el target intacto.
+- [x] 1.34 `src/db/entities/job.rs`: test que fija que una inserción **huérfana** —una tarea que apunta a un target inexistente, una ejecución que apunta a una tarea inexistente— se rechaza con error tipado y no deja fila.
+- [x] 1.35 `src/db/entities/repository.rs`: test que fija que un nombre con comillas simples y con la cadena `); DROP TABLE backup_jobs; --` llega íntegro a la fila y que las cuatro tablas siguen existiendo.
+- [x] 1.36 `src/db/entities/repository.rs`: test que fija que el error tipado de la capa de acceso, traducido a respuesta, lleva el mensaje **genérico** de los fallos del servidor y **no** el texto de la consulta.
+- [x] 1.37 `src/db/crypto.rs`: test que fija que el valor almacenado empieza por `v1:` y tiene tres partes separadas por `:`.
+- [x] 1.38 `src/db/crypto.rs`: test que fija que dos cifrados del **mismo** secreto son **distintos**: ni el texto cifrado ni el nonce coinciden. Es lo que demuestra que el nonce es aleatorio por valor.
+- [x] 1.39 `src/db/crypto.rs`: test que fija que lo que devuelve la lectura por la capa de acceso es el valor original, **sin** el prefijo de versión.
+- [x] 1.40 `src/db/crypto.rs`: test que fija que un prefijo desconocido (`v2:`, `x:`) devuelve error y **no** un secreto vacío.
+- [x] 1.41 `src/db/crypto.rs`: test que fija que un nonce de longitud equivocada devuelve error y no un secreto vacío.
+- [x] 1.42 `src/db/crypto.rs`: test que fija que un texto cifrado con un byte cambiado devuelve error —el AEAD no autentica— y no un secreto parcial.
+- [x] 1.43 `src/db/crypto.rs`: test que fija que un valor en claro, sin sobre, devuelve error y **no** ese valor como si fuera un secreto legítimo.
+- [x] 1.44 `src/db/crypto.rs`: test que fija que el mensaje del error de descifrado **no** contiene el valor cifrado, ni el nonce, ni el valor en claro.
+- [x] 1.45 `src/db/crypto.rs`: test que fija que dos derivaciones con la misma `KESTO_MASTER_KEY` dan la misma clave, y que la etiqueta de derivación es una constante del módulo —cambiarla cambia la clave derivada—.
+- [x] 1.46 `src/db/crypto.rs`: test que fija que, con otra `KESTO_MASTER_KEY`, un valor cifrado antes **falla** al descifrarse y no devuelve un secreto vacío. Es el escenario que documenta el límite de la rotación.
+- [x] 1.47 `src/db/mod.rs`: test que fija que el valor de **tres secretos distinguibles** no aparece ni en el fichero `.db` ni en sus ficheros `-wal` y `-shm`, buscándolos **literalmente en los bytes del fichero**. **No** se consulta la capa de acceso: lo que se afirma es una propiedad del fichero.
+- [x] 1.48 `src/db/entities/repository.rs`: test que fija que el `Debug` de un repositorio y de un target leídos de la base **no** contiene ninguno de los tres secretos, y que el valor solo sale por el método explícito.
+- [x] 1.49 `src/db/entities/repository.rs`: test que fija que con `RUST_LOG=trace` el alta, la lectura y la actualización no dejan en el log ninguno de los tres secretos, **ni su forma cifrada**, con valores distinguibles que se buscan literalmente en la salida capturada.
+- [x] 1.50 `src/db/crypto.rs`: test que fija que con `RUST_LOG=trace` no aparece ni el valor de `KESTO_MASTER_KEY` ni el de la clave derivada. Usa el arnés de captura existente por el buffer **por hilo** (`src/test_support.rs`), sin `set_default` ni `with_default`.
 - [x] 1.51 `src/error.rs`: test que fija que la variante nueva de base de datos traduce a `500` con la envoltura, con el mensaje **genérico** y la causa al log.
 - [x] 1.52 `src/main.rs`: test que fija que el arranque abre la base y aplica las migraciones **antes** de aceptar peticiones, y que un fallo de migración impide arrancar.
 - [x] 1.53 Ejecutar `just check`: las pruebas nuevas fallan por no existir el código, y **los 93 tests existentes siguen verdes**.
@@ -75,9 +75,9 @@ Cada tarea es una prueba por escenario de `specs/db/spec.md` y `specs/secrets/sp
 - [x] 2.3 `migrations/0002_indexes.sql`: los cuatro índices que el SRS no tiene. Van en una migración **aparte** para que se lean como lo que son, un añadido al §3, y no se confundan con lo que el SRS declara.
 - [x] 2.4 `src/db/mod.rs`: el error tipado de la capa de base de datos —con sus variantes de apertura, migración y consulta, y conservando la causa—, la construcción de `SqliteConnectOptions` con `create_if_missing(true)`, `foreign_keys(true)`, `journal_mode(Wal)`, `busy_timeout` y el fichero resuelto desde el DSN, la comprobación explícita de que el directorio existe —con el mensaje que **nombra la ruta**— y el pool.
 - [x] 2.5 `src/db/migrate.rs`: `sqlx::migrate!()` y la aplicación al arrancar, con su error de arranque. **Antes** de esta tarea, `migrations/` ya tiene que existir: la macro resuelve su directorio en tiempo de compilación y sin el directorio el fallo es de `cargo check`, no de arranque.
-- [ ] 2.6 `src/db/crypto.rs`: el sobre `v1:<nonce>:<cifrado>` —prefijo, nonce aleatorio por valor con `OsRng`, base64 estándar—, la derivación de la clave con HKDF-SHA256 y la etiqueta fija `kesto/secrets/v1`, el cifrado con `Aes256Gcm` y el descifrado que **falla en alto** en los cuatro casos, con un error tipado que no publica el valor.
-- [ ] 2.7 `src/db/entities/mod.rs` y las cuatro entidades: los tipos con sus campos, el mapeo de los enumerados con `#[sqlx(rename_all = "lowercase")]`, el identificador en forma **hyphenated** para escribir `TEXT` —nunca `Uuid` directo, que escribiría un BLOB— y las fechas como `time::OffsetDateTime`.
-- [ ] 2.8 `src/db/entities/{repository,target,job,execution}.rs`: el alta —con el identificador generado en la capa de acceso—, la lectura por identificador que distingue «no está» de error, el listado con orden estable, la actualización y el borrado, todo con **prepared statements** y columnas enlazadas. Los tres campos de secreto entran y salen como `SecretString`.
+- [x] 2.6 `src/db/crypto.rs`: el sobre `v1:<nonce>:<cifrado>` —prefijo, nonce aleatorio por valor con `OsRng`, base64 estándar—, la derivación de la clave con HKDF-SHA256 y la etiqueta fija `kesto/secrets/v1`, el cifrado con `Aes256Gcm` y el descifrado que **falla en alto** en los cuatro casos, con un error tipado que no publica el valor.
+- [x] 2.7 `src/db/entities/mod.rs` y las cuatro entidades: los tipos con sus campos, el mapeo de los enumerados con `#[sqlx(rename_all = "lowercase")]`, el identificador en forma **hyphenated** para escribir `TEXT` —nunca `Uuid` directo, que escribiría un BLOB— y las fechas como `time::OffsetDateTime`.
+- [x] 2.8 `src/db/entities/{repository,target,job,execution}.rs`: el alta —con el identificador generado en la capa de acceso—, la lectura por identificador que distingue «no está» de error, el listado con orden estable, la actualización y el borrado, todo con **prepared statements** y columnas enlazadas. Los tres campos de secreto entran y salen como `SecretString`.
 - [x] 2.9 `src/main.rs`: el pool queda vivo tras abrir y migrar —una sola vez, antes de escuchar— y **no** pasa al `AppState` en este change: el traspaso al estado es la **primera** tarea del change que estrene su primer consumidor (los endpoints del §5), porque hoy no hay ninguno y un pool no opcional llevaría una base de datos a las más de treinta construcciones de `AppState` de las pruebas. El porqué completo está en el requisito 1 del spec.
 - [x] 2.10 `src/main.rs`: la apertura de la base y las migraciones al arrancar, **antes** de enlazar el socket, con su fallo como error de arranque.
 - [x] 2.11 `src/error.rs`: la variante nueva `Database`, que traduce a `500` con la envoltura y el mensaje genérico —la causa al log, nunca al cuerpo—, con su test por la vía de `IntoResponse`.
@@ -111,11 +111,11 @@ Cada tarea es una prueba por escenario de `specs/db/spec.md` y `specs/secrets/sp
 
 ## 5. Cierre
 
-- [ ] 5.1 `just check` en verde y `just check-all` con el panel en verde si `ui/` ya existe.
-- [ ] 5.2 `just spec-validate db-schema` en modo estricto.
-- [ ] 5.3 `AGENTS.md`: la fila de `DATABASE_URL` deja de decir «Todavía no se usa» —ya se usa— y se describe el esquema de cifrado en reposo (`v1:<nonce>:<cifrado>`, HKDF sobre `KESTO_MASTER_KEY`, nonce por valor), con la rotación como límite aceptado. Y el repaso de estado: `src/db/` deja de estar vacío.
-- [ ] 5.4 `README.md`: el estado deja de decir que no hay base de datos y de que los cinco módulos del §7 están vacíos.
-- [ ] 5.5 `docs/FEATURE-003-db-schema.md` con lo que realmente quedó construido: el esquema y sus migraciones, los cuatro índices añadidos y por qué, el sobre de cifrado con su etiqueta y su versión, la semántica de `db_name`, las versiones resueltas en la tarea 0.5 con la duplicación transitiva aceptada, y la deuda pendiente —los nueve endpoints del §5, el `VACUUM` y la retención de `job_executions`, la rotación de la clave, y el cambio del §4.A que el motor tendrá que hacer para respetar `db_name`—.
-- [ ] 5.6 Renombrar el plan del change a `plans/PLAN-003-COMPLETED.md` con `just plan-done 3`, y redactar el `Purpose` de `openspec/specs/db/spec.md` al archivar: es una capability **nueva** y no puede quedarse en `TBD`.
-- [ ] 5.7 `just spec-archive db-schema`.
-- [ ] 5.8 PR de `feature/db-schema` a **`development`** con `just gf-pr`, con el CI en verde —`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` y `cargo test --locked`, que es lo que corre el pipeline—. **Sin release**: no se abre PR a `main` ni se etiqueta nada. Un merge a `main` dispara la release y este change es la mitad de la base cerrada, no una entrega publicable.
+- [x] 5.1 `just check` en verde y `just check-all` con el panel en verde si `ui/` ya existe.
+- [x] 5.2 `just spec-validate db-schema` en modo estricto.
+- [x] 5.3 `AGENTS.md`: la fila de `DATABASE_URL` deja de decir «Todavía no se usa» —ya se usa— y se describe el esquema de cifrado en reposo (`v1:<nonce>:<cifrado>`, HKDF sobre `KESTO_MASTER_KEY`, nonce por valor), con la rotación como límite aceptado. Y el repaso de estado: `src/db/` deja de estar vacío.
+- [x] 5.4 `README.md`: el estado deja de decir que no hay base de datos y de que los cinco módulos del §7 están vacíos.
+- [x] 5.5 `docs/FEATURE-003-db-schema.md` con lo que realmente quedó construido: el esquema y sus migraciones, los cuatro índices añadidos y por qué, el sobre de cifrado con su etiqueta y su versión, la semántica de `db_name`, las versiones resueltas en la tarea 0.5 con la duplicación transitiva aceptada, y la deuda pendiente —los nueve endpoints del §5, el `VACUUM` y la retención de `job_executions`, la rotación de la clave, y el cambio del §4.A que el motor tendrá que hacer para respetar `db_name`—.
+- [x] 5.6 Renombrar el plan del change a `plans/PLAN-003-COMPLETED.md` con `just plan-done 3`, y redactar el `Purpose` de `openspec/specs/db/spec.md` al archivar: es una capability **nueva** y no puede quedarse en `TBD`.
+- [x] 5.7 `just spec-archive db-schema`.
+- [x] 5.8 PR de `feature/db-schema` a **`development`** con `just gf-pr`, con el CI en verde —`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` y `cargo test --locked`, que es lo que corre el pipeline—. **Sin release**: no se abre PR a `main` ni se etiqueta nada. Un merge a `main` dispara la release y este change es la mitad de la base cerrada, no una entrega publicable.
