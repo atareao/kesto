@@ -657,17 +657,92 @@ mod tests {
 
     #[tokio::test]
     async fn el_flujo_completo_no_deja_credenciales_en_el_log() {
-        // Escenario 1.38 — el único de la especificación que quedaba sin
-        // cobertura, y un SHALL del requisito «Ninguna credencial del proveedor
-        // acaba en el log ni en la cookie». Con el registro a `trace`, el flujo
-        // entero —login, callback y una petición con la sesión— no puede dejar en
-        // el log ninguna de las cuatro credenciales. Los cuatro valores son
-        // distinguibles y se buscan **literalmente** en la salida capturada.
+        // Escenario 1.38 — un SHALL del requisito «Ninguna credencial del
+        // proveedor acaba en el log ni en la cookie». Con el registro a `trace`,
+        // el flujo no puede dejar en el log ninguna de las credenciales que
+        // maneja. Se ejercitan los **dos** caminos, porque la fuga puede estar en
+        // cualquiera de ellos:
+        //
+        //   * el de **error** del canje, que es el único sitio por el que un
+        //     texto ajeno entra al registro —`tracing::error!(error = %causa, …)`
+        //     de `AppError::BadGateway`, con la causa del proveedor interpolada—,
+        //     y
+        //   * el **feliz**: login, callback, sesión emitida y una petición con
+        //     ella.
+        //
+        // **Por qué las dos primeras aserciones son sobre líneas del flujo.** La
+        // marca de control que había aquí —un `tracing::trace!` lanzado desde
+        // este hilo— probaba que el suscriptor estaba instalado, pero **no** que
+        // lo que el flujo registra en su propio contexto llegara al buffer: si el
+        // manejador se despachara en otro hilo, el flujo registraría fuera del
+        // alcance del suscriptor —`set_default` es **de hilo**—, la marca
+        // seguiría apareciendo y las cuatro búsquedas de abajo pasarían por
+        // vacío, en verde. Lo que se afirma ahora son dos líneas que emite el
+        // propio flujo ejercitado —una del callback, otra de la traducción del
+        // `502`—, así que el día que la captura deje de alcanzar al flujo, este
+        // test cae.
+        let (buffer, _guard) = capturar_log();
+
+        // ── Un rechazo del propio callback ───────────────────────────────────
         let proveedor = ProveedorFalso::servir().await;
         let router = router_oidc_con_emisor(&proveedor.issuer);
 
-        let (buffer, _guard) = capturar_log();
+        let rechazo = get(
+            router.clone(),
+            &callback_url("state-que-nadie-emitio", "codigo-inventado"),
+        )
+        .await;
 
+        assert_eq!(
+            rechazo.status(),
+            StatusCode::UNAUTHORIZED,
+            "un state que nadie emitió debe rechazarse"
+        );
+
+        // ── El camino de error del canje, con un cuerpo ajeno ────────────────
+        let proveedor_caido = ProveedorFalso::servir().await;
+        let router_caido = router_oidc_con_emisor(&proveedor_caido.issuer);
+        // El cuerpo del `502` es hostil a propósito: lleva credenciales de verdad,
+        // para que registrarlo quedara en evidencia. Kesto ni lo lee —solo mira
+        // el código de estado—, así que lo que aquí se fija es que no lo lea
+        // nadie y, sobre todo, que no se registre.
+        let cuerpo_ajeno = format!(
+            "{{\"error\":\"invalid_grant\",\"client_secret\":\"{OIDC_CLIENT_SECRET}\",\
+             \"access_token\":\"{ACCESS_TOKEN}\"}}"
+        );
+        // 502: el proveedor contesta un error al canje del código.
+        proveedor_caido
+            .montar_token_endpoint_con_error(502, &cuerpo_ajeno)
+            .await;
+
+        let (state_del_error, _nonce) = login_state_y_nonce(router_caido.clone()).await;
+        let codigo_del_error = "codigo-del-502-distinguible";
+        let caida = get(
+            router_caido,
+            &callback_url(&state_del_error, codigo_del_error),
+        )
+        .await;
+
+        assert_eq!(
+            caida.status(),
+            StatusCode::BAD_GATEWAY,
+            "un proveedor que contesta un error al canje debe dejar el callback en un 502"
+        );
+        assert!(
+            token_de_set_cookie(&caida).is_none(),
+            "un 502 no puede emitir cookie de sesión"
+        );
+
+        // La causa del 502 no sale al cuerpo: la respuesta es la envoltura con el
+        // mensaje genérico de todo `5xx`.
+        let texto_caida = body_text(caida).await;
+
+        assert!(
+            !texto_caida.contains(OIDC_CLIENT_SECRET),
+            "el 502 del callback publicó el client_secret en el cuerpo: {texto_caida}"
+        );
+
+        // ── El camino feliz, entero ──────────────────────────────────────────
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let id_token =
             proveedor.firmar(&IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce));
@@ -688,20 +763,32 @@ mod tests {
 
         assert_eq!(sesion.status(), StatusCode::OK);
 
-        // Marca de control: el camino feliz no registra nada por sí solo, así que
-        // sin esta línea las aserciones de abajo pasarían por vacías. Si no
-        // aparece, la captura no está en pie.
-        tracing::trace!("marca-de-control-del-log-de-1.38");
         let log = buffer.texto();
 
+        // Que la captura esté en pie lo prueba el propio **flujo**, no este hilo:
+        // el rechazo del callback y la traducción del `502` —con la causa del
+        // proveedor dentro—. Si el flujo registrara fuera del alcance del
+        // suscriptor, esto cae, y con ello deja de poder pasar por vacío lo de
+        // abajo.
         assert!(
-            log.contains("marca-de-control-del-log-de-1.38"),
-            "la captura de log no está en pie: {log}"
+            log.contains("callback con un state no utilizable"),
+            "la captura no está en pie: el rechazo del callback no quedó registrado: {log}"
+        );
+        assert!(
+            log.contains("un servicio de terceros no contestó")
+                && log.contains(
+                    "el proveedor de identidad contestó 502 Bad Gateway al canje del código"
+                ),
+            "la captura no está en pie: la causa del 502 no quedó registrada: {log}"
         );
 
         for (nombre, credencial) in [
             ("client_secret", OIDC_CLIENT_SECRET),
             ("código de autorización", codigo),
+            (
+                "código de autorización del camino de error",
+                codigo_del_error,
+            ),
             ("ID token", id_token.as_str()),
             ("token de acceso", ACCESS_TOKEN),
         ] {

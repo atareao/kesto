@@ -457,7 +457,7 @@ mod tests {
         EMAIL, OIDC_CLIENT_ID, OIDC_REDIRECT_URL, SESSION_SECRET, SUB, auth_oidc, callback_url,
         capturar_log, estado_oidc_con_emisor, get, header_text, login_state_y_nonce,
         parametros_de_consulta, proveedor_falso::IdToken, proveedor_falso::ProveedorFalso,
-        router_oidc_con_emisor, token_de_set_cookie,
+        proveedor_falso::token_con_alg_none, router_oidc_con_emisor, token_de_set_cookie,
     };
     use std::time::{Duration, Instant};
 
@@ -663,6 +663,28 @@ mod tests {
             token_de_set_cookie(&respuesta).is_none(),
             "un rechazo no puede emitir cookie de sesión"
         );
+    }
+
+    /// Claims de un ID token en regla, en crudo para firmarlo con una cabecera a
+    /// mano.
+    ///
+    /// Los tokens de los ataques de cabecera y de firma parten de aquí: si además
+    /// fallara un claim, el rechazo podría venir de otra comprobación y el
+    /// candado no probaría lo que anuncia. Con el `nonce` del login y sin nada
+    /// adelantado al reloj, lo único torcido del token es la parte que el ataque
+    /// toca.
+    fn claims_completos(proveedor: &ProveedorFalso, nonce: &str) -> serde_json::Value {
+        let ahora = jsonwebtoken::get_current_timestamp();
+
+        serde_json::json!({
+            "iss": proveedor.issuer,
+            "aud": OIDC_CLIENT_ID,
+            "sub": SUB,
+            "email": EMAIL,
+            "nonce": nonce,
+            "iat": ahora,
+            "exp": ahora + 600,
+        })
     }
 
     #[tokio::test]
@@ -883,9 +905,21 @@ mod tests {
         }));
         proveedor.montar_token_endpoint(&token).await;
 
+        let (buffer, _guard) = capturar_log();
         let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
 
         assert_rechazo_sin_cookie(respuesta).await;
+
+        // La causa registrada, no solo el `401`: un token rechazado por la
+        // firma, por el `kid`, por `iss` o por `aud` daría el mismo `401`, así
+        // que sin esta aserción el candado no fija de qué comprobación viene el
+        // rechazo que anuncia. El texto es el de `jsonwebtoken` —de quien es la
+        // comprobación— para el claim que falta, sin envolverlo en nada nuestro.
+        assert!(
+            log.contains("la verificación del ID token falló: Missing required claim: exp"),
+            "el rechazo no viene de que falte exp: {log}"
+        );
     }
 
     #[tokio::test]
@@ -911,9 +945,20 @@ mod tests {
         }));
         proveedor.montar_token_endpoint(&token).await;
 
+        let (buffer, _guard) = capturar_log();
         let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
 
         assert_rechazo_sin_cookie(respuesta).await;
+
+        // La causa registrada, no solo el `401`: el token trae firma, `kid`,
+        // `iss`, `aud`, `exp` y `nonce` en regla, así que sin esta aserción el
+        // candado no fija que el rechazo venga de la comprobación de `iat` que
+        // anuncia en vez de, por ejemplo, de la firma.
+        assert!(
+            log.contains("el ID token se emitió en el futuro"),
+            "el rechazo no viene del iat adelantado al reloj: {log}"
+        );
     }
 
     #[tokio::test]
@@ -986,6 +1031,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn un_id_token_sin_kid_no_se_acepta() {
+        // `kid` ausente — la cabecera no declara `kid`, así que no hay clave con
+        // la que verificar. La comprobación es **anterior** a la firma y hoy no
+        // tenía candado: con el JWKS publicando una sola clave, un «si solo hay
+        // una, úsala» —el atajo clásico— aceptaría este token, que va firmado con
+        // esa misma clave y con todos los claims en regla.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let token = proveedor.firmar_sin_kid(&claims_completos(&proveedor, &nonce));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let (buffer, _guard) = capturar_log();
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
+
+        assert_rechazo_sin_cookie(respuesta).await;
+
+        // La causa registrada es lo que fija que el rechazo venga de aquí y no
+        // de la firma, de `iss` o de `aud`.
+        assert!(
+            log.contains("el ID token no declara kid"),
+            "el rechazo no viene de la ausencia de kid: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_id_token_con_un_kid_que_el_jwks_no_publica_no_se_acepta() {
+        // `kid` desconocido — la cabecera declara un `kid` que el `jwks_uri` no
+        // publica. El token va firmado con la clave que **sí** se publica, así que
+        // la firma cuadraría: lo que falla es la búsqueda de la clave por su `kid`
+        // —la comprobación anterior a la firma—, y sin ella el token se aceptaría.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let token = proveedor.firmar_con_kid_ajeno(&claims_completos(&proveedor, &nonce));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let (buffer, _guard) = capturar_log();
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
+
+        assert_rechazo_sin_cookie(respuesta).await;
+        assert!(
+            log.contains("una clave que el jwks_uri no publica"),
+            "el rechazo no viene de que el kid no esté en el JWKS: {log}"
+        );
+    }
+
+    #[tokio::test]
     async fn una_firma_fuera_del_jwks_no_se_acepta() {
         // Escenario 1.18. El token va firmado con una clave que el `jwks_uri` no
         // publica, pero con el mismo `kid` que sí publica: la verificación
@@ -1003,6 +1100,73 @@ mod tests {
         let respuesta = get(router, &callback_url(&state, "codigo")).await;
 
         assert_rechazo_sin_cookie(respuesta).await;
+    }
+
+    #[tokio::test]
+    async fn un_id_token_con_alg_none_no_se_acepta() {
+        // `alg: none` — la confusión de algoritmo más burda: el token declara que
+        // no va firmado y lleva los claims legítimos dentro. Lo que lo rechaza no
+        // es una comprobación nuestra sino que `jsonwebtoken` no puede siquiera
+        // representar ese algoritmo —su `Algorithm` no tiene la variante—, y por
+        // eso se fija aquí: el día que alguien sustituya ese parseo por uno hecho
+        // a mano, el token entra y emite sesión sin haber comprobado nada.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let token = token_con_alg_none(&claims_completos(&proveedor, &nonce));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let (buffer, _guard) = capturar_log();
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
+
+        assert_rechazo_sin_cookie(respuesta).await;
+
+        // La causa: el token muere en la lectura de la cabecera, antes de la
+        // firma. Medido —y por eso la aserción no es solo el `401`—: ni siquiera
+        // `jsonwebtoken::dangerous::insecure_decode`, con la verificación
+        // desactivada entera, acepta este token, porque también parsea la
+        // cabecera; y quitando nuestro rechazo de cabecera ilegible el token se
+        // rechaza en otra capa y esta aserción cae.
+        assert!(
+            log.contains("la cabecera del ID token no es válida"),
+            "el rechazo no viene de la cabecera: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_id_token_firmado_en_hs256_no_se_acepta() {
+        // `HS256` con la clave pública — la confusión de algoritmo de verdad: el
+        // token va firmado en `HS256` usando como secreto HMAC la **clave pública**
+        // del proveedor, que es material que cualquiera tiene del `jwks_uri`. El
+        // `kid` es el legítimo, así que la clave se resuelve y lo que tiene que
+        // pararlo es la verificación. Son dos barreras: el algoritmo está fijado a
+        // `RS256` —no se lee de la cabecera— y, por detrás, `jsonwebtoken` tampoco
+        // deja verificar un `HMAC` con una clave de familia RSA. Medido: leyendo el
+        // algoritmo del token, este rechazo sale igual, pero como
+        // `InvalidKeyFormat` en vez de `InvalidAlgorithm` —que es justo lo que la
+        // aserción de abajo delata—.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let token = proveedor.firmar_confundiendo_algoritmo(&claims_completos(&proveedor, &nonce));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let (buffer, _guard) = capturar_log();
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
+
+        assert_rechazo_sin_cookie(respuesta).await;
+
+        // El algoritmo de la cabecera no está entre los admitidos: el rechazo es
+        // `InvalidAlgorithm`, no una firma que no cuadra ni una clave que no sirve
+        // —lo que sería la señal de que el algoritmo sí se leyó del token—.
+        assert!(
+            log.contains("la verificación del ID token falló: InvalidAlgorithm"),
+            "el rechazo no viene del algoritmo fijado a RS256: {log}"
+        );
     }
 
     #[tokio::test]

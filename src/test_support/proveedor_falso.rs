@@ -18,11 +18,18 @@
 //! **Ninguna prueba sale a internet**: `wiremock` levanta un servidor HTTP real
 //! atado a `127.0.0.1` con un puerto efímero, y todas las peticiones se quedan
 //! en la máquina.
+//!
+//! Además de los tokens legítimos, el arnés sabe fabricar los de los dos ataques
+//! clásicos a la verificación de un ID token: cabeceras a mano —`alg: none` y,
+//! para los casos de `kid`, sin `kid` y con uno que el JWKS no publica— y una
+//! firma `HS256` cuyo secreto HMAC son los bytes públicos del proveedor, que es
+//! la confusión de algoritmo.
 
+use base64::Engine as _;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rsa::RsaPrivateKey;
-use rsa::pkcs1::EncodeRsaPrivateKey;
+use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use serde::{Deserialize, Serialize};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -42,6 +49,14 @@ const RUTA_JWKS: &str = "/jwks";
 /// tiene que encontrar la clave por su `kid` y comprobar la firma contra ella,
 /// no tropezar antes con una clave ausente.
 pub(crate) const KID: &str = "kesto-clave-de-prueba";
+
+/// `kid` que el `jwks_uri` **no** publica.
+///
+/// Sirve para firmar un token que la verificación no puede resolver por su
+/// clave: el JWKS solo publica [`KID`]. El token va firmado con la clave que sí
+/// se publica, de modo que el rechazo no puede venir de la firma —cuadra— sino
+/// de que la clave que la cabecera nombra no está en el conjunto.
+pub(crate) const KID_AJENO: &str = "kid-que-el-jwks-no-publica";
 
 /// Token de acceso del proveedor: distinguible para que buscarlo en el log o en
 /// la cookie sea concluyente.
@@ -104,6 +119,12 @@ pub(crate) struct ProveedorFalso {
     /// rechazarse por una firma que no cuadra. Es lo que convierte el escenario
     /// 1.18 en una prueba de la verificación criptográfica y no de una búsqueda.
     clave_no_publicada: EncodingKey,
+    /// Clave de firma del token de confusión de algoritmo: un `HMAC` cuyo
+    /// secreto son los **bytes públicos** del proveedor —los que cualquiera
+    /// tiene del `jwks_uri`—. No es un par RSA: es un atacante firmando en
+    /// `HS256` con el material que conoce, convencido de que la verificación
+    /// leerá el algoritmo de la cabecera.
+    clave_confusa: EncodingKey,
 }
 
 impl ProveedorFalso {
@@ -119,8 +140,8 @@ impl ProveedorFalso {
 
         // El par de claves es real: la firma que el callback verifica es la
         // misma matemática que en producción. La segunda clave nunca se publica.
-        let clave = generar_clave();
-        let clave_no_publicada = generar_clave();
+        let (clave, clave_publica) = generar_clave();
+        let (clave_no_publicada, _) = generar_clave();
 
         let documento = serde_json::json!({
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -145,6 +166,7 @@ impl ProveedorFalso {
             issuer,
             clave,
             clave_no_publicada,
+            clave_confusa: EncodingKey::from_secret(&clave_publica),
         }
     }
 
@@ -177,6 +199,44 @@ impl ProveedorFalso {
         firmar_con(&self.clave_no_publicada, claims)
     }
 
+    /// Firma un ID token `RS256` **sin `kid`** en la cabecera.
+    ///
+    /// La firma es legítima —la hace la clave que el JWKS publica—, pero la
+    /// cabecera no dice con cuál, así que no hay clave que elegir. Un
+    /// «si el conjunto trae una sola clave, úsala» aceptaría este token.
+    pub(crate) fn firmar_sin_kid(&self, claims: &serde_json::Value) -> String {
+        let cabecera = Header::new(Algorithm::RS256);
+
+        encode(&cabecera, claims, &self.clave).expect("el ID token de prueba debe firmarse")
+    }
+
+    /// Firma un ID token `RS256` con la clave publicada pero con el `kid` de
+    /// [`KID_AJENO`], que el JWKS no publica.
+    ///
+    /// La firma cuadra con la única clave del conjunto; lo que falla es la
+    /// búsqueda por `kid`. Es el complemento de [`Self::firmar_con_clave_ajena`]:
+    /// allí el `kid` resuelve a una clave y la firma no cuadra; aquí la firma
+    /// cuadraría y es el `kid` el que no resuelve.
+    pub(crate) fn firmar_con_kid_ajeno(&self, claims: &serde_json::Value) -> String {
+        let mut cabecera = Header::new(Algorithm::RS256);
+        cabecera.kid = Some(KID_AJENO.to_owned());
+
+        encode(&cabecera, claims, &self.clave).expect("el ID token de prueba debe firmarse")
+    }
+
+    /// Firma un ID token `HS256` usando como secreto HMAC la **clave pública**
+    /// del proveedor: la confusión de algoritmo clásica.
+    ///
+    /// El `kid` es el legítimo, así que la resolución de la clave no falla: lo
+    /// único que separa a este token de la sesión es que la verificación fija
+    /// `RS256` en vez de leer el algoritmo de la cabecera.
+    pub(crate) fn firmar_confundiendo_algoritmo(&self, claims: &serde_json::Value) -> String {
+        let mut cabecera = Header::new(Algorithm::HS256);
+        cabecera.kid = Some(KID.to_owned());
+
+        encode(&cabecera, claims, &self.clave_confusa).expect("el ID token de prueba debe firmarse")
+    }
+
     /// Monta el `token_endpoint` para que devuelva el ID token dado.
     ///
     /// Devuelve también un `access_token` distinguible: el flujo no lo usa —con
@@ -193,6 +253,21 @@ impl ProveedorFalso {
         Mock::given(method("POST"))
             .and(path(RUTA_TOKEN))
             .respond_with(ResponseTemplate::new(200).set_body_json(cuerpo))
+            .mount(&self.server)
+            .await;
+    }
+
+    /// Monta el `token_endpoint` para que conteste un error con el cuerpo dado.
+    ///
+    /// El cuerpo viaja a propósito, y lo elige la prueba: es donde se ponen
+    /// credenciales distinguibles para comprobar que un error del proveedor —el
+    /// único camino por el que un texto ajeno se interpola en el registro— no
+    /// las arrastra al log. Kesto ni lee ese cuerpo: solo mira el código de
+    /// estado.
+    pub(crate) async fn montar_token_endpoint_con_error(&self, estado: u16, cuerpo: &str) {
+        Mock::given(method("POST"))
+            .and(path(RUTA_TOKEN))
+            .respond_with(ResponseTemplate::new(estado).set_body_string(cuerpo))
             .mount(&self.server)
             .await;
     }
@@ -245,7 +320,11 @@ impl ProveedorFalso {
 /// A 2048 bits, que es el mínimo que la verificación `RS256` de `jsonwebtoken`
 /// espera. La clave se exporta en PKCS#1 DER porque es lo que acepta
 /// `EncodingKey::from_rsa_der` y lo que `Jwk::from_encoding_key` sabe leer.
-fn generar_clave() -> EncodingKey {
+///
+/// Devuelve también la **clave pública** en PKCS#1 DER: son los bytes que
+/// cualquiera tiene del `jwks_uri` y con los que el atacante firma su token de
+/// confusión de algoritmo.
+fn generar_clave() -> (EncodingKey, Vec<u8>) {
     let mut rng = rand::thread_rng();
 
     let privada = RsaPrivateKey::new(&mut rng, 2048)
@@ -255,8 +334,14 @@ fn generar_clave() -> EncodingKey {
         .expect("la clave privada de prueba debe codificarse en PKCS#1")
         .as_bytes()
         .to_vec();
+    let publica = privada
+        .to_public_key()
+        .to_pkcs1_der()
+        .expect("la clave pública de prueba debe codificarse en PKCS#1")
+        .as_bytes()
+        .to_vec();
 
-    EncodingKey::from_rsa_der(&der)
+    (EncodingKey::from_rsa_der(&der), publica)
 }
 
 /// Publica la clave pública de `clave` como JWKS, con su `kid`.
@@ -279,4 +364,22 @@ fn firmar_con(clave: &EncodingKey, claims: &IdToken) -> String {
     cabecera.kid = Some(KID.to_owned());
 
     encode(&cabecera, claims, clave).expect("el ID token de prueba debe firmarse")
+}
+
+/// JWT con la cabecera `{"alg":"none","kid":…}` y **sin firma**.
+///
+/// Es la confusión de algoritmo más burda: el token declara que no va firmado y
+/// los claims son los legítimos. No se construye con `jsonwebtoken` porque su
+/// `Algorithm` no tiene la variante `none` —es justo la razón de que este token
+/// se rechace al leer la cabecera—, así que las tres partes se codifican a mano
+/// en base64url sin relleno, como manda el RFC 7515. La tercera va vacía: eso es
+/// exactamente lo que significa `alg: none`.
+pub(crate) fn token_con_alg_none(claims: &serde_json::Value) -> String {
+    let cabecera = serde_json::json!({ "alg": "none", "kid": KID });
+
+    let codificar = |valor: &serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(valor.to_string())
+    };
+
+    format!("{}.{}.", codificar(&cabecera), codificar(claims))
 }
