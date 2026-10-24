@@ -2,7 +2,8 @@
 
 > Implementación del change proposal `auth-capability`, archivado en `openspec/changes/archive/2026-10-24-auth-capability/` (12 requisitos, 50 escenarios, `openspec validate --strict` válido).
 > Cerrada el 2026-10-24. Rama: `feature/auth-capability`, desde `development`. Plan: `plans/PLAN-002-COMPLETED.md`. Especificación de origen: `docs/DEFINITION.md` §5 y §8.
-> Estado: **cerrado** — **92 tests** (91 unitarios + 1 de integración). La especificación vive ya en `openspec/specs/` —`auth`, capability nueva, y `api-shell`, que creció—, con su `Purpose` redactado tras el archivado.
+> PR: [#7 — `feature/auth-capability` → `development`](https://github.com/atareao/kesto/pull/7) · CI en verde (run [`40117195376`](https://github.com/atareao/kesto/actions/runs/40117195376)).
+> Estado: **cerrado** — **93 tests** (92 unitarios + 1 de integración). La especificación vive ya en `openspec/specs/` —`auth`, capability nueva, y `api-shell`, que creció—, con su `Purpose` redactado tras el archivado.
 
 **El archivo está hecho.** El delta se fundió en dos sitios: `openspec/specs/auth/spec.md`, que **nació** con este change —10 requisitos, 42 escenarios—, y `openspec/specs/api-shell/spec.md`, que **creció** de 5 requisitos / 12 escenarios a **7 / 20** con los 2 requisitos y 8 escenarios nuevos. El change, con sus 90 tareas tildadas, queda en `openspec/changes/archive/2026-10-24-auth-capability/`.
 
@@ -30,7 +31,7 @@ Cifras del diff contra `development`: 16 ficheros, +6502/−204.
 | `Cargo.toml` / `Cargo.lock` | +38 / +2004 | Las dependencias del flujo |
 | `.justfile` | 2 líneas | Las dos recetas de `openspec` que estaban rotas: `spec-status` pasaba el change como argumento posicional —`openspec status` solo acepta `--change`— y `spec-archive` no pasaba `--yes`, así que se quedaba esperando por `stdin` e inutilizaba la receta desde un agente o un CI |
 
-**92 tests**, frente a los 25 de `bootstrap-core`, repartidos así: `auth/oidc.rs` 24, `api/mod.rs` 13, `config.rs` 13, `api/auth.rs` 12, `auth/session.rs` 9, `api/health.rs` 4, `error.rs` 4, `state.rs` 4, `auth/middleware.rs` 3, `secret.rs` 3, `auth/mod.rs` 2 y `tests/arranque.rs` 1.
+**93 tests**, frente a los 25 de `bootstrap-core`, repartidos así: `auth/oidc.rs` 24, `api/mod.rs` 13, `config.rs` 13, `api/auth.rs` 12, `auth/session.rs` 9, `api/health.rs` 4, `error.rs` 4, `state.rs` 4, `auth/middleware.rs` 3, `secret.rs` 3, `auth/mod.rs` 2, `test_support.rs` 1 y `tests/arranque.rs` 1.
 
 ## Contratos
 
@@ -183,7 +184,9 @@ cargo test --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-**92 tests** (91 unitarios + 1 de integración), frente a los 25 de `bootstrap-core`.
+**93 tests** (92 unitarios + 1 de integración), frente a los 25 de `bootstrap-core`.
+
+**Uno de esos tests falló solo en CI, y no era un fallo de Kesto sino del arnés.** `api::auth::tests::el_flujo_completo_no_deja_credenciales_en_el_log` llevaba dos intentos en rojo en el runner y doce corridas en verde en local. Lo medido: el buffer de captura tenía el `DEBUG` de `src/api/auth.rs:154` y le faltaba el `ERROR` de `src/error.rs:72`, del **mismo hilo** y del **mismo camino de petición**. La causa estaba en `tracing-core`: con un suscriptor **de hilo** (`set_default`), un callsite estrenado desde un hilo **sin** suscriptor mientras solo hay un despachante vivo queda cacheado como `Interest::never()` **para todo el proceso** —`Rebuilder::JustOne` pregunta al despachante del hilo actual, `callsite.rs:566`—, y desde entonces su registro se descarta en silencio en cualquier hilo. En CI (2 CPUs) rara vez hay dos tests capturando a la vez y la condición casi siempre se da; en local (16 CPUs) no. El arreglo es estructural, en `src/test_support.rs`: suscriptor **global** instalado una sola vez (`OnceLock` + `set_global_default`, nivel `TRACE`) que elige el buffer **por hilo** con un `thread_local`, más un `rebuild_interest_cache()` explícito. **Ninguna aserción del test se tocó**: su intención era correcta. El candado nuevo, `test_support::tests::un_callsite_estrenado_sin_captura_llega_al_buffer`, reproduce la forma del fallo —capturar, estrenar el callsite desde un hilo ajeno y emitirlo desde el que captura—, y con el arnés viejo cae: medido a una CPU, el registro no llega 3/3 veces frente a 3/3 que sí llega con el global.
 
 Verificación manual (fase 4 del `tasks.md`), diez comprobaciones. Nueve se ejecutaron con `curl` contra el binario real y un proveedor de descubrimiento local, y la décima —el flujo completo contra un proveedor **real**, un `PocketId` 2.18.0 en contenedor— se completó también con un cliente HTTP, para **medir** la cabecera en vez de mirarla a ojo en las herramientas de desarrollo:
 

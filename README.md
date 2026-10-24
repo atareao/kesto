@@ -13,12 +13,12 @@ Kesto ("caja" en esperanto) es un contenedor único que:
 
 ## Estado
 
-Proyecto **en construcción**, pero el código ya ha empezado y los dos primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado) y `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada), con **92 tests en verde**. Lo siguiente es el esquema de base de datos. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
+Proyecto **en construcción**, pero el código ya ha empezado y los dos primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado) y `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada), con **93 tests en verde**. Lo siguiente es el esquema de base de datos. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
 
 | Pieza | Estado |
 |---|---|
 | Arranque y API | Cerrado: configuración desde el entorno, envoltura JSON única, salud, `404`/`405` y apagado ordenado (25 tests) |
-| Autenticación | Cerrado: sesión firmada con `KESTO_SECRET` en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y todo `/api/v1/*` bajo puerta salvo la salud y el flujo de entrada (**92 tests** en total) |
+| Autenticación | Cerrado: sesión firmada con `KESTO_SECRET` en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y todo `/api/v1/*` bajo puerta salvo la salud y el flujo de entrada (**93 tests** en total) |
 | CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) | Verde: `cargo fmt --check`, `cargo clippy -- -D warnings` y `cargo test --locked` |
 | Imagen | Pendiente de `Dockerfile`; el job del pipeline se salta solo hasta que exista |
 | Crate | `publish = false` a propósito, para no dejar un placeholder permanente en crates.io |

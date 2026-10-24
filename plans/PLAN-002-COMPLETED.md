@@ -2,6 +2,7 @@
 
 > **Estado:** cerrado el 2026-10-24 (implementado, auditado y verificado; el change se archiva en este mismo cierre).
 > **Rama:** `feature/auth-capability`, desde `development`.
+> **PR:** [#7 — `feature/auth-capability` → `development`](https://github.com/atareao/kesto/pull/7) · CI en verde (run [`40117195376`](https://github.com/atareao/kesto/actions/runs/40117195376), `attempt 1`, `Backend (fmt, clippy, test)` ✅). **Sin release a `main`.**
 > **Change de OpenSpec:** `openspec/changes/archive/2026-10-24-auth-capability/`.
 > **Especificación de origen:** `docs/DEFINITION.md` §5 (endpoints `/api/v1/*`) y §8 (variables de entorno). El SRS **no define ningún endpoint de autenticación**: ese es el hueco que cierra este change.
 > **Cambio anterior:** `bootstrap-core` (`PLAN-001-COMPLETED.md`, `docs/FEATURE-001-bootstrap-core.md`, 25 tests).
@@ -100,7 +101,7 @@ cargo test --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-**92 tests** (91 unitarios + 1 de integración del arranque), frente a los 25 de `bootstrap-core`.
+**93 tests** (92 unitarios + 1 de integración del arranque), frente a los 25 de `bootstrap-core`.
 
 Especificación del change: **12 requisitos / 50 escenarios** (`auth` 10/42, `api-shell` 2/8), `openspec validate auth-capability --strict` válido.
 
@@ -122,4 +123,5 @@ Verificación manual contra el binario (fase 4 de `tasks.md`), las diez comproba
 - [x] Arreglar en commit aparte las dos recetas rotas del `.justfile` (`spec-status` pasa un argumento posicional que `openspec status` no acepta; `spec-archive` no pasa `--yes` y se queda esperando por `stdin`).
 - [x] `openspec archive auth-capability`.
 - [x] Renombrar este fichero a `PLAN-002-COMPLETED.md`.
-- [ ] PR `feature/auth-capability` → `development` con el CI en verde. **Sin release a `main`**: se decidió publicar solo hasta `development`.
+- [x] PR `feature/auth-capability` → `development` con el CI en verde. **Sin release a `main`**: se decidió publicar solo hasta `development`. → [#7](https://github.com/atareao/kesto/pull/7), run [`40117195376`](https://github.com/atareao/kesto/actions/runs/40117195376) en verde (`attempt 1`).
+- [x] Arreglar el único test que fallaba **solo en CI** —`api::auth::tests::el_flujo_completo_no_deja_credenciales_en_el_log`—, que no era un fallo de Kesto sino del arnés de captura: con un suscriptor de hilo (`set_default`), un callsite estrenado desde un hilo sin suscriptor y con un solo despachante vivo queda cacheado como `Interest::never()` **para todo el proceso**, y desde entonces su registro se descarta en silencio. Se sustituyó por un suscriptor **global** con buffer por hilo (`src/test_support.rs`), **sin tocar ninguna aserción**: el test tenía razón y el roto era el arnés.
