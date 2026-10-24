@@ -4,7 +4,7 @@
 
 ## Estado del repositorio (2026-10-24)
 
-Repositorio público en `github.com/atareao/kesto` con la base completa: ramas `main` (producción) y `development` (integración), pipeline de GitHub Actions en verde y `GIT_FLOW.md`. Sigue siendo **greenfield en código**: `src/main.rs` es un `Hello, world!`, `Cargo.toml` no tiene dependencias y no hay `openspec/`, `ui/`, `Dockerfile`, `justfile` ni tests. Todo lo que sigue describe el sistema **a construir**, no lo que hay.
+Repositorio público en `github.com/atareao/kesto` con la base cerrada: ramas `main` (producción) y `development` (integración), pipeline de GitHub Actions en verde, `GIT_FLOW.md`, `openspec/` (con `config.yaml`, la especificación ya fusionada de `bootstrap-core` en `specs/` y su change en `changes/archive/`), `.justfile` y los directorios `plans/` y `docs/` (con sus `PLAN-001-COMPLETED.md` y `docs/FEATURE-001-bootstrap-core.md`). El primer change, `bootstrap-core`, ya está **implementado y verificado**: arranque, configuración desde el entorno, redacción de secretos, envoltura JSON única, salud, `404`/`405` y apagado ordenado con `SIGTERM`/`SIGINT`, con **25 tests en verde** y los cuatro portales limpios (`cargo fmt`, `cargo clippy -D warnings`, `cargo test` y `cargo doc`). Lo que **sigue sin existir** es lo que más importa: `ui/`, `Dockerfile` y los cinco módulos del §7 todavía sin contenido (`db`, `docker`, `engine`, `rustic`, `scheduler`), porque los changes `auth-capability` y `db-schema` están sin empezar: no hay autenticación, ni base de datos, ni SSE, ni motor, ni planificador. De `src/` solo existen `api` y los módulos de nivel superior `config`, `secret`, `error` y `state`. Todo lo que sigue describe el sistema **a construir**, no lo que hay.
 
 **Fuente de verdad: `docs/DEFINITION.md`** (SRS completo, en español). Manda sobre este fichero cuando haya conflicto. Secciones que hay que leer antes de tocar código:
 
@@ -21,6 +21,34 @@ Orquestador ligero de backups dentro de un contenedor: extrae dumps de MariaDB/P
 
 - Backend: Axum 0.7+, SQLite vía `sqlx` (WAL + migraciones embebidas), `bollard` (API Docker por socket UNIX), `tokio-cron-scheduler`, `rustic_core` + `rustic_backend`.
 - Frontend (en `ui/`): React + TypeScript (el SRS dice 18+, el entorno usa 19 en repos nuevos) + Antd v5 + TanStack Query + `EventSource`.
+
+## Variables de entorno
+
+| Variable | Obligatoria | Valor por defecto | Para qué |
+|---|---|---|---|
+| `RUST_LOG` | no | `info` | Filtro de `tracing-subscriber`. Nombre del §8, sin prefijo |
+| `BIND_ADDRESS` | no | `0.0.0.0:8080` | Dirección de escucha. Nombre del §8, sin prefijo |
+| `DATABASE_URL` | no | `sqlite:///app/data/kesto.db` | DSN de SQLite. Nombre del §8, sin prefijo. **Todavía no se usa**: llega con `db-schema` |
+| `KESTO_MASTER_KEY` | **sí, siempre** | — | Clave maestra del cifrado en reposo. Aún no cifra nada, pero se exige desde el primer día |
+| `KESTO_SECRET` | sí, si el modo es OIDC | — | Clave de firma de la sesión |
+| `OIDC_ISSUER_URL` | sí, si el modo es OIDC | — | Emisor del proveedor |
+| `OIDC_CLIENT_ID` | sí, si el modo es OIDC | — | Identificador del cliente |
+| `OIDC_CLIENT_SECRET` | sí, si el modo es OIDC | — | Secreto del cliente |
+| `OIDC_REDIRECT_URL` | no | `http://localhost:8080/api/v1/auth/callback` | URL de retorno del callback |
+
+- Los tres nombres del §8 (`RUST_LOG`, `BIND_ADDRESS`, `DATABASE_URL`) se leen **tal cual**, sin prefijo `KESTO_`, para que un `compose` copiado de `docs/DEFINITION.md` funcione sin editar una línea. El resto lleva prefijo `KESTO_`, salvo `OIDC_*`, que conserva el nombre que ya usa shuul.
+- Las tres variables `OIDC_*` que gobiernan el modo (`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`) son **un todo o nada**: las tres presentes encienden la autenticación; ninguna presente la apaga y lo anuncia con un aviso; unas sí y otras no es **error de arranque**, no un modo degradado. Degradar a «apagada» dejaría el panel abierto sin que nadie se entere.
+- `KESTO_MASTER_KEY` es obligatoria **siempre**, aunque todavía no haya nada que cifrar.
+- Una credencial de menos de 32 caracteres **avisa y arranca igualmente**: Kesto es el orquestador de las copias, y negarse a arrancar por una variable floja convertiría un error de configuración en ausencia de copias.
+- `BIND_ADDRESS` sin puerto es error de arranque, y **el valor vacío no cae al defecto**: `BIND_ADDRESS=` mata el arranque. Si usas `compose` con interpolación de una variable que no definiste, acuérdate de esto.
+- Lo mismo vale para `RUST_LOG`: presente pero vacía es **error de arranque**, no «sin registro». Si dejas `RUST_LOG=` en un `compose` con la variable sin definir, el proceso no arranca —que es mucho mejor que un servicio ciego—. Quitarla del todo sí cae al valor por defecto, `info`. Los espacios sobrantes se recortan: `RUST_LOG=" info "` funciona igual que `RUST_LOG=info`.
+- Un `OIDC_REDIRECT_URL` configurado **solo**, sin las otras tres, se ignora en silencio: los tres desenlaces se deciden sobre las tres variables de la autenticación. Quien configure solo el retorno creerá que encendió algo.
+
+### Modo de desarrollo (sin OIDC)
+
+Basta `KESTO_MASTER_KEY` para arrancar sin proveedor de identidad. En ese modo `GET /api/v1/health` contesta `auth_mode: "disabled"` —eso es lo que hay que consultar para comprobar qué modo está activo— y el arranque lo anuncia con un `WARN`.
+
+⚠️ Ese modo **deja el panel sin autenticar**: es para desarrollo, no para un despliegue expuesto. Hoy no hay ninguna capa de autenticación: llega con `auth-capability`.
 
 ## Layout (SRS §7 — respétalo)
 

@@ -13,10 +13,11 @@ Kesto ("caja" en esperanto) es un contenedor único que:
 
 ## Estado
 
-Proyecto **en construcción**. La base está lista —especificación, gitflow, CI y `.justfile`— y el código está por empezar: hoy `src/main.rs` es un `Hello, world!`. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
+Proyecto **en construcción**, pero el código ya ha empezado y el primer bloque está cerrado. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya se ha implementado `bootstrap-core`: arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado, con 25 tests en verde. Lo siguiente es la autenticación. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
 
 | Pieza | Estado |
 |---|---|
+| Arranque y API | Cerrado: configuración desde el entorno, envoltura JSON única, salud, `404`/`405` y apagado ordenado (25 tests) |
 | CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) | Verde: `cargo fmt --check`, `cargo clippy -- -D warnings` y `cargo test --locked` |
 | Imagen | Pendiente de `Dockerfile`; el job del pipeline se salta solo hasta que exista |
 | Crate | `publish = false` a propósito, para no dejar un placeholder permanente en crates.io |
@@ -82,6 +83,8 @@ just dev        # backend en local
 just ui-dev     # panel con recarga en caliente (cuando exista ui/)
 ```
 
+`just dev` **necesita `KESTO_MASTER_KEY` en el entorno** o el proceso no arranca. Sin variables `OIDC_*` arranca en modo desarrollo con la autenticación apagada; usa `RUST_LOG=debug` para ver el detalle.
+
 Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features (`plan-*`, `feature-new`), la imagen local (`build`, `run`) y OpenSpec (`check-spec`, `spec-*`).
 
 ## Pipeline
@@ -91,7 +94,13 @@ Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features 
 ## Estructura
 
 ```text
-src/     backend Rust (Axum): api, db, docker, engine, rustic, scheduler
+src/     backend Rust (Axum)
+  api/       endpoints: hoy solo salud (GET /api/v1/health) y la envoltura JSON
+  config.rs  configuración desde el entorno
+  secret.rs  redacción de credenciales
+  error.rs   errores tipados + IntoResponse
+  state.rs   estado compartido
+  # db, docker, engine, rustic y scheduler llegan con los changes siguientes
 ui/      panel React + TypeScript + Ant Design (pendiente)
 docs/    SRS y un documento por feature (FEATURE-NNN-<slug>.md)
 plans/   planes de implementación (PLAN-NNN.md)
