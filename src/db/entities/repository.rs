@@ -280,20 +280,25 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use sqlx::SqlitePool;
-    use time::PrimitiveDateTime;
     use time::macros::format_description;
+    use time::{OffsetDateTime, PrimitiveDateTime};
     use uuid::Uuid;
 
     use super::{AltaDeRepositorio, Repositorios};
+    use crate::db::entities::execution::{AltaDeEjecucion, Ejecuciones, Estado};
+    use crate::db::entities::job::{AltaDeTarea, Tareas};
+    use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
     use crate::error::AppError;
     use crate::secret::SecretString;
-    use crate::test_support::{DirectorioDePrueba, base_con_clave, body_text};
+    use crate::test_support::{DirectorioDePrueba, base_con_clave, body_text, capturar_log};
 
     /// Secreto de acceso distinguible y largo: si aparece en una salida, la salida
     /// es el fallo.
     const SECRETO_ACCESO: &str = "AKIAIOSFODNN7EXAMPLE-repositories-1";
     /// Passphrase distinguible y larga, por el mismo motivo.
     const PASSPHRASE: &str = "passphrase-distinguible-0000000000000000000000001";
+    /// Contraseña de base distinguible y larga: es el tercer secreto del §3.
+    const PASSWORD_DE_TARGET: &str = "db-password-distinguible-000000000000000000000049";
 
     /// Un `SecretString` con el valor dado.
     fn secreto(valor: &str) -> SecretString {
@@ -743,5 +748,256 @@ mod tests {
         // Y el valor solo sale por el método explícito.
         assert_eq!(leido.secret_access_key.expose(), SECRETO_ACCESO);
         assert_eq!(leido.passphrase.expose(), PASSPHRASE);
+    }
+
+    /// 1.33 — Borrar un **repositorio** deja sin tareas sus `backup_jobs` y sin
+    /// ejecuciones esas tareas, **con el target intacto**.
+    ///
+    /// Es la cascada del otro lado de la 1.32: `backup_jobs` tiene dos claves foráneas
+    /// con `ON DELETE CASCADE`, una por cada padre, y borrar cualquiera de los dos se
+    /// lleva la tarea. El target no era de este repositorio, así que sigue ahí.
+    #[tokio::test]
+    async fn borrar_un_repositorio_arrastra_sus_tareas_y_sus_ejecuciones_y_deja_el_target() {
+        let (_directorio, pool, clave) = base_con_clave().await;
+
+        let repositorios = Repositorios::nuevo(pool.clone(), clave.clone());
+        let targets = Targets::nuevo(pool.clone(), clave);
+        let tareas = Tareas::nuevo(pool.clone());
+        let ejecuciones = Ejecuciones::nuevo(pool.clone());
+
+        let repositorio = repositorios
+            .alta(alta("repo-1-33"))
+            .await
+            .expect("el alta del repositorio no puede fallar");
+
+        let target = targets
+            .alta(alta_target_de_directorio("target-1-33"))
+            .await
+            .expect("el alta del target no puede fallar");
+
+        let tarea = tareas
+            .alta(alta_tarea(&target.id, &repositorio.id, "0 3 * * *"))
+            .await
+            .expect("el alta de la tarea no puede fallar");
+
+        let ejecucion = ejecuciones
+            .alta(alta_ejecucion(&tarea.id))
+            .await
+            .expect("el alta de la ejecución no puede fallar");
+
+        assert!(
+            repositorios
+                .borrar(&repositorio.id)
+                .await
+                .expect("el borrado no puede fallar"),
+            "la fila existía, así que el borrado debe decir que sí"
+        );
+
+        let tareas_restantes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("el recuento de tareas no puede fallar");
+
+        assert_eq!(
+            tareas_restantes, 0,
+            "las tareas del repositorio sobrevivieron; el `CASCADE` no ocurrió"
+        );
+
+        let ejecuciones_restantes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_executions")
+            .fetch_one(&pool)
+            .await
+            .expect("el recuento de ejecuciones no puede fallar");
+
+        assert_eq!(
+            ejecuciones_restantes, 0,
+            "las ejecuciones sobrevivieron a sus tareas"
+        );
+
+        assert!(
+            tareas
+                .leer(&tarea.id)
+                .await
+                .expect("la lectura no puede fallar")
+                .is_none(),
+            "la tarea sobrevivió al repositorio"
+        );
+
+        assert!(
+            ejecuciones
+                .leer(&ejecucion.id)
+                .await
+                .expect("la lectura no puede fallar")
+                .is_none(),
+            "la ejecución sobrevivió a su tarea"
+        );
+
+        // El target **no** era de este repositorio: sigue ahí.
+        let target_sigue = targets
+            .leer(&target.id)
+            .await
+            .expect("la lectura no puede fallar");
+
+        assert!(
+            target_sigue.is_some(),
+            "el target no debía desaparecer: el que se borró fue el repositorio"
+        );
+    }
+
+    /// 1.49 — Con `RUST_LOG=trace`, el alta, la lectura y la actualización no dejan en
+    /// el registro ninguno de los tres secretos del §3 **ni su forma cifrada**.
+    ///
+    /// La forma cifrada se lee con SQL directo, que es la que está almacenada, y se busca
+    /// literalmente en la salida capturada. Usa el arnés de captura **por hilo** de
+    /// `src/test_support.rs`, nunca `set_default` ni `with_default`: un despachante de
+    /// hilo deja un callsite cacheado como `Interest::never` para todo el proceso y el
+    /// registro desaparece **en silencio**.
+    #[tokio::test]
+    async fn el_registro_de_una_lectura_no_publica_los_secretos() {
+        let (buffer, _guard) = capturar_log();
+
+        let (_directorio, pool, clave) = base_con_clave().await;
+
+        let repositorios = Repositorios::nuevo(pool.clone(), clave.clone());
+        let targets = Targets::nuevo(pool.clone(), clave);
+
+        // Entre el repositorio y el target están los tres secretos del §3.
+        let repositorio = repositorios
+            .alta(alta("repo-1-49"))
+            .await
+            .expect("el alta del repositorio no puede fallar");
+
+        let target = targets
+            .alta(alta_target_con_password("target-1-49"))
+            .await
+            .expect("el alta del target no puede fallar");
+
+        // Y su lectura y su actualización.
+        let leido = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        let mut cambiado = leido.clone();
+        cambiado.secret_access_key = secreto("AKIAIOSFODNN7EXAMPLE-rotado-1-49");
+        repositorios
+            .actualizar(&cambiado)
+            .await
+            .expect("la actualización no puede fallar");
+
+        let leido_target = targets
+            .leer(&target.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        targets
+            .actualizar(&leido_target)
+            .await
+            .expect("la actualización no puede fallar");
+
+        // La forma **almacenada** de los tres secretos: el escenario prohíbe registrarla
+        // a ella también.
+        let secreto_guardado: String =
+            sqlx::query_scalar("SELECT secret_access_key FROM repositories WHERE id = ?1")
+                .bind(repositorio.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("el secreto almacenado debe poder leerse");
+
+        let passphrase_guardada: String =
+            sqlx::query_scalar("SELECT passphrase FROM repositories WHERE id = ?1")
+                .bind(repositorio.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("la passphrase almacenada debe poder leerse");
+
+        let password_guardado: String =
+            sqlx::query_scalar("SELECT db_password FROM backup_targets WHERE id = ?1")
+                .bind(target.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("la contraseña almacenada debe poder leerse");
+
+        // El candado de ausencia solo vale si la captura está viva.
+        tracing::trace!("captura en pie para la prueba 1.49");
+
+        let log = buffer.texto();
+
+        assert!(
+            !log.is_empty(),
+            "el buffer de captura está vacío, así que la ausencia no prueba nada"
+        );
+        assert!(
+            log.contains("captura en pie para la prueba 1.49"),
+            "la captura por hilo no recibió el registro, así que no prueba nada"
+        );
+
+        for (nombre, valor) in [
+            ("el secreto de acceso en claro", SECRETO_ACCESO),
+            ("la passphrase en claro", PASSPHRASE),
+            ("la contraseña de base en claro", PASSWORD_DE_TARGET),
+            ("el sobre del secreto de acceso", secreto_guardado.as_str()),
+            ("el sobre de la passphrase", passphrase_guardada.as_str()),
+            (
+                "el sobre de la contraseña de base",
+                password_guardado.as_str(),
+            ),
+        ] {
+            assert!(!log.contains(valor), "el registro publica {nombre}: {log}");
+        }
+    }
+
+    /// Un alta de target de **directorio** mínima, para las pruebas que cruzan tablas.
+    fn alta_target_de_directorio(nombre: &str) -> AltaDeTarget {
+        AltaDeTarget {
+            name: nombre.to_owned(),
+            target_type: TipoDeTarget::Directory,
+            container_name: None,
+            db_user: None,
+            db_password: None,
+            db_name: None,
+            host_path: Some(format!("/srv/{nombre}")),
+        }
+    }
+
+    /// El mismo target, pero de base de datos: es el que aporta el tercer secreto.
+    fn alta_target_con_password(nombre: &str) -> AltaDeTarget {
+        AltaDeTarget {
+            target_type: TipoDeTarget::Mariadb,
+            container_name: Some(format!("contenedor-{nombre}")),
+            db_user: Some("usuario-de-base".to_owned()),
+            db_password: Some(secreto(PASSWORD_DE_TARGET)),
+            db_name: Some(format!("base-{nombre}")),
+            host_path: None,
+            ..alta_target_de_directorio(nombre)
+        }
+    }
+
+    /// Un alta de tarea mínima, para las pruebas que cruzan tablas.
+    fn alta_tarea(target_id: &Uuid, repository_id: &Uuid, cron: &str) -> AltaDeTarea {
+        AltaDeTarea {
+            target_id: *target_id,
+            repository_id: *repository_id,
+            cron_expression: cron.to_owned(),
+            keep_daily: 7,
+            keep_weekly: 4,
+            keep_monthly: 12,
+            enabled: true,
+        }
+    }
+
+    /// Un alta de ejecución mínima, para las pruebas que cruzan tablas.
+    fn alta_ejecucion(job_id: &Uuid) -> AltaDeEjecucion {
+        AltaDeEjecucion {
+            job_id: *job_id,
+            status: Estado::Pending,
+            snapshot_id: None,
+            bytes_processed: 0,
+            bytes_uploaded: 0,
+            error_message: None,
+            started_at: OffsetDateTime::now_utc(),
+            finished_at: None,
+        }
     }
 }

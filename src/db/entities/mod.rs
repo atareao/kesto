@@ -1,11 +1,10 @@
 //! Las entidades del §3 y la capa de acceso que las lee y las escribe.
 //!
-//! Cada tabla tiene su módulo —`repository`, y después `target`, `job` y
-//! `execution`— con tres piezas: la **entidad** (una fila), el **payload de alta**
-//! (lo que quien llama informa) y la **capa de acceso** (las consultas). Los tipos
-//! se nombran en español y los campos conservan el nombre de la columna en inglés,
-//! porque el §3 es el contrato y el mapeo fila→struct tiene que leerse de un
-//! vistazo.
+//! Cada tabla tiene su módulo —`repository`, `target`, `job` y `execution`— con tres
+//! piezas: la **entidad** (una fila), el **payload de alta** (lo que quien llama
+//! informa) y la **capa de acceso** (las consultas). Los tipos se nombran en español y
+//! los campos conservan el nombre de la columna en inglés, porque el §3 es el contrato
+//! y el mapeo fila→struct tiene que leerse de un vistazo.
 //!
 //! Tres reglas valen para todas las tablas:
 //!
@@ -25,6 +24,12 @@
 //! Todas las consultas van con `sqlx::query` y valores **enlazados**: ninguna
 //! consulta se construye concatenando cadenas, ni siquiera en piezas.
 
+pub mod execution;
+pub mod job;
 pub mod repository;
+pub mod target;
 
+pub use execution::{AltaDeEjecucion, Ejecucion, Ejecuciones, Estado};
+pub use job::{AltaDeTarea, Tarea, Tareas};
 pub use repository::{AltaDeRepositorio, Repositorio, Repositorios};
+pub use target::{AltaDeTarget, Target, Targets, TipoDeTarget};

@@ -273,7 +273,13 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::{BUSY_TIMEOUT, DbError, SUFIJO_WAL, abrir, preparar, preparar_con, ruta_del_dsn};
-    use crate::test_support::{config_con_dsn, directorio_de_prueba, migrador_roto};
+    use crate::db::entities::{
+        AltaDeRepositorio, AltaDeTarget, Repositorios, Targets, TipoDeTarget,
+    };
+    use crate::secret::SecretString;
+    use crate::test_support::{
+        DirectorioDePrueba, base_con_clave, config_con_dsn, directorio_de_prueba, migrador_roto,
+    };
 
     /// Tablas declaradas en la base, por nombre y en orden alfabético.
     async fn tablas(pool: &SqlitePool) -> Vec<String> {
@@ -752,5 +758,106 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    /// 1.47 — El valor de los tres secretos del §3 **no** aparece en claro ni en el
+    /// fichero de la base ni en sus ficheros `-wal` y `-shm`.
+    ///
+    /// Se busca **literalmente en los bytes** y no consultando la capa de acceso: lo que
+    /// se afirma es una propiedad del fichero, y una consulta que pasa por la capa que
+    /// descifra no la prueba.
+    ///
+    /// La prueba es **exigente**: comprueba que la búsqueda encuentra el nombre del
+    /// repositorio en esos mismos bytes. Sin esa comprobación, la ausencia de los
+    /// secretos podría ser un fichero mal leído o vacío.
+    #[tokio::test]
+    async fn los_tres_secretos_no_aparecen_en_claro_en_el_fichero() {
+        /// Nombre distinguible del repositorio: tiene que poder encontrarse en los bytes.
+        const NOMBRE_DEL_REPOSITORIO: &str = "repo-1-47-buscable-en-el-fichero";
+        /// Secreto de acceso distinguible y largo.
+        const SECRETO_ACCESO: &str = "AKIAIOSFODNN7EXAMPLE-1-47";
+        /// Passphrase distinguible y larga.
+        const PASSPHRASE: &str = "passphrase-distinguible-000000000000000000000047";
+        /// Contraseña de base distinguible y larga.
+        const PASSWORD_DE_BASE: &str = "db-password-distinguible-000000000000000000000047";
+
+        /// Busca una aguja de texto **literalmente** en los bytes dados.
+        fn contiene(pajar: &[u8], aguja: &str) -> bool {
+            !aguja.is_empty()
+                && pajar
+                    .windows(aguja.len())
+                    .any(|ventana| ventana == aguja.as_bytes())
+        }
+
+        /// Los bytes del fichero de la base y de sus `-wal` y `-shm`, concatenados.
+        ///
+        /// Se leen los tres porque con WAL el grueso de lo escrito vive en `-wal` hasta
+        /// el `CHECKPOINT`, y buscar solo en el `.db` sería buscar donde no está.
+        fn bytes_de_los_ficheros(directorio: &DirectorioDePrueba) -> Vec<u8> {
+            let mut bytes = Vec::new();
+
+            for sufijo in ["", SUFIJO_WAL, "-shm"] {
+                let ruta = PathBuf::from(format!(
+                    "{}{sufijo}",
+                    directorio.ruta_de_la_base().display()
+                ));
+
+                if let Ok(contenido) = std::fs::read(&ruta) {
+                    bytes.extend_from_slice(&contenido);
+                }
+            }
+
+            bytes
+        }
+
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        // Un repositorio y un target: entre los dos, los tres secretos del §3.
+        Repositorios::nuevo(pool.clone(), clave.clone())
+            .alta(AltaDeRepositorio {
+                name: NOMBRE_DEL_REPOSITORIO.to_owned(),
+                endpoint: "https://s3.example.test/repo-1-47".to_owned(),
+                bucket: "cubo-repo-1-47".to_owned(),
+                region: "eu-west-1".to_owned(),
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+                secret_access_key: SecretString::new(SECRETO_ACCESO.to_owned()),
+                passphrase: SecretString::new(PASSPHRASE.to_owned()),
+            })
+            .await
+            .expect("el alta del repositorio no puede fallar");
+
+        Targets::nuevo(pool.clone(), clave)
+            .alta(AltaDeTarget {
+                name: "target-1-47".to_owned(),
+                target_type: TipoDeTarget::Mariadb,
+                container_name: Some("contenedor-1-47".to_owned()),
+                db_user: Some("usuario-de-base".to_owned()),
+                db_password: Some(SecretString::new(PASSWORD_DE_BASE.to_owned())),
+                db_name: Some("base-1-47".to_owned()),
+                host_path: None,
+            })
+            .await
+            .expect("el alta del target no puede fallar");
+
+        let bytes = bytes_de_los_ficheros(&directorio);
+
+        // La búsqueda **funciona**: el nombre del repositorio, que no es secreto, está en
+        // esos bytes. Sin esto, la ausencia de los secretos no probaría nada.
+        assert!(
+            contiene(&bytes, NOMBRE_DEL_REPOSITORIO),
+            "el lector no encontró ni el nombre del repositorio, así que la ausencia de \
+             los secretos no prueba nada"
+        );
+
+        for (nombre, valor) in [
+            ("secret_access_key", SECRETO_ACCESO),
+            ("passphrase", PASSPHRASE),
+            ("db_password", PASSWORD_DE_BASE),
+        ] {
+            assert!(
+                !contiene(&bytes, valor),
+                "el valor en claro de {nombre} está en el fichero de la base"
+            );
+        }
     }
 }
