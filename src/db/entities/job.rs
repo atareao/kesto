@@ -213,11 +213,8 @@ impl Tareas {
 /// La sentencia entra por parámetro en vez de repetirse en cada `map_err`: así la que
 /// se ejecuta y la que viaja en el error son una sola cadena —la constante—, y no dos
 /// literales que pueden separarse.
-fn error_de_consulta(consulta: &str) -> impl FnOnce(sqlx::Error) -> DbError + '_ {
-    move |causa| DbError::Consulta {
-        consulta: consulta.to_owned(),
-        causa,
-    }
+fn error_de_consulta(consulta: &'static str) -> impl FnOnce(sqlx::Error) -> DbError {
+    move |causa| DbError::Consulta { consulta, causa }
 }
 
 /// Lee una columna de la fila, conservando la causa si falta o no tiene el tipo.
@@ -227,7 +224,7 @@ where
 {
     fila.try_get::<T, _>(nombre)
         .map_err(|causa| DbError::Consulta {
-            consulta: CONSULTA_MAPEO.to_owned(),
+            consulta: CONSULTA_MAPEO,
             causa,
         })
 }
@@ -243,19 +240,19 @@ fn desde_fila(fila: &SqliteRow) -> Result<Tarea, DbError> {
     // causa intacta, sin estrenar una variante para un fallo que ya tiene sitio.
     let id = columna::<String>(fila, "id")?;
     let id = Uuid::parse_str(&id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
     let target_id = columna::<String>(fila, "target_id")?;
     let target_id = Uuid::parse_str(&target_id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
     let repository_id = columna::<String>(fila, "repository_id")?;
     let repository_id = Uuid::parse_str(&repository_id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
@@ -484,12 +481,13 @@ mod tests {
 
     /// 1.34 — Una inserción **huérfana** se rechaza con error tipado y **no deja fila**.
     ///
-    /// Las dos claves foráneas del §3 son `NOT NULL` y sin excepción: ni una tarea sin
-    /// target, ni una ejecución sin tarea llegan a existir. La comprobación con SQL
-    /// directo es la que demuestra que no ha quedado ni una fila «a medias».
+    /// `backup_jobs` tiene **dos** claves foráneas —`target_id` y `repository_id`—, las dos
+    /// `NOT NULL` y sin excepción, así que se cubren las dos: ni una tarea sin target, ni una
+    /// tarea sin repositorio, ni una ejecución sin tarea llegan a existir. La comprobación
+    /// con SQL directo es la que demuestra que no ha quedado ni una fila «a medias».
     #[tokio::test]
     async fn una_insercion_huerfana_se_rechaza_y_no_deja_fila() {
-        let (_directorio, pool, tareas, _target_id, repository_id) = base_con_tarea_posible().await;
+        let (_directorio, pool, tareas, target_id, repository_id) = base_con_tarea_posible().await;
 
         let inexistente = Uuid::new_v4();
 
@@ -498,6 +496,17 @@ mod tests {
             .alta(alta_tarea(&inexistente, &repository_id, "0 3 * * *"))
             .await
             .expect_err("un target inexistente no puede dar una tarea");
+
+        assert!(
+            matches!(error, DbError::Consulta { .. }),
+            "el fallo debe llegar como error tipado: {error}"
+        );
+
+        // Y la **otra** clave foránea: una tarea que apunta a un repositorio que no existe.
+        let error = tareas
+            .alta(alta_tarea(&target_id, &inexistente, "0 4 * * *"))
+            .await
+            .expect_err("un repositorio inexistente no puede dar una tarea");
 
         assert!(
             matches!(error, DbError::Consulta { .. }),

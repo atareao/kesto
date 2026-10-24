@@ -147,6 +147,12 @@ impl Targets {
         // y un valor por defecto en el DDL obligaría a interpolarlo en la sentencia.
         let id = Uuid::new_v4();
 
+        // Un secreto **vacío** no se guarda, y solo se comprueba cuando **hay** secreto:
+        // el `None` de un target de directorio es legítimo y no es un secreto vacío.
+        if let Some(claro) = &alta.db_password {
+            exigir_no_vacio("db_password", claro)?;
+        }
+
         // El secreto se cifra **solo si lo hay**: un target de directorio no tiene
         // contraseña y su columna queda `NULL`, no un sobre de la cadena vacía. El
         // `None` viaja tal cual hasta el `bind`, que escribe `NULL`.
@@ -209,11 +215,21 @@ impl Targets {
 
     /// Actualiza la fila **entera** y devuelve si existía.
     ///
+    /// **Quien actualice tiene que rellenar `db_password` con el valor leído**: la
+    /// actualización es de fila entera y vuelve a cifrar el secreto, así que dejar el
+    /// campo en blanco no «conserva» la credencial —la sustituye por el cifrado de
+    /// nada—. Por eso el vacío se **rechaza** en vez de escribirse: para que ese olvido
+    /// no pase en silencio. Un `None` sí es legítimo: es el target de directorio.
+    ///
     /// El secreto se **vuelve a cifrar** —y solo si sigue habiendo secreto—, así que la
     /// fila estrena sobre y nonce aunque el valor en claro no cambie: el nonce es
     /// aleatorio por valor, y eso es lo correcto. Consecuencia práctica: el texto
     /// almacenado cambia en cada actualización.
     pub async fn actualizar(&self, target: &Target) -> Result<bool, DbError> {
+        if let Some(claro) = &target.db_password {
+            exigir_no_vacio("db_password", claro)?;
+        }
+
         let db_password = match &target.db_password {
             Some(claro) => Some(self.clave.cifrar(claro)?),
             None => None,
@@ -255,11 +271,21 @@ impl Targets {
 /// La sentencia entra por parámetro en vez de repetirse en cada `map_err`: así la que
 /// se ejecuta y la que viaja en el error son una sola cadena —la constante—, y no dos
 /// literales que pueden separarse.
-fn error_de_consulta(consulta: &str) -> impl FnOnce(sqlx::Error) -> DbError + '_ {
-    move |causa| DbError::Consulta {
-        consulta: consulta.to_owned(),
-        causa,
+fn error_de_consulta(consulta: &'static str) -> impl FnOnce(sqlx::Error) -> DbError {
+    move |causa| DbError::Consulta { consulta, causa }
+}
+
+/// Rechaza un secreto vacío, nombrando el **campo** y nunca el valor.
+///
+/// El descifrado ya falla en alto y no devuelve nunca un secreto vacío; ésta es la mitad
+/// simétrica, la de la escritura. Se llama **solo cuando hay secreto**: el `None` de un
+/// target de directorio es legítimo y no es un secreto vacío.
+fn exigir_no_vacio(campo: &'static str, secreto: &SecretString) -> Result<(), DbError> {
+    if secreto.expose().is_empty() {
+        return Err(DbError::SecretoVacio { campo });
     }
+
+    Ok(())
 }
 
 /// Lee una columna de la fila, conservando la causa si falta o no tiene el tipo.
@@ -272,7 +298,7 @@ where
 {
     fila.try_get::<T, _>(nombre)
         .map_err(|causa| DbError::Consulta {
-            consulta: CONSULTA_MAPEO.to_owned(),
+            consulta: CONSULTA_MAPEO,
             causa,
         })
 }
@@ -289,7 +315,7 @@ fn desde_fila(fila: &SqliteRow, clave: &Clave) -> Result<Target, DbError> {
     // causa intacta, sin estrenar una variante para un fallo que ya tiene sitio.
     let id = columna::<String>(fila, "id")?;
     let id = Uuid::parse_str(&id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
@@ -322,6 +348,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::{AltaDeTarget, Targets, TipoDeTarget};
+    use crate::db::DbError;
     use crate::db::entities::execution::{AltaDeEjecucion, Ejecuciones, Estado};
     use crate::db::entities::job::{AltaDeTarea, Tareas};
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
@@ -693,6 +720,99 @@ mod tests {
         assert!(
             repositorio_sigue.is_some(),
             "el repositorio no debía desaparecer: el que se borró fue el target"
+        );
+    }
+
+    /// 1.48 — El `Debug` de un **target** leído de la base no publica su contraseña.
+    ///
+    /// La tarea 1.48 pide el `Debug` del repositorio **y del target**, y el escenario del
+    /// `secrets/spec.md` empieza justamente por «un target leído de la base con su
+    /// `db_password`». Va aquí, junto a la entidad que prueba.
+    #[tokio::test]
+    async fn el_debug_de_un_target_no_publica_la_contrasena() {
+        let (_directorio, _pool, targets) = capa().await;
+
+        let dado_de_alta = targets
+            .alta(alta_mariadb("target-1-48"))
+            .await
+            .expect("el alta no puede fallar");
+
+        let leido = targets
+            .leer(&dado_de_alta.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        let impreso = format!("{leido:?}");
+
+        assert!(
+            !impreso.contains(PASSWORD),
+            "el `Debug` publicó la contraseña de base: {impreso}"
+        );
+        assert!(
+            impreso.to_lowercase().contains("redact"),
+            "el `Debug` no dice que la contraseña está redactada: {impreso}"
+        );
+
+        // Y el valor solo sale por el método explícito.
+        assert_eq!(
+            leido.db_password.as_ref().map(SecretString::expose),
+            Some(PASSWORD),
+            "el valor debe salir por `expose`"
+        );
+    }
+
+    /// Un `db_password` **vacío** se rechaza, y el `None` del directorio **no**.
+    ///
+    /// La guarda del vacío solo se aplica **cuando hay secreto**: un target de directorio
+    /// no tiene contraseña, y eso es legítimo, no un secreto vacío.
+    #[tokio::test]
+    async fn un_db_password_vacio_se_rechaza_y_el_none_no() {
+        let (_directorio, pool, targets) = capa().await;
+
+        let error = targets
+            .alta(AltaDeTarget {
+                db_password: Some(secreto("")),
+                ..alta_mariadb("target-t4-vacio")
+            })
+            .await
+            .expect_err("una contraseña vacía no puede darse de alta");
+
+        assert!(
+            matches!(error, DbError::SecretoVacio { campo } if campo == "db_password"),
+            "el fallo debe nombrar el campo vacío: {error}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+            .fetch_one(&pool)
+            .await
+            .expect("el recuento no puede fallar");
+
+        assert_eq!(filas, 0, "la fila se escribió pese al secreto vacío");
+
+        // El `None` **no** es un secreto vacío: es un target de directorio.
+        let directorio = targets
+            .alta(alta_directorio("target-t4-directorio", "/srv/datos"))
+            .await
+            .expect("un target de directorio sin contraseña es legítimo");
+
+        assert!(
+            directorio.db_password.is_none(),
+            "un directorio se queda sin contraseña, no con una vacía"
+        );
+
+        // Y por el camino de la actualización.
+        let mut vacio = directorio.clone();
+        vacio.db_password = Some(secreto(""));
+
+        let error = targets
+            .actualizar(&vacio)
+            .await
+            .expect_err("la actualización no puede guardar una contraseña vacía");
+
+        assert!(
+            matches!(error, DbError::SecretoVacio { campo } if campo == "db_password"),
+            "el fallo debe nombrar el campo vacío: {error}"
         );
     }
 }

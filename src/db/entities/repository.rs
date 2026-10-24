@@ -127,6 +127,11 @@ impl Repositorios {
         // y un valor por defecto en el DDL obligaría a interpolarlo en la sentencia.
         let id = Uuid::new_v4();
 
+        // Un secreto **vacío** no se guarda: se rechaza aquí, antes de cifrar, para que un
+        // campo en blanco no sustituya la credencial por el cifrado de nada sin señal.
+        exigir_no_vacio("secret_access_key", &alta.secret_access_key)?;
+        exigir_no_vacio("passphrase", &alta.passphrase)?;
+
         // Los dos secretos se guardan cifrados. `DbError::Cifrado` tiene `#[from]`, así
         // que el `?` encadena `ErrorDeCifrado → DbError` sin ceremonia.
         let secret_access_key = self.clave.cifrar(&alta.secret_access_key)?;
@@ -183,12 +188,21 @@ impl Repositorios {
 
     /// Actualiza la fila **entera** y devuelve si existía.
     ///
+    /// **Quien actualice tiene que rellenar los dos secretos con el valor leído**: la
+    /// actualización es de fila entera y los vuelve a cifrar, así que dejar el campo en
+    /// blanco no «conserva» la credencial —la sustituye por el cifrado de nada—. Por eso
+    /// el vacío se **rechaza** en vez de escribirse: para que ese olvido no pase en
+    /// silencio.
+    ///
     /// Los dos secretos se **vuelven a cifrar**, así que la fila estrena sobre y nonce
     /// aunque el valor en claro no cambie: el nonce es aleatorio por valor, y eso es lo
     /// correcto —repetirlo con la misma clave rompería el AEAD—. Consecuencia práctica:
     /// el texto almacenado cambia en cada actualización, y quien compare bytes verá una
     /// diferencia donde no la hay en el secreto.
     pub async fn actualizar(&self, repositorio: &Repositorio) -> Result<bool, DbError> {
+        exigir_no_vacio("secret_access_key", &repositorio.secret_access_key)?;
+        exigir_no_vacio("passphrase", &repositorio.passphrase)?;
+
         let secret_access_key = self.clave.cifrar(&repositorio.secret_access_key)?;
         let passphrase = self.clave.cifrar(&repositorio.passphrase)?;
 
@@ -228,11 +242,22 @@ impl Repositorios {
 /// La sentencia entra por parámetro en vez de repetirse en cada `map_err`: así la que
 /// se ejecuta y la que viaja en el error son una sola cadena —la constante—, y no dos
 /// literales que pueden separarse.
-fn error_de_consulta(consulta: &str) -> impl FnOnce(sqlx::Error) -> DbError + '_ {
-    move |causa| DbError::Consulta {
-        consulta: consulta.to_owned(),
-        causa,
+fn error_de_consulta(consulta: &'static str) -> impl FnOnce(sqlx::Error) -> DbError {
+    move |causa| DbError::Consulta { consulta, causa }
+}
+
+/// Rechaza un secreto vacío, nombrando el **campo** y nunca el valor.
+///
+/// El descifrado ya falla en alto y no devuelve nunca un secreto vacío; ésta es la mitad
+/// simétrica, la de la escritura. Sin ella, quien construya la entidad desde fuera y
+/// deje el campo en blanco sustituiría la credencial por el cifrado de nada, sin señal,
+/// y el fallo aparecería más tarde, en el motor, hablando de S3.
+fn exigir_no_vacio(campo: &'static str, secreto: &SecretString) -> Result<(), DbError> {
+    if secreto.expose().is_empty() {
+        return Err(DbError::SecretoVacio { campo });
     }
+
+    Ok(())
 }
 
 /// Lee una columna de la fila, conservando la causa si falta o no tiene el tipo.
@@ -242,7 +267,7 @@ where
 {
     fila.try_get::<T, _>(nombre)
         .map_err(|causa| DbError::Consulta {
-            consulta: CONSULTA_MAPEO.to_owned(),
+            consulta: CONSULTA_MAPEO,
             causa,
         })
 }
@@ -258,7 +283,7 @@ fn desde_fila(fila: &SqliteRow, clave: &Clave) -> Result<Repositorio, DbError> {
     // causa intacta, sin estrenar una variante para un fallo que ya tiene sitio.
     let id = columna::<String>(fila, "id")?;
     let id = Uuid::parse_str(&id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
@@ -284,7 +309,8 @@ mod tests {
     use time::{OffsetDateTime, PrimitiveDateTime};
     use uuid::Uuid;
 
-    use super::{AltaDeRepositorio, Repositorios};
+    use super::{AltaDeRepositorio, Repositorio, Repositorios};
+    use crate::db::DbError;
     use crate::db::entities::execution::{AltaDeEjecucion, Ejecuciones, Estado};
     use crate::db::entities::job::{AltaDeTarea, Tareas};
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
@@ -998,6 +1024,173 @@ mod tests {
             error_message: None,
             started_at: OffsetDateTime::now_utc(),
             finished_at: None,
+        }
+    }
+
+    /// `actualizar` y `borrar` sobre una fila que **no existe** devuelven `false`, no error.
+    ///
+    /// Es el contrato documentado de las dos: `false` significa «no había nada que hacer»,
+    /// que no es un fallo. Es el mismo trato que [`Repositorios::leer`] da al «no está».
+    #[tokio::test]
+    async fn actualizar_y_borrar_sin_fila_devuelven_false() {
+        let (_directorio, _pool, repositorios) = capa().await;
+
+        let fantasma = Uuid::new_v4();
+
+        assert!(
+            !repositorios
+                .actualizar(&Repositorio {
+                    id: fantasma,
+                    name: "repo-sin-fila".to_owned(),
+                    endpoint: "https://s3.example.test/repo-sin-fila".to_owned(),
+                    bucket: "cubo-sin-fila".to_owned(),
+                    region: "eu-west-1".to_owned(),
+                    access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+                    secret_access_key: secreto(SECRETO_ACCESO),
+                    passphrase: secreto(PASSPHRASE),
+                    created_at: OffsetDateTime::now_utc(),
+                })
+                .await
+                .expect("actualizar una fila que no existe no es un error"),
+            "actualizar sin fila debe decir que no"
+        );
+
+        assert!(
+            !repositorios
+                .borrar(&fantasma)
+                .await
+                .expect("borrar una fila que no existe no es un error"),
+            "borrar sin fila debe decir que no"
+        );
+    }
+
+    /// Un secreto **vacío** se rechaza al escribir y **no deja fila**.
+    ///
+    /// Es la mitad simétrica del «nunca un secreto vacío» del descifrado: sin esta guarda,
+    /// un campo en blanco sustituiría la credencial por el cifrado de nada, sin señal, y
+    /// el fallo aparecería más tarde, en el motor, hablando de S3.
+    #[tokio::test]
+    async fn un_secreto_vacio_se_rechaza_y_no_deja_fila() {
+        let (_directorio, pool, repositorios) = capa().await;
+
+        let error = repositorios
+            .alta(AltaDeRepositorio {
+                secret_access_key: secreto(""),
+                ..alta("repo-t4-vacio")
+            })
+            .await
+            .expect_err("un secreto de acceso vacío no puede darse de alta");
+
+        assert!(
+            matches!(error, DbError::SecretoVacio { campo } if campo == "secret_access_key"),
+            "el fallo debe nombrar el campo vacío: {error}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories")
+            .fetch_one(&pool)
+            .await
+            .expect("el recuento no puede fallar");
+
+        assert_eq!(filas, 0, "la fila se escribió pese al secreto vacío");
+
+        let error = repositorios
+            .alta(AltaDeRepositorio {
+                passphrase: secreto(""),
+                ..alta("repo-t4-vacio-dos")
+            })
+            .await
+            .expect_err("una passphrase vacía no puede darse de alta");
+
+        assert!(
+            matches!(error, DbError::SecretoVacio { campo } if campo == "passphrase"),
+            "el fallo debe nombrar el campo vacío: {error}"
+        );
+
+        // Y por el camino de la actualización: la fila existe y el rechazo no la toca.
+        let repositorio = repositorios
+            .alta(alta("repo-t4-ok"))
+            .await
+            .expect("el alta no puede fallar");
+
+        let mut vacio = repositorio.clone();
+        vacio.secret_access_key = secreto("");
+
+        let error = repositorios
+            .actualizar(&vacio)
+            .await
+            .expect_err("la actualización no puede guardar un secreto vacío");
+
+        assert!(
+            matches!(error, DbError::SecretoVacio { campo } if campo == "secret_access_key"),
+            "el fallo debe nombrar el campo vacío: {error}"
+        );
+
+        let leido = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        assert_eq!(
+            leido.secret_access_key.expose(),
+            SECRETO_ACCESO,
+            "el rechazo tocó la fila: el secreto original se perdió"
+        );
+    }
+
+    /// El descifrado que falla **atravesando la capa de acceso**.
+    ///
+    /// Es el camino que describen los escenarios del `secrets/spec.md` —«cuando se lee la
+    /// fila **por la capa de acceso**»— y el único que ejerce [`DbError::Cifrado`]: una
+    /// fila con el sobre roto entra por `desde_fila`, el `?` encadena `ErrorDeCifrado →
+    /// DbError`, y el resultado es un error **tipado**, no un `Ok` con un secreto vacío.
+    ///
+    /// La fila se escribe con **SQL directo**, que es la única forma de dejar un sobre
+    /// roto: la capa de acceso no produce uno. Se cubren los dos casos que el contrato
+    /// nombra, el sobre corrupto y el valor en claro sin sobre.
+    #[tokio::test]
+    async fn el_descifrado_que_falla_llega_como_error_tipado() {
+        let (_directorio, pool, clave) = base_con_clave().await;
+        let repositorios = Repositorios::nuevo(pool.clone(), clave.clone());
+
+        // La passphrase sí es un sobre legítimo: lo que se rompe es el otro secreto, para
+        // que el fallo sea del caso que se prueba y no de la fila entera.
+        let passphrase_legitima = clave
+            .cifrar(&secreto(PASSPHRASE))
+            .expect("cifrar no puede fallar");
+
+        // El `'v1:AAAA:BBBB'` de la comprobación de operador 4.8, y un valor en claro.
+        for (marca, secreto_guardado) in [
+            ("roto", "v1:AAAA:BBBB"),
+            ("claro", "AKIAIOSFODNN7EXAMPLE-en-claro-en-la-columna"),
+        ] {
+            let id = Uuid::new_v4();
+
+            sqlx::query(
+                "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+                 secret_access_key, passphrase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(id.hyphenated().to_string())
+            .bind(format!("repo-1-t3-{marca}"))
+            .bind("https://s3.example.test/repo-1-t3")
+            .bind("cubo-1-t3")
+            .bind("eu-west-1")
+            .bind("AKIAIOSFODNN7EXAMPLE")
+            .bind(secreto_guardado)
+            .bind(&passphrase_legitima)
+            .execute(&pool)
+            .await
+            .expect("la inserción directa no puede fallar");
+
+            let error = repositorios
+                .leer(&id)
+                .await
+                .expect_err("un secreto ilegible no puede dar un repositorio");
+
+            assert!(
+                matches!(error, DbError::Cifrado(_)),
+                "el fallo debe llegar como error de cifrado, no como otro ({marca}): {error}"
+            );
         }
     }
 }

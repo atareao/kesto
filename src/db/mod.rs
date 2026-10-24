@@ -124,16 +124,36 @@ pub enum DbError {
     ///
     /// Lleva el **texto de la consulta** además de la causa, y eso es deliberado:
     /// `sqlx` dice «no such table: repositories» y no **qué** sentencia lo dijo, así
-    /// que sin el texto el registro no permite reconstruir el fallo. El texto nunca
-    /// lleva valores —todo va enlazado—, así que no puede arrastrar un secreto; y se
-    /// queda en el registro: al cuerpo de la respuesta le llega el mensaje genérico.
+    /// que sin el texto el registro no permite reconstruir el fallo.
+    ///
+    /// El texto es **`&'static str`** y no un `String`, y no es un detalle de estilo:
+    /// el tipo hace **estructuralmente imposible** interpolable un valor en lo que
+    /// viaja al registro. Un `String` deja la garantía en manos de que nadie escriba
+    /// un `format!`; una constante `'static` solo puede venir del propio código, así
+    /// que el requisito «ninguna consulta se construye concatenando» pasa de vigilarse
+    /// a no poder incumplirse.
     #[error("la consulta falló: {consulta}: {causa}")]
     Consulta {
-        /// Texto de la consulta que falló. Sin valores enlazados.
-        consulta: String,
+        /// Texto de la consulta que falló: una constante del código, sin valores.
+        consulta: &'static str,
         /// Motivo, tal y como lo informa `sqlx`.
         #[source]
         causa: sqlx::Error,
+    },
+
+    /// Se intentó guardar un secreto **vacío**.
+    ///
+    /// El cifrado en reposo ya tiene la mitad que falla al leer —un descifrado no
+    /// devuelve nunca un secreto vacío—, y ésta es la mitad simétrica: la escritura
+    /// **no puede guardar** el vacío. Sin esta guarda, quien construya la entidad desde
+    /// fuera y deje el campo en blanco sustituiría la credencial por el cifrado de
+    /// nada, sin señal, y el fallo aparecería más tarde, en el motor, hablando de S3.
+    ///
+    /// El mensaje nombra el **campo**, nunca el valor.
+    #[error("el secreto de `{campo}` está vacío: un secreto vacío no se guarda")]
+    SecretoVacio {
+        /// Nombre de la columna cuyo secreto llegó vacío.
+        campo: &'static str,
     },
 
     /// El cifrado en reposo falló al cifrar o al descifrar un secreto.

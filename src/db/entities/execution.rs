@@ -12,7 +12,7 @@
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteRow;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::db::DbError;
@@ -161,8 +161,15 @@ impl Ejecuciones {
             .bind(alta.bytes_processed)
             .bind(alta.bytes_uploaded)
             .bind(&alta.error_message)
-            .bind(alta.started_at)
-            .bind(alta.finished_at)
+            // Las fechas se normalizan a UTC **al enlazarlas**: el `Encode` de `time`
+            // conserva el desplazamiento del valor, y el §3 dice que las fechas son UTC,
+            // así que un llamante con `+02:00` no puede dejar la columna fuera de UTC.
+            // Es el mismo instante, en otra representación.
+            .bind(alta.started_at.to_offset(UtcOffset::UTC))
+            .bind(
+                alta.finished_at
+                    .map(|fecha| fecha.to_offset(UtcOffset::UTC)),
+            )
             .fetch_one(&self.pool)
             .await
             .map_err(error_de_consulta(SQL_ALTA))?;
@@ -206,7 +213,12 @@ impl Ejecuciones {
             .bind(ejecucion.bytes_processed)
             .bind(ejecucion.bytes_uploaded)
             .bind(&ejecucion.error_message)
-            .bind(ejecucion.finished_at)
+            // Misma normalización que en el alta: el §3 dice UTC.
+            .bind(
+                ejecucion
+                    .finished_at
+                    .map(|fecha| fecha.to_offset(UtcOffset::UTC)),
+            )
             .bind(ejecucion.id.hyphenated().to_string())
             .execute(&self.pool)
             .await
@@ -232,11 +244,8 @@ impl Ejecuciones {
 /// La sentencia entra por parámetro en vez de repetirse en cada `map_err`: así la que
 /// se ejecuta y la que viaja en el error son una sola cadena —la constante—, y no dos
 /// literales que pueden separarse.
-fn error_de_consulta(consulta: &str) -> impl FnOnce(sqlx::Error) -> DbError + '_ {
-    move |causa| DbError::Consulta {
-        consulta: consulta.to_owned(),
-        causa,
-    }
+fn error_de_consulta(consulta: &'static str) -> impl FnOnce(sqlx::Error) -> DbError {
+    move |causa| DbError::Consulta { consulta, causa }
 }
 
 /// Lee una columna de la fila, conservando la causa si falta o no tiene el tipo.
@@ -249,7 +258,7 @@ where
 {
     fila.try_get::<T, _>(nombre)
         .map_err(|causa| DbError::Consulta {
-            consulta: CONSULTA_MAPEO.to_owned(),
+            consulta: CONSULTA_MAPEO,
             causa,
         })
 }
@@ -265,13 +274,13 @@ fn desde_fila(fila: &SqliteRow) -> Result<Ejecucion, DbError> {
     // causa intacta, sin estrenar una variante para un fallo que ya tiene sitio.
     let id = columna::<String>(fila, "id")?;
     let id = Uuid::parse_str(&id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
     let job_id = columna::<String>(fila, "job_id")?;
     let job_id = Uuid::parse_str(&job_id).map_err(|causa| DbError::Consulta {
-        consulta: CONSULTA_MAPEO.to_owned(),
+        consulta: CONSULTA_MAPEO,
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
@@ -291,6 +300,7 @@ fn desde_fila(fila: &SqliteRow) -> Result<Ejecucion, DbError> {
 #[cfg(test)]
 mod tests {
     use sqlx::SqlitePool;
+    use time::macros::datetime;
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
 
@@ -527,5 +537,64 @@ mod tests {
                 .expect("el `IS NULL` debe poder leerse");
 
         assert_eq!(es_nulo, 1, "la columna no es NULL, sino otra cosa");
+    }
+
+    /// Una fecha escrita por la aplicación **vuelve como UTC**.
+    ///
+    /// Sin esta prueba el escenario no estaba cubierto de verdad: lo que había comparaba
+    /// dos fechas **leídas** —las dos del camino de decodificación—, así que una corrupción
+    /// sistemática del encode/decode habría movido a las dos por igual y el test habría
+    /// seguido verde.
+    ///
+    /// Aquí se enlaza una fecha **conocida** y con desplazamiento **distinto de cero**, y se
+    /// afirma **contra la entrada**: mismo instante y desplazamiento cero al volver. El
+    /// `Encode` de `time` conserva el desplazamiento del valor, así que sin la
+    /// normalización del alta la columna no estaría en UTC y el §3 quedaría incumplido.
+    #[tokio::test]
+    async fn una_fecha_con_desplazamiento_vuelve_en_utc() {
+        let (_directorio, _pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+
+        let inicio = datetime!(2026-03-14 09:26:53 +2:30);
+        let fin = inicio + Duration::minutes(7);
+
+        assert!(
+            !inicio.offset().is_utc(),
+            "el aparato de la prueba no usó un desplazamiento distinto de cero"
+        );
+
+        let dado_de_alta = ejecuciones
+            .alta(AltaDeEjecucion {
+                started_at: inicio,
+                finished_at: Some(fin),
+                ..alta_ejecucion(&job_id)
+            })
+            .await
+            .expect("el alta no puede fallar");
+
+        let leido = ejecuciones
+            .leer(&dado_de_alta.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        assert!(
+            leido.started_at.offset().is_utc(),
+            "el started_at volvió con desplazamiento, no en UTC: {}",
+            leido.started_at
+        );
+        assert_eq!(
+            leido.started_at, inicio,
+            "el instante guardado no es el de entrada"
+        );
+
+        let fin_leido = leido
+            .finished_at
+            .expect("la ejecución se dio de alta terminada");
+
+        assert!(
+            fin_leido.offset().is_utc(),
+            "el finished_at volvió con desplazamiento, no en UTC: {fin_leido}"
+        );
+        assert_eq!(fin_leido, fin, "el instante final no es el de entrada");
     }
 }
