@@ -8,6 +8,7 @@
 //! Nada de aquí conoce las tablas: los tipos y las consultas de cada una viven en
 //! la capa de acceso, que es otro módulo de este mismo directorio.
 
+pub mod crypto;
 pub mod migrate;
 
 use std::path::{Path, PathBuf};
