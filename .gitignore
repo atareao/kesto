@@ -1,1 +1,7 @@
 /target
+/data
+/ui/node_modules
+/ui/dist
+/ui/coverage
+.env
+.env.*
