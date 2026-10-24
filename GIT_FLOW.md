@@ -2,13 +2,13 @@
 
 Este proyecto sigue **Git Flow** con versionado semántico. Igual que el resto de proyectos del entorno, se usa **siempre**: ninguna feature se commitea directamente en `main` ni en `development`.
 
-**Estado actual:** ramas `main` y `development` creadas, sin remote y sin CI. Pendiente: repo en GitHub, `.github/workflows/`, `.vampus.yml` y `cliff.toml` (la skill `gitflow` los genera en un paso).
+**Estado actual:** remoto en `github.com/atareao/kesto` (público), ramas `main` y `development`, y pipeline de GitHub Actions en verde. Pendiente: crear los secretos `GH_PAT` y `CARGO_REGISTRY_TOKEN`.
 
 ## Ramas
 
 | Rama | Propósito | Base |
 |---|---|---|
-| `main` | Producción. Cada merge aquí disparará una release. | — |
+| `main` | Producción. Cada merge aquí dispara una release. | — |
 | `development` | Integración de features en curso. Rama activa de trabajo. | `main` |
 | `feature/<kebab-case>` | Nuevas funcionalidades. | `development` |
 | `hotfix/<kebab-case>` | Correcciones urgentes a producción. | `main` |
@@ -40,13 +40,31 @@ git checkout development && git merge main && git push origin development
 
 ### Releases
 
-Todavía no hay release automatizada (sin `.vampus.yml` ni workflows). Procedimiento manual mientras tanto:
+Están automatizadas: **un merge a `main` es una release**. No se etiqueta a mano.
 
 1. PR `development` → `main`.
-2. Tag anotado `vX.Y.Z` en `main`.
-3. Sincronizar `development` con `main`.
+2. Al mergear, `release-prepare.yml` (trigger: push a `main`):
+   - compara `.vampus.yml:current_version` con el tag `vX.Y.Z` y decide entre `skip` (ya está publicada y HEAD es ese tag), `bump` (hay commits nuevos) o `tag` (la versión ya se subió a mano en el PR, solo falta etiquetar);
+   - deduce el bump de los conventional commits: `✨ feat` → minor, `!:` o `BREAKING CHANGE` → major, el resto → patch;
+   - verifica que vampus realmente subió la versión, resincroniza `Cargo.lock`, genera `CHANGELOG.md` con git-cliff y commitea `chore: release vX.Y.Z`;
+   - empuja el tag `vX.Y.Z` y sincroniza `development` con `main`.
+3. El tag dispara `release.yml`:
+   - **imagen** multi-arquitectura (amd64 + arm64) a `ghcr.io/atareao/kesto`, con un smoke test *antes* de publicar;
+   - **crate** a crates.io;
+   - **GitHub Release** con las notas del changelog.
 
-Cuando se configure el CI con la skill `gitflow`, `release-prepare.yml` hará el bump de versión, el changelog con git-cliff y el tag automáticamente.
+### Requisitos antes de la primera release
+
+| Secreto | Para qué |
+|---|---|
+| `GH_PAT` | PAT con `contents: write`. Lo necesita `release-prepare` en el checkout: un tag empujado con el `GITHUB_TOKEN` por defecto **no** dispara `release.yml`. |
+| `CARGO_REGISTRY_TOKEN` | Token de API de crates.io para el job `publish` de `release.yml`. |
+
+### Por qué el crate no se publica todavía
+
+`Cargo.toml` lleva `publish = false` a propósito. `cargo publish` se niega a publicar mientras esté ahí y el job `publish` lee esa línea para saltarse solo. La razón: crates.io **no permite borrar** una versión publicada, solo yank, así que sin la guarda la primera release dejaría un `0.1.0` de `hello world` ahí para siempre. **Borra esa línea cuando el crate merezca publicarse.**
+
+Y la imagen: el job `image` se salta mientras no existan `Dockerfile` y `ui/package.json`. Los dos se encienden solos, sin editar los workflows.
 
 ## Conventional Commits con gitmoji
 
@@ -80,16 +98,27 @@ cargo test
 cd ui && pnpm run lint && npx tsc --noEmit && pnpm test
 ```
 
+En corto: `just check` encadena los tres del backend en el orden exacto del CI, y `just check-all` añade los cuatro del panel. Para aplicar formato en vez de comprobarlo: `just fmt-fix`, `just justfile-fmt` y `pnpm run lint` dentro de `ui/`.
+
 Si el formateo produce cambios, commitéalos aparte antes de cualquier otro cambio:
 
 ```bash
 git commit -m "🎨 style: apply formatting"
 ```
 
+## CI
+
+| Workflow | Cuándo | Qué |
+|---|---|---|
+| `ci.yml` | PR y push a `development`/`main` | `preflight` → `backend` (fmt, clippy, test) → `frontend` (se salta mientras no exista `ui/`) |
+| `release-prepare.yml` | push a `main` | versión, changelog y tag |
+| `release.yml` | tag `v*` | imagen a GHCR, crate a crates.io, GitHub Release |
+
 ## Planes y features
 
 - Un plan por trabajo en `plans/PLAN-NNN.md`; al terminar `plans/PLAN-NNN-COMPLETED.md`, si se aparca `plans/PLAN-NNN-PENDING.md`.
 - Un documento por feature entregada en `docs/FEATURE-NNN-<slug>.md`.
+- Automatizado en el `.justfile`: `just plans`, `just plan-new`, `just plan-done N`, `just plan-pending N` y `just feature-new <slug>`.
 - Convención completa: [AGENTS.md](./AGENTS.md).
 
 ## Resumen visual

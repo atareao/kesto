@@ -1,0 +1,29 @@
+# Docker build context exclusions.
+#
+# Keep the context small AND avoid clobbering in-container build output:
+#   - `ui/dist` and `ui/node_modules` are produced/installed inside the UI
+#     stage; the host copies must never be copied in.
+#   - `target/` is produced by the builder stage.
+# The `ui/` *source* (package.json, lockfile, src, configs) IS kept.
+
+# Rust build artifacts
+target/
+
+# Frontend build artifacts & dependencies (built inside their stages)
+ui/node_modules/
+ui/dist/
+ui/coverage/
+
+# VCS / local state / secrets
+.git/
+.gitignore
+data/
+.env
+.env.*
+
+# Docs, plans and packaging files not needed inside the image
+plans/
+docs/
+*.md
+Dockerfile
+.dockerignore

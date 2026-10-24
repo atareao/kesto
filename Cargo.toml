@@ -2,5 +2,19 @@
 name = "kesto"
 version = "0.1.0"
 edition = "2024"
+description = "Lightweight backup orchestrator in a container: dumps MariaDB/PostgreSQL and host directories into rustic repositories on S3, with a live React panel."
+license = "MIT"
+repository = "https://github.com/atareao/kesto"
+readme = "README.md"
+keywords = ["backup", "rustic", "s3", "docker", "postgresql"]
+categories = ["command-line-utilities", "database"]
+
+# Guard, not a life sentence: `cargo publish` refuses to run while this is here,
+# and the release workflow reads it to skip the crates.io job. DELETE THIS LINE
+# when the crate is actually worth publishing.
+publish = false
+
+# The published crate carries the Rust sources only.
+exclude = ["docs", "plans", "ui", ".github", "AGENTS.md", "GIT_FLOW.md", "cliff.toml", ".dockerignore", ".vampus.yml", "Dockerfile", ".justfile"]
 
 [dependencies]
