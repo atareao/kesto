@@ -68,18 +68,28 @@ pub fn issue(secret: &SecretString, sub: String, email: String) -> Result<String
     })
 }
 
-/// Verifica la firma, el algoritmo y la vigencia del JWT de sesión.
+/// Verifica la firma, el algoritmo y la vigencia de un JWT de sesión.
 ///
-/// Toda cookie ausente, mal firmada, firmada con otra clave, caducada o
-/// manipulada se rechaza con [`AppError::Unauthorized`].
+/// Rechaza con [`AppError::Unauthorized`] todo token mal firmado, firmado con
+/// otra clave, caducado o manipulado. La cookie **ausente** no llega hasta aquí:
+/// la rechaza el *gate* de la superficie protegida antes de llamar a esta
+/// función, que trabaja sobre un token ya extraído.
 pub fn verify(secret: &SecretString, token: &str) -> Result<Claims, AppError> {
     // El algoritmo se fija aquí y no se lee de la cabecera del token: aceptar el
     // que traiga el propio token es la confusión de algoritmo de manual.
     let mut validacion = Validation::new(Algorithm::HS256);
-    // La sesión no declara `aud`: el panel es su único destinatario.
+    // La sesión no declara `aud` —el panel es su único destinatario— y hoy el
+    // defecto de `Validation` tampoco lo rechazaría por ausencia: sin `aud` en la
+    // validación, la rama que lo comprueba no se dispara. Se desactiva para que
+    // el día que la sesión lleve un `aud` no quede a medio comprobar en silencio:
+    // o se valida de verdad, con su valor esperado, o no se valida.
     validacion.validate_aud = false;
-    // Sin margen por desfase de reloj: «`exp` en vigor» es literal, y un token
-    // caducado no se sostiene por un minuto de cortesía.
+    // Sin margen de cortesía sobre `exp`: «`exp` en vigor» es literal. El
+    // `leeway` que trae `Validation` por defecto —60 segundos— no cubre ningún
+    // desfase entre relojes, porque no hay dos: el navegador no valida el JWT,
+    // solo guarda la cookie, y el único reloj que interviene es el de este
+    // proceso, que firma y verifica con el mismo. Lo único que haría ese minuto
+    // es **alargar la vida de una sesión ya caducada**.
     validacion.leeway = 0;
 
     let clave = DecodingKey::from_secret(secret.expose().as_bytes());
@@ -213,6 +223,26 @@ mod tests {
         }
 
         caracteres.into_iter().collect()
+    }
+
+    /// Firma un JWT de sesión con el `exp` indicado, saltándose `issue`.
+    ///
+    /// Es lo que permite fabricar un token caducado: la emisión real siempre
+    /// pone `exp` a ocho horas vista.
+    fn firmar_con_caducidad(exp: u64) -> String {
+        let claims = Claims {
+            sub: SUB.to_owned(),
+            email: EMAIL.to_owned(),
+            iat: exp - SESSION_LIFETIME.as_secs(),
+            exp,
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("el token de prueba debe poder firmarse")
     }
 
     /// Claves del payload de un JWT, ordenadas y sin verificar la firma.
@@ -358,22 +388,35 @@ mod tests {
 
     #[test]
     fn una_cookie_caducada_no_se_acepta() {
-        let ahora = jsonwebtoken::get_current_timestamp();
-        let claims = Claims {
-            sub: SUB.to_owned(),
-            email: EMAIL.to_owned(),
-            iat: ahora - 2 * 60 * 60,
-            exp: ahora - 60 * 60,
-        };
-
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+        let error = verify(
+            &secret(),
+            &firmar_con_caducidad(jsonwebtoken::get_current_timestamp() - 60 * 60),
         )
-        .expect("el token caducado debe poder firmarse");
+        .expect_err("una sesión caducada no se acepta");
 
-        let error = verify(&secret(), &token).expect_err("una sesión caducada no se acepta");
+        assert!(
+            matches!(error, AppError::Unauthorized(_)),
+            "el rechazo debe ser un 401 tipado: {error}"
+        );
+    }
+
+    #[test]
+    fn una_cookie_con_el_exp_apenas_pasado_no_se_acepta() {
+        // Este es el candado de `validacion.leeway = 0`, y el único test que lo
+        // sostiene: `exp` treinta segundos atrás lo rechaza el leeway cero y lo
+        // **aceptaría** el de cortesía que trae `Validation::new` por defecto
+        // —sesenta segundos—, de modo que revertir esa decisión pone este test
+        // en rojo. No es «otro caso de caducado»: es el que distingue las dos
+        // situaciones. Y el margen no cubriría ningún desfase entre relojes,
+        // porque no hay dos: el navegador no valida el JWT, solo guarda la
+        // cookie, y el único reloj que interviene es el de este proceso, que
+        // firma y verifica con el mismo. Lo único que haría es alargar la vida
+        // de una sesión ya caducada.
+        let error = verify(
+            &secret(),
+            &firmar_con_caducidad(jsonwebtoken::get_current_timestamp() - 30),
+        )
+        .expect_err("una sesión caducada hace 30 segundos no se acepta");
 
         assert!(
             matches!(error, AppError::Unauthorized(_)),
@@ -393,7 +436,13 @@ mod tests {
     }
 
     #[test]
-    fn el_jwt_de_la_cookie_no_lleva_los_tokens_del_proveedor() {
+    fn el_payload_de_la_cookie_son_exactamente_los_cuatro_claims() {
+        // Es un candado del **esquema del payload**, no una prueba de fuga por
+        // marcador: en M1 `issue` no tiene por dónde recibir un ID token, así que
+        // no hay camino en el que acabe en la cookie. La prueba de fuga de verdad
+        // —credenciales distinguibles buscadas literalmente en el log de un flujo
+        // completo— es el escenario 1.38, que vive en `src/auth/mod.rs` y llega
+        // con M2.
         let token = sesion();
         let cookie = session_cookie(token.clone(), REDIRECT_HTTP).expect("la cookie se construye");
 
@@ -413,7 +462,8 @@ mod tests {
         );
 
         // Y si el proveedor hubiera dejado su ID token en la cookie, tampoco
-        // valdría como sesión: aquí solo firma Kesto, con KESTO_SECRET.
+        // valdría como sesión: aquí solo firma Kesto, con KESTO_SECRET, así que
+        // un token `RS256` del proveedor no pasa la comprobación de algoritmo.
         assert!(
             verify(&secret(), ID_TOKEN_DEL_PROVEEDOR).is_err(),
             "un token del proveedor no puede pasar por sesión de Kesto"
