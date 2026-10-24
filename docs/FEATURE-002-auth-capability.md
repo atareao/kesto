@@ -1,10 +1,10 @@
 # FEATURE-002 — auth-capability
 
-> Implementación del change proposal `auth-capability`, en `openspec/changes/auth-capability/` (12 requisitos, 50 escenarios, `openspec validate --strict` válido).
-> Rama: `feature/auth-capability`, desde `development`. Plan: `plans/PLAN-002-auth-capability.md`. Especificación de origen: `docs/DEFINITION.md` §5 y §8.
-> Estado: **implementado, auditado y verde** — **92 tests** (91 unitarios + 1 de integración). Queda el cierre documental y el archivo del change.
+> Implementación del change proposal `auth-capability`, archivado en `openspec/changes/archive/2026-10-24-auth-capability/` (12 requisitos, 50 escenarios, `openspec validate --strict` válido).
+> Cerrada el 2026-10-24. Rama: `feature/auth-capability`, desde `development`. Plan: `plans/PLAN-002-COMPLETED.md`. Especificación de origen: `docs/DEFINITION.md` §5 y §8.
+> Estado: **cerrado** — **92 tests** (91 unitarios + 1 de integración). La especificación vive ya en `openspec/specs/` —`auth`, capability nueva, y `api-shell`, que creció—, con su `Purpose` redactado tras el archivado.
 
-**Al archivar, el delta se funde en dos sitios**: `openspec/specs/auth/spec.md`, que **nace** con este change (10 requisitos, 42 escenarios), y `openspec/specs/api-shell/spec.md`, que **crece** de 5 requisitos / 12 escenarios a 7 / 20 con los 2 requisitos y 8 escenarios nuevos.
+**El archivo está hecho.** El delta se fundió en dos sitios: `openspec/specs/auth/spec.md`, que **nació** con este change —10 requisitos, 42 escenarios—, y `openspec/specs/api-shell/spec.md`, que **creció** de 5 requisitos / 12 escenarios a **7 / 20** con los 2 requisitos y 8 escenarios nuevos. El change, con sus 90 tareas tildadas, queda en `openspec/changes/archive/2026-10-24-auth-capability/`.
 
 ## Qué quedó construido
 
@@ -185,7 +185,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 **92 tests** (91 unitarios + 1 de integración), frente a los 25 de `bootstrap-core`.
 
-Verificación manual (fase 4 del `tasks.md`), diez comprobaciones. Nueve se ejecutaron con `curl` contra el binario real y un proveedor de descubrimiento local; la décima —el flujo completo en el navegador contra un proveedor OIDC real, comprobando los atributos de la cookie en las herramientas de desarrollo— la ejecuta el operador del despliegue, porque necesita su proveedor de identidad y un navegador:
+Verificación manual (fase 4 del `tasks.md`), diez comprobaciones. Nueve se ejecutaron con `curl` contra el binario real y un proveedor de descubrimiento local, y la décima —el flujo completo contra un proveedor **real**, un `PocketId` 2.18.0 en contenedor— se completó también con un cliente HTTP, para **medir** la cabecera en vez de mirarla a ojo en las herramientas de desarrollo:
 
 | # | Qué se comprobó | Resultado medido |
 |---|---|---|
@@ -195,12 +195,12 @@ Verificación manual (fase 4 del `tasks.md`), diez comprobaciones. Nueve se ejec
 | 4.4 | `/auth/session` sin cookie | `401` con la envoltura |
 | 4.5 | `/auth/login` sin seguir el redirector | `302` con la `Location` y sus **seis** parámetros; siguiendo el redirector, la URL del proveedor conserva `state` y `nonce` |
 | 4.6 | `logout`: `POST` sin cookie, `GET` sin cookie y `GET` con sesión | `401`, `401` y `405`, los tres envueltos |
-| 4.7 | Flujo completo en el navegador contra un proveedor real | **La ejecuta el operador.** Está pendiente de confirmación al escribir este documento: es la única comprobación que ejercita el flujo contra un proveedor de verdad |
+| 4.7 | Flujo completo contra el proveedor real (`PocketId` 2.18.0) | **Completado**: el `POST /api/oidc/token` del proveedor contesta `200`, el callback de Kesto responde `302` con `Set-Cookie: kesto_session=…` —`HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=28800`, **sin** `Secure`—, y `GET /api/v1/auth/session` contesta `200` con el `sub` y el `email` de la cuenta |
 | 4.8 | Cookie manipulada | `401` envuelto: también con la firma hecha con otra clave y con una cookie caducada |
 | 4.9 | `RUST_LOG=trace` en todo el recorrido | **0** apariciones del `client_secret`, **0** del token de acceso, **0** del ID token y **0** de la cookie |
 | 4.10 | Configuración incompleta | `KESTO_SECRET` ausente en modo `Oidc` → no arranca y el mensaje la nombra; las `OIDC_*` a medias → error de arranque nombrando la que falta |
 
-Todo esto lo ejecuta y lo reproduce el arnés guardado fuera del repositorio, con un proveedor de descubrimiento local que sirve `/.well-known/openid-configuration`.
+Todo lo anterior se reproduce con el arnés guardado fuera del repositorio —un proveedor de descubrimiento local que sirve `/.well-known/openid-configuration`—, salvo la 4.7, que necesita un proveedor de verdad: se ejecutó contra un `PocketId` 2.18.0 en contenedor, en local, obteniendo la sesión del proveedor con su token de un solo uso para no depender de una passkey de hardware.
 
 ## Deuda pendiente y límites aceptados
 
@@ -209,7 +209,6 @@ Todo esto lo ejecuta y lo reproduce el arnés guardado fuera del repositorio, co
 - Escenarios de robustez que siguen **sin candado**: el fallo del JWKS, el fallo del `token_endpoint` por causas distintas del código de estado, un documento de descubrimiento incompleto y el límite exacto del TTL de los `state` ya consumidos. (La confusión de algoritmo y la ausencia de `kid` **sí** quedaron candadeadas.)
 - El `iat` con margen y el `exp` sin él es una **asimetría deliberada**, no un olvido: ver su apartado.
 - `nbf` **no** es deuda, y está medido: `validate_nbf` viene en `false` por defecto y `nbf` no se lee.
-- El `Purpose` de `openspec/specs/auth/spec.md` se escribe al archivar: `openspec archive` crea la capability con un marcador de relleno («TBD - created by archiving change…») que `validate --strict` delata.
 
 Los cabos sueltos del SRS que **no** toca esta feature, y a qué change esperan. Son los mismos que listó `FEATURE-001`, y siguen abiertos:
 
@@ -228,4 +227,4 @@ Refresh tokens; revocación de sesiones —el JWT vive hasta su `exp`, no hay li
 
 Y el panel: **`ui/` sigue sin existir**. Tras el login, la vuelta a `/` contesta `404` envuelto, y eso es lo esperado hoy: no hay panel que servir. La puerta está puesta antes de que haya puerta que cruzar.
 
-Este documento es el hermano de `plans/PLAN-002-auth-capability.md` y continúa a `docs/FEATURE-001-bootstrap-core.md`.
+Este documento es el hermano de `plans/PLAN-002-COMPLETED.md` y continúa a `docs/FEATURE-001-bootstrap-core.md`.

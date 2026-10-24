@@ -13,11 +13,12 @@ Kesto ("caja" en esperanto) es un contenedor único que:
 
 ## Estado
 
-Proyecto **en construcción**, pero el código ya ha empezado y el primer bloque está cerrado. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya se ha implementado `bootstrap-core`: arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado, con 25 tests en verde. Lo siguiente es la autenticación. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
+Proyecto **en construcción**, pero el código ya ha empezado y los dos primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado) y `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada), con **92 tests en verde**. Lo siguiente es el esquema de base de datos. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
 
 | Pieza | Estado |
 |---|---|
 | Arranque y API | Cerrado: configuración desde el entorno, envoltura JSON única, salud, `404`/`405` y apagado ordenado (25 tests) |
+| Autenticación | Cerrado: sesión firmada con `KESTO_SECRET` en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y todo `/api/v1/*` bajo puerta salvo la salud y el flujo de entrada (**92 tests** en total) |
 | CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) | Verde: `cargo fmt --check`, `cargo clippy -- -D warnings` y `cargo test --locked` |
 | Imagen | Pendiente de `Dockerfile`; el job del pipeline se salta solo hasta que exista |
 | Crate | `publish = false` a propósito, para no dejar un placeholder permanente en crates.io |
@@ -83,7 +84,7 @@ just dev        # backend en local
 just ui-dev     # panel con recarga en caliente (cuando exista ui/)
 ```
 
-`just dev` **necesita `KESTO_MASTER_KEY` en el entorno** o el proceso no arranca. Sin variables `OIDC_*` arranca en modo desarrollo con la autenticación apagada; usa `RUST_LOG=debug` para ver el detalle.
+`just dev` **necesita `KESTO_MASTER_KEY` en el entorno** o el proceso no arranca. Sin variables `OIDC_*` arranca en modo desarrollo: **sin capa de autenticación**, con todo `/api/v1/*` abierto y `/api/v1/auth/*` contestando `404`; con las tres `OIDC_*` presentes exige además `KESTO_SECRET` y pone la puerta sobre toda la superficie de negocio. Usa `RUST_LOG=debug` para ver el detalle.
 
 Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features (`plan-*`, `feature-new`), la imagen local (`build`, `run`) y OpenSpec (`check-spec`, `spec-*`).
 
@@ -95,7 +96,8 @@ Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features 
 
 ```text
 src/     backend Rust (Axum)
-  api/       endpoints: hoy solo salud (GET /api/v1/health) y la envoltura JSON
+  api/       endpoints: la salud, el flujo de entrada y la sesión
+  auth/      el flujo OIDC, la sesión y el gate (módulo propio, no del §7)
   config.rs  configuración desde el entorno
   secret.rs  redacción de credenciales
   error.rs   errores tipados + IntoResponse

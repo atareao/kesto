@@ -1,8 +1,8 @@
 # PLAN-002 — `auth-capability`
 
-> **Estado:** en curso (implementación terminada y auditada; queda el cierre documental y el archivo del change).
+> **Estado:** cerrado el 2026-10-24 (implementado, auditado y verificado; el change se archiva en este mismo cierre).
 > **Rama:** `feature/auth-capability`, desde `development`.
-> **Change de OpenSpec:** `openspec/changes/auth-capability/`.
+> **Change de OpenSpec:** `openspec/changes/archive/2026-10-24-auth-capability/`.
 > **Especificación de origen:** `docs/DEFINITION.md` §5 (endpoints `/api/v1/*`) y §8 (variables de entorno). El SRS **no define ningún endpoint de autenticación**: ese es el hueco que cierra este change.
 > **Cambio anterior:** `bootstrap-core` (`PLAN-001-COMPLETED.md`, `docs/FEATURE-001-bootstrap-core.md`, 25 tests).
 
@@ -100,11 +100,11 @@ cargo test --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-**91 tests** (90 unitarios + 1 de integración del arranque), frente a los 25 de `bootstrap-core`.
+**92 tests** (91 unitarios + 1 de integración del arranque), frente a los 25 de `bootstrap-core`.
 
-Especificación del change: **12 requisitos / 49 escenarios** (`auth` 10/41, `api-shell` 2/8), `openspec validate auth-capability --strict` válido.
+Especificación del change: **12 requisitos / 50 escenarios** (`auth` 10/42, `api-shell` 2/8), `openspec validate auth-capability --strict` válido.
 
-Verificación manual contra el binario (fase 4 de `tasks.md`), nueve de las diez comprobaciones hechas por el Director con `curl` y variables de entorno; la décima —completar el flujo en el navegador contra un proveedor OIDC real y comprobar los atributos de la cookie en las herramientas de desarrollo— la ejecuta el operador, porque necesita su proveedor de identidad y un navegador. Todas las pruebas automatizadas van contra un proveedor falso: la comprobación 4.7 es la única que ejercita el flujo contra un proveedor real.
+Verificación manual contra el binario (fase 4 de `tasks.md`), las diez comprobaciones hechas: nueve con `curl` y variables de entorno contra un proveedor de descubrimiento local. La décima —completar el flujo contra un proveedor OIDC **real**— se hizo contra un `PocketId` 2.18.0 en contenedor, en el navegador y además con un cliente HTTP para medir la cabecera: `Set-Cookie` con `HttpOnly`, `SameSite=Strict`, `Path=/` y `Max-Age=28800`, sin `Secure`, y `GET /api/v1/auth/session` contestando el `sub` y el `email`. Todas las pruebas automatizadas van contra un proveedor falso: la 4.7 es la única que ejercita el flujo contra un proveedor de verdad.
 
 ## Deuda declarada
 
@@ -115,11 +115,11 @@ Verificación manual contra el binario (fase 4 de `tasks.md`), nueve de las diez
 
 ## Cierre
 
-- [ ] Tildar `tasks.md` completo (obligatorio: `openspec archive` se niega si queda una casilla sin marcar).
-- [ ] `docs/FEATURE-002-auth-capability.md`.
-- [ ] Actualizar `AGENTS.md` (obligatoriedad de `KESTO_SECRET` en modo OIDC; el modo de desarrollo deja de describirse como «panel sin autenticar») y `README.md`.
-- [ ] Escribir el `Purpose` de `openspec/specs/auth/spec.md`: es capability nueva y no puede quedarse en `TBD`.
-- [ ] Arreglar en commit aparte las dos recetas rotas del `.justfile` (`spec-status` pasa un argumento posicional que `openspec status` no acepta; `spec-archive` no pasa `--yes` y se queda esperando por `stdin`).
-- [ ] `openspec archive auth-capability`.
-- [ ] Renombrar este fichero a `PLAN-002-COMPLETED.md`.
+- [x] Tildar `tasks.md` completo (obligatorio: `openspec archive` se niega si queda una casilla sin marcar).
+- [x] `docs/FEATURE-002-auth-capability.md`.
+- [x] Actualizar `AGENTS.md` (obligatoriedad de `KESTO_SECRET` en modo OIDC; el modo de desarrollo deja de describirse como «panel sin autenticar») y `README.md`.
+- [x] Escribir el `Purpose` de `openspec/specs/auth/spec.md`: es capability nueva y no puede quedarse en `TBD`.
+- [x] Arreglar en commit aparte las dos recetas rotas del `.justfile` (`spec-status` pasa un argumento posicional que `openspec status` no acepta; `spec-archive` no pasa `--yes` y se queda esperando por `stdin`).
+- [x] `openspec archive auth-capability`.
+- [x] Renombrar este fichero a `PLAN-002-COMPLETED.md`.
 - [ ] PR `feature/auth-capability` → `development` con el CI en verde. **Sin release a `main`**: se decidió publicar solo hasta `development`.
