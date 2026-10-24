@@ -1,0 +1,197 @@
+name: Release
+
+# Un tag de release (`vX.Y.Z`, empujado por release-prepare) publica los dos
+# entregables y abre la GitHub Release:
+#
+#   * imagen de contenedor -> ghcr.io/<owner>/<repo>, multi-arquitectura
+#   * crate                -> crates.io
+#
+# Los dos jobs están condicionados por `preflight` para que una release
+# temprana no reventase por artefactos que aún no existen:
+#
+#   * la imagen se salta mientras no existan `Dockerfile` y `ui/package.json`
+#   * el crate se salta mientras `Cargo.toml` siga diciendo `publish = false`
+#
+# Ambos se encienden solos, sin editar este fichero, en cuanto existan.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-26.04
+    outputs:
+      has_image: ${{ steps.detect.outputs.has_image }}
+      publish_crate: ${{ steps.detect.outputs.publish_crate }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Detect what can be published
+        id: detect
+        run: |
+          if [ -f Dockerfile ] && [ -f ui/package.json ]; then
+            echo "has_image=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_image=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Sin Dockerfile o sin ui/package.json todavia: se salta la publicacion de la imagen."
+          fi
+          if grep -qE '^publish[[:space:]]*=[[:space:]]*false' Cargo.toml; then
+            echo "publish_crate=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cargo.toml todavia dice 'publish = false' (crate placeholder): se salta crates.io."
+          else
+            echo "publish_crate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    name: Container image (ghcr.io)
+    needs: preflight
+    if: needs.preflight.outputs.has_image == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Se compila solo amd64 y se carga en el daemon local para que el smoke
+      # test corra contra la misma imagen que está a punto de publicarse. Un
+      # build multi-plataforma no se puede `load`, de ahí los dos builds.
+      - name: Build image (amd64, local)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: kesto:release-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Arranca la imagen y espera a que el puerto HTTP conteste. Solo prueba que
+      # el contenedor levanta, que las migraciones corren y que el servidor se
+      # ata al puerto: es deliberadamente laxo porque tiene que valer para
+      # cualquier versión. Endurecerlo (un /healthz de verdad) cuando la API
+      # defina uno.
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+
+          docker run -d --name kesto-smoke -p 8080:8080 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e RUST_LOG=info \
+            -e DATABASE_URL='sqlite:///app/data/kesto.db' \
+            -e BIND_ADDRESS='0.0.0.0:8080' \
+            kesto:release-candidate
+
+          ok=0
+          for attempt in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)"
+            if [ "${code}" != "000" ]; then
+              echo "El puerto 8080 contestó ${code} tras ${attempt} intento(s)."
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${ok}" != "1" ]; then
+            echo "::error::el contenedor no contestó en HTTP sobre 8080 en 60s."
+            docker logs kesto-smoke || true
+            exit 1
+          fi
+
+          if [ "$(docker inspect -f '{{.State.Running}}' kesto-smoke)" != "true" ]; then
+            echo "::error::el contenedor se murió durante el smoke test."
+            docker logs kesto-smoke || true
+            exit 1
+          fi
+
+          echo "Smoke test superado."
+
+      - name: Dump container logs
+        if: failure()
+        run: docker logs kesto-smoke || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f kesto-smoke || true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Container metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    name: Crate (crates.io)
+    needs: preflight
+    if: needs.preflight.outputs.publish_crate == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if curl -sf -A 'kesto-release-ci' "https://crates.io/api/v1/crates/kesto/${VERSION}" >/dev/null; then
+            echo "kesto ${VERSION} ya está en crates.io: nada que hacer."
+            exit 0
+          fi
+          cargo publish
+
+  release:
+    name: GitHub Release
+    needs: [preflight]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate release notes
+        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: kesto ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
