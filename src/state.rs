@@ -13,14 +13,15 @@ use crate::secret::SecretString;
 /// Caducidad de un `state` emitido en el login: 5 minutos.
 ///
 /// Un login que no se completa en ese plazo es un intento abandonado. La
-/// comprobación de verdad al consumir es M4 —es el defecto de la plantilla que
-/// este change corrige—, pero el dato de la caducidad vive aquí desde ya.
+/// comprobación de verdad se hace al consumir, en `AuthState::consumir_login`
+/// —es el defecto de la plantilla que este change corrige: guardaba la marca de
+/// tiempo y nunca la miraba—.
 pub const STATE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Un login en curso: el `nonce` emitido y el instante en que se emitió.
 ///
-/// El `nonce` se guarda **junto** al `state` y no en un mapa aparte: M4 tendrá
-/// que compararlo con el del ID token al verificar, y con la asociación hecha
+/// El `nonce` se guarda **junto** al `state` y no en un mapa aparte: el callback
+/// lo compara con el del ID token al verificar, y con la asociación hecha
 /// —`state → (nonce, instante)`— esa comparación no depende de nada más.
 #[derive(Debug, Clone)]
 pub struct PendingLogin {
@@ -39,6 +40,24 @@ impl PendingLogin {
     pub fn expirado_en(&self, ahora: Instant) -> bool {
         ahora.saturating_duration_since(self.issued_at) >= STATE_TTL
     }
+}
+
+/// Por qué se rechaza un `state` al consumirlo en el callback.
+///
+/// Las tres condiciones son distintas y se distinguen en el código y en el
+/// registro, aunque el mensaje que ve el cliente sea el mismo: quien no ha
+/// entrado no aprende si su `state` era inventado, caducado o ya gastado. El
+/// defecto de la plantilla que este change corrige es, precisamente, que la
+/// caducidad no se comprobaba; separar los tres casos es lo que hace que la
+/// comprobación no se pueda perder sin que un test lo note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RechazoState {
+    /// El `state` no se emitió nunca: no está en el mapa ni entre los gastados.
+    Desconocido,
+    /// El `state` se emitió, pero hace más de [`STATE_TTL`].
+    Caducado,
+    /// El `state` ya lo gastó un callback anterior.
+    Reutilizado,
 }
 
 /// Estado de la autenticación.
@@ -71,6 +90,13 @@ pub struct AuthState {
     /// Tras un [`Mutex`] porque insertar y purgar son mutaciones: el mapa no
     /// puede crecer sin límite con cada intento de entrada que nadie completa.
     pub(crate) logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
+    /// `state` ya consumidos, con el instante en que se gastaron.
+    ///
+    /// Se recuerdan para poder distinguir «reutilizado» de «desconocido» sin
+    /// confundirlos: si un `state` consumido se descartara sin dejar rastro, un
+    /// segundo callback con el mismo `state` parecería uno inventado. La purga
+    /// por TTL acota su crecimiento igual que la de los pendientes.
+    pub(crate) consumidos: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl AuthState {
@@ -81,6 +107,7 @@ impl AuthState {
             settings: Arc::new(settings),
             discovery: Arc::new(RwLock::new(None)),
             logins: Arc::new(Mutex::new(HashMap::new())),
+            consumidos: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -93,8 +120,8 @@ impl AuthState {
     /// AVISO — esto acota el mapa a la ventana del TTL, pero **no le pone un
     /// tope duro**: un caudal alto de logins dentro de esos cinco minutos lo hace
     /// crecer sin límite. La spec solo exige purgar por caducidad, así que el
-    /// tope no se implementa aquí; M4, al añadir el consumo del `state` en el
-    /// callback, decide si quiere uno.
+    /// tope no se implementa aquí; el consumo del `state` en el callback añade la
+    /// purga al consumir, pero tampoco un tope.
     pub async fn registrar_login(&self, state: &str, nonce: &str) {
         let ahora = Instant::now();
         let mut logins = self.logins.lock().await;
@@ -107,6 +134,45 @@ impl AuthState {
                 issued_at: ahora,
             },
         );
+    }
+
+    /// Consume un `state`: lo extrae del mapa y lo descarta una sola vez.
+    ///
+    /// Distingue los tres rechazos —desconocido, caducado y reutilizado— y
+    /// comprueba la caducidad **de verdad** al consumir, no solo la registra:
+    /// es el defecto de la plantilla que este change corrige. La purga de
+    /// entradas caducadas y de marcas de consumo viejas ocurre aquí, de modo
+    /// que el mapa y su rastro de gastados no crecen sin límite.
+    pub(crate) async fn consumir_login(&self, state: &str) -> Result<PendingLogin, RechazoState> {
+        let ahora = Instant::now();
+        let mut logins = self.logins.lock().await;
+        let mut consumidos = self.consumidos.lock().await;
+
+        // La entrada objetivo se saca **antes** de purgar: si la purga la
+        // borrara primero, una entrada caducada se volvería indistinguible de una
+        // desconocida y las dos condiciones dejarían de separarse.
+        let entrada = logins.remove(state);
+
+        // Purga al consumir: pendientes caducados y marcas de consumo viejas. El
+        // mapa no crece con intentos abandonados, ni el rastro de gastados con el
+        // tiempo.
+        logins.retain(|_, pendiente| !pendiente.expirado_en(ahora));
+        consumidos.retain(|_, gastado_en| ahora.saturating_duration_since(*gastado_en) < STATE_TTL);
+
+        match entrada {
+            None => {
+                if consumidos.contains_key(state) {
+                    Err(RechazoState::Reutilizado)
+                } else {
+                    Err(RechazoState::Desconocido)
+                }
+            }
+            Some(pendiente) if pendiente.expirado_en(ahora) => Err(RechazoState::Caducado),
+            Some(pendiente) => {
+                consumidos.insert(state.to_owned(), ahora);
+                Ok(pendiente)
+            }
+        }
     }
 }
 
@@ -205,8 +271,8 @@ mod tests {
 
     #[test]
     fn el_ttl_del_state_es_de_cinco_minutos() {
-        // Fija el valor de la constante: la spec dice «más de 5 minutos» y M4
-        // rechazará por `expirado_en`, que compara contra `STATE_TTL`.
+        // Fija el valor de la constante: la spec dice «más de 5 minutos» y el
+        // callback rechaza por `expirado_en`, que compara contra `STATE_TTL`.
         assert_eq!(
             STATE_TTL,
             Duration::from_secs(300),

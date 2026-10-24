@@ -201,6 +201,65 @@ pub(crate) fn session_cookie_header(token: &str) -> String {
     format!("{}={token}", crate::auth::session::SESSION_COOKIE_NAME)
 }
 
+/// Token del JWT de sesión que viaja en la `Set-Cookie` de una respuesta.
+///
+/// Devuelve solo el valor de la cookie —el JWT—, sin atributos: es lo que un
+/// test necesita para verificar la identidad de la sesión emitida.
+pub(crate) fn token_de_set_cookie(response: &Response) -> Option<String> {
+    header_text(response, header::SET_COOKIE).and_then(|cabecera| {
+        cabecera
+            .split(';')
+            .next()
+            .and_then(|par| {
+                par.trim()
+                    .strip_prefix(&format!("{}=", crate::auth::session::SESSION_COOKIE_NAME))
+            })
+            .map(ToOwned::to_owned)
+    })
+}
+
+/// URL del callback con el `code` y el `state` dados, ya codificados.
+///
+/// Se codifican aunque hoy los dos sean alfanuméricos: si un día dejan de serlo,
+/// la URL sigue siendo correcta sin que nadie se acuerde de este arnés.
+pub(crate) fn callback_url(state: &str, code: &str) -> String {
+    format!(
+        "/api/v1/auth/callback?code={}&state={}",
+        urlencoding::encode(code),
+        urlencoding::encode(state)
+    )
+}
+
+/// Lanza un `GET /api/v1/auth/login` y devuelve el `state` y el `nonce` emitidos.
+///
+/// Es el arranque del flujo que el callback consume: los tests que necesitan un
+/// `state` de verdad —y su `nonce` para firmar un ID token coherente— empiezan
+/// aquí y no inventan ni uno ni otro.
+pub(crate) async fn login_state_y_nonce(router: Router) -> (String, String) {
+    let respuesta = get(router, "/api/v1/auth/login").await;
+
+    assert_eq!(
+        respuesta.status(),
+        axum::http::StatusCode::FOUND,
+        "el login debe redirigir para emitir el state y el nonce"
+    );
+
+    let location =
+        header_text(&respuesta, header::LOCATION).expect("el 302 del login trae Location");
+    let parametros = parametros_de_consulta(&location);
+
+    (
+        parametros
+            .get("state")
+            .expect("la redirección del login debe traer state")
+            .clone(),
+        parametros
+            .get("nonce")
+            .expect("la redirección del login debe traer nonce")
+            .clone(),
+    )
+}
+
 /// Cookie de sesión válida emitida por el propio Kesto.
 pub(crate) fn cookie_de_sesion() -> String {
     let token = crate::auth::session::issue(
