@@ -51,7 +51,7 @@ Cada tarea es una prueba por escenario de `specs/auth/spec.md` y `specs/api-shel
 - [ ] 1.35 `src/api/auth.rs`: test que fija que `GET /api/v1/auth/logout` **con una cookie de sesión válida** contesta `405` con la envoltura.
 - [ ] 1.36 `src/api/auth.rs`: test que fija que `GET /api/v1/auth/session` con sesión contesta `200` con el `sub` y el `email`.
 - [ ] 1.37 `src/api/auth.rs`: test que fija que `GET /api/v1/auth/session` sin cookie contesta `401` con la envoltura.
-- [ ] 1.38 `src/auth/mod.rs`: test que fija que con `RUST_LOG=trace` el flujo completo —login, callback y una petición con la sesión— no deja en el log ni el `client_secret`, ni el código de autorización, ni el ID token, ni el token de acceso, usando valores distinguibles que se buscan literalmente en la salida capturada.
+- [ ] 1.38 `src/api/auth.rs`: test que fija que con `RUST_LOG=trace` el flujo completo —login, callback y una petición con la sesión— no deja en el log ni el `client_secret`, ni el código de autorización, ni el ID token, ni el token de acceso, usando valores distinguibles que se buscan literalmente en la salida capturada.
 - [ ] 1.39 `src/auth/session.rs`: test que fija que el JWT de la cookie no lleva el ID token ni el token de acceso del proveedor.
 - [ ] 1.40 `src/api/auth.rs`: test que fija que la `Location` de la vuelta al panel no contiene el código de autorización.
 - [ ] 1.41 `src/api/mod.rs`: test que fija que las rutas públicas no pasan por el *gate* —la salud no contesta `401`— y que la superficie de negocio sí.
@@ -59,7 +59,8 @@ Cada tarea es una prueba por escenario de `specs/auth/spec.md` y `specs/api-shel
 - [ ] 1.43 `src/api/mod.rs`: test que fija que ese mismo método no declarado —`POST /api/v1/auth/session`—, **con** una cookie de sesión válida, contesta `405` con la envoltura.
 - [ ] 1.44 `src/api/mod.rs`: test que fija que una **ruta no declarada** bajo `/api/v1` contesta `404` con la envoltura **sin** exigir sesión: el `404` no pasa por el *gate*, y eso es correcto.
 - [ ] 1.45 `src/api/auth.rs`: test que fija que `GET /api/v1/auth/logout` **sin** cookie contesta `401` con la envoltura y **no** `405`.
-- [ ] 1.46 Ejecutar `just check`: las pruebas nuevas fallan por no existir el código, y la suite de `bootstrap-core` sigue verde.
+- [ ] 1.46 `src/auth/oidc.rs`: test que fija que un `iat` adelantado al reloj dentro del margen —30 segundos— no tumba el login, con `302` y cookie de sesión. El `exp` sigue sin margen, y su candado es el escenario 1.16.
+- [ ] 1.47 Ejecutar `just check`: las pruebas nuevas fallan por no existir el código, y la suite de `bootstrap-core` sigue verde.
 
 ## 2. GREEN (implementación mínima)
 
@@ -74,7 +75,8 @@ Cada tarea es una prueba por escenario de `specs/auth/spec.md` y `specs/api-shel
 - [ ] 2.9 `src/api/mod.rs`: la partición del router —lista blanca pública, mitad protegida con el *gate* por `route_layer`— y la no-montura del flujo en modo `Disabled`. El `method_not_allowed_fallback` global SHALL declararse **antes** de colgar la capa, para que la capa lo envuelva y el *gate* decida antes que el enrutado por método: **el orden de esas dos líneas es semántico, no cosmético**.
 - [ ] 2.10 `src/main.rs`: el descubrimiento al arrancar, su aviso cuando falla y el router partido.
 - [ ] 2.11 El proveedor falso local de la tarea 0.5: `wiremock` sirviendo `authorization_endpoint`, `token_endpoint` y `jwks_uri`, con un **par RSA real** y el ID token firmado **RS256**, sin salir a internet. No hay dobles de las piezas de red.
-- [ ] 2.12 `just check` en verde.
+- [ ] 2.12 `src/auth/oidc.rs`: la constante del margen de reloj —60 segundos— y su aplicación **solo** a la comparación del `iat`, con `saturating_add`.
+- [ ] 2.13 `just check` en verde.
 
 ## 3. REFACTOR
 

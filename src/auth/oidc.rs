@@ -35,6 +35,22 @@ pub const SCOPE: &str = "openid email";
 /// Longitud del `state` y del `nonce`: 32 caracteres aleatorios.
 pub const TOKEN_LENGTH: usize = 32;
 
+/// Margen de cortesía, en segundos, para el `iat` del ID token.
+///
+/// El `exp` de la sesión se valida con margen cero porque los dos extremos son
+/// Kesto, y el `exp` del ID token por otro motivo: va una hora visto, así que un
+/// desfase de segundos no lo alcanza. El `iat` del ID token es el caso distinto:
+/// lo firma el reloj del proveedor y lo compara el de Kesto —dos relojes—, y va
+/// redondeado al segundo, de modo que sin margen un desfase de un segundo tumba
+/// un login por lo demás en regla con un `401` genérico. Sesenta segundos es la
+/// tolerancia habitual de un JWT y no alarga la vida de nada: solo tolera el
+/// futuro, nunca estira la vigencia.
+///
+/// Si algún día se activara `validate_nbf` en `Validation` —hoy viene en
+/// `false` y `nbf` no se mira—, volvería esta misma clase de falso `401`:
+/// muchos proveedores emiten `nbf` ligeramente al alza.
+pub const MARGEN_DE_RELOJ: u64 = 60;
+
 /// Documento de descubrimiento, con lo que de verdad se usa.
 ///
 /// `userinfo_endpoint` **no** se declara a propósito: el ID token verificado
@@ -429,10 +445,14 @@ pub async fn verificar_id_token(
     }
 
     // `iat` en vigor: un token emitido en el futuro no es de fiar. Tampoco lo
-    // valida `jsonwebtoken`, así que se comprueba aquí. El margen es el mismo
-    // cero que en `exp`: no hay dos relojes en juego.
+    // valida `jsonwebtoken`, así que se comprueba aquí. A diferencia del `exp`
+    // —donde el margen es cero porque los dos extremos son Kesto—, aquí hay
+    // **dos relojes**: el `iat` lo firma el del proveedor y lo compara el de
+    // Kesto, redondeado al segundo, así que un desfase de un segundo entre
+    // ambos tumbaría un login por lo demás en regla. De ahí el margen de
+    // cortesía: solo alarga la tolerancia hacia el futuro, nunca la vigencia.
     let ahora = jsonwebtoken::get_current_timestamp();
-    if datos.claims.iat > ahora {
+    if datos.claims.iat > ahora.saturating_add(MARGEN_DE_RELOJ) {
         return Err(rechazar_id_token("el ID token se emitió en el futuro"));
     }
 
@@ -447,7 +467,7 @@ mod tests {
     use axum::Router;
     use axum::http::{StatusCode, header};
 
-    use super::{Discovery, build_authorization_url};
+    use super::{Discovery, MARGEN_DE_RELOJ, build_authorization_url};
     use crate::api::api_router;
     use crate::auth::session;
     use crate::config::OidcSettings;
@@ -929,6 +949,12 @@ mod tests {
         // el campo del struct—, este token, con todo lo demás en regla, se
         // aceptaría y emitiría sesión. El `exp` es válido a propósito: lo que
         // tiene que rechazar la petición es el `iat` adelantado al reloj.
+        //
+        // Diez minutos de adelanto siguen cayendo **porque están más allá del
+        // margen de cortesía** —[`MARGEN_DE_RELOJ`]—, no porque el margen sea
+        // cero: el margen que se tolera hacia el futuro lo fija el test de abajo.
+        // Un `iat` dentro de ese margen es un desfase de reloj y se acepta; este
+        // es un token emitido en el futuro de verdad.
         let proveedor = ProveedorFalso::servir().await;
         let router = router_oidc_con_emisor(&proveedor.issuer);
 
@@ -958,6 +984,48 @@ mod tests {
         assert!(
             log.contains("el ID token se emitió en el futuro"),
             "el rechazo no viene del iat adelantado al reloj: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_iat_dentro_del_margen_de_reloj_no_tumba_el_login() {
+        // El otro filo de la comprobación de `iat`: el `iat` lo firma el reloj del
+        // proveedor y lo compara el de Kesto, así que un desfase de segundos entre
+        // ambos no puede tumbar un login por lo demás en regla con un `401`
+        // genérico. El desfase se deriva de [`MARGEN_DE_RELOJ`] —su mitad— y no es
+        // un número suelto, para que el candado siga valiendo si el margen cambia.
+        //
+        // El suelo de cinco segundos es lo que hace que el candado muerda: sin él,
+        // la mitad del margen se anula con el margen mismo y el test pasaría por
+        // vacío —un `iat` igual al reloj no prueba nada—, así que poner el margen a
+        // cero daría verde en vez de rojo. Con el margen de verdad el desfase son 30
+        // segundos; con el margen a cero cae a 5, que siguen estando muy por encima
+        // de la ventana del arnés —decenas de milisegundos, medidas—, y por eso el
+        // control negativo con el margen a cero cae siempre: para colarlo haría
+        // falta que el flujo se parase más de cinco segundos entre las dos lecturas
+        // del reloj. Un suelo de un segundo no bastaba: la ventana del arnés cruza
+        // la frontera del segundo y de 60 repeticiones una salía verde.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let desfase = (MARGEN_DE_RELOJ / 2).max(5);
+        let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
+        claims.iat = jsonwebtoken::get_current_timestamp() + desfase;
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&claims))
+            .await;
+
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::FOUND,
+            "un desfase de reloj dentro del margen no puede tumbar el login"
+        );
+        assert!(
+            token_de_set_cookie(&respuesta).is_some(),
+            "el callback debe completar el flujo y emitir la cookie de sesión"
         );
     }
 

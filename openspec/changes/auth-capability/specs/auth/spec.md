@@ -129,6 +129,8 @@ Tras canjear el código en el `token_endpoint`, la aplicación SHALL verificar e
 
 Un token que falle cualquiera de las cinco comprobaciones NO SHALL aceptarse y NO SHALL producir cookie de sesión. Es el segundo defecto de shuul que aquí se corrige: shuul canjea el código y va directo a `userinfo`, sin verificar el ID token que acaba de recibir.
 
+La comprobación de `iat` SHALL tolerar un desfase de reloj de hasta **60 segundos**, el valor de una constante del módulo: el `iat` del ID token lo firma el reloj del proveedor y lo compara el de Kesto —dos relojes—, y va redondeado al segundo, así que sin margen un desfase de un segundo tumba un login por lo demás en regla con un `401` genérico. El `exp` NO SHALL llevar margen: el de un ID token va una hora visto, un desfase de segundos no lo alcanza, y tolerarlo alargaría la vida de un token recién caducado. Más allá del margen, un `iat` adelantado al reloj SHALL rechazarse.
+
 Del token **verificado** SHALL tomarse `sub` y `email` como identidad de la sesión. Como consecuencia, NO SHALL llamarse al endpoint `userinfo`: con el ID token verificado sobra, y un documento de descubrimiento sin `userinfo_endpoint` SHALL bastar para completar el flujo.
 
 #### Scenario: Un `aud` ajeno no se acepta
@@ -142,6 +144,11 @@ Del token **verificado** SHALL tomarse `sub` y `email` como identidad de la sesi
 - **WHEN** se atiende el callback
 - **THEN** SHALL contestar un error con la envoltura
 - **AND** NO SHALL emitir cookie de sesión
+
+#### Scenario: Un desfase de reloj dentro del margen no tumba el login
+- **GIVEN** un ID token en regla salvo su `iat`, adelantado al reloj de Kesto dentro de los 60 segundos de margen
+- **WHEN** se atiende el callback
+- **THEN** SHALL completar el flujo, con `302` y cookie de sesión
 
 #### Scenario: Un `nonce` distinto no se acepta
 - **GIVEN** un ID token cuyo `nonce` no es el emitido en el login
