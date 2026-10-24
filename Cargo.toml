@@ -27,6 +27,44 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 zeroize = "1.9.1"
 
+# OIDC flow (auth-capability), written by hand with reqwest + jsonwebtoken.
+# Every version below is the one already present in this machine's Cargo cache
+# (~/.cargo/registry): this repository must build offline, so versions are
+# resolved against the cache, not picked by reputation.
+#
+# `jsonwebtoken`: `default-features = false` leaves the crate with no crypto
+# backend of its own. On the 11.x line the backend sits behind a `CryptoProvider`
+# chosen by feature, and `aws_lc_rs` is an optional feature, not the default --
+# the crate declares `default = ["use_pem"]`. `rust_crypto` selects the pure-Rust
+# RustCrypto backend and keeps `aws-lc-rs` out of the tree (verified: zero
+# occurrences in `cargo tree`); `use_pem` is what reads the provider's JWKS keys.
+# Both features exist in the cached 11.1.0.
+#
+# NOT used, on purpose: `openidconnect` and `tower-sessions`. Neither is in the
+# local Cargo cache, and a dependency that forces a network fetch would break the
+# premise that this repository compiles with no connection. Check this note
+# before reaching for them.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+# `rustls-tls` (not the TLS default) keeps native-tls/OpenSSL out of the build and
+# is what the spec asks for; `json` is needed for discovery, the code exchange and
+# the JWKS. Note: reqwest 0.13.x renamed `rustls-tls` away and defaults to a
+# `rustls` feature that pulls `aws-lc-rs`, so the spec's feature name pins 0.12.x.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+axum-extra = { version = "0.10.3", features = ["cookie"] }
+rand = "0.8.8"
+urlencoding = "2.1.3"
+
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1"
+# Local fake OIDC provider: it serves `authorization_endpoint`, `token_endpoint`
+# and `jwks_uri`, and no test ever reaches the internet.
+wiremock = "0.6.5"
+# A real RSA keypair, so the ID token is signed RS256 for real (never stubbed).
+# `pem` (already part of rsa's defaults) is what lets the public key be exported
+# as a JWK.
+rsa = { version = "0.9.10", features = ["pem"] }
+# base64url for the JWK `n`/`e` parameters. Pinned to 0.22 because base64 is a
+# direct dependency here and ^0.22 is the only major already in the tree
+# (jsonwebtoken and wiremock both require ^0.22); 0.21 would duplicate it.
+base64 = "0.22.1"

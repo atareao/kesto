@@ -9,6 +9,7 @@
 // código muerto; declararla es lo que hace que el contrato no se lea como
 // código muerto y siga delatando, en cambio, los ayudantes privados sin uso.
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod secret;
@@ -18,7 +19,6 @@ pub mod state;
 mod test_support;
 
 use std::future::Future;
-use std::sync::Arc;
 
 use crate::state::AppState;
 
@@ -124,11 +124,29 @@ async fn main() -> std::process::ExitCode {
         tracing::warn!("{aviso}");
     }
 
-    // 4. Router, escucha y apagado.
+    // 4. Router, escucha y apagado. El estado se construye desde la
+    //    configuración ya resuelta: en modo `Oidc` lleva el estado de
+    //    autenticación, y en desarrollo no lleva ninguno.
     let address = config.bind_address;
-    let state = AppState {
-        config: Arc::new(config),
+
+    let state = match AppState::new(config) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("kesto no puede arrancar: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
+
+    // 5. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
+    //    si no contesta, se avisa y se sigue. Kesto es el orquestador de las
+    //    **copias**, y negarse a arrancar porque el proveedor está caído
+    //    convertiría un problema de autenticación en ausencia de copias. El
+    //    reintento llega con el primer login, que además cachea el resultado.
+    if let Some(auth) = state.auth.as_ref()
+        && let Some(aviso) = auth::descubrimiento_al_arrancar(auth).await
+    {
+        tracing::warn!("{aviso}");
+    }
 
     tracing::info!(%address, "escuchando");
 

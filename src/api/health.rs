@@ -23,14 +23,15 @@ pub async fn health(State(state): State<AppState>) -> ApiResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::http::StatusCode;
 
     use crate::api::api_router;
     use crate::config::Config;
     use crate::state::AppState;
-    use crate::test_support::{body_json, body_text, get, lookup_from};
+    // El emisor de ejemplo se toma de `test_support` en vez de redeclararlo: era
+    // una segunda fuente de verdad del mismo literal, y cambiar una y no la otra
+    // dejaría los dos tests mintiendo en silencio.
+    use crate::test_support::{OIDC_ISSUER_URL, body_json, body_text, get, lookup_from};
 
     /// Versión que tiene que declarar la salud: la del binario.
     const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -41,8 +42,6 @@ mod tests {
     const SESSION_SECRET: &str = "clave-de-firma-distinguible-0000000000000000000000000000000";
     /// Secreto de cliente OIDC: solo tiene que estar presente.
     const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
-    /// Emisor OIDC de pruebas: un endpoint sin autenticar no tiene por qué publicarlo.
-    const OIDC_ISSUER_URL: &str = "https://idp.example.test/realms/kesto";
     /// Identificador público del cliente OIDC de pruebas, por el mismo motivo.
     const OIDC_CLIENT_ID: &str = "kesto-panel";
     /// Dirección de escucha distinguible, para detectarla si se publica.
@@ -59,9 +58,7 @@ mod tests {
         let lookup = lookup_from(pares);
         let config = Config::from_lookup(&lookup).expect("configuración de prueba válida");
 
-        AppState {
-            config: Arc::new(config),
-        }
+        AppState::new(config).expect("el estado de prueba se construye")
     }
 
     /// Configuración de desarrollo: sin OIDC.
@@ -178,9 +175,7 @@ mod tests {
             "una clave maestra débil debe avisar: {avisos:?}"
         );
 
-        let estado = AppState {
-            config: Arc::new(config),
-        };
+        let estado = AppState::new(config).expect("el estado de prueba se construye");
 
         let respuesta = get(api_router(estado), "/api/v1/health").await;
 
