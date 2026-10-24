@@ -17,6 +17,20 @@
 //! y abre la puerta a ataques con texto claro conocido—, así que guardar dos veces
 //! el mismo secreto produce dos sobres distintos.
 //!
+//! **No hay *associated data***: el AEAD no autentica ni la columna ni la fila. Los
+//! tres secretos comparten una sola clave y nada ata un sobre a su sitio, así que
+//! quien pueda **escribir** en el fichero no puede fabricar un sobre —no tiene la
+//! clave— pero **sí copiar uno válido** de una columna o de una fila a otra, y el
+//! AEAD lo autenticará: la aplicación leería un secreto legítimo en el sitio
+//! equivocado, sin señal. No es divulgación —quien escribe el fichero ya controla el
+//! plano de datos— sino **integridad**, y se descarta a sabiendas: atar la columna
+//! obligaría a que el `aad` entrara **por parámetro** en `cifrar` y `descifrar`, y
+//! decidirlo **después** invalidaría las filas ya escritas. Queda escrito para que
+//! quien lo quiera sepa que es un cambio de contrato, no un detalle.
+//!
+//! La etiqueta es, además, el **dominio de separación**: si otro módulo llegara a
+//! cifrar con esta misma clave, tiene que estrenar etiqueta propia.
+//!
 //! El descifrado **falla en alto**: un prefijo desconocido, un nonce de longitud
 //! equivocada, un base64 ilegible, un texto cifrado que el AEAD no autentica o un
 //! valor en claro son [`ErrorDeCifrado`], nunca un [`SecretString`] vacío.
@@ -37,6 +51,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::secret::SecretString;
 
@@ -51,8 +66,8 @@ pub const PREFIJO: &str = "v1";
 /// Cambiarla cambia todas las claves derivadas, y una etiqueta que se toca por
 /// variable de entorno es una forma de perder los secretos sin haber rotado nada,
 /// así que va aquí y no en la configuración. Termina en [`PREFIJO`] a propósito:
-/// la versión del sobre y la de la derivación son la misma, y el test 1.45 fija
-/// ese acuerdo.
+/// la versión del sobre y la de la derivación son la misma, y el test 1.45 la fija
+/// **literalmente** —no basta con que «acabe en `v1`»—.
 pub const ETIQUETA: &[u8] = b"kesto/secrets/v1";
 
 /// Error del cifrado en reposo.
@@ -81,7 +96,20 @@ pub enum ErrorDeCifrado {
     },
 
     /// Una de las partes del sobre no es base64 válido.
-    #[error("una de las partes del sobre no es base64 válido")]
+    ///
+    /// La causa **sí se interpola**, y es la única del módulo que lo hace: el estilo
+    /// de registro del repositorio imprime solo el `Display` —`error = %causa` en
+    /// `src/error.rs`—, así que sin interpolarla el operador leería el mensaje
+    /// genérico y perdería el desplazamiento, que es lo único que conserva este
+    /// error para el registro del servidor.
+    ///
+    /// No filtra nada: el `Display` de `base64::DecodeError` imprime un valor de
+    /// byte y un desplazamiento (`Invalid symbol 33, offset 0.`), **nunca** la cadena
+    /// de entrada; y el nonce y la versión del sobre no son secretos —están en la
+    /// misma columna, a la vista de quien lea la base—, así que citar un byte no
+    /// revela nada que no estuviera ya ahí. El cifrado y el claro, que **sí** son el
+    /// secreto, no se interpolan en ninguna variante.
+    #[error("una de las partes del sobre no es base64 válido: {causa}")]
     Base64Ilegible {
         /// Motivo, tal y como lo informa `base64`.
         #[source]
@@ -93,15 +121,21 @@ pub enum ErrorDeCifrado {
     /// No se conserva el error de `aes-gcm` como fuente: es un tipo opaco
     /// —`aead::Error` no lleva mensaje ni longitud—, así que no añadiría nada al
     /// registro. Lo que sí se conserva es el **veredicto** del AEAD: no se traga,
-    /// que es la regla del requisito.
-    #[error("el texto cifrado no autentica: la clave no es la que se usó o el dato se manipuló")]
+    /// que es la regla del requisito. Un cifrado **truncado** —más corto que el tag
+    /// de 16 bytes— cae también aquí.
+    #[error(
+        "el texto cifrado no autentica: la clave no es la que se usó, el dato se manipuló o está \
+         truncado"
+    )]
     NoAutentica,
 
-    /// El AEAD no pudo cifrar el secreto.
+    /// El AEAD no pudo cifrar el secreto, o no hubo entropía para el nonce.
     ///
-    /// No tiene un caso esperable —ni la falta de entropía ni el límite de tamaño
-    /// del AEAD se dan con lo que aquí se cifra—, pero es la rama que evita un
-    /// `unwrap`: el cifrado devuelve `Result` y hay que contestarle.
+    /// Ya **no** es una rama formal: la generación del nonce usa `try_fill_bytes`, así
+    /// que el fallo del `getrandom` subyacente —un syscall bloqueado por `seccomp`,
+    /// un kernel sin él— llega aquí y se devuelve como error tipado en vez de entrar
+    /// en pánico y cortar la conexión sin la envoltura JSON. El otro modo de fallo,
+    /// el límite de tamaño del AEAD, tampoco es alcanzable con lo que aquí se cifra.
     #[error("no se pudo cifrar el secreto")]
     CifradoFallido,
 
@@ -120,8 +154,10 @@ pub enum ErrorDeCifrado {
 ///
 /// No publica su material: su [`Debug`] dice que está redactada y no hay ningún
 /// camino que lo exponga. La clave no acompaña al dato —no se guarda en la base ni
-/// en una variable global— y se deriva una vez por proceso.
-pub struct Clave([u8; 32]);
+/// en una variable global— y se deriva una vez por proceso. El material vive en un
+/// [`Zeroizing`], así que se borra al caer, como el de [`SecretString`]: es la
+/// misma política del crate para todo lo que es secreto.
+pub struct Clave(Zeroizing<[u8; 32]>);
 
 impl Clave {
     /// Deriva la clave de la maestra con [`ETIQUETA`].
@@ -129,16 +165,21 @@ impl Clave {
     /// No devuelve `Result` a propósito: HKDF-SHA256 con cualquier entrada
     /// funciona, así que no hay ningún fallo que informar.
     pub fn desde_maestra(maestra: &SecretString) -> Self {
-        Clave(derivar(maestra, ETIQUETA))
+        Clave(Zeroizing::new(derivar(maestra, ETIQUETA)))
     }
 
     /// Cifra un secreto en el sobre `v1:<nonce>:<cifrado>`.
     pub fn cifrar(&self, claro: &SecretString) -> Result<String, ErrorDeCifrado> {
         // Nonce **aleatorio por valor**, del `OsRng` del propio `aead` —su feature
         // `getrandom`, activa por defecto, trae `rand_core`—: ni fijo ni derivado de
-        // la clave, que es lo que rompería el AEAD al repetirse.
+        // la clave, que es lo que rompería el AEAD al repetirse. `try_fill_bytes` y
+        // no `fill_bytes`: el `fill_bytes` de `rand_core` **entra en pánico** si el
+        // `getrandom` subyacente falla —un syscall bloqueado por `seccomp`, un kernel
+        // sin él—, y un pánico aquí corta la conexión sin la envoltura JSON.
         let mut nonce = [0u8; LONGITUD_DEL_NONCE];
-        OsRng.fill_bytes(&mut nonce);
+        OsRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|_| ErrorDeCifrado::CifradoFallido)?;
 
         let cifrado = self
             .cifrador()
@@ -210,7 +251,7 @@ impl Clave {
     /// fija la longitud que el algoritmo exige, así que la construcción es
     /// infalible y no hay ningún `Result` que contestar.
     fn cifrador(&self) -> Aes256Gcm {
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0))
+        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0[..]))
     }
 }
 
@@ -243,6 +284,8 @@ fn derivar(maestra: &SecretString, etiqueta: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{Clave, ETIQUETA, ErrorDeCifrado, PREFIJO};
     use crate::secret::SecretString;
     use crate::test_support::capturar_log;
@@ -304,7 +347,8 @@ mod tests {
     }
 
     /// 1.38 — Dos cifrados del mismo secreto son distintos: el nonce es aleatorio
-    /// **por valor**, no fijo ni derivado de la clave.
+    /// **por valor**, no fijo ni derivado de la clave. Se afirma sobre el nonce y
+    /// sobre el **texto cifrado**, que es lo que pide el escenario.
     #[test]
     fn dos_cifrados_del_mismo_secreto_son_distintos() {
         let clave = clave_de(MAESTRA);
@@ -322,13 +366,42 @@ mod tests {
             "los dos sobres del mismo secreto son iguales: el nonce no es aleatorio"
         );
 
-        let nonce_de =
-            |sobre: &str| -> String { sobre.split(':').nth(1).unwrap_or_default().to_owned() };
+        let parte_de = |sobre: &str, indice: usize| -> String {
+            sobre
+                .split(':')
+                .nth(indice)
+                .expect("el sobre tiene el prefijo, el nonce y el cifrado")
+                .to_owned()
+        };
 
         assert_ne!(
-            nonce_de(&primero),
-            nonce_de(&segundo),
+            parte_de(&primero, 1),
+            parte_de(&segundo, 1),
             "los dos nonces son iguales: repetir un nonce con la misma clave rompe el AEAD"
+        );
+        assert_ne!(
+            parte_de(&primero, 2),
+            parte_de(&segundo, 2),
+            "los dos textos cifrados son iguales"
+        );
+
+        // Una pareja no distingue un generador bueno de uno de entropía baja: 64
+        // cifrados del mismo secreto tienen que dar 64 nonces distintos.
+        let nonces: HashSet<String> = (0..64)
+            .map(|_| {
+                let sobre = clave
+                    .cifrar(&valor)
+                    .expect("cifrar no puede fallar con una clave derivada en pie");
+
+                parte_de(&sobre, 1)
+            })
+            .collect();
+
+        assert_eq!(
+            nonces.len(),
+            64,
+            "64 cifrados del mismo secreto no dieron 64 nonces distintos: \
+             el nonce no es aleatorio por valor"
         );
     }
 
@@ -381,12 +454,13 @@ mod tests {
     /// 1.41 — Un nonce de longitud equivocada devuelve error y no un secreto vacío.
     ///
     /// El sobre se fabrica a mano: el nonce va en base64 y decodifica a 8 y a 16
-    /// bytes, ninguna de las dos la longitud de AES-GCM.
+    /// bytes, ninguna de las dos la longitud de AES-GCM. Se afirma también la
+    /// longitud que el error dice, que es el dato que la variante existe para llevar.
     #[test]
     fn un_nonce_de_longitud_equivocada_no_se_descifra() {
         let clave = clave_de(MAESTRA);
 
-        for nonce in ["AAAAAAAAAAA=", "AAAAAAAAAAAAAAAAAAAAAA=="] {
+        for (nonce, esperada) in [("AAAAAAAAAAA=", 8), ("AAAAAAAAAAAAAAAAAAAAAA==", 16)] {
             let sobre = format!("{PREFIJO}:{nonce}:{nonce}");
 
             let error = clave
@@ -394,8 +468,12 @@ mod tests {
                 .expect_err("un nonce de longitud equivocada no puede dar un secreto");
 
             assert!(
-                matches!(error, ErrorDeCifrado::NonceDeLongitudEquivocada { .. }),
-                "el fallo debe ser el nonce de longitud equivocada, no otro: {error}"
+                matches!(
+                    error,
+                    ErrorDeCifrado::NonceDeLongitudEquivocada { longitud }
+                        if longitud == esperada
+                ),
+                "el fallo debe ser el nonce de longitud equivocada y decir cuál ({esperada}): {error}"
             );
         }
     }
@@ -486,6 +564,33 @@ mod tests {
         );
     }
 
+    /// Un sobre cuya parte no es base64 válido: la variante que conserva la causa y
+    /// que hasta ahora no ejercía ningún test.
+    ///
+    /// Es un test **extra**, más allá de los once de las tareas: cubre la variante
+    /// `Base64Ilegible`, que ninguno de los once tocaba, y comprueba a la vez que
+    /// interpolar la causa **no** publica la parte ilegible.
+    #[test]
+    fn la_parte_que_no_es_base64_no_se_descifra_ni_publica_la_parte() {
+        let clave = clave_de(MAESTRA);
+        let almacenado = format!("{PREFIJO}:no-es-base64:cualquiera");
+
+        let error = clave
+            .descifrar(&almacenado)
+            .expect_err("una parte que no es base64 no puede dar un secreto");
+
+        assert!(
+            matches!(error, ErrorDeCifrado::Base64Ilegible { .. }),
+            "el fallo debe ser la parte ilegible, no otro: {error}"
+        );
+
+        let mensaje = error.to_string();
+        assert!(
+            !mensaje.contains("no-es-base64"),
+            "el mensaje publica la parte ilegible: {mensaje}"
+        );
+    }
+
     /// 1.45 — La derivación es determinista, **cambiar la etiqueta la cambia**, y
     /// [`ETIQUETA`] termina en [`PREFIJO`].
     ///
@@ -511,10 +616,33 @@ mod tests {
             "cambiar la etiqueta no cambió la clave derivada"
         );
 
-        let etiqueta = std::str::from_utf8(ETIQUETA).expect("la etiqueta es UTF-8");
-        assert!(
-            etiqueta.ends_with(PREFIJO),
-            "la etiqueta `{etiqueta}` no termina en el prefijo del sobre `{PREFIJO}`"
+        // La etiqueta es **literal**: no basta con que «acabe en `v1`». Cambiarla
+        // aquí tiene que doler, porque cambiarla en producción deja ilegibles todos
+        // los secretos ya guardados y el síntoma aparece más tarde, en el motor,
+        // hablando de S3.
+        assert_eq!(
+            ETIQUETA, b"kesto/secrets/v1",
+            "la etiqueta de derivación cambió: los secretos ya guardados quedarían ilegibles"
+        );
+    }
+
+    /// El material derivado, contra un valor conocido y calculado aparte (RFC 5869).
+    ///
+    /// Es un **known-answer test**: fija de una vez el algoritmo (HKDF-SHA256), la
+    /// sal (la del propio HKDF, 32 ceros) y la etiqueta. Si alguien cambia
+    /// cualquiera de los tres, esto se pone rojo aquí y no en producción.
+    #[test]
+    fn el_material_derivado_es_el_de_hkdf_sha256_con_esta_sal() {
+        let material = super::derivar(&secreto(MAESTRA), ETIQUETA);
+
+        assert_eq!(
+            material,
+            [
+                0x74, 0xf0, 0x86, 0x11, 0x88, 0xf1, 0xb4, 0x23, 0xdd, 0x12, 0x7e, 0x34, 0x5d, 0xde,
+                0x32, 0xac, 0xca, 0x70, 0x4f, 0x9d, 0xb0, 0x1e, 0x77, 0x10, 0x6e, 0x47, 0xa3, 0x56,
+                0xf8, 0x1b, 0x47, 0x38,
+            ],
+            "el material derivado no es el de HKDF-SHA256 con sal por defecto y esta etiqueta"
         );
     }
 
@@ -544,7 +672,13 @@ mod tests {
     }
 
     /// 1.50 — Con `RUST_LOG=trace` no aparece ni el valor de `KESTO_MASTER_KEY` ni
-    /// el de la clave derivada.
+    /// el de la clave derivada, y las operaciones de alta y lectura con secreto no
+    /// filtran ni el claro ni la forma cifrada.
+    ///
+    /// El escenario es «`RUST_LOG=trace` **y una operación de alta y otra de lectura
+    /// con secreto**», así que se cifra y se descifra de verdad: un
+    /// `tracing::trace!` metido **dentro** de `cifrar` —el fallo realista— lo caza
+    /// esta prueba, y sin ejecutar las operaciones no lo cazaría.
     ///
     /// Usa el arnés de captura **por hilo** de `src/test_support.rs`, nunca
     /// `set_default` ni `with_default`: un despachante de hilo deja un callsite
@@ -560,10 +694,25 @@ mod tests {
         // `Debug` de `Clave` dejara de redactar, el `?clave` de abajo lo publicaría.
         let derivada = super::derivar(&maestra, ETIQUETA);
 
+        // Alta y lectura con secreto, dentro de la captura.
+        let en_claro = "AKIAIOSFODNN7EXAMPLE-no-debe-salir-1-50";
+        let sobre = clave
+            .cifrar(&secreto(en_claro))
+            .expect("cifrar no puede fallar");
+        let leido = clave
+            .descifrar(&sobre)
+            .expect("descifrar lo que se acaba de cifrar no puede fallar");
+
         tracing::trace!(?clave, "clave de cifrado derivada de la maestra");
         tracing::trace!(?maestra, "clave maestra cargada");
 
         let log = buffer.texto();
+
+        assert_eq!(
+            leido.expose(),
+            en_claro,
+            "la ida y vuelta debe devolver el mismo valor"
+        );
 
         // El candado de ausencia solo vale si la captura está viva: sin esta
         // aserción, un registro que no llegara al buffer pasaría por bueno.
@@ -572,9 +721,26 @@ mod tests {
             "la captura por hilo no recibió el registro, así que no prueba nada: {log}"
         );
 
+        // Y el `Debug` de la clave **se formateó**, redactado: sin esta aserción, el
+        // candado probaría que el evento llegó, pero no que el valor no salió.
+        assert!(
+            log.contains("Clave(<redactada>)"),
+            "el `Debug` de la clave no aparece redactado en el registro: {log}"
+        );
+
         assert!(
             !log.contains(MAESTRA),
             "el registro publica el valor de la clave maestra: {log}"
+        );
+
+        assert!(
+            !log.contains(en_claro),
+            "el registro publica el valor en claro del secreto: {log}"
+        );
+
+        assert!(
+            !log.contains(&sobre),
+            "el registro publica el sobre cifrado: {log}"
         );
 
         let huella = format!("{derivada:?}");
@@ -582,5 +748,18 @@ mod tests {
             !log.contains(&huella),
             "el registro publica el material de la clave derivada: {log}"
         );
+    }
+
+    /// La clave se comparte entre tareas: el módulo que la consuma la tendrá en un
+    /// `Arc`, así que `Send + Sync` es parte del contrato.
+    ///
+    /// Es un candado de contrato para el módulo 2 —la capa de acceso—: si alguien
+    /// metiera un `Rc<RefCell<…>>` dentro, el fallo aparecería al montar el estado y
+    /// no aquí.
+    #[test]
+    fn la_clave_es_compartible_entre_hilos() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Clave>();
     }
 }
