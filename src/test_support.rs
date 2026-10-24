@@ -1,6 +1,8 @@
 //! Utilidades que comparten las pruebas: lectura inyectada y arnés del router.
 //!
 //! El router se ejercita con `tower::ServiceExt::oneshot`, sin abrir sockets.
+//! Las piezas que hablan con el proveedor lo hacen contra el proveedor falso
+//! local de [`proveedor_falso`]: **ninguna prueba sale a internet**.
 
 use std::collections::HashMap;
 
@@ -14,6 +16,8 @@ use tower::ServiceExt;
 use crate::config::{Config, Lookup};
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState};
+
+pub(crate) mod proveedor_falso;
 
 /// Clave maestra de las pruebas: larga, para que ningún aviso se cuele.
 pub(crate) const MASTER_KEY: &str =
@@ -30,6 +34,8 @@ pub(crate) const OIDC_ISSUER_URL: &str = "https://idp.example.test/realms/kesto"
 pub(crate) const OIDC_CLIENT_ID: &str = "kesto-panel";
 /// Secreto del cliente OIDC: solo tiene que estar presente.
 pub(crate) const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
+/// URL de retorno por defecto: la del SRS, la que se usa si no se declara otra.
+pub(crate) const OIDC_REDIRECT_URL: &str = "http://localhost:8080/api/v1/auth/callback";
 /// Usuario distinguible de la sesión de pruebas.
 pub(crate) const SUB: &str = "usuario-distinguible-1";
 /// Correo distinguible de la sesión de pruebas.
@@ -56,21 +62,6 @@ pub(crate) fn lookup_from(pares: &[(&str, &str)]) -> impl Lookup + use<> {
     move |nombre: &str| variables.get(nombre).cloned()
 }
 
-/// Las tres variables `OIDC_*` más la clave de firma: el modo `Oidc` entero.
-///
-/// Lleva también la dirección de escucha efímera: un estado de prueba no puede
-/// heredar el puerto por defecto.
-pub(crate) fn variables_oidc() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("KESTO_MASTER_KEY", MASTER_KEY),
-        ("KESTO_SECRET", SESSION_SECRET),
-        ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
-        ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
-        ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
-        ("BIND_ADDRESS", BIND_ADDRESS),
-    ]
-}
-
 /// Estado con la autenticación apagada: el modo de desarrollo.
 pub(crate) fn estado_desarrollo() -> AppState {
     let config = Config::from_lookup(&lookup_from(&[
@@ -83,18 +74,94 @@ pub(crate) fn estado_desarrollo() -> AppState {
 }
 
 /// Estado con la autenticación encendida.
+///
+/// Apunta a un puerto local donde nadie escucha, **no** a un emisor de verdad:
+/// así cualquier login que una prueba dispare por accidente falla contra
+/// `127.0.0.1` al instante, sin resolver un DNS ni salir a la red. Las pruebas
+/// que quieren un descubrimiento que funcione usan
+/// [`estado_oidc_con_emisor`] con el proveedor falso.
 pub(crate) fn estado_oidc() -> AppState {
-    let config = Config::from_lookup(&lookup_from(&variables_oidc()))
+    estado_oidc_con_emisor(&emisor_caido())
+}
+
+/// Lectura inyectada con las variables `OIDC_*`, apuntando a un emisor dado.
+///
+/// Es lo que permite que una prueba hable con el proveedor falso local: el
+/// emisor entra por parámetro en vez de fijarse en el entorno del proceso.
+pub(crate) fn lookup_oidc_con_emisor(emisor: &str) -> impl Lookup + use<> {
+    let variables: HashMap<String, String> = [
+        ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_SECRET", SESSION_SECRET),
+        ("OIDC_ISSUER_URL", emisor),
+        ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+        ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+        ("BIND_ADDRESS", BIND_ADDRESS),
+    ]
+    .into_iter()
+    .map(|(nombre, valor)| (nombre.to_owned(), valor.to_owned()))
+    .collect();
+
+    move |nombre: &str| variables.get(nombre).cloned()
+}
+
+/// Estado en modo `Oidc` con el emisor indicado.
+pub(crate) fn estado_oidc_con_emisor(emisor: &str) -> AppState {
+    let config = Config::from_lookup(&lookup_oidc_con_emisor(emisor))
         .expect("la configuración OIDC es válida");
 
     AppState::new(config).expect("el estado OIDC se construye")
 }
 
+/// Router de producción en modo `Oidc`, apuntando al emisor indicado.
+pub(crate) fn router_oidc_con_emisor(emisor: &str) -> Router {
+    crate::api::api_router(estado_oidc_con_emisor(emisor))
+}
+
+/// Emisor al que nada contesta: un puerto que se reserva y se suelta.
+///
+/// El puerto efímero se elige con un `TcpListener` que se cierra acto seguido,
+/// de modo que el emisor apunta a un puerto donde nadie escucha y la conexión
+/// se rechaza al instante. Es el «proveedor caído» de los escenarios, sin
+/// levantar un servidor que finja no contestar.
+pub(crate) fn emisor_caido() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("la reserva de un puerto efímero no puede fallar");
+    let puerto = listener
+        .local_addr()
+        .expect("el puerto reservado debe conocerse")
+        .port();
+    drop(listener);
+
+    format!("http://127.0.0.1:{puerto}")
+}
+
+/// Parámetros de la cadena de consulta de una URL, ya decodificados.
+pub(crate) fn parametros_de_consulta(url: &str) -> HashMap<String, String> {
+    let consulta = url
+        .split_once('?')
+        .map(|(_, consulta)| consulta)
+        .unwrap_or("");
+
+    consulta
+        .split('&')
+        .filter_map(|par| par.split_once('='))
+        .map(|(clave, valor)| {
+            let decodificar = |texto: &str| {
+                urlencoding::decode(texto)
+                    .map(|decodificada| decodificada.into_owned())
+                    .unwrap_or_else(|_| texto.to_owned())
+            };
+
+            (decodificar(clave), decodificar(valor))
+        })
+        .collect()
+}
+
 /// Estado de autenticación suelto, para colgar el *gate* de un router de prueba.
 pub(crate) fn auth_oidc() -> AuthState {
-    AuthState {
-        secret: SecretString::new(SESSION_SECRET.to_owned()),
-    }
+    estado_oidc()
+        .auth
+        .expect("el modo Oidc construye estado de autenticación")
 }
 
 /// Router de producción con la autenticación apagada.

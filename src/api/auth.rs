@@ -6,13 +6,18 @@
 //! están declarados pero son esqueletos, porque la partición del router y la
 //! lista blanca de rutas públicas los necesitan para existir.
 
-use axum::extract::Extension;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{Extension, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum_extra::extract::cookie::{Cookie, CookieJar};
 
 use crate::api::response::{ApiResponse, Data, ErrorResponse};
 use crate::auth::middleware::SessionIdentity;
+use crate::auth::oidc;
 use crate::auth::session::SESSION_COOKIE_NAME;
+use crate::error::AppError;
+use crate::state::AppState;
 
 /// Mensaje de un esqueleto: la ruta existe, el flujo todavía no.
 ///
@@ -23,9 +28,57 @@ const SIN_IMPLEMENTAR: &str = "la ruta existe, pero su flujo todavía no está i
 
 /// `GET /api/v1/auth/login` — pública.
 ///
-/// En M2 es un esqueleto: el flujo que redirige al proveedor es M3.
-pub async fn login() -> ErrorResponse {
-    ErrorResponse::new(StatusCode::NOT_IMPLEMENTED, SIN_IMPLEMENTAR)
+/// Redirige al `authorization_endpoint` del proveedor con los seis parámetros
+/// del flujo, guarda el `state`/`nonce` emitidos y **no** emite sesión: la
+/// cookie llega con el callback (M4).
+pub async fn login(State(state): State<AppState>) -> Response {
+    // La ruta solo se monta en modo `Oidc` (`api_router`), así que este camino
+    // es inalcanzable por construcción. No se confía en ello: sin estado de
+    // autenticación se contesta el `5xx` genérico en vez de un `panic`.
+    let Some(auth) = state.auth.as_ref() else {
+        return AppError::Other("el login se atendió sin estado de autenticación".to_owned())
+            .into_response();
+    };
+
+    // El descubrimiento cacheado o su reintento. Si falla, el error ya es un
+    // `BadGateway`, que traduce a `502` con la envoltura y el mensaje genérico.
+    let discovery = match oidc::discovery_cached(auth).await {
+        Ok(discovery) => discovery,
+        Err(error) => return error.into_response(),
+    };
+
+    let solicitud = oidc::build_authorization_url(auth.settings.as_ref(), &discovery);
+
+    // El `state` se guarda con su marca de tiempo y junto al `nonce` emitido:
+    // M4 tendrá que comparar ese `nonce` con el del ID token. La respuesta no
+    // emite cookie: la sesión llega con el callback.
+    auth.registrar_login(&solicitud.state, &solicitud.nonce)
+        .await;
+
+    redireccion_302(&solicitud.url)
+}
+
+/// Respuesta `302` con la cabecera `Location`.
+///
+/// Se construye a mano porque `axum::response::Redirect` no ofrece `302`
+/// —`to` es `303`, y el flujo de entrada exige `302` literal—. La respuesta
+/// lleva solo `Location`, sin `Set-Cookie`: el login no establece sesión.
+fn redireccion_302(destino: &str) -> Response {
+    match HeaderValue::from_str(destino) {
+        Ok(location) => {
+            let mut respuesta = Response::new(Body::empty());
+            *respuesta.status_mut() = StatusCode::FOUND;
+            respuesta.headers_mut().insert(header::LOCATION, location);
+
+            respuesta
+        }
+        // Una URL que no cabe en una cabecera no es un destino a medias: es un
+        // fallo al construirla.
+        Err(error) => AppError::Other(format!(
+            "la URL de autorización no es una cabecera válida: {error}"
+        ))
+        .into_response(),
+    }
 }
 
 /// `GET /api/v1/auth/callback` — pública.
@@ -85,11 +138,13 @@ fn cookie_de_borrado() -> Cookie<'static> {
 #[cfg(test)]
 mod tests {
     use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
 
     use crate::auth::session::SESSION_COOKIE_NAME;
+    use crate::error::AppError;
     use crate::test_support::{
-        EMAIL, SUB, body_json, body_text, cookie_de_sesion, get, get_with_cookie, header_text,
-        post, post_with_cookie, router_oidc,
+        EMAIL, OIDC_CLIENT_SECRET, SUB, body_json, body_text, cookie_de_sesion, emisor_caido, get,
+        get_with_cookie, header_text, post, post_with_cookie, router_oidc, router_oidc_con_emisor,
     };
 
     #[tokio::test]
@@ -232,6 +287,51 @@ mod tests {
                 .as_str()
                 .is_some_and(|mensaje| !mensaje.is_empty()),
             "el 401 debe traer un mensaje: {texto}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_login_con_el_proveedor_caido_contesta_502() {
+        // Escenario 1.10.
+        //
+        // El 502 y no un 500: el fallo es de un servicio de terceros —el
+        // proveedor no contesta—, no de Kesto. Y como todo `5xx`, el cuerpo
+        // lleva el mensaje genérico: la causa se queda en el registro del
+        // servidor y no se estrena un mensaje que nombre al proveedor.
+        let router = router_oidc_con_emisor(&emisor_caido());
+
+        let respuesta = get(router, "/api/v1/auth/login").await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::BAD_GATEWAY,
+            "un proveedor caído debe dejar el login en un 502"
+        );
+
+        let texto = body_text(respuesta).await;
+
+        assert!(
+            !texto.contains(OIDC_CLIENT_SECRET),
+            "el 502 publicó el client_secret: {texto}"
+        );
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 502 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 502);
+
+        // El mensaje es **el mismo** de cualquier `5xx`: se compara con el de un
+        // 500 genérico, no con un literal, para que no baste con «algo que
+        // suene genérico».
+        let generico = body_json(
+            AppError::Other("una causa distinguible que no debe salir al cuerpo".to_owned())
+                .into_response(),
+        )
+        .await;
+
+        assert_eq!(
+            cuerpo["message"], generico["message"],
+            "el 502 debe traer el mismo mensaje genérico que un 500: {cuerpo}"
         );
     }
 }

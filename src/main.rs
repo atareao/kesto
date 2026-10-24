@@ -137,6 +137,17 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // 5. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
+    //    si no contesta, se avisa y se sigue. Kesto es el orquestador de las
+    //    **copias**, y negarse a arrancar porque el proveedor está caído
+    //    convertiría un problema de autenticación en ausencia de copias. El
+    //    reintento llega con el primer login, que además cachea el resultado.
+    if let Some(auth) = state.auth.as_ref()
+        && let Some(aviso) = auth::descubrimiento_al_arrancar(auth).await
+    {
+        tracing::warn!("{aviso}");
+    }
+
     tracing::info!(%address, "escuchando");
 
     if let Err(error) = serve(state, shutdown_signal()).await {
