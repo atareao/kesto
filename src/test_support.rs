@@ -34,6 +34,14 @@ pub(crate) const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguibl
 pub(crate) const SUB: &str = "usuario-distinguible-1";
 /// Correo distinguible de la sesión de pruebas.
 pub(crate) const EMAIL: &str = "operador-distinguible@example.test";
+/// Dirección de escucha de las pruebas: un puerto efímero, **nunca** el 8080.
+///
+/// `crate::serve` abre un socket de verdad, así que un estado de prueba que
+/// herede el puerto por defecto pone la suite roja por `AddrInUse` en cuanto
+/// algo ocupe el 8080 —y el propio Kesto en desarrollo lo ocupa—: un fallo del
+/// entorno disfrazado de fallo del código. Con el puerto `0` lo elige el
+/// sistema, y no hay que acordarse test a test.
+pub(crate) const BIND_ADDRESS: &str = "127.0.0.1:0";
 
 /// Construye una lectura de entorno inyectada a partir de pares nombre/valor.
 ///
@@ -49,6 +57,9 @@ pub(crate) fn lookup_from(pares: &[(&str, &str)]) -> impl Lookup + use<> {
 }
 
 /// Las tres variables `OIDC_*` más la clave de firma: el modo `Oidc` entero.
+///
+/// Lleva también la dirección de escucha efímera: un estado de prueba no puede
+/// heredar el puerto por defecto.
 pub(crate) fn variables_oidc() -> Vec<(&'static str, &'static str)> {
     vec![
         ("KESTO_MASTER_KEY", MASTER_KEY),
@@ -56,13 +67,17 @@ pub(crate) fn variables_oidc() -> Vec<(&'static str, &'static str)> {
         ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
         ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
         ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+        ("BIND_ADDRESS", BIND_ADDRESS),
     ]
 }
 
 /// Estado con la autenticación apagada: el modo de desarrollo.
 pub(crate) fn estado_desarrollo() -> AppState {
-    let config = Config::from_lookup(&lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY)]))
-        .expect("la configuración de desarrollo es válida");
+    let config = Config::from_lookup(&lookup_from(&[
+        ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("BIND_ADDRESS", BIND_ADDRESS),
+    ]))
+    .expect("la configuración de desarrollo es válida");
 
     AppState::new(config).expect("el estado de desarrollo se construye")
 }

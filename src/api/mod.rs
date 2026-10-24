@@ -87,9 +87,24 @@ where
         // entrado qué métodos existen.
         //
         // Invertir las dos líneas no rompe la compilación ni hace caer ninguna
-        // prueba de ruta válida: solo abre ese agujero. Lo cierra el test
-        // `un_metodo_no_declarado_sin_sesion_no_contesta_405`, que es el único
-        // que cae si el orden se invierte.
+        // prueba de ruta válida: solo abre ese agujero. Lo cierran **dos** tests
+        // —medido invirtiendo las líneas y corriendo la suite entera, con
+        // `54 passed; 2 failed`—:
+        //
+        // - `un_metodo_no_declarado_sin_sesion_no_contesta_405` (tarea 1.42),
+        //   aquí en este módulo;
+        // - `sin_sesion_no_se_aprende_que_metodos_hay` (tarea 1.45), en
+        //   `src/api/auth.rs`, sobre `GET /api/v1/auth/logout`.
+        //
+        // Los dos con el mismo `left: 405, right: 405`. Si se filtran los tests
+        // por nombre antes de correrlos, el de 1.45 se queda fuera del filtro
+        // —su nombre no menciona el método no declarado— y parece que el candado
+        // es más débil de lo que es: se comprueba con la suite entera.
+        //
+        // Y lo que **no** sirve de candado, porque pasa en los dos órdenes: el
+        // test `un_metodo_no_declarado_con_sesion_contesta_405` (tarea 1.43).
+        // Con sesión el `405` sale igual por el *fallback* envuelto que por el
+        // que lo pisó, así que su verde no dice nada del orden.
         .method_not_allowed_fallback(metodo_no_permitido)
         .route_layer(axum::middleware::from_fn_with_state(
             auth.clone(),
@@ -123,8 +138,8 @@ mod tests {
     use super::{api_router, protected_router};
     use crate::api::response::{ApiResponse, Data};
     use crate::test_support::{
-        auth_oidc, body_json, body_text, cookie_de_sesion, estado_desarrollo, get, get_with_cookie,
-        header_text, post, post_with_cookie, router_desarrollo, router_oidc,
+        auth_oidc, body_json, body_text, cookie_de_sesion, estado_desarrollo, estado_oidc, get,
+        get_with_cookie, header_text, post, post_with_cookie, router_desarrollo, router_oidc,
     };
 
     /// Ruta de negocio ficticia: hoy ningún change declara rutas de negocio, así
@@ -132,6 +147,25 @@ mod tests {
     /// mismo camino que la producción.
     async fn negocio() -> ApiResponse {
         ApiResponse::new(StatusCode::OK, "atendida", Data::None)
+    }
+
+    #[test]
+    fn los_estados_de_prueba_no_heredan_el_puerto_por_defecto() {
+        // Es un candado del arnés, no del router, y nace de una regresión real:
+        // `crate::serve` abre un socket de verdad, así que un estado de prueba
+        // que herede el puerto por defecto pone la suite roja por `AddrInUse` en
+        // cuanto algo ocupe el 8080 —el propio Kesto en desarrollo lo ocupa—, y
+        // eso es un fallo del entorno disfrazado de fallo del código. El puerto
+        // `0` es el efímero: lo elige el sistema y no hay que acordarse test a
+        // test.
+        for (modo, estado) in [("desarrollo", estado_desarrollo()), ("Oidc", estado_oidc())] {
+            assert_eq!(
+                estado.config.bind_address.port(),
+                0,
+                "el estado de {modo} escucha en {} y no en un puerto efímero",
+                estado.config.bind_address
+            );
+        }
     }
 
     #[tokio::test]
