@@ -11,6 +11,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod secret;
 pub mod state;
@@ -124,7 +125,25 @@ async fn main() -> std::process::ExitCode {
         tracing::warn!("{aviso}");
     }
 
-    // 4. Router, escucha y apagado. El estado se construye desde la
+    // 4. Base de datos: se abre y se deja el esquema aplicado **antes** de
+    //    escuchar. Un fallo aquí no arranca el proceso, y no es un modo
+    //    degradado: un esquema a medias es peor que un arranque fallido, porque
+    //    el motor escribiría contra columnas que no existen y el síntoma sería
+    //    una copia perdida en vez de un arranque roto.
+    //
+    //    El pool se queda vivo como variable local hasta que exista quien lo
+    //    consuma: el motor y el planificador lo recibirán por el estado de la
+    //    aplicación en su propio change. Soltarlo aquí cerraría la base en cuanto
+    //    el servidor empezara a escuchar.
+    let _database = match db::preparar(&config).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            eprintln!("kesto no puede arrancar: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // 5. Router, escucha y apagado. El estado se construye desde la
     //    configuración ya resuelta: en modo `Oidc` lleva el estado de
     //    autenticación, y en desarrollo no lleva ninguno.
     let address = config.bind_address;
@@ -137,7 +156,7 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // 5. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
+    // 6. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
     //    si no contesta, se avisa y se sigue. Kesto es el orquestador de las
     //    **copias**, y negarse a arrancar porque el proveedor está caído
     //    convertiría un problema de autenticación en ausencia de copias. El
@@ -160,4 +179,87 @@ async fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db;
+    use crate::test_support::{config_con_dsn, directorio_de_prueba, migrador_roto};
+
+    /// 1.52 — El arranque deja la base preparada antes de aceptar peticiones.
+    ///
+    /// `db::preparar` es la **única** llamada que hace el arranque para esto:
+    /// abre el pool y aplica las migraciones de una vez, y el orden respecto a
+    /// `serve` vive en la secuencia de `main`, que ningún test unitario puede
+    /// observar sin deformar `main`. Lo que se fija aquí es que esa llamada hace
+    /// las dos cosas: si alguien la cambiara por una que solo abriera, el esquema
+    /// no estaría y este test caería.
+    #[tokio::test]
+    async fn el_arranque_prepara_la_base_antes_de_escuchar() {
+        let directorio = directorio_de_prueba();
+
+        let pool = db::preparar(&config_con_dsn(&directorio.dsn()))
+            .await
+            .expect("el arranque debe poder preparar la base");
+
+        let tablas = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("la consulta de tablas no puede fallar");
+
+        for esperada in [
+            "repositories",
+            "backup_targets",
+            "backup_jobs",
+            "job_executions",
+        ] {
+            assert!(
+                tablas.iter().any(|tabla| tabla == esperada),
+                "el arranque no dejó la tabla {esperada}: {tablas:?}"
+            );
+        }
+
+        pool.close().await;
+    }
+
+    /// 1.52 — Un fallo de migración impide arrancar.
+    ///
+    /// El arranque no sigue: `main` devuelve el código de fallo sin escuchar. Y no
+    /// deja la base a medias, que es lo que hace que eso sea la decisión correcta.
+    #[tokio::test]
+    async fn un_fallo_de_migracion_impide_arrancar() {
+        let directorio = directorio_de_prueba();
+
+        let error = db::preparar_con(&config_con_dsn(&directorio.dsn()), &migrador_roto())
+            .await
+            .expect_err("una migración que falla no puede dar un arranque en pie");
+
+        assert!(
+            matches!(error, db::DbError::Migracion { .. }),
+            "el fallo debe llegar como error de migración: {error}"
+        );
+
+        // Y el esquema no quedó a medias: la base se abre, y las cuatro tablas
+        // del §3 no están, porque la migración que las crea nunca llegó a
+        // aplicarse entera.
+        let pool = db::abrir(&directorio.dsn())
+            .await
+            .expect("la base debe poder abrirse para comprobar que no quedó a medias");
+
+        let tablas = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("la consulta de tablas no puede fallar");
+
+        pool.close().await;
+
+        assert!(
+            !tablas.iter().any(|tabla| tabla == "repositories"),
+            "el arranque falló pero dejó el esquema a medias: {tablas:?}"
+        );
+    }
 }

@@ -6,9 +6,11 @@
 //! loopback, el del proveedor falso de [`proveedor_falso`], que es un servidor
 //! HTTP de verdad en `127.0.0.1`—. **Ninguna prueba sale a internet.**
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Router;
@@ -16,7 +18,9 @@ use axum::body::Body;
 use axum::http::{HeaderName, Method, Request, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
+use sqlx::migrate::{Migration, MigrationType, Migrator};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use crate::config::{Config, Lookup};
 use crate::secret::SecretString;
@@ -65,6 +69,88 @@ pub(crate) fn lookup_from(pares: &[(&str, &str)]) -> impl Lookup + use<> {
         .collect();
 
     move |nombre: &str| variables.get(nombre).cloned()
+}
+
+/// Nombre del fichero de la base en los directorios de prueba.
+pub(crate) const FICHERO_DE_LA_BASE: &str = "kesto.db";
+
+/// Directorio temporal de una prueba, borrado al soltarse.
+///
+/// Cada prueba de la capa de datos abre **su** base y no una compartida: la suite
+/// corre en paralelo, y una base común convertiría a un test que bloquea en el
+/// fallo de otro. El nombre lleva un UUID para que dos pruebas que arranquen a la
+/// vez no se pisen el directorio.
+pub(crate) struct DirectorioDePrueba {
+    ruta: PathBuf,
+}
+
+impl DirectorioDePrueba {
+    /// Ruta del directorio.
+    pub(crate) fn ruta(&self) -> &Path {
+        &self.ruta
+    }
+
+    /// Ruta del fichero de la base dentro del directorio.
+    pub(crate) fn ruta_de_la_base(&self) -> PathBuf {
+        self.ruta.join(FICHERO_DE_LA_BASE)
+    }
+
+    /// DSN de la base, con la forma de tres barras del SRS.
+    ///
+    /// La ruta es absoluta, así que las dos barras del esquema más la suya dan
+    /// las tres de `sqlite:///…` sin que nadie tenga que contar ninguna.
+    pub(crate) fn dsn(&self) -> String {
+        format!("sqlite://{}", self.ruta_de_la_base().display())
+    }
+}
+
+impl Drop for DirectorioDePrueba {
+    fn drop(&mut self) {
+        // Limpiar es cortesía, no parte de lo que se afirma: si el borrado falla
+        // —una prueba dejó el directorio en solo lectura— no hay nada que
+        // comprobar sobre ello, y fallar aquí taparía el resultado real del test.
+        let _ = std::fs::remove_dir_all(&self.ruta);
+    }
+}
+
+/// Crea el directorio temporal de una prueba.
+pub(crate) fn directorio_de_prueba() -> DirectorioDePrueba {
+    let ruta = std::env::temp_dir().join(format!("kesto-prueba-{}", Uuid::new_v4()));
+
+    std::fs::create_dir_all(&ruta).expect("el directorio temporal de la prueba debe crearse");
+
+    DirectorioDePrueba { ruta }
+}
+
+/// Configuración válida que apunta a una base de datos dada.
+pub(crate) fn config_con_dsn(dsn: &str) -> Config {
+    Config::from_lookup(&lookup_from(&[
+        ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("BIND_ADDRESS", BIND_ADDRESS),
+        ("DATABASE_URL", dsn),
+    ]))
+    .expect("la configuración de prueba con base de datos es válida")
+}
+
+/// Migrador que falla: su única migración no es SQL.
+///
+/// Es lo que permite ejercitar «una migración que falla es error de arranque» sin
+/// tocar las migraciones de verdad del repositorio: el migrador embebido está en
+/// verde por construcción, así que ese camino solo se puede recorrer inyectando
+/// uno que falle.
+pub(crate) fn migrador_roto() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(vec![Migration::new(
+            1,
+            Cow::Borrowed("rota"),
+            MigrationType::Simple,
+            Cow::Borrowed("ESTO NO ES SQL"),
+            false,
+        )]),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    }
 }
 
 /// Estado con la autenticación apagada: el modo de desarrollo.
