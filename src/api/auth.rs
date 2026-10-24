@@ -1,10 +1,10 @@
 //! Rutas del flujo de entrada: `/api/v1/auth/*`.
 //!
 //! Aquí solo hay HTTP: la verificación de la sesión vive en `src/auth/`, y el
-//! flujo OIDC —el descubrimiento, la URL de autorización y el canje del
-//! código— llegará a `src/auth/oidc.rs` en M3 y M4. Hoy `login` y `callback`
-//! están declarados pero son esqueletos, porque la partición del router y la
-//! lista blanca de rutas públicas los necesitan para existir.
+//! flujo OIDC vive repartido —el descubrimiento y la URL de autorización ya en
+//! `src/auth/oidc.rs`; el canje del código y la verificación del ID token,
+//! todavía por llegar en M4—. De los dos endpoints del flujo, **`login` ya no es
+//! un esqueleto**: solo `callback` lo sigue siendo.
 
 use axum::body::Body;
 use axum::extract::{Extension, State};
@@ -137,15 +137,76 @@ fn cookie_de_borrado() -> Cookie<'static> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
+    use crate::api::api_router;
     use crate::auth::session::SESSION_COOKIE_NAME;
     use crate::error::AppError;
     use crate::test_support::{
-        EMAIL, OIDC_CLIENT_SECRET, SUB, body_json, body_text, cookie_de_sesion, emisor_caido, get,
-        get_with_cookie, header_text, post, post_with_cookie, router_oidc, router_oidc_con_emisor,
+        EMAIL, OIDC_CLIENT_SECRET, SUB, body_json, body_text, cookie_de_sesion, emisor_caido,
+        estado_oidc_con_emisor, get, get_with_cookie, header_text, parametros_de_consulta, post,
+        post_with_cookie, proveedor_falso::ProveedorFalso, router_oidc, router_oidc_con_emisor,
     };
+
+    #[tokio::test]
+    async fn el_login_guarda_el_state_con_su_nonce_y_su_marca_de_tiempo() {
+        // Candado del SHALL «el state SHALL guardarse en memoria con su marca de
+        // tiempo» —el contrato que M4, el callback, va a consumir—. Hasta ahora
+        // ninguna prueba leía `auth.logins`: quitar la llamada a `registrar_login`
+        // dejaba la suite entera verde, y el fallo habría aparecido en M4 como un
+        // callback que rechaza *todos* los state y parece un bug del callback.
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = estado_oidc_con_emisor(&proveedor.issuer);
+        // El mapa vive tras un `Arc`, así que esta copia comparte el mismo mapa
+        // que usa el router: no hace falta deformar el estado para poder mirarlo.
+        let auth = estado
+            .auth
+            .clone()
+            .expect("en modo Oidc hay estado de autenticación");
+        let router = api_router(estado);
+
+        let antes = Instant::now();
+        let respuesta = get(router, "/api/v1/auth/login").await;
+        let despues = Instant::now();
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::FOUND,
+            "el login debe redirigir"
+        );
+
+        let location = header_text(&respuesta, header::LOCATION).expect("el 302 trae Location");
+        let parametros = parametros_de_consulta(&location);
+        let state = parametros
+            .get("state")
+            .expect("la redirección debe traer state")
+            .clone();
+        let nonce = parametros
+            .get("nonce")
+            .expect("la redirección debe traer nonce")
+            .clone();
+
+        let logins = auth.logins.lock().await;
+        let entrada = logins
+            .get(&state)
+            .expect("el state emitido debe quedar guardado en el mapa");
+
+        assert_eq!(
+            entrada.nonce, nonce,
+            "el nonce guardado no es el emitido junto al state: {entrada:?}"
+        );
+        assert!(
+            entrada.issued_at >= antes && entrada.issued_at <= despues,
+            "la marca de tiempo guardada no es la del login: {entrada:?}"
+        );
+        assert!(
+            !entrada.expirado_en(Instant::now()),
+            "un state recién emitido no puede estar caducado: {entrada:?}"
+        );
+    }
 
     #[tokio::test]
     async fn el_cierre_borra_la_cookie() {

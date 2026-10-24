@@ -89,6 +89,12 @@ impl AuthState {
     /// Purga las entradas caducadas **al insertar**: sin esto el mapa crecería
     /// con cada login que nadie termina —un `state` que caduca sin consumirse— y
     /// el proceso acabaría guardando la memoria de intentos abandonados.
+    ///
+    /// AVISO — esto acota el mapa a la ventana del TTL, pero **no le pone un
+    /// tope duro**: un caudal alto de logins dentro de esos cinco minutos lo hace
+    /// crecer sin límite. La spec solo exige purgar por caducidad, así que el
+    /// tope no se implementa aquí; M4, al añadir el consumo del `state` en el
+    /// callback, decide si quiere uno.
     pub async fn registrar_login(&self, state: &str, nonce: &str) {
         let ahora = Instant::now();
         let mut logins = self.logins.lock().await;
@@ -144,12 +150,69 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::AppState;
+    use std::time::{Duration, Instant};
+
+    use super::{AppState, PendingLogin, STATE_TTL};
     use crate::config::Config;
     use crate::test_support::{
-        MASTER_KEY, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER_URL, SESSION_SECRET,
+        MASTER_KEY, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER_URL, SESSION_SECRET, auth_oidc,
         lookup_from,
     };
+
+    #[tokio::test]
+    async fn la_purga_descarta_las_entradas_caducadas() {
+        // Tarea 3.5: el mapa de `state`/`nonce` no crece sin límite. Borrar el
+        // `retain` de `registrar_login` deja este test en rojo: la entrada
+        // caducada sobreviviría y el mapa tendría dos entradas en vez de una.
+        let auth = auth_oidc();
+
+        // La entrada se inserta con su marca de tiempo **ya retrasada** más allá
+        // del TTL: determinista, sin dormir y sin inyectar un reloj en el estado
+        // de producción.
+        let hace = Instant::now()
+            .checked_sub(STATE_TTL + Duration::from_secs(1))
+            .expect("la purga necesita un uptime mayor que STATE_TTL");
+        {
+            let mut logins = auth.logins.lock().await;
+            logins.insert(
+                "state-caducado".to_owned(),
+                PendingLogin {
+                    nonce: "nonce-caducado".to_owned(),
+                    issued_at: hace,
+                },
+            );
+            assert_eq!(logins.len(), 1, "el mapa arranca con la entrada caducada");
+        }
+
+        auth.registrar_login("state-nuevo", "nonce-nuevo").await;
+
+        let logins = auth.logins.lock().await;
+
+        assert_eq!(
+            logins.len(),
+            1,
+            "la entrada caducada debe purgarse al insertar: el mapa no puede crecer: {logins:?}"
+        );
+        assert!(
+            !logins.contains_key("state-caducado"),
+            "la entrada caducada sigue en el mapa: {logins:?}"
+        );
+        assert!(
+            logins.contains_key("state-nuevo"),
+            "la entrada nueva debe quedar registrada: {logins:?}"
+        );
+    }
+
+    #[test]
+    fn el_ttl_del_state_es_de_cinco_minutos() {
+        // Fija el valor de la constante: la spec dice «más de 5 minutos» y M4
+        // rechazará por `expirado_en`, que compara contra `STATE_TTL`.
+        assert_eq!(
+            STATE_TTL,
+            Duration::from_secs(300),
+            "el TTL del state debe ser de 5 minutos"
+        );
+    }
 
     #[test]
     fn en_desarrollo_no_hay_estado_de_autenticacion() {

@@ -78,6 +78,17 @@ mod tests {
     async fn el_primer_login_reintenta_el_descubrimiento_y_lo_cachea() {
         // Escenario 1.6 — el candado de la caché.
         //
+        // El GIVEN literal del escenario es «un arranque cuyo descubrimiento
+        // falló»; aquí se aproxima por «la caché del descubrimiento está vacía».
+        // Para la caché los dos estados son el mismo —tras un fallo, `discovery`
+        // queda en `None`, que es como arranca el estado—, por eso las aserciones
+        // de abajo son las correctas y no vacuas. No se reproduce literalmente
+        // porque recrearlo exigiría construir el estado con un emisor caído,
+        // dejar que el descubrimiento fallara y luego reapuntarlo al proveedor
+        // falso, y `settings` no se muta tras construir el estado: la forma de
+        // forzarlo sería un emisor que primero falla y luego contesta, más arnés
+        // del que el escenario necesita para quedar probado.
+        //
         // La única forma de probar que el resultado se cachea de verdad es
         // contar las peticiones que llegan al proveedor: si la caché
         // desapareciera, el segundo login volvería a pedirlo y el contador

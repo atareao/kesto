@@ -168,8 +168,22 @@ pub fn build_authorization_url(
         .collect::<Vec<_>>()
         .join("&");
 
+    // El `authorization_endpoint` lo publica el propio proveedor en su documento
+    // de descubrimiento, así que se confía en él: los proveedores reales no
+    // llevan `?`, `&` ni `#` en esa URL, y el proveedor falso la genera limpia.
+    // Aun así el separador se elige según lo que ya traiga: un `?` fijo produciría
+    // dos interrogantes si el endpoint ya viniera con consulta. No se defiende
+    // contra un `#` —haría que el navegador descartara los seis parámetros—, pero
+    // sería un proveedor mal formado, y defenderse exige un parser de URL entero
+    // para un valor que no se controla y que ningún test puede provocar.
+    let separador = if discovery.authorization_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+
     AuthorizationRequest {
-        url: format!("{}?{consulta}", discovery.authorization_endpoint),
+        url: format!("{}{separador}{consulta}", discovery.authorization_endpoint),
         state,
         nonce,
     }
@@ -195,6 +209,9 @@ mod tests {
     use axum::Router;
     use axum::http::{StatusCode, header};
 
+    use super::{Discovery, build_authorization_url};
+    use crate::config::OidcSettings;
+    use crate::secret::SecretString;
     use crate::test_support::{
         OIDC_CLIENT_ID, OIDC_REDIRECT_URL, get, header_text, parametros_de_consulta,
         proveedor_falso::ProveedorFalso, router_oidc_con_emisor,
@@ -224,6 +241,33 @@ mod tests {
         assert!(
             location.starts_with(&format!("{}/authorize?", proveedor.issuer)),
             "la redirección no apunta al authorization_endpoint: {location}"
+        );
+
+        // El recuento y la codificación se afirman sobre la `Location` **cruda**:
+        // si se quitara el `urlencoding::encode`, los parámetros seguirían
+        // decodificándose a los mismos valores, así que una aserción solo sobre lo
+        // ya decodificado no notaría el cambio. Y el recuento por `&` es lo que
+        // hace caer el test ante un parámetro de más (un `prompt=none`, por
+        // ejemplo): serían siete.
+        let consulta = location
+            .split_once('?')
+            .map(|(_, consulta)| consulta)
+            .expect("la redirección debe traer cadena de consulta");
+
+        assert_eq!(
+            consulta.split('&').count(),
+            6,
+            "la redirección debe llevar exactamente seis parámetros: {location}"
+        );
+        assert!(
+            location.contains(
+                "redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fapi%2Fv1%2Fauth%2Fcallback"
+            ),
+            "el redirect_uri debe ir codificado en la Location: {location}"
+        );
+        assert!(
+            location.contains("scope=openid%20email"),
+            "el scope debe ir codificado (openid%20email) en la Location: {location}"
         );
 
         let parametros = parametros_de_consulta(&location);
@@ -322,6 +366,40 @@ mod tests {
         assert!(
             header_text(&respuesta, header::SET_COOKIE).is_none(),
             "el login no puede emitir una Set-Cookie de sesión"
+        );
+    }
+
+    #[test]
+    fn el_endpoint_que_ya_trae_consulta_no_duplica_el_interrogante() {
+        // El separador de la consulta se elige según lo que ya traiga el
+        // `authorization_endpoint`: un endpoint con `?` recibe `&`, de modo que no
+        // aparece un segundo interrogante que descartaría su consulta original.
+        let settings = OidcSettings {
+            issuer: "https://proveedor.test".to_owned(),
+            client_id: OIDC_CLIENT_ID.to_owned(),
+            client_secret: SecretString::new("secreto-de-prueba".to_owned()),
+            redirect_url: OIDC_REDIRECT_URL.to_owned(),
+        };
+        let discovery = Discovery {
+            authorization_endpoint: "https://proveedor.test/authorize?audience=kesto".to_owned(),
+            token_endpoint: "https://proveedor.test/token".to_owned(),
+            jwks_uri: "https://proveedor.test/jwks".to_owned(),
+        };
+
+        let solicitud = build_authorization_url(&settings, &discovery);
+
+        assert!(
+            solicitud
+                .url
+                .starts_with("https://proveedor.test/authorize?audience=kesto&"),
+            "el endpoint que ya trae consulta debe continuar con `&`: {}",
+            solicitud.url
+        );
+        assert_eq!(
+            solicitud.url.matches('?').count(),
+            1,
+            "no puede haber dos interrogantes en la URL: {}",
+            solicitud.url
         );
     }
 }

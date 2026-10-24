@@ -1,8 +1,10 @@
 //! Utilidades que comparten las pruebas: lectura inyectada y arnés del router.
 //!
-//! El router se ejercita con `tower::ServiceExt::oneshot`, sin abrir sockets.
-//! Las piezas que hablan con el proveedor lo hacen contra el proveedor falso
-//! local de [`proveedor_falso`]: **ninguna prueba sale a internet**.
+//! Las peticiones se lanzan con `tower::ServiceExt::oneshot` sobre el router, sin
+//! abrir un socket de **escucha**. Cuidado: eso describe al arnés, no a todo el
+//! camino —el login (`/api/v1/auth/login`) sí abre un socket **saliente** a
+//! loopback, el del proveedor falso de [`proveedor_falso`], que es un servidor
+//! HTTP de verdad en `127.0.0.1`—. **Ninguna prueba sale a internet.**
 
 use std::collections::HashMap;
 
@@ -117,12 +119,23 @@ pub(crate) fn router_oidc_con_emisor(emisor: &str) -> Router {
     crate::api::api_router(estado_oidc_con_emisor(emisor))
 }
 
-/// Emisor al que nada contesta: un puerto que se reserva y se suelta.
+/// Emisor al que nada contesta: un puerto local que se reserva **y no se suelta**.
 ///
-/// El puerto efímero se elige con un `TcpListener` que se cierra acto seguido,
-/// de modo que el emisor apunta a un puerto donde nadie escucha y la conexión
-/// se rechaza al instante. Es el «proveedor caído» de los escenarios, sin
-/// levantar un servidor que finja no contestar.
+/// El puerto se obtiene con un `TcpListener` efímero que se **conserva**: un hilo
+/// acepta cada conexión y la cierra sin escribir nada, de modo que `reqwest` falla
+/// al instante con un EOF en vez de esperar al timeout del descubrimiento.
+///
+/// Antes el puerto se reservaba, se **soltaba** y se devolvía la URL. Eso dejaba
+/// una carrera real: entre soltarlo y el `reqwest` del login, otro test en
+/// paralelo —o el `MockServer` de otro— puede ocupar ese puerto, y entonces este
+/// «proveedor caído» contestaría un descubrimiento válido y el escenario del
+/// `502` fallaría con un `302`. La probabilidad es ínfima, pero la suite corre en
+/// CI muchas veces. Conservar el listener elimina la carrera por construcción: el
+/// puerto no vuelve a quedar libre, así que nadie puede ocuparlo. **No reintroducir
+/// el `drop(listener)`**: «aceptar y cerrar» sigue siendo «un proveedor al que
+/// nada contesta».
+///
+/// **No sale a la red**: todo queda en `127.0.0.1`.
 pub(crate) fn emisor_caido() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("la reserva de un puerto efímero no puede fallar");
@@ -130,7 +143,16 @@ pub(crate) fn emisor_caido() -> String {
         .local_addr()
         .expect("el puerto reservado debe conocerse")
         .port();
-    drop(listener);
+
+    // El hilo vive tanto como el proceso de pruebas: sostiene el puerto mientras
+    // el test lo necesite, que es lo que impide que otro lo ocupe.
+    std::thread::spawn(move || {
+        // Cerrar la conexión sin contestar deja a `reqwest` con un EOF
+        // inmediato: el descubrimiento falla rápido.
+        for stream in listener.incoming().flatten() {
+            drop(stream);
+        }
+    });
 
     format!("http://127.0.0.1:{puerto}")
 }
