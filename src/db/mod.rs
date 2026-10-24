@@ -9,6 +9,7 @@
 //! la capa de acceso, que es otro módulo de este mismo directorio.
 
 pub mod crypto;
+pub mod entities;
 pub mod migrate;
 
 use std::path::{Path, PathBuf};
@@ -120,12 +121,30 @@ pub enum DbError {
     },
 
     /// Una consulta de la capa de acceso falló.
-    #[error("la consulta falló: {causa}")]
+    ///
+    /// Lleva el **texto de la consulta** además de la causa, y eso es deliberado:
+    /// `sqlx` dice «no such table: repositories» y no **qué** sentencia lo dijo, así
+    /// que sin el texto el registro no permite reconstruir el fallo. El texto nunca
+    /// lleva valores —todo va enlazado—, así que no puede arrastrar un secreto; y se
+    /// queda en el registro: al cuerpo de la respuesta le llega el mensaje genérico.
+    #[error("la consulta falló: {consulta}: {causa}")]
     Consulta {
+        /// Texto de la consulta que falló. Sin valores enlazados.
+        consulta: String,
         /// Motivo, tal y como lo informa `sqlx`.
         #[source]
         causa: sqlx::Error,
     },
+
+    /// El cifrado en reposo falló al cifrar o al descifrar un secreto.
+    ///
+    /// Es transparente sobre [`crate::db::crypto::ErrorDeCifrado`] y lleva su
+    /// `#[from]`, así que el `?` encadena `ErrorDeCifrado → DbError → AppError` sin
+    /// que ningún módulo intermedio tenga que envolverlo a mano: `src/error.rs` ya
+    /// traduce un `DbError` a `500` con el mensaje genérico y la causa al registro.
+    /// El mensaje del error de cifrado no publica el valor, así que éste tampoco.
+    #[error(transparent)]
+    Cifrado(#[from] crate::db::crypto::ErrorDeCifrado),
 }
 
 /// Ruta del fichero de la base a partir del DSN.

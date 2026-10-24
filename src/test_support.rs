@@ -18,11 +18,13 @@ use axum::body::Body;
 use axum::http::{HeaderName, Method, Request, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
+use sqlx::SqlitePool;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::config::{Config, Lookup};
+use crate::db::crypto::Clave;
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState};
 
@@ -130,6 +132,27 @@ pub(crate) fn config_con_dsn(dsn: &str) -> Config {
         ("DATABASE_URL", dsn),
     ]))
     .expect("la configuración de prueba con base de datos es válida")
+}
+
+/// Directorio temporal, pool con el esquema del §3 ya aplicado y la clave de cifrado.
+///
+/// Es el punto de partida que comparten las pruebas de la capa de acceso: base **de
+/// verdad** —nada de dobles del driver, porque lo que se prueba es el comportamiento
+/// de SQLite—, esquema aplicado por las migraciones embebidas y una `Clave` dentro de
+/// un `Arc`, que es como la recibirá cada capa. El directorio viaja en el retorno para
+/// que quien llame lo mantenga vivo: al soltarlo se borra, y con él la base.
+pub(crate) async fn base_con_clave() -> (DirectorioDePrueba, SqlitePool, Arc<Clave>) {
+    let directorio = directorio_de_prueba();
+
+    let pool = crate::db::preparar(&config_con_dsn(&directorio.dsn()))
+        .await
+        .expect("el esquema del §3 debe aplicarse sobre la base de prueba");
+
+    let clave = Arc::new(Clave::desde_maestra(&SecretString::new(
+        MASTER_KEY.to_owned(),
+    )));
+
+    (directorio, pool, clave)
 }
 
 /// Migrador que falla: su única migración no es SQL.
