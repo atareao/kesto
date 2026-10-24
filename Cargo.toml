@@ -15,6 +15,6 @@ categories = ["command-line-utilities", "database"]
 publish = false
 
 # The published crate carries the Rust sources only.
-exclude = ["docs", "plans", "ui", ".github", "AGENTS.md", "GIT_FLOW.md", "cliff.toml", ".dockerignore", ".vampus.yml", "Dockerfile"]
+exclude = ["docs", "plans", "ui", ".github", "AGENTS.md", "GIT_FLOW.md", "cliff.toml", ".dockerignore", ".vampus.yml", "Dockerfile", ".justfile"]
 
 [dependencies]
