@@ -19,7 +19,6 @@ pub mod state;
 mod test_support;
 
 use std::future::Future;
-use std::sync::Arc;
 
 use crate::state::AppState;
 
@@ -125,10 +124,17 @@ async fn main() -> std::process::ExitCode {
         tracing::warn!("{aviso}");
     }
 
-    // 4. Router, escucha y apagado.
+    // 4. Router, escucha y apagado. El estado se construye desde la
+    //    configuración ya resuelta: en modo `Oidc` lleva el estado de
+    //    autenticación, y en desarrollo no lleva ninguno.
     let address = config.bind_address;
-    let state = AppState {
-        config: Arc::new(config),
+
+    let state = match AppState::new(config) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("kesto no puede arrancar: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
 
     tracing::info!(%address, "escuchando");

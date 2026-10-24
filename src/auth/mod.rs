@@ -5,4 +5,5 @@
 //! sesión, allí el HTTP—: `src/api/auth.rs` traducirá peticiones a llamadas de
 //! este módulo, y no al revés.
 
+pub mod middleware;
 pub mod session;

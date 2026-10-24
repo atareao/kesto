@@ -23,8 +23,6 @@ pub async fn health(State(state): State<AppState>) -> ApiResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::http::StatusCode;
 
     use crate::api::api_router;
@@ -59,9 +57,7 @@ mod tests {
         let lookup = lookup_from(pares);
         let config = Config::from_lookup(&lookup).expect("configuración de prueba válida");
 
-        AppState {
-            config: Arc::new(config),
-        }
+        AppState::new(config).expect("el estado de prueba se construye")
     }
 
     /// Configuración de desarrollo: sin OIDC.
@@ -178,9 +174,7 @@ mod tests {
             "una clave maestra débil debe avisar: {avisos:?}"
         );
 
-        let estado = AppState {
-            config: Arc::new(config),
-        };
+        let estado = AppState::new(config).expect("el estado de prueba se construye");
 
         let respuesta = get(api_router(estado), "/api/v1/health").await;
 

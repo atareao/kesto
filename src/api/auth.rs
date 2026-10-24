@@ -1,0 +1,237 @@
+//! Rutas del flujo de entrada: `/api/v1/auth/*`.
+//!
+//! Aquí solo hay HTTP: la verificación de la sesión vive en `src/auth/`, y el
+//! flujo OIDC —el descubrimiento, la URL de autorización y el canje del
+//! código— llegará a `src/auth/oidc.rs` en M3 y M4. Hoy `login` y `callback`
+//! están declarados pero son esqueletos, porque la partición del router y la
+//! lista blanca de rutas públicas los necesitan para existir.
+
+use axum::extract::Extension;
+use axum::http::StatusCode;
+use axum_extra::extract::cookie::{Cookie, CookieJar};
+
+use crate::api::response::{ApiResponse, Data, ErrorResponse};
+use crate::auth::middleware::SessionIdentity;
+use crate::auth::session::SESSION_COOKIE_NAME;
+
+/// Mensaje de un esqueleto: la ruta existe, el flujo todavía no.
+///
+/// Es constante y no lleva causa ninguna —un `5xx` no la cuenta—, así que no
+/// hay nada que redactar y no se inventa una variante de error que solo sirva
+/// para decir «aún no».
+const SIN_IMPLEMENTAR: &str = "la ruta existe, pero su flujo todavía no está implementado";
+
+/// `GET /api/v1/auth/login` — pública.
+///
+/// En M2 es un esqueleto: el flujo que redirige al proveedor es M3.
+pub async fn login() -> ErrorResponse {
+    ErrorResponse::new(StatusCode::NOT_IMPLEMENTED, SIN_IMPLEMENTAR)
+}
+
+/// `GET /api/v1/auth/callback` — pública.
+///
+/// En M2 es un esqueleto: el retorno del proveedor es M4.
+pub async fn callback() -> ErrorResponse {
+    ErrorResponse::new(StatusCode::NOT_IMPLEMENTED, SIN_IMPLEMENTAR)
+}
+
+/// `POST /api/v1/auth/logout` — protegida.
+///
+/// Borra la cookie de sesión —la **misma** cookie, con el mismo `Path` y con
+/// `Max-Age=0`— y contesta la envoltura. Se declara como `POST` y no como `GET`
+/// porque cambia estado: un `GET` lo dispararían un enlace, un prefetch o una
+/// imagen.
+pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse) {
+    // La `Set-Cookie` de borrado viaja por el propio frasco de la petición: es
+    // lo que hace que la respuesta lleve la cabecera y la envoltura a la vez.
+    let jar = jar.add(cookie_de_borrado());
+
+    (
+        jar,
+        ApiResponse::new(StatusCode::OK, "sesión cerrada", Data::None),
+    )
+}
+
+/// `GET /api/v1/auth/session` — protegida.
+///
+/// Contesta la identidad de la sesión —su `sub` y su `email`— sin devolver el
+/// JWT. Sin cookie válida, el `401` del *gate* **es** la respuesta a «¿hay
+/// sesión?».
+pub async fn session(Extension(identidad): Extension<SessionIdentity>) -> ApiResponse {
+    // La identidad entra por las *extensions* que dejó el *gate*: aquí no se
+    // lee la cookie ni se verifica el JWT otra vez, y el token no se devuelve.
+    ApiResponse::new(
+        StatusCode::OK,
+        "sesión en vigor",
+        Data::Some(serde_json::json!({
+            "sub": identidad.sub,
+            "email": identidad.email,
+        })),
+    )
+}
+
+/// Cookie de borrado: la misma cookie, mismo `Path` y `Max-Age=0`.
+///
+/// Se construye con `make_removal` en vez de con `CookieJar::remove` a
+/// propósito: `remove` solo emite la `Set-Cookie` si la petición traía esa
+/// cookie, y el borrado no puede depender de que la cookie esté —el `logout`
+/// responde igual aunque el cliente la haya perdido por el camino—.
+fn cookie_de_borrado() -> Cookie<'static> {
+    let mut cookie = Cookie::build((SESSION_COOKIE_NAME, "")).path("/").build();
+    cookie.make_removal();
+    cookie
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{StatusCode, header};
+
+    use crate::auth::session::SESSION_COOKIE_NAME;
+    use crate::test_support::{
+        EMAIL, SUB, body_json, body_text, cookie_de_sesion, get, get_with_cookie, header_text,
+        post, post_with_cookie, router_oidc,
+    };
+
+    #[tokio::test]
+    async fn el_cierre_borra_la_cookie() {
+        // Escenario 1.33.
+        let respuesta =
+            post_with_cookie(router_oidc(), "/api/v1/auth/logout", &cookie_de_sesion()).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cabecera = header_text(&respuesta, header::SET_COOKIE)
+            .expect("el logout debe traer una Set-Cookie de borrado");
+
+        assert!(
+            cabecera.starts_with(&format!("{SESSION_COOKIE_NAME}=;")),
+            "la cookie de borrado debe dejar el valor vacío: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Max-Age=0"),
+            "la cookie de borrado debe llevar Max-Age=0: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Path=/"),
+            "la cookie de borrado debe llevar el mismo Path que la de sesión: {cabecera}"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 200);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el logout debe contestar la envoltura con message: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_sesion_el_cierre_no_se_atiende() {
+        // Escenario 1.34.
+        let respuesta = post(router_oidc(), "/api/v1/auth/logout").await;
+
+        assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 401);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 401 debe traer un mensaje: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_cierre_no_se_declara_como_get() {
+        // Escenario 1.35.
+        let respuesta =
+            get_with_cookie(router_oidc(), "/api/v1/auth/logout", &cookie_de_sesion()).await;
+
+        assert_eq!(respuesta.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 405);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 405 debe traer un mensaje: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_sesion_no_se_aprende_que_metodos_hay() {
+        // Escenario 1.45.
+        let respuesta = get(router_oidc(), "/api/v1/auth/logout").await;
+
+        assert_ne!(
+            respuesta.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "sin sesión, el 405 revelaría qué métodos existen"
+        );
+        assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
+
+        let texto = body_text(respuesta).await;
+
+        assert!(!texto.is_empty(), "el 401 llegó con el cuerpo vacío");
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 401 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 401);
+    }
+
+    #[tokio::test]
+    async fn con_sesion_se_contesta_la_identidad() {
+        // Escenario 1.36.
+        let respuesta =
+            get_with_cookie(router_oidc(), "/api/v1/auth/session", &cookie_de_sesion()).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 200);
+        assert_eq!(
+            cuerpo["data"]["sub"], SUB,
+            "la sesión debe contestar el sub: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["email"], EMAIL,
+            "la sesión debe contestar el email: {cuerpo}"
+        );
+        // El JWT no se devuelve: la cookie es su único sitio.
+        assert!(
+            !cuerpo.to_string().contains("eyJ"),
+            "la sesión no debe devolver el JWT: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sin_sesion_el_401_es_la_respuesta() {
+        // Escenario 1.37.
+        let respuesta = get(router_oidc(), "/api/v1/auth/session").await;
+
+        assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
+
+        let texto = body_text(respuesta).await;
+
+        assert!(!texto.is_empty(), "el 401 llegó con el cuerpo vacío");
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 401 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 401);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 401 debe traer un mensaje: {texto}"
+        );
+    }
+}
