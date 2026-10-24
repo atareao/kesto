@@ -356,11 +356,11 @@ spec-validate change_name:
 
 # Estado de los artefactos de un change (qué falta por escribir)
 spec-status change_name:
-    openspec status {{ change_name }}
+    openspec status --change {{ change_name }}
 
 # Archiva un change completado y funde su delta en openspec/specs/
 spec-archive change_name:
-    openspec archive {{ change_name }}
+    openspec archive --yes {{ change_name }}
 
 # ── Planes y documentación (convención fija del repo) ─────────────────────
 # Un plan por trabajo en plans/PLAN-NNN.md; al cerrarlo se RENOMBRA (nunca se
