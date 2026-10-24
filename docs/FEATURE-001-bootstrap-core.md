@@ -1,8 +1,8 @@
 # FEATURE-001 — bootstrap-core
 
-> Implementación del change proposal `openspec/changes/bootstrap-core/`.
+> Implementación del change proposal `bootstrap-core`, archivado en `openspec/changes/archive/2026-10-24-bootstrap-core/`.
 > Cerrada el 2026-10-24. Rama: `feature/bootstrap-core`, PR #6 hacia `development`.
-> Estado: implementado, auditado y pendiente de archivar la spec.
+> Estado: **cerrado**. La especificación vive ya en `openspec/specs/` —`config`, `secrets` y `api-shell`—, con su `Purpose` redactado tras el archivado.
 
 ## Qué quedó construido
 
@@ -171,4 +171,4 @@ Cabos del SRS que siguen abiertos y pasan a ser responsabilidad de los changes s
 
 Sin autenticación, sin base de datos, sin SSE, sin motor, sin planificador, sin panel. Los changes `auth-capability` y `db-schema` están sin empezar.
 
-Este documento es el hermano de `plans/PLAN-001.md`, que a partir de ahora se llama `PLAN-001-COMPLETED.md`.
+Este documento es el hermano de `plans/PLAN-001-COMPLETED.md`.

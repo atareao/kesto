@@ -93,4 +93,4 @@ Estas correcciones salen de la auditoría de `rust-reviewer` del 2026-10-24, pos
 - [x] 5.2 `AGENTS.md`: la tabla de variables de entorno y el modo de desarrollo.
 - [x] 5.3 `README.md`: la sección de estado deja de describir `src/main.rs` como un `Hello, world!`.
 - [x] 5.4 `docs/FEATURE-001-bootstrap-core.md` con lo que realmente quedó construido.
-- [ ] 5.5 `just plan-done` y `just spec-archive bootstrap-core`.
+- [x] 5.5 `just plan-done` y `just spec-archive bootstrap-core`.

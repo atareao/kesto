@@ -1,8 +1,8 @@
 # PLAN-001 — bootstrap-core
 
-> Implementación del change proposal `openspec/changes/bootstrap-core/`.
-> Aprobado el 2026-10-24. Rama: `feature/bootstrap-core`.
-> Especificación que manda: `openspec/changes/bootstrap-core/specs/` (**15 requisitos, 32 escenarios**).
+> Implementación del change proposal `bootstrap-core`, archivado en `openspec/changes/archive/2026-10-24-bootstrap-core/`.
+> Aprobado el 2026-10-24 y cerrado el 2026-10-24. Rama: `feature/bootstrap-core`, PR #6.
+> Especificación que manda: `openspec/specs/` (**15 requisitos, 32 escenarios**). El change se archivó al cerrar, en `openspec/changes/archive/2026-10-24-bootstrap-core/`.
 
 ## Objetivo
 
