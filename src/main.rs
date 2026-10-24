@@ -9,6 +9,7 @@
 // código muerto; declararla es lo que hace que el contrato no se lea como
 // código muerto y siga delatando, en cambio, los ayudantes privados sin uso.
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod secret;

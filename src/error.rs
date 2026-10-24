@@ -29,9 +29,18 @@ pub enum AppError {
     #[error("{0}")]
     MethodNotAllowed(String),
 
+    /// Sin sesión válida no se atiende: el motivo sí se explica.
+    #[error("{0}")]
+    Unauthorized(String),
+
     /// Fallo interno: el detalle va al registro y al cliente le llega un mensaje genérico.
     #[error("{0}")]
     Other(String),
+
+    /// Un servicio de terceros no contesta: la causa va al registro y al cliente
+    /// le llega el mismo mensaje genérico que con un fallo interno.
+    #[error("{0}")]
+    BadGateway(String),
 
     /// La configuración no permite arrancar.
     #[error(transparent)]
@@ -46,6 +55,8 @@ impl IntoResponse for AppError {
             Self::NotFound(motivo) => (StatusCode::NOT_FOUND, motivo),
             // El cliente se equivocó de método, no de recurso: se le explica.
             Self::MethodNotAllowed(motivo) => (StatusCode::METHOD_NOT_ALLOWED, motivo),
+            // Al cliente que no ha entrado se le explica el motivo, como en el 400.
+            Self::Unauthorized(motivo) => (StatusCode::UNAUTHORIZED, motivo),
             // Estos dos son fallos del servidor: la causa va al log, no al cuerpo.
             Self::Other(causa) => {
                 tracing::error!(error = %causa, "fallo interno al atender la petición");
@@ -53,6 +64,13 @@ impl IntoResponse for AppError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     INTERNAL_MESSAGE.to_owned(),
                 )
+            }
+            // También es un fallo del servidor: el 502 dice que el que falla está
+            // fuera, pero el cuerpo no publica la causa —es un `5xx`—, así que
+            // lleva el mismo mensaje genérico que el 500.
+            Self::BadGateway(causa) => {
+                tracing::error!(error = %causa, "un servicio de terceros no contestó");
+                (StatusCode::BAD_GATEWAY, INTERNAL_MESSAGE.to_owned())
             }
             Self::Config(error) => {
                 // Por construcción, esta variante solo puede dispararse al
@@ -124,6 +142,69 @@ mod tests {
             cuerpo["message"],
             super::INTERNAL_MESSAGE,
             "el 500 debe traer exactamente el mensaje genérico: {cuerpo}"
+        );
+        assert!(
+            cuerpo.get("data").is_none(),
+            "el error no debe traer la clave data: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_peticion_sin_sesion_da_401_con_el_motivo() {
+        let motivo = "la cookie de sesión no es válida";
+        let respuesta = AppError::Unauthorized(motivo.to_owned()).into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
+
+        let texto = body_text(respuesta).await;
+
+        // El 401 explica lo suyo —no es un 5xx— pero no deja el cuerpo vacío ni
+        // redirige: la API contesta JSON y es el panel quien decide qué hacer.
+        assert!(!texto.is_empty(), "el 401 llegó con el cuerpo vacío");
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 401 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 401);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(motivo),
+            "el 401 debe explicar el motivo: {cuerpo}"
+        );
+        assert!(
+            cuerpo.get("data").is_none(),
+            "el error no debe traer la clave data: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_502_no_filtra_la_causa() {
+        let respuesta = AppError::BadGateway(format!(
+            "el proveedor de identidad no contesta: {CREDENCIAL}"
+        ))
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::BAD_GATEWAY);
+
+        let texto = body_text(respuesta).await;
+
+        // El 502 es de un servicio de terceros, pero es un 5xx: al cuerpo le rige
+        // la misma regla que al fallo interno, y la causa se queda en el registro.
+        assert!(
+            !texto.contains(CREDENCIAL),
+            "el 502 publicó el contenido de la causa: {texto}"
+        );
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 502 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 502);
+        assert_eq!(
+            cuerpo["message"],
+            super::INTERNAL_MESSAGE,
+            "el 502 debe traer el mismo mensaje genérico que el 500: {cuerpo}"
         );
         assert!(
             cuerpo.get("data").is_none(),
