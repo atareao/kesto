@@ -224,6 +224,31 @@ gf-pr:
     git push -u origin "${branch}"
     gh pr create --base "${base}" --head "${branch}" --fill
 
+# Fusiona en su base el PR de la rama actual, borra la rama y deja development al día
+gf-merge:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    case "${branch}" in
+        feature/*|chore/*) base="development" ;;
+        hotfix/*)          base="main" ;;
+        *) echo "❌ Estás en '${branch}'. Solo se fusionan PRs de feature/*, chore/* o hotfix/*."; exit 1 ;;
+    esac
+    # Fusión condicionada al CI: `gh pr checks` sale distinto de cero si algún
+    # check falla o sigue pendiente.
+    gh pr checks >/dev/null 2>&1 || { echo "❌ El PR no tiene todos los checks en verde:"; gh pr checks; exit 1; }
+    gh pr merge --merge --delete-branch
+    git checkout "${base}"
+    git pull --ff-only
+    # Un hotfix entra en main y hay que devolverlo a la integración.
+    if [ "${base}" = "main" ]; then
+        git checkout development
+        git pull --ff-only
+        git merge origin/main --no-edit
+        git push origin development
+    fi
+    echo "✅ PR de ${branch} fusionado en ${base}."
+
 # No etiquetes a mano: mergear este PR dispara la release automática (bump + tag
 # + imagen a GHCR + crate a crates.io).
 #
