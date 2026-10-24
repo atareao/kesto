@@ -38,6 +38,8 @@ El change se reparte en tres módulos entregables, cada uno con su ciclo RED →
 | 2 | Entidades y acceso | Las cuatro entidades, su mapeo y su capa de acceso, con la cascada a tres niveles | `src/db/entities/{mod,repository,target,job,execution}.rs` |
 | 3 | Cifrado en reposo | El sobre versionado, la derivación por HKDF y el descifrado que falla en alto | `src/db/crypto.rs` |
 
+El **orden de entrega** es 1 → 3 → 2, y no el de la numeración: la capa de acceso **descifra** —el escenario «la lectura por la capa de acceso devuelve el valor original» y los cuatro del «descifrado que falla en alto» pasan por ella—, así que las entidades dependen del módulo de cifrado. Escribirlas antes obligaría a escribirlas dos veces: una con el valor guardado en claro y otra cuando llegara el sobre. La numeración de la tabla es la del reparto de contenido, no la del calendario.
+
 ## Decisiones tomadas
 
 ### Alcance: persistencia, sin HTTP
