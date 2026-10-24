@@ -75,7 +75,7 @@ jobs:
         run: cargo test --locked
 
   frontend:
-    name: Frontend (${{ needs.preflight.outputs.ui_pm }})
+    name: Frontend
     needs: preflight
     if: needs.preflight.outputs.has_ui == 'true'
     runs-on: ubuntu-26.04
