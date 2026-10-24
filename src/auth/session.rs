@@ -441,8 +441,7 @@ mod tests {
         // marcador: en M1 `issue` no tiene por dónde recibir un ID token, así que
         // no hay camino en el que acabe en la cookie. La prueba de fuga de verdad
         // —credenciales distinguibles buscadas literalmente en el log de un flujo
-        // completo— es el escenario 1.38, que vive en `src/auth/mod.rs` y llega
-        // con M2.
+        // completo— es el escenario 1.38, en `src/api/auth.rs`.
         let token = sesion();
         let cookie = session_cookie(token.clone(), REDIRECT_HTTP).expect("la cookie se construye");
 
