@@ -6,9 +6,10 @@
 //! loopback, el del proveedor falso de [`proveedor_falso`], que es un servidor
 //! HTTP de verdad en `127.0.0.1`—. **Ninguna prueba sale a internet.**
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Router;
 use axum::body::Body;
@@ -394,26 +395,262 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferDeLog {
     }
 }
 
+// ── Captura del registro ─────────────────────────────────────────────────────
+//
+// El arnés instala **un suscriptor global**, una sola vez por proceso, y elige a
+// qué buffer escribe cada evento por **hilo**: un `thread_local` guarda el buffer
+// del test que está capturando en ese hilo, y el evento que sale de un hilo sin
+// captura se descarta en silencio.
+//
+// Antes esto era un `set_default` —un suscriptor **de hilo**— y de ahí salía un
+// fallo que no se reproduce en local y sí en CI, y cuyo síntoma no se parece a lo
+// que es: **un registro que falta**, no un test rojo. La cadena, medida en
+// `tracing-core` (`0.1.32`; el `0.1.36` que resuelve este árbol lleva el mismo
+// código):
+//
+//   * `callsite.rs:541` — `has_just_one` nace en `true` y solo se recalcula en
+//     `register_dispatch` como `dispatchers.len() <= 1`, ya retenidas las
+//     referencias débiles muertas.
+//   * `callsite.rs:566` (la `565` en `0.1.36`) —
+//     `Rebuilder::JustOne => dispatcher::get_default(f)`: con un solo despachante
+//     vivo, reconstruir el interés **no itera el registro global**, le pregunta
+//     al despachante **del hilo actual**.
+//   * `subscriber.rs:661` — `Interest::and`: mezclar opiniones da `sometimes`
+//     (inofensivo); el interés solo se queda en `never` si **todos** los
+//     consultados dicen `never`.
+//
+// Consecuencia: un callsite que se registre por primera vez desde un hilo **sin**
+// suscriptor, mientras solo haya un despachante vivo, queda cacheado como
+// `Interest::never()` **para todo el proceso** —`get_default` devolvió
+// `Dispatch::none()`—. A partir de ahí ese `tracing::error!` no construye el
+// evento y lo descarta, en cualquier hilo, aunque el suscriptor esté instalado.
+// Es lo que pasa en CI: `AppError::BadGateway::into_response` lo ejecutan también
+// tests que **no** capturan, y con dos CPUs rara vez hay dos capturando a la vez,
+// así que `has_just_one` casi siempre es `true`. El síntoma es exactamente el
+// medido: llega un `DEBUG` del propio camino de la petición y falta el `ERROR`
+// del mismo camino, con el mismo hilo y el mismo despachante.
+//
+// Con el suscriptor **global**, `get_default` lo resuelve desde **cualquier**
+// hilo —`SCOPED_COUNT == 0` va directo a `get_global()`, y con `SCOPED_COUNT > 0`
+// el `None` del hilo cae también al global—, así que `Rebuilder::JustOne` ya no
+// puede consultar un hilo sin suscriptor: el interés de un callsite no puede
+// quedar en `never` (en `sometimes` sí, si otro despachante opina distinto).
+// Quedan dos caminos a `Dispatch::none()` —`state.enter()` devolviendo `None`
+// por un despacho anidado, y `try_with` fallando durante la destrucción del
+// `thread_local`—: ninguno se da en esta suite, porque estrenar un callsite
+// exigiría hacerlo desde dentro de un despachante o de un destructor de TLS.
+// **No reintroducir `set_default` ni `with_default` en este arnés**: es el único
+// que instala un despachante en el binario de pruebas, y volver al de hilo
+// devuelve el fallo de arriba, que no se ve en local.
+
+thread_local! {
+    /// Buffer de captura del hilo actual, si ese hilo está capturando.
+    static BUFFER_DEL_HILO: RefCell<Option<BufferDeLog>> = const { RefCell::new(None) };
+}
+
+/// Marca de que el suscriptor global del arnés ya está instalado.
+///
+/// Un `OnceLock` y no un `bool`: la instalación tiene que ser **idempotente** y
+/// segura ante dos tests que la pidan a la vez, porque `set_global_default` solo
+/// se puede llamar una vez por proceso.
+static SUSCRIPTOR_GLOBAL: OnceLock<()> = OnceLock::new();
+
+/// Escritor del suscriptor global: escribe en el buffer del hilo, si lo hay.
+///
+/// Es lo que el suscriptor entrega a cada evento. Fuera del alcance de una
+/// captura no hay buffer y el registro se descarta **en silencio**, como un
+/// `/dev/null`: así un hilo que no captura no contamina a nadie, la suite sigue
+/// corriendo en paralelo y no hace falta serializar tests ni compartir un
+/// `Mutex` global.
+struct EscritorDeCaptura(Option<BufferDeLog>);
+
+impl io::Write for EscritorDeCaptura {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &mut self.0 {
+            Some(buffer) => buffer.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `MakeWriter` del suscriptor global: elige el buffer **por hilo**.
+struct CapturaGlobal;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturaGlobal {
+    type Writer = EscritorDeCaptura;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        EscritorDeCaptura(BUFFER_DEL_HILO.with(|celda| celda.borrow().clone()))
+    }
+}
+
+/// Instala el suscriptor global de las pruebas, una sola vez por proceso.
+///
+/// El filtro es por **nivel**, no por `target` ni por `EnvFilter`: `LevelFilter`
+/// contesta `Interest::always` a todo lo que pasa el nivel y no cachea interés
+/// por callsite, así que le quita una capa de caché al fallo que este arnés
+/// existe para no tener. El nivel es `TRACE` a propósito: un candado de «esto no
+/// se registra» solo vale si el registro estaba en su nivel más hablador cuando
+/// se comprobó.
+///
+/// `set_global_default` solo se puede llamar una vez. Si devuelve error es que
+/// **otro** sitio de este binario ya instaló un despachante, y eso rompe la
+/// captura —el que gane no sabe nada de `BUFFER_DEL_HILO`—: por eso se cae en
+/// alto en vez de seguir con pruebas que podrían pasar por vacío. Este arnés es
+/// el único que instala un suscriptor en el binario de pruebas.
+///
+/// **No cambiar esto por `init()` ni `try_init()`**: ésos instalan además el
+/// puente `log` → `tracing`, y `wiremock` instrumenta con `log` —`debug!` con el
+/// cuerpo de la petición que no esperaba, y el cuerpo del canje lleva el
+/// `client_secret`—, así que el puente metería credenciales en el buffer de
+/// captura y pondría en rojo las aserciones de ausencia.
+fn instalar_suscriptor_global() {
+    SUSCRIPTOR_GLOBAL.get_or_init(|| {
+        let suscriptor = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(CapturaGlobal)
+            .finish();
+
+        if let Err(error) = tracing::subscriber::set_global_default(suscriptor) {
+            panic!(
+                "el arnés de captura no pudo instalar su suscriptor global: {error}. \
+                 Este arnés es el único que instala un suscriptor en el binario de \
+                 pruebas: quita el que lo pisa —el único del crate está en \
+                 `src/main.rs:99`, y usa `try_init()`—, o la captura de registro \
+                 deja de ser fiable."
+            );
+        }
+
+        // Aquí hace falta, y no es ceremonia: `set_global_default` ya reconstruye
+        // el interés de lo **ya registrado** —`Dispatch::new` llama a
+        // `register_dispatch`, que itera el registro con `Rebuilder::Write`—,
+        // pero lo hace **antes** de poner `GLOBAL_INIT` en `INITIALIZED`. En esa
+        // ventana, un callsite estrenado por un test que no captura toma
+        // `Rebuilder::JustOne` → `dispatcher::get_default` → `GLOBAL_INIT !=
+        // INITIALIZED` → `Dispatch::none()` → `Interest::never`, y puede caer
+        // fuera del recorrido del `Write`. Esta llamada, ya con el global puesto,
+        // es lo que repara esos callsites: sin ella quedarían envenenados para
+        // todo el proceso.
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
+/// Guardián de una captura: al soltarse, devuelve al hilo el buffer que tenía.
+///
+/// Guarda el valor **anterior** del `thread_local`, no un `None` a secas: si una
+/// captura se anidara dentro de otra, al cerrar la de dentro hay que volver a la
+/// de fuera, no dejar el hilo sin buffer. Mantenerlo vivo mientras se lean los
+/// eventos es obligatorio: al soltarlo, el hilo deja de capturar.
+/// No la muevas de hilo: su `Drop` escribe en el `thread_local` del hilo que la
+/// suelta, así que soltarla en otro hilo le dejaría a ése el buffer prestado.
+#[must_use = "soltar la guardia deja de capturar: manténla viva mientras leas el buffer"]
+pub(crate) struct GuardiaDeCaptura(Option<BufferDeLog>);
+
+impl Drop for GuardiaDeCaptura {
+    fn drop(&mut self) {
+        BUFFER_DEL_HILO.with(|celda| *celda.borrow_mut() = self.0.take());
+    }
+}
+
 /// Captura el registro del hilo actual en memoria y devuelve el buffer.
 ///
-/// El suscriptor es **de hilo** —`set_default`, no `set_global_default`—: el
-/// global solo se puede fijar una vez por proceso y la suite corre en paralelo,
-/// así que un test que lo tomara dejaría al resto sin registro propio. El
-/// guardián viaja con el buffer y hay que mantenerlo vivo mientras se lean los
-/// eventos: al soltarlo, el suscriptor se desregistra.
+/// La firma no cambia para sus ocho puntos de uso —todos
+/// `let (buffer, _guard) = capturar_log();`—: cambia el motor. El suscriptor es
+/// **global** y se instala una sola vez ([`instalar_suscriptor_global`]); lo que
+/// cada llamada fija es el **buffer del hilo**. Ese es el arreglo: con un
+/// suscriptor de hilo, reconstruir el interés podía preguntar a un hilo sin
+/// suscriptor y dejar un callsite envenenado como `never`, y desde entonces su
+/// registro desaparece para todo el proceso.
 ///
-/// El filtro es `trace` a propósito: un candado de «esto no se registra» solo
-/// vale si el registro estaba en su nivel más hablador cuando se comprobó.
-pub(crate) fn capturar_log() -> (BufferDeLog, tracing::subscriber::DefaultGuard) {
+/// **El síntoma de aquel fallo es «un registro que falta», no un test rojo**, y
+/// eso es lo que lo hace traicionero: el test no cae por lo que registra de menos,
+/// sino por la aserción que comprueba que la captura está en pie. Si algún día
+/// esta captura vuelve a fallar así, se arregla aquí —no aflojando la aserción—.
+pub(crate) fn capturar_log() -> (BufferDeLog, GuardiaDeCaptura) {
+    instalar_suscriptor_global();
+
     let buffer = BufferDeLog::default();
-    let suscriptor = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
-        .with_writer(buffer.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
+    let anterior = BUFFER_DEL_HILO.with(|celda| celda.borrow_mut().replace(buffer.clone()));
 
-    let guard = tracing::subscriber::set_default(suscriptor);
+    (buffer, GuardiaDeCaptura(anterior))
+}
 
-    (buffer, guard)
+#[cfg(test)]
+mod tests {
+    use super::capturar_log;
+
+    /// Texto del callsite de `debug!` de la prueba de abajo.
+    const MENSAJE_DE_DEBUG: &str = "mensaje del callsite de depuración del arnés";
+    /// Texto del callsite de `error!` de la prueba de abajo.
+    const MENSAJE_DE_ERROR: &str = "mensaje del callsite de error del arnés";
+
+    /// Emite desde **su propio** callsite: el `debug!` de esta función.
+    ///
+    /// Solo lo usa la prueba de abajo, y solo desde el hilo que captura.
+    fn emitir_por_debug() {
+        tracing::debug!("{MENSAJE_DE_DEBUG}");
+    }
+
+    /// Emite desde **su propio** callsite: el `error!` de esta función.
+    ///
+    /// Solo lo usa la prueba de abajo, y su **primer** registro tiene que salir
+    /// del hilo ajeno de esa prueba: es el que estrena el callsite.
+    fn emitir_por_error() {
+        tracing::error!("{MENSAJE_DE_ERROR}");
+    }
+
+    /// El candado del arnés: un callsite **estrenado desde un hilo sin captura**
+    /// tiene que llegar igualmente al buffer del hilo que captura, y otro
+    /// callsite distinto también.
+    ///
+    /// Es la invariante que se rompió en CI, en su forma mínima: allí llegaba al
+    /// buffer el `DEBUG` de un callsite y no el `ERROR` de otro. El `ERROR` se
+    /// había estrenado desde un hilo sin suscriptor —`AppError::BadGateway` lo
+    /// ejecutan también tests que no capturan— y quedó cacheado como
+    /// `Interest::never()` **para todo el proceso**: desde entonces su registro
+    /// se descarta en cualquier hilo, incluido el que captura.
+    ///
+    /// Por eso el `debug!` no basta y no puede bastar: se registra desde el hilo
+    /// que captura y llegaría igual con el arnés viejo. Lo que distingue a este
+    /// candado es el `error!`, y sobre todo **el orden**: la captura tiene que
+    /// estar en pie antes de que el hilo ajeno estrene el callsite, porque
+    /// instalar el suscriptor global reconstruye el interés de lo ya registrado.
+    /// Con el despachante de hilo, este test cae en cuanto es el único
+    /// capturando, que es la condición del fallo; con el global, no puede caer.
+    #[test]
+    fn un_callsite_estrenado_sin_captura_llega_al_buffer() {
+        // El orden es el del fallo: la captura primero, y con ella el único
+        // despachante vivo.
+        let (buffer, _guard) = capturar_log();
+
+        // El callsite del `error!` se estrena aquí, en un hilo sin captura: es
+        // lo que hacía el test que no capturaba en CI. Con el arnés viejo este
+        // primer registro pregunta al despachante de **este** hilo —ninguno— y
+        // cachea `never` para todo el proceso.
+        std::thread::spawn(emitir_por_error)
+            .join()
+            .expect("el hilo que estrena el callsite no puede entrar en pánico");
+
+        // Y ahora ese mismo callsite desde el hilo que captura, más un callsite
+        // distinto que estrena este hilo.
+        emitir_por_error();
+        emitir_por_debug();
+
+        let log = buffer.texto();
+
+        assert!(
+            log.contains(MENSAJE_DE_ERROR),
+            "el registro de un callsite estrenado sin captura se perdió: {log}"
+        );
+        assert!(
+            log.contains(MENSAJE_DE_DEBUG),
+            "el registro del callsite de `debug!` no llegó al buffer: {log}"
+        );
+    }
 }

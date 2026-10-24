@@ -672,15 +672,15 @@ mod tests {
         //
         // **Por qué las dos primeras aserciones son sobre líneas del flujo.** La
         // marca de control que había aquí —un `tracing::trace!` lanzado desde
-        // este hilo— probaba que el suscriptor estaba instalado, pero **no** que
-        // lo que el flujo registra en su propio contexto llegara al buffer: si el
+        // este hilo— probaba que la captura estaba en pie, pero **no** que lo que
+        // el flujo registra en su propio contexto llegara al buffer: si el
         // manejador se despachara en otro hilo, el flujo registraría fuera del
-        // alcance del suscriptor —`set_default` es **de hilo**—, la marca
-        // seguiría apareciendo y las cuatro búsquedas de abajo pasarían por
-        // vacío, en verde. Lo que se afirma ahora son dos líneas que emite el
-        // propio flujo ejercitado —una del callback, otra de la traducción del
-        // `502`—, así que el día que la captura deje de alcanzar al flujo, este
-        // test cae.
+        // buffer de éste —el suscriptor es global, pero el buffer de la captura
+        // es **de hilo**—, la marca seguiría apareciendo y las cuatro búsquedas
+        // de abajo pasarían por vacío, en verde. Lo que se afirma ahora son dos
+        // líneas que emite el propio flujo ejercitado —una del callback, otra de
+        // la traducción del `502`—, así que el día que la captura deje de
+        // alcanzar al flujo, este test cae.
         let (buffer, _guard) = capturar_log();
 
         // ── Un rechazo del propio callback ───────────────────────────────────
