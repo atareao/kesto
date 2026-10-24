@@ -98,6 +98,8 @@ cargo test
 cd ui && pnpm run lint && npx tsc --noEmit && pnpm test
 ```
 
+En corto: `just check` encadena los tres del backend en el orden exacto del CI, y `just check-all` añade los cuatro del panel. Para aplicar formato en vez de comprobarlo: `just fmt-fix`, `just justfile-fmt` y `pnpm run lint` dentro de `ui/`.
+
 Si el formateo produce cambios, commitéalos aparte antes de cualquier otro cambio:
 
 ```bash
@@ -116,6 +118,7 @@ git commit -m "🎨 style: apply formatting"
 
 - Un plan por trabajo en `plans/PLAN-NNN.md`; al terminar `plans/PLAN-NNN-COMPLETED.md`, si se aparca `plans/PLAN-NNN-PENDING.md`.
 - Un documento por feature entregada en `docs/FEATURE-NNN-<slug>.md`.
+- Automatizado en el `.justfile`: `just plans`, `just plan-new`, `just plan-done N`, `just plan-pending N` y `just feature-new <slug>`.
 - Convención completa: [AGENTS.md](./AGENTS.md).
 
 ## Resumen visual
