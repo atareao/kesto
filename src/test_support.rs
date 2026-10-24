@@ -7,6 +7,8 @@
 //! HTTP de verdad en `127.0.0.1`—. **Ninguna prueba sale a internet.**
 
 use std::collections::HashMap;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -347,4 +349,71 @@ pub(crate) fn header_text(response: &Response, name: HeaderName) -> Option<Strin
         .get(name)
         .and_then(|valor| valor.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+/// Buffer de registro en memoria, compartido por todas las copias que se clonen.
+///
+/// Es el destino al que el suscriptor de [`capturar_log`] escribe: lo que se
+/// registre en el hilo pasa a ser texto que la prueba puede inspeccionar, en vez
+/// de salir por la salida estándar.
+#[derive(Clone, Default)]
+pub(crate) struct BufferDeLog(Arc<Mutex<Vec<u8>>>);
+
+impl BufferDeLog {
+    /// Texto acumulado hasta este instante.
+    pub(crate) fn texto(&self) -> String {
+        let bytes = self
+            .0
+            .lock()
+            .expect("el buffer de log no puede envenenarse");
+
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl io::Write for BufferDeLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("el buffer de log no puede envenenarse")
+            .extend_from_slice(buf);
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferDeLog {
+    type Writer = BufferDeLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Captura el registro del hilo actual en memoria y devuelve el buffer.
+///
+/// El suscriptor es **de hilo** —`set_default`, no `set_global_default`—: el
+/// global solo se puede fijar una vez por proceso y la suite corre en paralelo,
+/// así que un test que lo tomara dejaría al resto sin registro propio. El
+/// guardián viaja con el buffer y hay que mantenerlo vivo mientras se lean los
+/// eventos: al soltarlo, el suscriptor se desregistra.
+///
+/// El filtro es `trace` a propósito: un candado de «esto no se registra» solo
+/// vale si el registro estaba en su nivel más hablador cuando se comprobó.
+pub(crate) fn capturar_log() -> (BufferDeLog, tracing::subscriber::DefaultGuard) {
+    let buffer = BufferDeLog::default();
+    let suscriptor = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+        .with_writer(buffer.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    let guard = tracing::subscriber::set_default(suscriptor);
+
+    (buffer, guard)
 }

@@ -153,6 +153,19 @@ impl ProveedorFalso {
         firmar_con(&self.clave, claims)
     }
 
+    /// Firma un ID token `RS256` a partir de claims crudos.
+    ///
+    /// Es lo que permite fabricar tokens que **omiten** un claim obligatorio:
+    /// [`IdToken`] declara `exp` e `iat` y no sabe representar su ausencia, y los
+    /// candados de A2 necesitan un token sin `exp` y otro sin `iat` para probar
+    /// que se rechazan.
+    pub(crate) fn firmar_claims(&self, claims: &serde_json::Value) -> String {
+        let mut cabecera = Header::new(Algorithm::RS256);
+        cabecera.kid = Some(KID.to_owned());
+
+        encode(&cabecera, claims, &self.clave).expect("el ID token de prueba debe firmarse")
+    }
+
     /// Firma un ID token `RS256` con la clave que el JWKS **no** publica.
     ///
     /// La cabecera lleva el mismo `kid` que el JWK publicado: así la

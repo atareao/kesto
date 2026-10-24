@@ -228,10 +228,18 @@ struct TokenResponse {
 /// Claims del ID token que se releen después de que [`Validation`] compruebe
 /// firma, `iss`, `aud` y `exp`.
 ///
-/// Solo `sub`, `email`, `nonce` e `iat`: `iss`, `aud` y `exp` los valida la
-/// propia biblioteca sobre el token, así que releerlos aquí sería duplicar la
+/// Solo `sub`, `email`, `nonce` e `iat`: `iss` y `aud` los valida la propia
+/// biblioteca sobre el token, así que releerlos aquí sería duplicar la
 /// comprobación. `nonce` e `iat` sí se miran aquí porque `jsonwebtoken` no los
 /// valida.
+///
+/// `exp` **no se declara a propósito**, aunque sí se valide. Quien lo exige es
+/// `required_spec_claims`, que `jsonwebtoken` comprueba sobre el mapa **crudo**
+/// del token —no sobre este struct—, de modo que un token sin `exp` se rechaza
+/// sin que aquí haya un campo. Añadirlo sin leerlo daría un `dead_code` que
+/// rompería `-D warnings`, y comprobarlo a mano duplicaría lo que ya hace la
+/// biblioteca: el candado de esa exigencia es el test
+/// `un_id_token_sin_exp_no_se_acepta`.
 #[derive(Deserialize)]
 struct IdTokenClaims {
     /// Usuario.
@@ -444,12 +452,12 @@ mod tests {
     use crate::auth::session;
     use crate::config::OidcSettings;
     use crate::secret::SecretString;
-    use crate::state::{PendingLogin, STATE_TTL};
+    use crate::state::{PendingLogin, RechazoState, STATE_TTL};
     use crate::test_support::{
-        EMAIL, OIDC_CLIENT_ID, OIDC_REDIRECT_URL, SESSION_SECRET, SUB, callback_url,
-        estado_oidc_con_emisor, get, header_text, login_state_y_nonce, parametros_de_consulta,
-        proveedor_falso::IdToken, proveedor_falso::ProveedorFalso, router_oidc_con_emisor,
-        token_de_set_cookie,
+        EMAIL, OIDC_CLIENT_ID, OIDC_REDIRECT_URL, SESSION_SECRET, SUB, auth_oidc, callback_url,
+        capturar_log, estado_oidc_con_emisor, get, header_text, login_state_y_nonce,
+        parametros_de_consulta, proveedor_falso::IdToken, proveedor_falso::ProveedorFalso,
+        router_oidc_con_emisor, token_de_set_cookie,
     };
     use std::time::{Duration, Instant};
 
@@ -734,6 +742,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn el_consumo_purga_los_pendientes_caducados_y_el_rastro_de_consumidos() {
+        // Tarea 3.5: el mapa de `state`/`nonce` no crece sin límite. La purga al
+        // **insertar** ya tiene candado —`state::tests::la_purga_descarta_las_entradas_caducadas`—;
+        // esta cubre la del **consumo** —pendientes caducados y marcas de consumo
+        // viejas, el rastro que permite distinguir «reutilizado» de «desconocido»—,
+        // que era la mitad sin candado. Borrar cualquiera de los dos `retain` de
+        // `consumir_login` deja este test en rojo.
+        let auth = auth_oidc();
+        let hace = Instant::now()
+            .checked_sub(STATE_TTL + Duration::from_secs(1))
+            .expect("la purga necesita un uptime mayor que STATE_TTL");
+        {
+            let mut logins = auth.logins.lock().await;
+            logins.insert(
+                "pendiente-caducado".to_owned(),
+                PendingLogin {
+                    nonce: "nonce-caducado".to_owned(),
+                    issued_at: hace,
+                },
+            );
+
+            let mut consumidos = auth.consumidos.lock().await;
+            consumidos.insert("consumido-viejo".to_owned(), hace);
+        }
+
+        // Un `state` que nadie emitió: pasa por el camino de rechazo de
+        // `consumir_login`, que es donde vive la purga, y no inserta nada.
+        let rechazo = auth
+            .consumir_login("state-que-nadie-emitio")
+            .await
+            .expect_err("un state desconocido debe rechazarse");
+
+        assert_eq!(rechazo, RechazoState::Desconocido);
+        assert!(
+            auth.logins.lock().await.is_empty(),
+            "el pendiente caducado debe purgarse al consumir: el mapa no puede crecer"
+        );
+        assert!(
+            auth.consumidos.lock().await.is_empty(),
+            "la marca de consumo vieja debe purgarse al consumir: el rastro no puede crecer"
+        );
+    }
+
+    #[tokio::test]
     async fn un_error_del_proveedor_no_llega_a_canjear_nada() {
         // Escenario 1.14. El `token_endpoint` se monta para que el contador tenga
         // dónde contar: si el callback intentara canjear, subiría. El requisito es
@@ -802,6 +854,117 @@ mod tests {
         let respuesta = get(router, &callback_url(&state, "codigo")).await;
 
         assert_rechazo_sin_cookie(respuesta).await;
+    }
+
+    #[tokio::test]
+    async fn un_id_token_sin_exp_no_se_acepta() {
+        // A2 — **el candado de que `exp` es obligatorio**.
+        //
+        // El escenario 1.16 prueba un `exp` en el pasado, pero siempre con un
+        // token que **trae** `exp`: quitara quien quitara `"exp"` de
+        // `required_spec_claims`, la suite seguiría verde y un token sin vigencia
+        // declarada pasaría. Aquí se omite el claim entero.
+        //
+        // Quien lo exige es `required_spec_claims`, que `jsonwebtoken` comprueba
+        // sobre el mapa **crudo** del token y no sobre `IdTokenClaims`; ahí está
+        // el rojo de esta prueba: quitando `"exp"` de esa lista, el token se
+        // acepta y este test cae.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let token = proveedor.firmar_claims(&serde_json::json!({
+            "iss": proveedor.issuer,
+            "aud": OIDC_CLIENT_ID,
+            "sub": SUB,
+            "email": EMAIL,
+            "nonce": nonce,
+            "iat": jsonwebtoken::get_current_timestamp(),
+        }));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+
+        assert_rechazo_sin_cookie(respuesta).await;
+    }
+
+    #[tokio::test]
+    async fn un_id_token_emitido_en_el_futuro_no_se_acepta() {
+        // A2 — **el candado de la comprobación de `iat`**. `jsonwebtoken` no
+        // valida `iat`: lo mira el handler. Con esa comprobación fuera —y con ella
+        // el campo del struct—, este token, con todo lo demás en regla, se
+        // aceptaría y emitiría sesión. El `exp` es válido a propósito: lo que
+        // tiene que rechazar la petición es el `iat` adelantado al reloj.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let ahora = jsonwebtoken::get_current_timestamp();
+        let token = proveedor.firmar_claims(&serde_json::json!({
+            "iss": proveedor.issuer,
+            "aud": OIDC_CLIENT_ID,
+            "sub": SUB,
+            "email": EMAIL,
+            "nonce": nonce,
+            "iat": ahora + 600,
+            "exp": ahora + 1800,
+        }));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+
+        assert_rechazo_sin_cookie(respuesta).await;
+    }
+
+    #[tokio::test]
+    async fn un_id_token_sin_iat_no_se_acepta() {
+        // A2 — **el candado de que `iat` está declarado** en `IdTokenClaims`. Con
+        // el campo fuera, un token sin `iat` se deserializaría y se aceptaría,
+        // porque `jsonwebtoken` no lo exige; sin este test, borrar el campo dejaba
+        // la suite verde y la vigencia sin comprobar.
+        //
+        // Y aprovecha el camino de error de **deserialización** —el único que
+        // podría arrastrar al log un fragmento del payload— para comprobar que no
+        // lo hace: el mensaje de `jsonwebtoken` es una etiqueta, no el token. La
+        // aserción de que el rechazo se registró es lo que demuestra que la
+        // captura estaba en pie y que la de abajo no pasa por vacía.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let token = proveedor.firmar_claims(&serde_json::json!({
+            "iss": proveedor.issuer,
+            "aud": OIDC_CLIENT_ID,
+            "sub": SUB,
+            "email": EMAIL,
+            "nonce": nonce,
+            "exp": jsonwebtoken::get_current_timestamp() + 600,
+        }));
+        proveedor.montar_token_endpoint(&token).await;
+
+        let (buffer, _guard) = capturar_log();
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        let log = buffer.texto();
+
+        assert_rechazo_sin_cookie(respuesta).await;
+
+        assert!(
+            log.contains("ID token rechazado"),
+            "la captura de log no está en pie: el rechazo no quedó registrado: {log}"
+        );
+
+        // El payload del ID token, además del token entero: es el fragmento que
+        // el error de deserialización podría arrastrar.
+        let payload = token.split('.').nth(1).expect("un JWT tiene tres partes");
+
+        assert!(
+            !log.contains(token.as_str()),
+            "el rechazo publicó el ID token en el log: {log}"
+        );
+        assert!(
+            !log.contains(payload),
+            "el rechazo publicó el payload del ID token en el log: {log}"
+        );
     }
 
     #[tokio::test]

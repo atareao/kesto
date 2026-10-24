@@ -9,6 +9,7 @@
 //! sesión en el callback.
 
 use axum::body::Body;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -101,15 +102,34 @@ fn redireccion_302(destino: &str) -> Response {
 /// Retorno del proveedor: consume el `state`, canjea el código, verifica el ID
 /// token y, si todo cuadra, emite la cookie de sesión y vuelve al panel. Todo
 /// rechazo contesta la envoltura y **no** emite cookie.
+///
+/// La consulta se extrae **tipada** —`Result<Query<_>, QueryRejection>` y no
+/// `Query<_>` a secas— para poder traducir el rechazo del extractor: servir el
+/// que trae `Query` por defecto rompe las dos reglas de la envoltura. Sale con
+/// `text/plain` —no con el JSON de `api-shell`— y con el detalle de serde, que
+/// publica la estructura interna del struct («duplicate field `code`»). Y no es
+/// un borde teórico: un `code` duplicado en la URL lo provoca cualquiera.
 pub async fn callback(
     State(state): State<AppState>,
-    Query(params): Query<CallbackParams>,
+    params: Result<Query<CallbackParams>, QueryRejection>,
 ) -> Response {
     // La ruta solo se monta en modo `Oidc` (`api_router`), así que este camino
     // es inalcanzable por construcción. No se confía en ello.
     let Some(auth) = state.auth.as_ref() else {
         return AppError::Other("el callback se atendió sin estado de autenticación".to_owned())
             .into_response();
+    };
+
+    // Una consulta que el extractor no sabe leer es un callback mal formado, y se
+    // contesta como tal: `400` con la envoltura y el mensaje genérico del flujo.
+    // El detalle del rechazo —el de serde— no se traduce ni al cuerpo ni al
+    // registro: nombra campos internos del struct y al cliente no le sirve.
+    let Query(params) = match params {
+        Ok(params) => params,
+        Err(_) => {
+            tracing::debug!("la consulta del callback no pasa el extractor");
+            return AppError::InvalidInput(CALLBACK_INCOMPLETO.to_owned()).into_response();
+        }
     };
 
     // Un `error` en la consulta es el proveedor diciendo que no: se rechaza sin
@@ -265,10 +285,10 @@ mod tests {
     use crate::error::AppError;
     use crate::test_support::{
         EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SUB, body_json, body_text, callback_url,
-        cookie_de_sesion, emisor_caido, estado_oidc_con_emisor, get, get_with_cookie, header_text,
-        login_state_y_nonce, parametros_de_consulta, post, post_with_cookie,
-        proveedor_falso::IdToken, proveedor_falso::ProveedorFalso, router_oidc,
-        router_oidc_con_emisor, token_de_set_cookie,
+        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc_con_emisor, get, get_with_cookie,
+        header_text, login_state_y_nonce, parametros_de_consulta, post, post_with_cookie,
+        proveedor_falso::ACCESS_TOKEN, proveedor_falso::IdToken, proveedor_falso::ProveedorFalso,
+        router_oidc, router_oidc_con_emisor, session_cookie_header, token_de_set_cookie,
     };
 
     #[tokio::test]
@@ -548,6 +568,159 @@ mod tests {
         assert!(
             token_de_set_cookie(&respuesta).is_some(),
             "el callback correcto debe emitir la cookie de sesión"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_consulta_de_callback_duplicada_contesta_la_envoltura_json() {
+        // A1. El rechazo del extractor `Query` se sirve antes que este handler, y
+        // con `Query<CallbackParams>` a secas rompía las dos reglas de
+        // `api-shell`: salía `text/plain` —no la envoltura— y con el detalle de
+        // serde, que publica la estructura interna del struct. Un `code`
+        // duplicado lo provoca cualquier cliente, no es un borde teórico.
+        let respuesta = get(router_oidc(), "/api/v1/auth/callback?code=a&code=b").await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::BAD_REQUEST,
+            "una consulta ilegible debe rechazarse con un 400"
+        );
+
+        let tipo = header_text(&respuesta, header::CONTENT_TYPE)
+            .expect("la respuesta debe traer content-type");
+
+        assert!(
+            tipo.starts_with("application/json"),
+            "el rechazo no puede volver con el text/plain del extractor: {tipo}"
+        );
+        assert!(
+            !tipo.contains("text/plain"),
+            "el rechazo volvió con text/plain en vez de la envoltura: {tipo}"
+        );
+
+        let texto = body_text(respuesta).await;
+
+        assert!(
+            !texto.contains("duplicate field"),
+            "el 400 publicó el detalle de serde: {texto}"
+        );
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 400 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 400);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 400 debe traer la envoltura con message: {cuerpo}"
+        );
+        assert!(
+            cuerpo.get("data").is_none(),
+            "el rechazo no debe traer la clave data: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_callback_sin_parametros_contesta_400_envuelto_y_no_un_401() {
+        // El otro lado de A1: una consulta **ausente** no es un rechazo del
+        // extractor —todos los campos son `Option`, así que se leen vacíos—, y el
+        // handler contesta su `400`. El escenario 1.4 de `src/api/mod.rs` depende
+        // de que esta ruta no conteste `401`, y por eso se deja candado aquí.
+        let respuesta = get(router_oidc(), "/api/v1/auth/callback").await;
+
+        assert_ne!(
+            respuesta.status(),
+            StatusCode::UNAUTHORIZED,
+            "el callback sin parámetros no puede contestar 401"
+        );
+        assert_eq!(respuesta.status(), StatusCode::BAD_REQUEST);
+
+        let tipo = header_text(&respuesta, header::CONTENT_TYPE)
+            .expect("la respuesta debe traer content-type");
+
+        assert!(
+            tipo.starts_with("application/json"),
+            "el 400 debe llevar la envoltura JSON: {tipo}"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 400);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 400 debe traer la envoltura con message: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_flujo_completo_no_deja_credenciales_en_el_log() {
+        // Escenario 1.38 — el único de la especificación que quedaba sin
+        // cobertura, y un SHALL del requisito «Ninguna credencial del proveedor
+        // acaba en el log ni en la cookie». Con el registro a `trace`, el flujo
+        // entero —login, callback y una petición con la sesión— no puede dejar en
+        // el log ninguna de las cuatro credenciales. Los cuatro valores son
+        // distinguibles y se buscan **literalmente** en la salida capturada.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer);
+
+        let (buffer, _guard) = capturar_log();
+
+        let (state, nonce) = login_state_y_nonce(router.clone()).await;
+        let id_token =
+            proveedor.firmar(&IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce));
+        proveedor.montar_token_endpoint(&id_token).await;
+
+        let codigo = "codigo-de-autorizacion-distinguible";
+        let respuesta = get(router.clone(), &callback_url(&state, codigo)).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::FOUND,
+            "el flujo debe completarse para que el log sea el de un flujo real"
+        );
+
+        let jwt = token_de_set_cookie(&respuesta).expect("el callback debe emitir la sesión");
+        let sesion =
+            get_with_cookie(router, "/api/v1/auth/session", &session_cookie_header(&jwt)).await;
+
+        assert_eq!(sesion.status(), StatusCode::OK);
+
+        // Marca de control: el camino feliz no registra nada por sí solo, así que
+        // sin esta línea las aserciones de abajo pasarían por vacías. Si no
+        // aparece, la captura no está en pie.
+        tracing::trace!("marca-de-control-del-log-de-1.38");
+        let log = buffer.texto();
+
+        assert!(
+            log.contains("marca-de-control-del-log-de-1.38"),
+            "la captura de log no está en pie: {log}"
+        );
+
+        for (nombre, credencial) in [
+            ("client_secret", OIDC_CLIENT_SECRET),
+            ("código de autorización", codigo),
+            ("ID token", id_token.as_str()),
+            ("token de acceso", ACCESS_TOKEN),
+        ] {
+            assert!(
+                !log.contains(credencial),
+                "el log publicó el {nombre}: {log}"
+            );
+        }
+
+        // Y el payload del ID token, además del token entero: es el fragmento que
+        // un error de deserialización podría arrastrar.
+        let payload = id_token
+            .split('.')
+            .nth(1)
+            .expect("un JWT tiene tres partes");
+
+        assert!(
+            !log.contains(payload),
+            "el log publicó el payload del ID token: {log}"
         );
     }
 }
