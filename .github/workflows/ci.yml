@@ -1,0 +1,121 @@
+name: CI
+
+# Checks every PR into an integration branch and every push that lands on one.
+#
+# `ui/` (el panel React) todavía no existe. El job `preflight` detecta lo que hay
+# de verdad en el árbol y el job `frontend` se salta solo mientras no exista, así
+# que este workflow está verde hoy y se enciende sin tocar nada cuando llegue el
+# SPA. El gestor de paquetes se deduce del lockfile que haya en `ui/`, de modo que
+# funciona tanto con npm como con pnpm.
+
+on:
+  pull_request:
+    branches: [development, main]
+  push:
+    branches: [development, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-26.04
+    outputs:
+      has_ui: ${{ steps.detect.outputs.has_ui }}
+      ui_pm: ${{ steps.detect.outputs.ui_pm }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Detect ui/ and its package manager
+        id: detect
+        run: |
+          if [ -f ui/package.json ]; then
+            echo "has_ui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ui=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ui/package.json no existe todavia: se salta el job de frontend."
+          fi
+          if [ -f ui/pnpm-lock.yaml ]; then
+            echo "ui_pm=pnpm" >> "$GITHUB_OUTPUT"
+          else
+            echo "ui_pm=npm" >> "$GITHUB_OUTPUT"
+          fi
+
+  backend:
+    name: Backend (fmt, clippy, test)
+    needs: preflight
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  frontend:
+    name: Frontend
+    needs: preflight
+    if: needs.preflight.outputs.has_ui == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v7
+
+      # `pnpm/action-setup` aborta si se le pasa `version:` y `ui/package.json`
+      # declara `packageManager`. Si algún día pasa eso, borra el `version:` de
+      # este paso y deja que lo decida package.json.
+      - name: Setup pnpm
+        if: needs.preflight.outputs.ui_pm == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      # Un solo setup-node: la cache de pnpm necesita que pnpm ya esté instalado
+      # (de ahí el orden), y la ruta del lockfile se elige en la expresión para no
+      # apuntar nunca a un lockfile que no existe.
+      - name: Setup Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: ${{ needs.preflight.outputs.ui_pm }}
+          cache-dependency-path: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'ui/pnpm-lock.yaml' || 'ui/package-lock.json' }}
+
+      - name: Install dependencies
+        run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm install --frozen-lockfile' || 'npm ci' }}
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run lint' || 'npm run lint' }}
+
+      - name: Test
+        run: npx vitest run
+
+      - name: Build
+        run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run build' || 'npm run build' }}

@@ -4,9 +4,7 @@
 
 ## Estado del repositorio (2026-10-24)
 
-Base ya creada: commit inicial en `main`, rama `development` activa, más `GIT_FLOW.md`, `AGENTS.md` y los directorios `plans/` y `docs/`. **Sin remote y sin CI todavía.**
-
-Sigue siendo **greenfield en código**: `src/main.rs` es un `Hello, world!`, `Cargo.toml` no tiene dependencias y no hay `openspec/`, `ui/`, `Dockerfile`, `justfile`, tests ni CI. Todo lo que sigue describe el sistema **a construir**, no lo que hay.
+Repositorio público en `github.com/atareao/kesto` con la base completa: ramas `main` (producción) y `development` (integración), pipeline de GitHub Actions en verde y `GIT_FLOW.md`. Sigue siendo **greenfield en código**: `src/main.rs` es un `Hello, world!`, `Cargo.toml` no tiene dependencias y no hay `openspec/`, `ui/`, `Dockerfile`, `justfile` ni tests. Todo lo que sigue describe el sistema **a construir**, no lo que hay.
 
 **Fuente de verdad: `docs/DEFINITION.md`** (SRS completo, en español). Manda sobre este fichero cuando haya conflicto. Secciones que hay que leer antes de tocar código:
 
@@ -59,6 +57,8 @@ cd ui && pnpm dev | build | test | lint && npx tsc --noEmit
 openspec init                   # el root de OpenSpec todavía no existe
 openspec list | openspec new change <feature> | openspec archive <feature>
 podman compose up -d --build    # despliegue local
+gh run list -R atareao/kesto    # estado del pipeline
+gh pr checks <n> -R atareao/kesto
 ```
 
 Orden antes de commit: `cargo fmt` → `cargo clippy -- -D warnings` → `cargo test`; en `ui/`: `tsc --noEmit` → `vitest run` → `lint`.
@@ -69,15 +69,40 @@ Orden antes de commit: `cargo fmt` → `cargo clippy -- -D warnings` → `cargo 
 
 | Rama | Base | Uso |
 |---|---|---|
-| `main` | — | Producción |
+| `main` | — | Producción. Un merge aquí **dispara una release**. |
 | `development` | `main` | Integración (rama activa de trabajo) |
 | `feature/<kebab-case>` | `development` | Nuevas funcionalidades |
 | `hotfix/<kebab-case>` | `main` | Correcciones urgentes sobre producción |
 
+```bash
+git checkout development && git pull --ff-only
+git checkout -b feature/<nombre>
+# ... trabajo ...
+git push -u origin feature/<nombre>
+gh pr create --base development --head feature/<nombre>
+```
+
 - Mensajes: conventional commits con gitmoji (`✨ feat:`, `🐛 fix:`, `🚑️ hotfix:`, `📝 docs:`, `✅ test:`, `🔧 chore:`…). Flujo completo y tabla de gitmoji en `GIT_FLOW.md`; automatización en la skill `gitflow`.
 - **Ojo con la skill `gitflow`**: sus pasos de formateo asumen `backend/` y `frontend/`. Aquí el layout es `src/` + `ui/`: adapta los comandos, no los directorios.
 - Formateo **antes** de cada commit: `cargo fmt --all` → `cargo clippy -- -D warnings` → `cargo test`; en `ui/`: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test`. Si el formateo toca ficheros, commit aparte (`🎨 style: apply formatting`).
-- **No hay remote configurado**: `git push`, `gh pr create` y todo el flujo de PR fallan hasta que exista. Mientras tanto, trabaja en local con las ramas igualmente.
+- Nunca hagas `git commit` directo en `main`: ahí solo entran PRs de release desde `development`.
+
+## Pipeline (GitHub Actions)
+
+| Workflow | Se dispara con | Hace |
+|---|---|---|
+| `ci.yml` | PR y push a `development`/`main` | `preflight` detecta el árbol → `backend` (`fmt --check`, `clippy -D warnings`, `test --locked`) → `frontend` (npm o pnpm según el lockfile) |
+| `release-prepare.yml` | push a `main` (solo eso) | bump con vampus, CHANGELOG con git-cliff, tag `vX.Y.Z`, sincroniza `development` |
+| `release.yml` | tag `v*` | imagen multi-arquitectura a `ghcr.io/atareao/kesto` + crate a crates.io + GitHub Release |
+
+Lo que hay que saber antes de tocarlo:
+
+- **Un merge a `main` ES una release.** No se etiqueta a mano: `release-prepare` decide el bump desde los conventional commits (`feat` → minor, `!:` / `BREAKING CHANGE` → major, resto → patch) y empuja el tag, que es lo que dispara `release.yml`.
+- **Dos guardas deliberadas** para no publicar basura, ambas auto-activables: la imagen se salta mientras no existan `Dockerfile` y `ui/package.json`; el crate se salta mientras `Cargo.toml` diga `publish = false`. **Quita `publish = false` cuando el crate merezca publicarse**: crates.io no permite borrar versiones, solo yank.
+- **El job `frontend` del CI se salta solo** mientras no exista `ui/package.json`, y elige npm o pnpm por el lockfile presente. No hace falta tocarlo cuando llegue la UI.
+- **Secretos necesarios antes de la primera release**: `GH_PAT` (PAT con `contents: write`) y `CARGO_REGISTRY_TOKEN`. Sin `GH_PAT` el tag no dispara `release.yml`, porque un tag empujado con el `GITHUB_TOKEN` por defecto no dispara workflows.
+- La versión vive en **tres sitios** que deben ir sincronizados: `Cargo.toml`, la entrada `[[package]]` de `Cargo.lock` y `.vampus.yml:current_version`. `release-prepare` los resincroniza y falla en alto si vampus no sube nada; si lo tocas a mano, toca los tres.
+- El CI corre exactamente `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` y `cargo test --locked`: replica esos comandos antes de cada push para no descubrir el fallo en el PR.
 
 ## Planes y documentación — regla fija
 
@@ -114,3 +139,4 @@ Ciclo de vida de una feature: change proposal de OpenSpec aprobado → `plans/PL
 4. Las contraseñas van por línea de comandos (`-p<db_password>`), visibles en el listado de procesos del contenedor: considera `MYSQL_PWD` o fichero de credenciales.
 5. `job_executions` solo tiene FK a `backup_jobs`; filtrar ejecuciones por repositorio obliga a un join. Si el dashboard lo va a hacer, añade el índice correspondiente.
 6. El compose de §8 monta el socket como `:ro`, pero el motor necesita la API completa (`exec`). Verifica que el `exec` funciona con ese montaje en tu runtime antes de darlo por bueno.
+7. Aún no hay `Dockerfile`: hasta que exista, el job de imagen de `release.yml` se salta solo. Escríbelo con el orden de etapas del §7 (UI → Rust → runtime) y sin privilegios de root.

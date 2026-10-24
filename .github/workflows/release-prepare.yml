@@ -1,0 +1,170 @@
+name: Prepare Release
+
+# Un merge a `main` ES una release. Este workflow deduce el tipo de bump de los
+# conventional commits, escribe el CHANGELOG, commitea, etiqueta `vX.Y.Z` y
+# sincroniza `development` con `main`.
+#
+# El tag que empuja es lo que dispara `release.yml` (imagen a ghcr.io + crate a
+# crates.io). Empujar un tag con el GITHUB_TOKEN por defecto NO dispara otros
+# workflows: por eso el checkout de abajo necesita el secreto GH_PAT (un PAT con
+# permiso `contents: write`).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Version, changelog and tag
+    # Solo protege contra re-dispararse con su propio commit automático.
+    if: "!startsWith(github.event.head_commit.message, 'chore: release')"
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install vampus
+        run: cargo install vampus --git https://github.com/atareao/vampus
+
+      # Un merge a `main` puede llegar en tres estados. Comparar la versión de
+      # `.vampus.yml` con el tag que apunta a ella los distingue, y eso hace el
+      # job idempotente:
+      #
+      #   skip -> `v$CURRENT` existe y HEAD *es* ese tag. No hay nada que
+      #           publicar; es lo que se ve al re-ejecutar una release ya hecha.
+      #           Sin este caso, una re-ejecución volvería a subir la versión y
+      #           publicaría una release espuria.
+      #   bump -> `v$CURRENT` existe pero HEAD tiene commits nuevos (el PR de
+      #           release normal, que solo trae features): primero se sube.
+      #   tag  -> `v$CURRENT` todavía no está etiquetada (el PR de release ya
+      #           subió `.vampus.yml` a mano): solo changelog + tag.
+      - name: Decide what to do
+        id: state
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          CURRENT=$(grep '^current_version' .vampus.yml | sed 's/.*: *//')
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/v$CURRENT" >/dev/null; then
+            TAGGED_SHA=$(git rev-list -n1 "v$CURRENT")
+            if [ "$TAGGED_SHA" = "$(git rev-parse HEAD)" ]; then
+              echo "action=skip" >> "$GITHUB_OUTPUT"
+              echo "v$CURRENT ya está publicada y HEAD es exactamente ese tag: no hay nada que hacer."
+            else
+              echo "action=bump" >> "$GITHUB_OUTPUT"
+              echo "v$CURRENT ya está publicada pero HEAD tiene commits nuevos: subiendo versión."
+            fi
+          else
+            echo "action=tag" >> "$GITHUB_OUTPUT"
+            echo "v$CURRENT todavía no está etiquetada (subida en el PR de release): solo se etiqueta."
+          fi
+
+      - name: Determine bump type from commits
+        if: steps.state.outputs.action == 'bump'
+        id: bump
+        run: |
+          LAST_TAG="${{ steps.state.outputs.last_tag }}"
+          BASE=${LAST_TAG:-$(git rev-list --max-parents=0 HEAD | head -1)}
+          COMMITS=$(git log "$BASE"..HEAD --format="%s")
+          if echo "$COMMITS" | grep -qE "BREAKING CHANGE|!:"; then
+            echo "type=--major" >> "$GITHUB_OUTPUT"
+          elif echo "$COMMITS" | grep -qE "^✨ ?feat|^feat"; then
+            echo "type=--minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=--patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      # vampus compara sus patrones `replaces` contra el literal de la versión
+      # *actual*, así que todos los ficheros gestionados deben estar en sintonía
+      # con `.vampus.yml:current_version` antes de llamarlo. Cuando no lo están,
+      # aborta sin escribir nada, que es el comportamiento seguro: vampus sale con
+      # código 0 al abortar, así que se comprueba el antes y el después.
+      - name: Bump version with vampus
+        if: steps.state.outputs.action == 'bump'
+        run: |
+          BEFORE=$(grep '^current_version' .vampus.yml | sed 's/.*: *//')
+          vampus upgrade ${{ steps.bump.outputs.type }}
+          AFTER=$(grep '^current_version' .vampus.yml | sed 's/.*: *//')
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "::error::vampus dejó la versión en $BEFORE en vez de subirla."
+            echo "vampus sale con 0 cuando aborta, así que sin esta comprobación el paso pasaría en silencio."
+            echo "Causa más probable: falta un fichero listado en los 'replaces' de .vampus.yml."
+            exit 1
+          fi
+          echo "Bumped $BEFORE -> $AFTER"
+
+      # vampus sube la versión declarada en `.vampus.yml`, pero no sabe nada de
+      # Cargo.lock: el propio crate lleva su versión en una entrada
+      # `[[package]]`. Dejarla atrás rompe `cargo --locked` en el tag de release,
+      # así que se resincroniza aquí y se falla en alto si no toma.
+      - name: Sync Cargo.lock with the bumped version
+        if: steps.state.outputs.action == 'bump'
+        run: |
+          read_locked() {
+            sed -n '/^name = "kesto"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock
+          }
+          BEFORE=$(read_locked)
+          cargo update --workspace
+          AFTER=$(read_locked)
+          if [ "$BEFORE" = "$AFTER" ]; then
+            echo "::error::Cargo.lock se quedó en $BEFORE en vez de sincronizarse con el bump."
+            exit 1
+          fi
+          echo "Cargo.lock sincronizado: $BEFORE -> $AFTER"
+
+      - name: Read release version
+        if: steps.state.outputs.action != 'skip'
+        id: version
+        run: |
+          V=$(grep '^current_version' .vampus.yml | sed 's/.*: *//')
+          echo "value=$V" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$V"
+
+      - name: Generate changelog
+        if: steps.state.outputs.action != 'skip'
+        run: git-cliff -o CHANGELOG.md --tag "v${{ steps.version.outputs.value }}"
+
+      - name: Commit, tag and push
+        if: steps.state.outputs.action != 'skip'
+        run: |
+          V="${{ steps.version.outputs.value }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "chore: release v${V}"
+            git push origin main
+          fi
+          if git rev-parse -q --verify "refs/tags/v${V}" >/dev/null; then
+            echo "El tag v${V} ya existe, no se crea otra vez."
+          else
+            git tag "v${V}"
+            git push origin "v${V}"
+          fi
+
+      - name: Sync development with main
+        run: |
+          if ! git fetch origin development; then
+            echo "::error::no se puede hacer fetch de origin/development. Lo más probable es que la rama no exista todavía en el remoto; si no es eso, lee el error del fetch de arriba."
+            exit 1
+          fi
+          git checkout -B development origin/development
+          git merge origin/main --no-edit
+          git push origin development
