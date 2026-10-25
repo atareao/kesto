@@ -7,14 +7,19 @@
 //! cuatro piezas que cruzan esa frontera son el puente ([`origen`]), el gancho de progreso
 //! ([`progreso`]), el repositorio ([`repositorio`]) y la retención ([`retencion`]).
 //!
-//! Nada de lo que entra por aquí pasa por el disco, y nada que salga de aquí lleva datos del
-//! volcado: ni un [`std::fmt::Debug`], ni un registro.
+//! Nada que venga de un **volcado** pasa por el disco: los bytes van del `stream` del
+//! `exec` al árbol de la instantánea sin fichero temporal, y nada que salga de aquí lleva
+//! datos del volcado: ni un [`std::fmt::Debug`], ni un registro. Lo que sí lee del sistema
+//! de ficheros es [`Repositorio::archivar_directorio`], y es su cometido —el target de tipo
+//! `directory` va contra un directorio del host, no contra un contenedor—: la promesa es de
+//! los volcados, no del módulo entero.
 //!
 //! Lo que este módulo rechaza por su cuenta es lo que la biblioteca no puede validar —un
-//! nombre de volcado que no sirve para nombrar nada, una copia sin rutas, una fila que no
-//! describe un destino utilizable— y los desenlaces que la biblioteca no distingue, como
-//! cuál de los tres le ocurrió a la puesta en marcha de un repositorio. Lo que ya está en
-//! manos de la biblioteca no se puede validar desde aquí, y sus pánicos son suyos.
+//! nombre de volcado que no sirve para nombrar nada, un nombre de volcado que no es el que
+//! la copia declara, una copia sin rutas, una fila que no describe un destino utilizable— y
+//! los desenlaces que la biblioteca no distingue, como cuál de los tres le ocurrió a la
+//! puesta en marcha de un repositorio. Lo que ya está en manos de la biblioteca no se puede
+//! validar desde aquí, y sus pánicos son suyos.
 //!
 //! Y hay un desenlace que este módulo **no** fabrica: la condición de éxito de una copia. El
 //! `Ok` del archivado no la da —está medido: silencia el fallo del lector y guarda la

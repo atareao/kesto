@@ -21,7 +21,7 @@ use axum::response::Response;
 use bollard::container::{CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
 use http_body_util::BodyExt;
 use rustic_backend::local::LocalBackend;
-use rustic_core::repofile::{SnapshotFile, SnapshotId};
+use rustic_core::repofile::{Node, SnapshotFile, SnapshotId};
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, Excludes, KeyOptions, LocalSource,
     LocalSourceFilterOptions, LocalSourceSaveOptions, OpenStatus, Repository, RepositoryBackends,
@@ -176,6 +176,23 @@ pub(crate) const CLAVE_SECRETA_DE_PRUEBA: &str =
 /// Etiqueta con la que se siembran los snapshots de prueba.
 pub(crate) const ETIQUETA_SEMBRADA: &str = "tarea-sembrada-de-prueba";
 
+/// Etiqueta de la instantánea **ajena**: la que no creó Kesto.
+///
+/// Distinta de [`ETIQUETA_SEMBRADA`] a propósito, y no un detalle: el criterio con el que la
+/// biblioteca agrupa las instantáneas para retener incluye la etiqueta, así que una
+/// instantánea con otra etiqueta cae en otro grupo —que es exactamente lo que la hace
+/// ajena—. Ver [`sembrar_snapshot_ajeno`].
+pub(crate) const ETIQUETA_AJENA: &str = "instantanea-de-otra-herramienta";
+
+/// El host de la instantánea ajena: otro de los tres campos del grupo de retención.
+pub(crate) const HOST_AJENO: &str = "host-ajeno";
+
+/// El fichero que deja dentro del árbol la instantánea ajena.
+pub(crate) const AJENA: &str = "paisaje.txt";
+
+/// El contenido de ese fichero, distinguible del de la semilla.
+pub(crate) const AJENA_CONTENIDO: &[u8] = b"contenido-de-la-instantanea-ajena\n";
+
 /// El fichero que la semilla deja dentro del árbol.
 pub(crate) const SEMILLA: &str = "semilla.txt";
 
@@ -251,6 +268,32 @@ pub(crate) fn snapshot_guardado(ruta: &Path, passphrase: &str, id: &str) -> Snap
         .into_iter()
         .next()
         .expect("el identificador tiene que resolver exactamente un snapshot")
+}
+
+/// El nodo del fichero `nombre` tal y como quedó en el snapshot `id`.
+///
+/// Publica el nodo entero y no solo sus bytes porque hay afirmaciones que son **sobre el
+/// nodo**: que el del volcado declara tamaño cero, por ejemplo, que es la razón de que el
+/// emparejamiento con la instantánea anterior tenga que desactivarse para un volcado. Con
+/// [`volcado_guardado`] eso no se puede medir —los bytes estarían ahí igual—.
+///
+/// Entra en pánico si el snapshot no tiene ese nodo: quien quiera afirmar «no está» tiene
+/// [`volcado_guardado`], que devuelve `Option` justo para eso.
+pub(crate) fn nodo_del_snapshot(ruta: &Path, passphrase: &str, id: &str, nombre: &str) -> Node {
+    let repositorio = abrir_local(ruta, passphrase);
+    let snapshot = repositorio
+        .get_snapshots(&[id])
+        .expect("el snapshot del identificador dado se lee del repositorio")
+        .into_iter()
+        .next()
+        .expect("el identificador tiene que resolver exactamente un snapshot");
+    let indexado = repositorio
+        .to_indexed()
+        .expect("el índice del repositorio de prueba se lee");
+
+    indexado
+        .node_from_snapshot_and_path(&snapshot, nombre)
+        .expect("el snapshot tiene que tener ese nodo dentro")
 }
 
 /// Los bytes del fichero `nombre` tal y como quedaron en el snapshot `id`.
@@ -426,6 +469,59 @@ pub(crate) fn sembrar_snapshots(ruta: &Path, passphrase: &str, fechas: &[&str]) 
         identificadores,
         nodo,
     }
+}
+
+/// Deja en el destino **una instantánea ajena**: otro host, otra etiqueta, otro comando y
+/// otro árbol, con un fichero distinto dentro.
+///
+/// Existe porque el listado tiene que salir **del repositorio** y no del histórico de
+/// ejecuciones de Kesto, y las instantáneas que siembra [`sembrar_snapshots`] no permiten
+/// medirlo: las tres salen del mismo ayudante, así que un listado que dedujera el contenido
+/// del histórico las devolvería igualmente. Esta no se parece a ninguna de ellas —ni el
+/// host, ni la etiqueta, ni el comando, ni el camino del fichero, ni su contenido—, de modo
+/// que si aparece en el listado es porque el listado leyó el repositorio.
+///
+/// Se archiva con la **biblioteca** y no con el módulo, que es lo que la hace ajena: el
+/// módulo de Kesto no ha intervenido en escribirla.
+///
+/// El destino tiene que estar ya **inicializado** —esto abre, no inicializa—: se siembra
+/// después de [`sembrar_snapshots`].
+///
+/// Devuelve el identificador en hex completo y el camino del fichero **dentro del árbol**,
+/// por la misma razón que [`Siembra`]: no se puede adivinar.
+pub(crate) fn sembrar_snapshot_ajeno(ruta: &Path, passphrase: &str) -> (String, String) {
+    let repositorio = abrir_local(ruta, passphrase)
+        .to_indexed_ids()
+        .expect("el índice reducido del repositorio sembrado se lee");
+
+    // La fuente, en su propio directorio temporal: al soltarse se borra, y para entonces los
+    // datos ya están dentro del repositorio.
+    let fuente = directorio_de_prueba();
+    let fichero = fuente.ruta().join(AJENA);
+    std::fs::write(&fichero, AJENA_CONTENIDO).expect("el fichero ajeno se escribe");
+    let nodo = fichero.to_string_lossy().trim_start_matches('/').to_owned();
+
+    let instantanea = SnapshotFile::from_options(
+        &SnapshotOptions::default()
+            .label(ETIQUETA_AJENA.to_owned())
+            .host(HOST_AJENO.to_owned())
+            .command("rustic -r otro-sitio backup /otro/sitio".to_owned()),
+    )
+    .expect("la instantánea ajena se construye");
+    let rutas = vec![fuente.ruta().to_path_buf()];
+    let origen = LocalSource::new(
+        LocalSourceSaveOptions::default(),
+        &Excludes::default(),
+        &LocalSourceFilterOptions::default(),
+        &rutas,
+    )
+    .expect("la fuente local de la instantánea ajena se construye");
+
+    let guardada = repositorio
+        .archive(&BackupOptions::default(), &origen, instantanea, &rutas)
+        .expect("la instantánea ajena se archiva");
+
+    (guardada.id.to_hex().as_str().to_owned(), nodo)
 }
 
 /// Configuración válida que apunta a una base de datos dada.

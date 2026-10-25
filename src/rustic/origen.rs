@@ -424,6 +424,26 @@ pub struct OrigenDelVolcado {
     inactividad_maxima: Duration,
 }
 
+impl OrigenDelVolcado {
+    /// El nombre con el que el motor pidió este volcado: es la identidad que el puente
+    /// **declara**, y la que el nodo tendrá dentro del árbol de la instantánea.
+    ///
+    /// Existe porque el nombre del origen y el de la copia vivían en dos sitios y nada
+    /// obligaba a que coincidieran: [`Copia::nombre`](crate::rustic::Copia) es lo que la
+    /// instantánea **declara** contener y este es lo que el árbol **contiene de verdad**,
+    /// así que si divergen la instantánea miente sobre su propio contenido —el mismo fallo
+    /// que el módulo existe para no cometer, en versión de metadatos—. Publicarlo es lo que
+    /// permite compararlos antes de archivar:
+    /// [`archivar_volcado`](crate::rustic::Repositorio::archivar_volcado) lo hace y rechaza
+    /// la copia entera si no coinciden.
+    ///
+    /// Lo que valida [`tunel_del_volcado`] no cubre esto: allí se comprueba que el nombre
+    /// **sirva** como nombre de fichero, no que sea el que la copia dice.
+    pub fn nombre(&self) -> &str {
+        &self.nombre
+    }
+}
+
 impl std::fmt::Debug for OrigenDelVolcado {
     /// Publica el nombre del volcado y nada del receptor ni de lo que viaja por él.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

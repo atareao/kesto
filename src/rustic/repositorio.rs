@@ -135,11 +135,17 @@ use crate::secret::SecretString;
 /// Se sacan con [`SecretString::expose`], que es un método con nombre: cada sitio que los
 /// usa queda visible al leer el código.
 ///
+/// **No es `Clone`**, y es deliberado: con la copia clonable, cada duplicación del acceso
+/// duplica en memoria los dos secretos —la clave y la passphrase—, que es justo lo que este
+/// tipo evita al no guardarse dentro del repositorio una vez abierto (el repositorio guarda
+/// el **nombre** del destino, no el acceso del que salió). Quien necesite hablar dos veces
+/// con el mismo destino construye el acceso otra vez desde la fila, que es de donde salió.
+///
 /// La `region` viaja tal cual y **no** se valida: el §3 la guarda, hay destinos que la
 /// declaran vacía y `opendal` decide qué hacer con eso. Lo que sí se valida es que el
 /// destino y las credenciales estén informados, porque un cubo vacío o una credencial
 /// vacía no son una configuración floja: son una fila que no puede funcionar.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Acceso {
     /// Endpoint del servicio S3.
     pub endpoint: String,
@@ -291,6 +297,40 @@ impl Copia {
 /// medidos —qué instantánea se guardó y qué contó el archivado como procesado—, y el
 /// motor los combina con la señal de la entrega del volcado y con el código de salida del
 /// proceso de extracción.
+///
+/// # Cuál de los dos números sirve para decidir, y cuál **no**
+///
+/// El motor necesita una tercera comprobación que no sea el `Ok` del archivado ni la señal
+/// de la entrega, y de los dos números que hay aquí **sólo uno sirve**:
+///
+/// - [`bytes`](Self::bytes) **no sirve**: vale `0` tanto en una copia truncada —el
+///   archivado descarta la entrada que falló— como en una copia legítimamente vacía, así
+///   que no distingue un fallo de un éxito. `0` no es un veredicto.
+/// - [`ficheros`](Self::ficheros) sí sirve, y está **medido** en las dos direcciones:
+///   archivar un volcado truncado deja `ficheros == 0` —ver
+///   `un_volcado_que_no_se_entrega_entero_no_deja_el_volcado_dentro`—, y archivar un
+///   volcado de **longitud cero** —un productor que declara el final sin enviar un solo
+///   byte— deja `ficheros == 1` con `bytes == 0` y el nodo presente en el árbol, con
+///   tamaño declarado cero. Un volcado vacío sigue siendo un nodo: por eso el apoderado
+///   sirve, y por eso `bytes` no.
+///
+/// Lo medido, con un volcado de **longitud cero** archivado por el puente:
+///
+/// ```text
+/// ficheros = 1
+/// bytes    = 0
+/// nodo     = File, con `size: 0` y contenido vacío (`Some([])`)
+/// ```
+///
+/// Lo miden dos pruebas y en las dos direcciones:
+/// `un_volcado_que_no_se_entrega_entero_no_deja_el_volcado_dentro` —el truncado, con
+/// `ficheros == 0` y el nodo ausente— y
+/// `un_volcado_de_longitud_cero_deja_un_nodo_vacio_y_cuenta_un_fichero` —el vacío, con
+/// `ficheros == 1` y el nodo presente—.
+///
+/// Quien componga la condición de éxito con `ficheros` está midiendo que **el volcado llegó
+/// al árbol**; quien la componga con `bytes` está midiendo que llegó algo, que no es lo
+/// mismo —una base de datos vacía produce un volcado vacío perfectamente bueno—.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopiaHecha {
     /// El identificador de la instantánea, en hex completo.
@@ -301,8 +341,19 @@ pub struct CopiaHecha {
     /// al listado.
     pub id: String,
     /// Los ficheros que el archivado contó como procesados.
+    ///
+    /// Es el apoderado que sirve para decidir si el volcado llegó: `0` significa que el
+    /// archivado **no procesó la entrada**, que es lo medido con un volcado truncado; `1`
+    /// significa que el nodo del volcado está en la instantánea, aunque esté vacío. Ver el
+    /// rustdoc del tipo.
     pub ficheros: u64,
     /// Los bytes que el archivado contó como procesados.
+    ///
+    /// **No vale para decidir el éxito**, y por eso no hay que leerlo como veredicto: `0` es
+    /// también el número de un volcado legítimamente vacío. Sirve para lo que sí dice —el
+    /// tamaño de la copia que el panel publica—, que es el único sitio donde ese número
+    /// existe: el nodo del volcado declara tamaño cero, porque su longitud no se conoce
+    /// hasta que termina.
     pub bytes: u64,
 }
 
@@ -430,7 +481,9 @@ impl Repositorio {
     ///
     /// Devuelve [`Error::AccesoInvalido`] si la fila no describe un destino utilizable,
     /// [`Error::DestinoNoAlcanzable`] si el destino no se alcanza o no se puede preparar, y
-    /// [`Error::PassphraseNoAbre`] si el repositorio existe y la passphrase no lo abre.
+    /// [`Error::PassphraseNoAbre`] si el repositorio existe y la passphrase no lo abre —lo
+    /// que incluye, medido, el caso de un repositorio sin claves utilizables: ver el
+    /// rustdoc de esa variante—.
     pub fn poner_en_marcha(
         acceso: &Acceso,
         barras: BarrasDelMotor,
@@ -451,18 +504,42 @@ impl Repositorio {
     /// [`tunel_del_volcado`](crate::rustic::tunel_del_volcado): es el `path` del nodo
     /// dentro del árbol y no puede ser un camino.
     ///
+    /// # El nombre de la copia y el del origen tienen que coincidir
+    ///
+    /// Antes de archivar nada se comprueba que [`Copia::nombre`] y
+    /// [`OrigenDelVolcado::nombre`] sean la misma cadena, y si no lo son se rechaza la copia
+    /// con [`Error::NombreDeVolcadoIncoherente`] **sin escribir nada**. Es la comprobación
+    /// que el tipo no impone y que hasta ahora sostenía un comentario en las pruebas
+    /// —«coinciden a propósito»—: la instantánea declara las rutas que le da la [`Copia`],
+    /// y el nodo que acaba dentro del árbol lo nombra el puente, así que dos nombres
+    /// distintos dejan una copia que dice contener lo que no tiene. Se comprueba antes de
+    /// `archive` y no después, porque después ya está guardada.
+    ///
     /// # Errors
     ///
     /// Devuelve [`Error::CopiaSinRutas`] si la copia no declara ninguna ruta —la
-    /// biblioteca indexaría su primera ruta sin preguntar— y [`Error::CopiaFallida`] si el
-    /// archivado falla. **Que no devuelva error no significa que la copia esté completa**:
-    /// ver el encabezado del módulo.
+    /// biblioteca indexaría su primera ruta sin preguntar—,
+    /// [`Error::NombreDeVolcadoIncoherente`] si el nombre de la copia y el del origen no
+    /// coinciden, y [`Error::CopiaFallida`] si el archivado falla. **Que no devuelva error
+    /// no significa que la copia esté completa**: ver el encabezado del módulo.
     pub fn archivar_volcado(
         &self,
         copia: &Copia,
         origen: &OrigenDelVolcado,
     ) -> Result<CopiaHecha, Error> {
         let rutas = copia.rutas()?;
+
+        // El nombre que la instantánea publica y el del nodo que se archiva tienen que ser
+        // el mismo, y eso no lo impone ningún tipo: la copia lleva el suyo y el puente
+        // nombra el suyo. Se comprueba aquí, que es el último punto en que discrepancia es
+        // un error con motivo en vez de una instantánea mintiendo sobre su contenido.
+        if copia.nombre != origen.nombre() {
+            return Err(Error::NombreDeVolcadoIncoherente {
+                en_la_copia: copia.nombre.clone(),
+                en_el_origen: origen.nombre().to_owned(),
+            });
+        }
+
         let instantanea = copia.instantanea()?;
         let opciones = BackupOptions::default().parent_opts(ParentOptions::default().force(true));
 
@@ -523,7 +600,9 @@ impl Repositorio {
     ///
     /// # Errors
     ///
-    /// Devuelve [`Error::RetencionFallida`] si falla cualquiera de las tres. **Una
+    /// Devuelve [`Error::RetencionQueLoBorraTodo`] si las tres reglas valen cero —no es una
+    /// retención que conserva de menos, es el historial entero del repositorio— y
+    /// [`Error::RetencionFallida`] si falla cualquiera de las tres operaciones. **Una
     /// retención que falla no cambia el resultado de la copia**: la copia ya está hecha y
     /// es correcta, y lo que hay que reportar es que la copia está y la retención no.
     pub fn aplicar_retencion(&self, retencion: &Retencion) -> Result<InformeDeRetencion, Error> {
@@ -599,21 +678,7 @@ impl Repositorio {
 /// Devuelve [`Error::AccesoInvalido`] si la fila no describe un destino utilizable y
 /// [`Error::DestinoNoAlcanzable`] si el destino no se puede construir con esas opciones.
 fn backends_de_s3(acceso: &Acceso) -> Result<RepositoryBackends, Error> {
-    acceso.validar()?;
-
-    let opciones: BTreeMap<String, String> = [
-        ("endpoint", acceso.endpoint.clone()),
-        ("region", acceso.region.clone()),
-        ("bucket", acceso.bucket.clone()),
-        ("access_key_id", acceso.access_key_id.clone()),
-        (
-            "secret_access_key",
-            acceso.secret_access_key.expose().to_owned(),
-        ),
-    ]
-    .into_iter()
-    .map(|(clave, valor)| (clave.to_owned(), valor))
-    .collect();
+    let opciones = opciones_de_s3(acceso)?;
 
     let backend: Arc<dyn WriteBackend> = Arc::new(
         OpenDALBackend::new(ESQUEMA_DE_S3, opciones).map_err(|error| {
@@ -625,6 +690,39 @@ fn backends_de_s3(acceso: &Acceso) -> Result<RepositoryBackends, Error> {
     );
 
     Ok(RepositoryBackends::new(backend, None))
+}
+
+/// Las opciones de `opendal` que describen el destino, y la validación de la fila.
+///
+/// Está separada de [`backends_de_s3`] porque es lo único de ese camino que se puede
+/// inspeccionar sin red: construir un operador de S3 no la necesita, pero **comprobar que
+/// los valores de la fila llegan al mapa sí es una prueba** y no hay otra forma de verlo
+/// desde fuera —`opendal` no publica las opciones con las que construyó su operador—. Así
+/// que esta función es el contrato que se prueba: la fila entra, y lo que sale es lo que
+/// viajará hasta la dependencia, incluida la clave secreta.
+///
+/// La validación de la fila va aquí y no en [`backends_de_s3`] a propósito: lo que no puede
+/// ser un destino no llega a convertirse en opciones.
+///
+/// # Errors
+///
+/// Devuelve [`Error::AccesoInvalido`] nombrando el primer campo vacío de la fila.
+fn opciones_de_s3(acceso: &Acceso) -> Result<BTreeMap<String, String>, Error> {
+    acceso.validar()?;
+
+    Ok([
+        ("endpoint", acceso.endpoint.clone()),
+        ("region", acceso.region.clone()),
+        ("bucket", acceso.bucket.clone()),
+        ("access_key_id", acceso.access_key_id.clone()),
+        (
+            "secret_access_key",
+            acceso.secret_access_key.expose().to_owned(),
+        ),
+    ]
+    .into_iter()
+    .map(|(clave, valor)| (clave.to_owned(), valor))
+    .collect())
 }
 
 /// El esquema de `opendal` que sirve a S3.
@@ -651,20 +749,25 @@ const ESQUEMA_DE_S3: &str = "s3";
 /// 3. si tiene ficheros, hay repositorio: se **abre** y el desenlace es
 ///    [`PuestaEnMarcha::Conectado`]. Si el abrir falla y el fallo es el de una passphrase
 ///    que no abre, se reporta como tal; cualquier otro fallo al abrir es un fallo del
-///    destino, porque se acaba de listar y por tanto se alcanza.
+///    destino, porque se acaba de listar y por tanto se alcanza. Ver
+///    [`Error::PassphraseNoAbre`] para lo que ese desenlace significa de verdad, que no es
+///    exactamente «la passphrase es la equivocada».
 ///
 /// # Visibilidad
 ///
-/// `pub(crate)` y no privada: las pruebas de [`crate::rustic::retencion`] también la
-/// necesitan, y compartir el banco de pruebas de un módulo entre dos ficheros de pruebas
-/// es más barato que duplicarlo. No es `pub`: no forma parte de la superficie del crate, y
-/// el destino local que recibe es un gancho de prueba, no un modo de funcionamiento.
+/// **Privada**, y no `pub(crate)` como decía antes su documentación: sus únicos
+/// consumidores son las pruebas de este mismo fichero, que son un módulo hijo y ven lo
+/// privado. Lo que sí necesitan las pruebas de [`crate::rustic::retencion`] son los
+/// ayudantes del arnés —`abrir_local` y compañía, que solo existen con `cfg(test)`—, y ésos
+/// no pasan por aquí: aquella prueba mide las reglas sobre un repositorio que abre por su
+/// cuenta. Tampoco es `pub`: el destino local que recibe es un gancho de prueba, no un modo
+/// de funcionamiento.
 ///
 /// # Errors
 ///
 /// Las tres del desenlace y las de la construcción del propio repositorio. Ver
 /// [`Repositorio::poner_en_marcha`].
-pub(crate) fn poner_en_marcha_con(
+fn poner_en_marcha_con(
     acceso: &Acceso,
     backends: RepositoryBackends,
     barras: BarrasDelMotor,
@@ -705,9 +808,19 @@ pub(crate) fn poner_en_marcha_con(
         (
             repositorio.open(&credenciales).map_err(|error| {
                 // Se acaba de listar el destino, así que se alcanza: si el abrir falla, lo
-                // que falla es la passphrase. Se comprueba con el código que la biblioteca
-                // publica para esa pregunta —el mismo que usa ella— y no por el texto del
-                // mensaje, que puede cambiar en cualquier versión menor.
+                // que falla es la apertura del repositorio. Se comprueba con el código que
+                // la biblioteca publica para esa pregunta —el mismo que usa ella— y no por
+                // el texto del mensaje, que puede cambiar en cualquier versión menor.
+                //
+                // Lo que ese código **no** distingue, y está medido: C002 sale también
+                // cuando el repositorio tiene configuración y **ninguna clave utilizable**
+                // —los ficheros de `keys/` no están, o están corruptos—. La biblioteca
+                // recorre sus claves saltando las que no puede leer y, si no le queda
+                // ninguna que acepte la contraseña, emite el mismo «no suitable key found»
+                // que con una contraseña equivocada. Así que la variante que se devuelve
+                // dice lo que se puede afirmar —no hay ninguna clave que abra con esta
+                // passphrase—, y no «la passphrase es la equivocada». Ver
+                // [`Error::PassphraseNoAbre`].
                 if error.is_incorrect_password() {
                     Error::PassphraseNoAbre {
                         destino: destino.clone(),
@@ -734,18 +847,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use rustic_backend::opendal::OpenDALBackend;
     use rustic_core::repofile::SnapshotFile;
     use rustic_core::{FileType, ReadBackend, SnapshotOptions};
 
     use crate::rustic::tunel_del_volcado;
+    use crate::secret::SecretString;
     use crate::test_support::{
-        CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, ETIQUETA_SEMBRADA, OTRA_PASSPHRASE_DE_PRUEBA,
-        PASSPHRASE_DE_PRUEBA, SEMILLA_CONTENIDO, acceso_local, backends_locales, barras_mudas,
-        directorio_de_prueba, sembrar_snapshots, snapshot_guardado, volcado_guardado,
+        AJENA_CONTENIDO, CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, ETIQUETA_AJENA,
+        ETIQUETA_SEMBRADA, OTRA_PASSPHRASE_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, SEMILLA_CONTENIDO,
+        acceso_local, backends_locales, barras_mudas, directorio_de_prueba, nodo_del_snapshot,
+        sembrar_snapshot_ajeno, sembrar_snapshots, snapshot_guardado, volcado_guardado,
     };
 
     use super::{
-        Acceso, Copia, CopiaHecha, Error, PuestaEnMarcha, Repositorio, poner_en_marcha_con,
+        Acceso, Copia, CopiaHecha, ESQUEMA_DE_S3, Error, PuestaEnMarcha, Repositorio,
+        backends_de_s3, opciones_de_s3, poner_en_marcha_con,
     };
 
     /// El plazo de inactividad de los túneles de prueba.
@@ -1680,6 +1797,786 @@ mod tests {
             time::macros::datetime!(2026-01-03 10:00:00 UTC),
             "la fecha del resumen no es la de la instantánea: se convirtió por su \
              representación local en vez de por su instante"
+        );
+
+        drop(repositorio);
+    }
+
+    /// **14.** El nombre del volcado de la copia y el del origen tienen que **coincidir**, y
+    /// si no, no se archiva nada.
+    ///
+    /// Es la comprobación que ningún tipo impone y que antes sostenía un comentario de las
+    /// pruebas —«el nombre y las rutas coinciden a propósito»—, que es reconocer que la
+    /// pareja podía divergir. Lo que se fija aquí es fail-closed por construcción: con los
+    /// dos nombres iguales se archiva, y con dos distintos se devuelve
+    /// [`Error::NombreDeVolcadoIncoherente`] **sin tocar el destino**.
+    ///
+    /// La segunda mitad es la que importa y se comprueba de dos formas: por el error —que
+    /// nombra los dos nombres, para que quien lo lea vea la discrepancia— y por la foto del
+    /// destino, que tiene que quedar idéntica. Comprobar solo el error dejaría pasar una
+    /// implementación que rechazara **después** de escribir la instantánea, que es
+    /// exactamente el desenlace que hay que evitar: una copia que existe, dice contener algo
+    /// y contiene otra cosa.
+    ///
+    /// El caso de los nombres distintos se construye con el **túnel** —que es quien nombra
+    /// el nodo del árbol— pidiéndole un nombre y entregándole una copia con otro, que es
+    /// justo el fallo que se teme: el motor llama al túnel con un nombre y construye la copia
+    /// con otro.
+    #[test]
+    fn archivar_volcado_exige_que_el_nombre_de_la_copia_y_el_del_origen_coincidan() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+
+        // El lado que se conserva: los dos nombres iguales archivan.
+        let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
+        let hecho = archivar(&repositorio, &copia, b"-- tienda\nSELECT 1;\n")
+            .expect("con los dos nombres iguales el volcado se archiva");
+        assert_eq!(
+            volcado_guardado(
+                &destino.ruta,
+                PASSPHRASE_DE_PRUEBA,
+                &hecho.id,
+                &copia.nombre
+            ),
+            Some(b"-- tienda\nSELECT 1;\n".to_vec()),
+            "el volcado archivado no se puede leer con el nombre que la copia declara"
+        );
+
+        // El lado que se rechaza: el túnel nombra el nodo con un nombre y la copia declara
+        // otro. La instantánea diría contener `en_la_copia` y contendría `en_el_origen`.
+        let antes = destino.instantanea();
+        let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
+        let tunel = tunel_del_volcado("volcado-de-otra-cosa.sql".to_owned(), 4, PLAZO_DE_PRUEBA)
+            .expect("el nombre del otro volcado es válido");
+        let productor = tunel.productor;
+        let emisor = std::thread::spawn(move || productor.terminar());
+
+        let error = repositorio
+            .archivar_volcado(&copia, &tunel.origen)
+            .expect_err("con los dos nombres distintos no se puede archivar");
+        emisor.join().expect("el hilo productor no puede caerse");
+
+        let Error::NombreDeVolcadoIncoherente {
+            en_la_copia,
+            en_el_origen,
+        } = &error
+        else {
+            panic!(
+                "una copia cuyo nombre no es el del nodo tiene que rechazarse nombrando la \
+                 discrepancia, y se rechazó de otra forma: {error}"
+            );
+        };
+        assert_eq!(
+            en_la_copia, &copia.nombre,
+            "el error no dice el nombre que la copia declara"
+        );
+        assert_eq!(
+            en_el_origen,
+            tunel.origen.nombre(),
+            "el error no dice el nombre con el que el origen nombra su nodo"
+        );
+        assert_ne!(
+            en_la_copia, en_el_origen,
+            "los dos nombres del error son iguales: el error no describe una discrepancia"
+        );
+
+        assert_eq!(
+            destino.instantanea(),
+            antes,
+            "la copia con el nombre incoherente se rechazó **después** de escribir en el \
+             destino: la instantánea que declara una cosa y contiene otra quedó guardada"
+        );
+
+        drop(repositorio);
+    }
+
+    /// **15.** El nodo del volcado declara **tamaño cero**, y el tamaño real está en el
+    /// resumen.
+    ///
+    /// Es la mitad del contrato que faltaba por comprobar: el escenario dice literalmente
+    /// que el nodo del volcado declara tamaño cero y que el tamaño de verdad está en el
+    /// resumen de la instantánea, y hasta ahora la prueba del volcado comprobaba el resumen
+    /// y **no** el nodo. Y la afirmación tiene consecuencia: es la razón de que el
+    /// emparejamiento con la instantánea anterior haya que desactivarlo para un volcado —dos
+    /// copias del mismo destino comparan igual, la biblioteca descarta el lector sin leerlo y
+    /// la instantánea nueva apunta al contenido de la anterior—, así que si el nodo pasara a
+    /// llevar el tamaño real, media docena de comentarios del módulo quedarían mintiendo.
+    ///
+    /// Se comprueba con un volcado de contenido **no vacío**, que es cuando se nota: un nodo
+    /// de tamaño cero con un contenido de verdad es un nodo que no puede tener el tamaño
+    /// dentro.
+    #[test]
+    fn el_nodo_del_volcado_declara_tamano_cero() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
+        let contenido = b"-- tienda\nCREATE TABLE tienda (id INT);\n";
+
+        let hecho = archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+
+        let nodo = nodo_del_snapshot(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &hecho.id,
+            &copia.nombre,
+        );
+        assert_eq!(
+            nodo.meta.size, 0,
+            "el nodo del volcado declara tamaño {} y el contrato dice que declara cero: el \
+             tamaño de un volcado por `stdout` no se conoce hasta que termina, y el único \
+             sitio donde existe es el resumen de la instantánea. Si el nodo lo llevara, el \
+             emparejamiento con la instantánea anterior lo compararía y la segunda copia \
+             del mismo destino se descartaría sin leerla",
+            nodo.meta.size
+        );
+        assert!(
+            hecho.bytes > 0,
+            "el volcado archivado no tiene bytes: la comprobación de arriba pasa por vacío"
+        );
+        assert_eq!(
+            volcado_guardado(
+                &destino.ruta,
+                PASSPHRASE_DE_PRUEBA,
+                &hecho.id,
+                &copia.nombre
+            ),
+            Some(contenido.to_vec()),
+            "el nodo declara tamaño cero pero el contenido tiene que estar entero dentro"
+        );
+        assert_eq!(
+            hecho.bytes,
+            contenido.len() as u64,
+            "el tamaño real del volcado tiene que estar en el resumen, y el resumen dice {} \
+             para un contenido de {}",
+            hecho.bytes,
+            contenido.len()
+        );
+
+        drop(repositorio);
+    }
+
+    /// **16.** Un volcado de **longitud cero** —un productor que declara el final sin mandar
+    /// un solo byte— deja **un** fichero dentro del árbol y **cero** bytes.
+    ///
+    /// Es la medición que decide cuál de los dos números de [`CopiaHecha`] sirve para
+    /// componer la condición de éxito: `bytes` no puede servir porque vale `0` lo mismo en un
+    /// volcado vacío que en uno truncado, y `ficheros` sólo sirve si un volcado vacío sigue
+    /// siendo un nodo. Aquí se mide, y sale `ficheros == 1` y `bytes == 0` con el nodo
+    /// presente y de tamaño declarado cero.
+    ///
+    /// El caso no es un invento: una base de datos recién creada, sin tablas y sin datos,
+    /// produce un volcado perfectamente vacío. Y `terminar` sin enviar nada **es** una
+    /// entrega completa —lo que distingue un volcado vacío de uno truncado es el final
+    /// declarado, no el tamaño—, y la prueba lo comprueba: sin eso, lo que se estaría
+    /// midiendo es el caso del truncado, que ya tiene la suya.
+    #[test]
+    fn un_volcado_de_longitud_cero_deja_un_nodo_vacio_y_cuenta_un_fichero() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let copia = copia_de("volcado-vacio.sql", ETIQUETA);
+
+        let hecho = archivar(&repositorio, &copia, b"").expect("archivar no puede fallar");
+
+        assert_eq!(
+            hecho.ficheros, 1,
+            "un volcado de longitud cero tiene que dejar su nodo en el árbol —es la medición \
+             que decide que `ficheros` sirva como apoderado del éxito—, y el archivado contó \
+             {} ficheros. Si esto cambia, el apoderado cambia con él y lo que hay que usar \
+             para decidir el éxito es otra cosa",
+            hecho.ficheros
+        );
+        assert_eq!(
+            hecho.bytes, 0,
+            "un volcado vacío no puede tener bytes, y el archivado contó {}",
+            hecho.bytes
+        );
+        assert_eq!(
+            volcado_guardado(
+                &destino.ruta,
+                PASSPHRASE_DE_PRUEBA,
+                &hecho.id,
+                &copia.nombre
+            ),
+            Some(Vec::new()),
+            "el nodo del volcado vacío no está en el árbol: `ficheros == 1` y el nodo ausente \
+             no pueden ser verdad a la vez"
+        );
+        let nodo = nodo_del_snapshot(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &hecho.id,
+            &copia.nombre,
+        );
+        assert_eq!(
+            nodo.meta.size, 0,
+            "el nodo del volcado vacío declara tamaño {} y no puede declarar otro",
+            nodo.meta.size
+        );
+
+        drop(repositorio);
+    }
+
+    /// **17.** El listado trae **también** las instantáneas que no creó Kesto.
+    ///
+    /// Es la mitad del escenario del listado que no estaba medida: el módulo promete que la
+    /// lista sale **del repositorio** y no del histórico de ejecuciones —«una instantánea que
+    /// no está en el histórico es una copia hecha con otra herramienta»—, pero las tres
+    /// instantáneas de la prueba del listado las siembra el mismo ayudante, así que un
+    /// listado que dedujera su contenido del histórico las habría devuelto igual y la prueba
+    /// habría pasado midiendo otra cosa.
+    ///
+    /// Aquí se siembra una instantánea **ajena** —la archiva la biblioteca, con otro host,
+    /// otra etiqueta, otro comando, otro camino de fichero y otro contenido— y se comprueba
+    /// que aparece en el listado, con sus datos: no vale con que aparezca el identificador,
+    /// porque lo que se está midiendo es que el resumen se construye desde el repositorio.
+    #[test]
+    fn el_listado_trae_tambien_las_instantaneas_que_no_creo_kesto() {
+        let destino = Destino::nuevo();
+        let siembra = sembrar_snapshots(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &[
+                "2026-01-01T10:00:00Z",
+                "2026-01-02T10:00:00Z",
+                "2026-01-03T10:00:00Z",
+            ],
+        );
+        let (ajena, nodo_ajeno) = sembrar_snapshot_ajeno(&destino.ruta, PASSPHRASE_DE_PRUEBA);
+
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino sembrado se abre");
+
+        let todos = repositorio
+            .listar_snapshots(100)
+            .expect("el repositorio se puede listar");
+        assert_eq!(
+            todos.len(),
+            4,
+            "el repositorio tiene tres instantáneas sembradas y una ajena, y el listado \
+             devolvió {}: el listado no está saliendo del repositorio",
+            todos.len()
+        );
+
+        let resumen = todos
+            .iter()
+            .find(|resumen| resumen.id == ajena)
+            .unwrap_or_else(|| {
+                panic!(
+                    "la instantánea ajena no está en el listado ({ajena}): el listado solo \
+                     devuelve lo que el histórico de Kesto conoce, y su contrato dice que \
+                     sale del repositorio"
+                )
+            });
+
+        assert_eq!(
+            resumen.etiqueta.as_deref(),
+            Some(ETIQUETA_AJENA),
+            "el resumen de la instantánea ajena no trae su etiqueta"
+        );
+        assert_eq!(
+            resumen.rutas.len(),
+            1,
+            "el resumen de la instantánea ajena no trae sus rutas: {:?}",
+            resumen.rutas
+        );
+        assert_ne!(
+            resumen.rutas,
+            snapshot_guardado(
+                &destino.ruta,
+                PASSPHRASE_DE_PRUEBA,
+                &siembra.identificadores[0]
+            )
+            .paths
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>(),
+            "la instantánea ajena declara las mismas rutas que una sembrada: no es ajena, y \
+             esta prueba no mediría lo que dice medir"
+        );
+        assert!(
+            resumen.bytes > 0,
+            "el resumen de la instantánea ajena dice que procesó cero bytes"
+        );
+        assert_eq!(
+            volcado_guardado(&destino.ruta, PASSPHRASE_DE_PRUEBA, &ajena, &nodo_ajeno),
+            Some(AJENA_CONTENIDO.to_vec()),
+            "el contenido de la instantánea ajena no se puede restaurar y el resumen dice que \
+             está: el listado la leyó a medias"
+        );
+
+        // Y el orden del listado sigue siendo el suyo: la ajena se archivó **ahora**, así que
+        // es la más reciente de las cuatro. Es lo que hace que la ventana del panel deje
+        // fuera las sembradas de enero antes que la de hoy.
+        assert_eq!(
+            todos[0].id, ajena,
+            "la instantánea ajena es la más reciente y no encabeza el listado"
+        );
+
+        drop(repositorio);
+    }
+
+    /// **18.** Un repositorio con su configuración y **sin claves utilizables** se reporta
+    /// como [`Error::PassphraseNoAbre`], y **está medido** que es lo que ocurre.
+    ///
+    /// Es la corrección del hallazgo: `is_incorrect_password()` es `is_code("C002")`, y C002
+    /// lo emite la biblioteca **sólo** al final del bucle que busca una clave que acepte la
+    /// contraseña —un bucle que salta los errores de las claves que no puede leer y sigue—.
+    /// Así que un destino que tiene configuración y **ninguna clave utilizable** —una clave
+    /// corrupta, un repositorio a medio inicializar, un `keys/` que se perdió— cae también
+    /// por ahí, y el módulo lo reporta con la variante de la passphrase.
+    ///
+    /// Lo que esta prueba fija es **la medición, no una aspiración**: se monta el caso
+    /// —inicializar el destino y retirarle todo lo que no sea `config`— y se comprueba que
+    /// sale esta variante y no la de destino inalcanzable. Si algún día la biblioteca
+    /// distingue los dos casos, esta prueba cae y hay que volver a medir; entonces la
+    /// variante podrá prometer algo más de lo que promete hoy. Lo que **no** puede pasar es
+    /// que el módulo prometa distinguirlos mientras la biblioteca no los distinga.
+    ///
+    /// Y se comprueba además la parte del motivo que sí se puede afirmar: lleva el código
+    /// que la biblioteca publica para esa pregunta —`C002`—, y nombra el destino. Ese código
+    /// es lo que hace que el desenlace salga por el camino de la passphrase en vez del de
+    /// destino inalcanzable, así que dejarlo escrito es lo que ata la prueba a la causa.
+    #[test]
+    fn un_repositorio_sin_claves_utilizables_se_reporta_como_una_passphrase_que_no_abre() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        drop(repositorio);
+
+        // El destino queda con su `config` y sin nada más: es el repositorio al que se le
+        // perdió el directorio de claves. `config` se conserva porque es lo que decide que
+        // el desenlace sea «existe» y no «no existe» —que es lo que hace que la biblioteca
+        // llegue al bucle de las claves en vez de decir que no hay repositorio—.
+        let mut quedan = 0;
+        for (relativa, _) in destino.instantanea() {
+            if !relativa.starts_with("config") {
+                std::fs::remove_file(destino.ruta.join(&relativa))
+                    .expect("los ficheros del destino se pueden retirar");
+            } else {
+                quedan += 1;
+            }
+        }
+        assert_eq!(
+            quedan, 1,
+            "el destino tiene que quedarse con un solo fichero de configuración y quedaron \
+             {quedan}: sin él el desenlace sería «el repositorio no existe», que es otro caso"
+        );
+
+        let error = destino.en_marcha(PASSPHRASE_DE_PRUEBA).expect_err(
+            "un repositorio sin claves utilizables no puede abrirse, ni siquiera con la \
+             passphrase con la que se creó",
+        );
+
+        let Error::PassphraseNoAbre {
+            destino: nombrado,
+            motivo,
+        } = &error
+        else {
+            panic!(
+                "medido: sin claves utilizables la biblioteca devuelve el mismo código que con \
+                 una contraseña equivocada —C002—, así que la variante tiene que ser la de la \
+                 passphrase. Salió otra cosa: {error}"
+            );
+        };
+        assert!(
+            nombrado.contains(&destino.ruta.display().to_string()),
+            "el motivo del fallo no nombra el destino ({}): {nombrado}",
+            destino.ruta.display()
+        );
+        assert!(
+            motivo.contains("C002"),
+            "el motivo tiene que llevar el código con el que la biblioteca señala «no hay \
+             ninguna clave que acepte esta contraseña» —C002—, porque es el código el que \
+             decide el desenlace y no el texto: {motivo}"
+        );
+    }
+
+    /// **19.** Un fallo de `open()` que **no** es el de la passphrase no se reporta como
+    /// passphrase: sale como fallo del destino.
+    ///
+    /// Es el otro lado de la rama `if` de [`poner_en_marcha_con`], y hasta ahora no estaba
+    /// cubierto: el caso «destino inalcanzable» se provocaba **antes** de `open()`, así que
+    /// una implementación que asignara la variante de la passphrase a **cualquier** fallo de
+    /// `open()` habría pasado todas las pruebas anteriores. Aquí se provoca un fallo de
+    /// `open()` de verdad y distinto.
+    ///
+    /// Cómo, sin red y sin depender del texto de la biblioteca: se deja el destino con su
+    /// configuración y se ponen sus ficheros en modo `000`. Listar el destino —la pregunta
+    /// que decide si hay repositorio— es un recorrido de directorio y **no** necesita leer
+    /// los ficheros, así que el desenlace es «existe»; leer la configuración, en cambio,
+    /// falla con un error de permisos del backend, que no es C002. Medido, el motivo es:
+    ///
+    /// ```text
+    /// Error: Failed to read the contents of the file. Please check the file and try again.
+    ///     (kind: related to the backend): caused by: Permission denied (os error 13)
+    /// ```
+    ///
+    /// Los permisos se restauran al terminar: el directorio de la prueba se borra al soltar
+    /// su guarda, y `remove_dir_all` sobre un directorio en modo `000` tampoco puede. El
+    /// `Drop` de la guarda ignora el fallo del borrado, así que sin restaurarlos lo que
+    /// quedaría es basura en el directorio temporal —y en `/tmp`, que aquí es RAM—.
+    #[test]
+    fn un_fallo_de_apertura_que_no_es_el_de_la_passphrase_es_un_fallo_del_destino() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        drop(repositorio);
+
+        let ficheros = destino.instantanea();
+        assert!(
+            !ficheros.is_empty(),
+            "el destino se inicializó y su foto está vacía"
+        );
+
+        let mut permisos_originales = Vec::new();
+        for (relativa, _) in &ficheros {
+            let camino = destino.ruta.join(relativa);
+            let originales = std::fs::metadata(&camino)
+                .expect("cada fichero del destino tiene metadatos")
+                .permissions();
+            let mut sin_permisos = originales.clone();
+            sin_permisos.set_mode(0o000);
+            std::fs::set_permissions(&camino, sin_permisos)
+                .expect("los permisos del destino se pueden cambiar");
+            permisos_originales.push((camino, originales));
+        }
+
+        let resultado = destino.en_marcha(PASSPHRASE_DE_PRUEBA);
+
+        // Se devuelven los permisos **antes** de comprobar nada: si una aserción entra en
+        // pánico, el `Drop` de la guarda tiene que poder borrar el directorio.
+        for (camino, originales) in permisos_originales {
+            std::fs::set_permissions(&camino, originales)
+                .expect("los permisos del destino se pueden devolver");
+        }
+
+        let error = resultado.expect_err("con los ficheros ilegibles, el destino no abre");
+
+        let Error::DestinoNoAlcanzable {
+            destino: nombrado,
+            motivo,
+        } = &error
+        else {
+            panic!(
+                "un fallo de apertura que no es el de la passphrase —un error de permisos del \
+                 backend— tiene que reportarse como fallo del destino y no como «la passphrase \
+                 no abre»: una implementación que asignara esa variante a cualquier fallo de \
+                 `open()` pasaría todas las demás pruebas. Salió: {error}"
+            );
+        };
+        assert!(
+            !matches!(error, Error::PassphraseNoAbre { .. }),
+            "el fallo de permisos del backend se confundió con una passphrase que no abre: \
+             {error}"
+        );
+        assert!(
+            nombrado.contains(&destino.ruta.display().to_string()),
+            "el fallo del destino no nombra el destino ({}): {nombrado}",
+            destino.ruta.display()
+        );
+        assert!(
+            motivo.contains("Permission denied") || motivo.contains("os error 13"),
+            "el motivo no es el del fallo de permisos que provoca la prueba, así que esta \
+             prueba puede estar midiendo otro fallo del destino: {motivo}"
+        );
+    }
+
+    /// **20.** El destino de S3 se construye con el esquema que funciona (`"s3"`) y **no**
+    /// con el que le pide a `opendal` un servicio que no existe (`"opendal:s3"`).
+    ///
+    /// Es la prueba que faltaba del camino de S3, y el único camino del módulo que quedaba
+    /// sin candado. Lo que fija importa porque quien «arregle» la constante a `"opendal:s3"`
+    /// —que es lo que parece natural, porque es la forma de una URL de backend— pasa las
+    /// cuatro puertas del CI: ninguna prueba tocaba esta función. Y no necesita red:
+    /// construir un operador de S3 no la necesita, porque `opendal` no contacta con el
+    /// destino hasta que se le pide un dato.
+    ///
+    /// Los dos errores son distinguibles y la prueba comprueba **el texto medido**: el
+    /// esquema malo le pide un servicio llamado «opendal», que no está registrado, y el
+    /// error lo dice nombrando el esquema y la lista de los que sí existen. Medido:
+    ///
+    /// ```text
+    /// Error: Creating Operator from path `opendal:s3` failed. Please check the given schema
+    ///     and options. (kind: related to the backend): caused by: Unsupported (permanent) at
+    ///     , context: { scheme: opendal, available: azblob, …, s3, … } => scheme is not
+    ///     registered
+    /// ```
+    #[test]
+    fn el_destino_de_s3_se_construye_con_el_esquema_bueno_y_no_con_el_malo() {
+        let destino = Destino::nuevo();
+        let acceso = destino.acceso(PASSPHRASE_DE_PRUEBA);
+        let opciones = opciones_de_s3(&acceso).expect("la fila de prueba es un destino válido");
+
+        // El esquema bueno construye el backend, y el destino que construye es el que se le
+        // pidió: `opendal` publica su localización, y ahí está el cubo.
+        let bueno = OpenDALBackend::new(ESQUEMA_DE_S3, opciones.clone()).unwrap_or_else(|error| {
+            panic!(
+                "el esquema `{ESQUEMA_DE_S3}` tiene que construir el backend sin red y falló: \
+                 {}. Es el esquema que la biblioteca registra para S3; si esto falla, la \
+                 constante que usa el módulo no es la que `opendal` espera",
+                error.display_log()
+            )
+        });
+        assert_eq!(
+            ESQUEMA_DE_S3, "s3",
+            "el módulo tiene que pasarle a `opendal` el **esquema** de S3, que es `s3`"
+        );
+        assert!(
+            bueno.location().ends_with(&acceso.bucket),
+            "la localización del backend ({}) no termina en el cubo de la fila ({})",
+            bueno.location(),
+            acceso.bucket
+        );
+
+        // Y el camino de producción entero —la función que el motor usa— construye los
+        // backends con esa misma constante: es la comprobación de que lo que se prueba
+        // arriba es lo que se usa, y no una constante paralela que solo existe en la prueba.
+        let backends = backends_de_s3(&acceso)
+            .expect("el camino de producción construye los backends de S3 sin red");
+        assert!(
+            backends.repository().location().ends_with(&acceso.bucket),
+            "el backend que construye el camino de producción no apunta al cubo de la fila"
+        );
+
+        // El esquema malo falla, y el error nombra el esquema equivocado.
+        let error = OpenDALBackend::new("opendal:s3", opciones).expect_err(
+            "`opendal:s3` no es un esquema: la ruta se parte por el primer `:` y lo que \
+                 queda delante es el servicio que `opendal` busca en su registro",
+        );
+        let motivo = error.display_log();
+        assert!(
+            motivo.contains("opendal"),
+            "el error del esquema malo no nombra el esquema que no está registrado: {motivo}"
+        );
+        assert!(
+            motivo.contains("scheme is not registered"),
+            "el error del esquema malo no dice que el esquema no está registrado: {motivo}"
+        );
+    }
+
+    /// **21.** Los valores de la fila —endpoint, región y cubo— **llegan** al destino de S3.
+    ///
+    /// Es la comprobación que el camino de S3 no tenía, y va por dentro: `opendal` no publica
+    /// las opciones con las que construyó su operador, así que la única forma de ver desde
+    /// fuera que los valores de la fila viajan es mirar el mapa que el módulo le entrega a la
+    /// dependencia. Ese mapa es el contrato —lo que sale de aquí es lo que la dependencia
+    /// recibe, y ahí dentro va el `secret_access_key`—, y por eso [`opciones_de_s3`] está
+    /// separada de [`backends_de_s3`].
+    ///
+    /// La región se comprueba aunque el §3 admita que esté vacía: lo que se afirma no es que
+    /// tenga un valor útil, sino que **el que la fila trae es el que llega**, sin que nadie lo
+    /// descarte por no validarlo.
+    #[test]
+    fn los_valores_de_la_fila_llegan_al_destino_de_s3() {
+        let acceso = Acceso {
+            endpoint: "https://s3.example.test:9000".to_owned(),
+            bucket: "cesto-de-copias".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let opciones = opciones_de_s3(&acceso).expect("la fila describe un destino utilizable");
+
+        for (clave, valor) in [
+            ("endpoint", acceso.endpoint.as_str()),
+            ("region", acceso.region.as_str()),
+            ("bucket", acceso.bucket.as_str()),
+            ("access_key_id", acceso.access_key_id.as_str()),
+        ] {
+            assert_eq!(
+                opciones.get(clave).map(String::as_str),
+                Some(valor),
+                "el valor de `{clave}` no llega al destino de S3: el mapa que se le entrega a \
+                 la dependencia trae {:?}",
+                opciones.get(clave)
+            );
+        }
+
+        // Y el cubo se puede ver también desde el backend ya construido, que es lo que
+        // confirma que el mapa no se queda por el camino.
+        let backend = OpenDALBackend::new(ESQUEMA_DE_S3, opciones)
+            .expect("el esquema de S3 construye el backend sin red");
+        assert!(
+            backend.location().ends_with(&acceso.bucket),
+            "el backend construido no apunta al cubo de la fila: {}",
+            backend.location()
+        );
+    }
+
+    /// **22.** Un fallo al construir el destino de S3 **no publica la clave secreta**.
+    ///
+    /// El único sitio del módulo donde el `secret_access_key` entra en un `BTreeMap` que se
+    /// le entrega a una dependencia, y el único que quedaba sin mirar. Lo que se comprueba es
+    /// que el camino de salida de un error de esa construcción no arrastra el mapa: el
+    /// `secret_access_key` es un [`SecretString`], así que no puede salir por formateo, pero
+    /// el mapa que se construye **sí lleva el valor en claro** —la dependencia lo necesita
+    /// así— y lo que hay que asegurar es que ese mapa no acaba dentro de un mensaje.
+    ///
+    /// El fallo se provoca con el **esquema malo**, que es lo único de la construcción que
+    /// falla sin red: un endpoint al que no se puede llegar no falla aquí, porque `opendal`
+    /// no contacta con el destino hasta que le piden un dato. La aserción lleva su control
+    /// —que el error no esté vacío— para que no pase por vacío.
+    #[test]
+    fn un_fallo_al_construir_el_destino_de_s3_no_publica_la_clave_secreta() {
+        let acceso = Acceso {
+            endpoint: "https://s3.example.test:9000".to_owned(),
+            bucket: "cesto-de-copias".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+        let opciones = opciones_de_s3(&acceso).expect("la fila describe un destino utilizable");
+        assert_eq!(
+            opciones.get("secret_access_key").map(String::as_str),
+            Some(CLAVE_SECRETA_DE_PRUEBA),
+            "el mapa tiene que llevar la clave secreta en claro —la dependencia la necesita \
+             así—, o esta prueba no mediría lo que dice medir"
+        );
+
+        let error = OpenDALBackend::new("opendal:s3", opciones)
+            .expect_err("el esquema malo no construye nada");
+        let publicado = format!("{} {error:?} {}", error.display_log(), error);
+
+        assert!(
+            !publicado.is_empty() && publicado.trim().len() > 1,
+            "el error de la construcción está vacío, así que la comprobación de abajo pasaría \
+             sin medir nada"
+        );
+        assert!(
+            !publicado.contains(CLAVE_SECRETA_DE_PRUEBA),
+            "un error al construir el destino de S3 publicó la clave secreta: {publicado}"
+        );
+        assert!(
+            !publicado.contains(PASSPHRASE_DE_PRUEBA),
+            "un error al construir el destino de S3 publicó la passphrase: {publicado}"
+        );
+    }
+
+    /// **23.** El informe de la retención lleva lo que el plan de purga dice que va a
+    /// reclamar, y el número sale del plan.
+    ///
+    /// Es lo que hace verdad el comentario que decía que el plan se calcula antes «para que
+    /// quede constancia de lo que se va a borrar»: hasta ahora el plan se calculaba y se
+    /// entregaba a la purga sin que nadie le leyera nada, así que la constancia no existía.
+    ///
+    /// El escenario se construye con **tres volcados de contenido distinto** y no con la
+    /// siembra de fechas: las instantáneas de la siembra comparten el mismo árbol —son el
+    /// mismo árbol con otro sello de tiempo—, así que retirar dos no deja nada sin
+    /// referenciar y el plan diría `0`. Con contenidos distintos cada instantánea tiene su
+    /// propio contenido, y al retirar dos el plan tiene algo que reclamar de verdad: es el
+    /// caso que hace que el campo se pueda comprobar en positivo y no solo «que sea cero».
+    ///
+    /// **Medido, y es donde la primera versión de esta prueba se equivocó**: el número son
+    /// bytes de **paquete**, no bytes de contenido. Los tres volcados suman `217` bytes de
+    /// contenido y el plan dice que va a reclamar `514`, porque dentro de los paquetes van
+    /// además los árboles y el armazón de los paquetes:
+    ///
+    /// ```text
+    /// // FALLO MEDIDO:
+    /// el plan dice que va a reclamar 514 bytes y lo archivado en total fueron 217: una purga
+    /// no puede reclamar más de lo que se escribió en el repositorio
+    /// ```
+    ///
+    /// Por eso lo que se comprueba es que sea mayor que cero —que el plan se leyó y tenía
+    /// trabajo— y no una cota por el tamaño de los volcados, que no es la magnitud de este
+    /// campo. La interpretación está en el rustdoc de
+    /// [`InformeDeRetencion::bytes_a_reclamar`].
+    ///
+    /// Y se comprueba también el otro lado, que es el de la primera prueba de la retención
+    /// del repositorio: cuando lo retirado compartía árbol con lo que se conserva, el plan no
+    /// tiene nada que reclamar y el campo vale `0` sin que eso sea un fallo.
+    #[test]
+    fn el_informe_de_retencion_lleva_los_bytes_que_el_plan_va_a_reclamar() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
+
+        for contenido in [
+            &b"-- de ayer\nCREATE TABLE tienda (id INT);\n"[..],
+            &b"-- de hoy\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (7);\n"[..],
+            &b"-- de manana\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (8);\n\
+              INSERT INTO tienda VALUES (9);\n"[..],
+        ] {
+            archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+        }
+
+        let informe = repositorio
+            .aplicar_retencion(&crate::rustic::Retencion {
+                keep_daily: 1,
+                keep_weekly: 0,
+                keep_monthly: 0,
+            })
+            .expect("aplicar la retención no puede fallar");
+
+        assert_eq!(
+            informe.retirados.len(),
+            2,
+            "con `keep_daily = 1` sobre tres instantáneas del mismo día tienen que sobrar dos, \
+             y sobraron {}",
+            informe.retirados.len()
+        );
+        assert!(
+            informe.purgado,
+            "la retención retiró instantáneas y no purgó"
+        );
+        assert!(
+            informe.bytes_a_reclamar > 0,
+            "los dos volcados retirados tenían contenido propio y el plan dice que no hay nada \
+             que reclamar: el informe no está leyendo el plan, o lo está leyendo después de \
+             que la purga hiciera su trabajo"
+        );
+
+        // El otro lado: retirar sin dejar nada huérfano da `0`, y `0` no es un fallo.
+        let destino = Destino::nuevo();
+        sembrar_snapshots(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &[
+                "2026-01-01T10:00:00Z",
+                "2026-01-02T10:00:00Z",
+                "2026-01-03T10:00:00Z",
+            ],
+        );
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino sembrado se abre");
+
+        let informe = repositorio
+            .aplicar_retencion(&crate::rustic::Retencion {
+                keep_daily: 1,
+                keep_weekly: 0,
+                keep_monthly: 0,
+            })
+            .expect("aplicar la retención no puede fallar");
+
+        assert_eq!(
+            informe.retirados.len(),
+            2,
+            "la siembra tiene tres fechas en tres días distintos y `keep_daily = 1` tiene que \
+             retirar dos"
+        );
+        assert_eq!(
+            informe.bytes_a_reclamar, 0,
+            "las tres instantáneas sembradas comparten el mismo árbol, así que al retirar dos \
+             no queda nada sin referenciar y el plan no tiene nada que reclamar: el informe \
+             dice {}",
+            informe.bytes_a_reclamar
         );
 
         drop(repositorio);

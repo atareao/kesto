@@ -51,7 +51,15 @@
 //!
 //! - **cero** significa «no conservar ninguna por esta regla», y se respeta: el §3 admite
 //!   ese valor y la retención que lo escriba se lleva por delante todas las instantáneas
-//!   que no conserve otra regla. Es una instrucción, no un error.
+//!   que no conserve otra regla. Es una instrucción, no un error — pero **sólo mientras
+//!   otra regla conserve algo**: ver el punto siguiente—.
+//! - **las tres a la vez a cero** sí es un error, y de los que hay que parar:
+//!   [`Error::RetencionQueLoBorraTodo`]. Las reglas serían válidas para la biblioteca, que
+//!   las obedecería, y no conservarían **nada**: la retención retiraría y purgaría el
+//!   historial entero del repositorio, incluida la copia que se acaba de hacer. El §3 pone
+//!   `DEFAULT 7` en las tres columnas pero **sin cota**, así que un `0` entra por la API y
+//!   entra a mano con `sqlite3`, y este es el único sitio del motor que lo puede parar.
+//!   `keep_daily = 0` con `keep_monthly = 12` no es ese caso: es una decisión.
 //! - **-1** significa «conservar todas», que es como lo lee la biblioteca.
 //! - **cualquier otro negativo** se rechaza con un motivo que nombra la columna, porque la
 //!   biblioteca lo leería como «conservar todas» sin decirlo y una columna de retención con
@@ -102,9 +110,36 @@ pub struct InformeDeRetencion {
     ///
     /// `true` significa que el plan de purga se calculó y se ejecutó, no que los bytes se
     /// hayan reclamado en este instante: la biblioteca marca los paquetes para borrar y los
-    /// conserva un tiempo —su opción `keep_delete`—, así que el espacio se recupera en una
-    /// purga posterior. Lo que este campo afirma es que la tercera operación ocurrió.
+    /// conserva un tiempo —su opción `keep_delete`, 23 horas por defecto—, así que el
+    /// espacio se recupera en una purga posterior. Lo que este campo afirma es que la
+    /// tercera operación ocurrió.
     pub purgado: bool,
+    /// Los bytes que el **plan de purga** dice que va a reclamar.
+    ///
+    /// Es lo que el plan expone de más legible: el tamaño, **dentro de los paquetes**, del
+    /// contenido que la purga va a dejar de estar referenciado y, por tanto, a retirar. Es la
+    /// suma por tipo de blob del `size.remove` que la biblioteca calcula al construir el plan.
+    /// Existe porque el plan se calculaba y se entregaba a la purga **sin mirarlo**, con un
+    /// comentario que decía que así quedaba constancia de lo que se iba a borrar: no quedaba
+    /// ninguna, porque nadie leía el plan más que la propia biblioteca. Este número es esa
+    /// constancia.
+    ///
+    /// ⚠️ **No es «bytes liberados»**, y la diferencia importa: el plan se calcula **antes**
+    /// de purgar, así que dice lo que hay por reclamar en ese momento; cuánto se recupera de
+    /// verdad depende de `keep_delete` y de la purga siguiente.
+    ///
+    /// ⚠️ **Tampoco es el tamaño de los volcados retirados**, ni se acota por él: son bytes de
+    /// **paquete**, que es donde la biblioteca los mide, así que llevan dentro los árboles y el
+    /// armazón de los paquetes además del contenido —medido en
+    /// `el_informe_de_retencion_lleva_los_bytes_que_el_plan_va_a_reclamar`: tres volcados de
+    /// 217 bytes de contenido en total dan 514 bytes a reclamar al retirar dos— y la
+    /// deduplicación hace que retirar una instantánea no libere su tamaño, sino solo lo que
+    /// dejó de estar referenciado.
+    ///
+    /// `0` es un valor normal y no un fallo: significa que la purga no encontró nada que
+    /// reclamar —lo habitual cuando las instantáneas retiradas compartían árbol con las que se
+    /// conservan—.
+    pub bytes_a_reclamar: u64,
 }
 
 /// Aplica la retención sobre un repositorio abierto, en sus tres operaciones.
@@ -158,6 +193,11 @@ pub(crate) fn aplicar<S: Open>(
     }
 
     // 3. Purgar, con el plan **calculado antes** de ejecutarlo.
+    //
+    // Y mirándolo, que es lo que el comentario decía y no ocurría: el plan se pasaba a
+    // `prune` sin leerle nada, así que «queda constancia de lo que se va a borrar» era
+    // falso mientras nadie leyera el plan. Lo que se le lee es lo único que dice de forma
+    // legible cuánto contenido va a dejar de estar referenciado, y viaja al informe.
     let opciones = PruneOptions::default();
     let plan = repositorio.prune_plan(&opciones).map_err(|error| {
         fallo(format!(
@@ -165,6 +205,11 @@ pub(crate) fn aplicar<S: Open>(
             error.display_log()
         ))
     })?;
+    // `size_sum()` suma los cuatro tipos de blob en un solo `SizeStats`, y su campo
+    // `remove` es justo lo que la purga va a retirar. Se lee **antes** de purgar: después,
+    // el plan ya está consumido —`prune` lo toma por valor— y el repositorio ha cambiado.
+    let bytes_a_reclamar = plan.stats.size_sum().remove;
+
     repositorio
         .prune(&opciones, plan)
         .map_err(|error| fallo(format!("no se ha podido purgar: {}", error.display_log())))?;
@@ -172,6 +217,7 @@ pub(crate) fn aplicar<S: Open>(
     Ok(InformeDeRetencion {
         retirados: identificadores(&a_retirar),
         purgado: true,
+        bytes_a_reclamar,
     })
 }
 
@@ -198,11 +244,25 @@ fn identificadores(ids: &[SnapshotId]) -> Vec<String> {
 /// propio porque un defecto inventado por este módulo sería una segunda política de
 /// retención que nadie ha pedido.
 ///
+/// # Las tres a cero se rechazan, y un cero suelto no
+///
+/// Antes de traducir nada se rechaza el caso en que **las tres** valen cero. Un cero suelto
+/// es una instrucción —«de esta regla no conserves ninguna»—, pero las tres a la vez no son
+/// una retención que conserva de menos: las reglas resultantes son válidas para la
+/// biblioteca, que las obedece, y no conservan **nada**, así que la retención retiraría y
+/// purgaría todo el historial del repositorio, incluida la copia recién hecha. Ver
+/// [`Error::RetencionQueLoBorraTodo`].
+///
 /// # Errors
 ///
-/// Devuelve [`Error::RetencionFallida`] si alguno de los tres valores no significa nada
-/// como regla. Ver [`regla`].
+/// Devuelve [`Error::RetencionQueLoBorraTodo`] si las tres valen cero, y
+/// [`Error::RetencionFallida`] si alguno de los tres valores no significa nada como regla.
+/// Ver [`regla`].
 pub(crate) fn reglas(retencion: &Retencion) -> Result<KeepOptions, Error> {
+    if retencion.keep_daily == 0 && retencion.keep_weekly == 0 && retencion.keep_monthly == 0 {
+        return Err(Error::RetencionQueLoBorraTodo);
+    }
+
     Ok(KeepOptions::default()
         .keep_daily(regla("keep_daily", retencion.keep_daily)?)
         .keep_weekly(regla("keep_weekly", retencion.keep_weekly)?)
@@ -241,6 +301,9 @@ fn regla(columna: &str, valor: i64) -> Result<i32, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    use rustic_core::PruneOptions;
     use rustic_core::repofile::SnapshotFile;
 
     use crate::test_support::{
@@ -453,5 +516,275 @@ mod tests {
             motivo.contains("-2"),
             "el motivo del rechazo no dice el valor que lo provocó: {motivo}"
         );
+    }
+
+    /// **4.** Las **tres** reglas a cero se rechazan: no son una retención que conserva de
+    /// menos, son el historial entero del repositorio.
+    ///
+    /// Es un guardarraíl y por eso la prueba mira las dos caras: que las reglas se rechazan
+    /// —con la variante que lo dice, no con un fallo genérico— y que **no se retiró nada**.
+    /// Sin la segunda mitad, una implementación que decidiera el rechazo *después* de
+    /// retirar pasaría la primera y habría borrado el repositorio igualmente.
+    ///
+    /// El caso es alcanzable y no teórico: el §3 pone `DEFAULT 7` en las tres columnas pero
+    /// **sin cota**, así que un `0` entra por la API y entra a mano con `sqlite3`. Y la
+    /// biblioteca no lo corrige: tres reglas de cero son válidas para ella y no conservan
+    /// nada.
+    #[test]
+    fn las_tres_reglas_a_cero_se_rechazan_y_no_retiran_nada() {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio");
+        sembrar_snapshots(&ruta, PASSPHRASE_DE_PRUEBA, &FECHAS);
+
+        let repositorio = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+
+        // Las reglas, primero, que es donde se decide.
+        let error = reglas(&Retencion {
+            keep_daily: 0,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        })
+        .expect_err(
+            "con las tres reglas a cero no hay nada que conservar: el historial entero del \
+             repositorio se retiraría, incluida la copia recién hecha",
+        );
+
+        assert!(
+            matches!(error, Error::RetencionQueLoBorraTodo),
+            "el rechazo de las tres reglas a cero tiene que ser la variante que lo dice, y \
+             salió {error}"
+        );
+        assert!(
+            error.to_string().contains("keep_daily")
+                && error.to_string().contains("keep_weekly")
+                && error.to_string().contains("keep_monthly"),
+            "el motivo del rechazo tiene que nombrar las tres columnas y no una: una retención \
+             que solo tuviera mal una no es este caso. Motivo: {error}"
+        );
+
+        // Y la retención entera: no solo se rechaza, es que no toca el repositorio.
+        let error = aplicar(
+            &repositorio,
+            &Retencion {
+                keep_daily: 0,
+                keep_weekly: 0,
+                keep_monthly: 0,
+            },
+        )
+        .expect_err("aplicar una retención que lo borra todo tiene que fallar antes de aplicar");
+
+        assert!(
+            matches!(error, Error::RetencionQueLoBorraTodo),
+            "la retención no falló por el motivo del guardarraíl: {error}"
+        );
+
+        let quedan: Vec<SnapshotFile> = repositorio
+            .get_all_snapshots()
+            .expect("el repositorio se puede listar");
+        assert_eq!(
+            quedan.len(),
+            3,
+            "el rechazo llegó **después** de retirar: quedan {} instantáneas de las tres que \
+             había, y ninguna tenía que tocarse",
+            quedan.len()
+        );
+    }
+
+    /// **5.** Un cero **suelto** sigue siendo una retención legítima, y se aplica.
+    ///
+    /// Es la otra mitad del guardarraíl, y la que impide que el guardarraíl se pase de
+    /// largo: `keep_daily = 0` con `keep_monthly = 12` es una decisión del operador —«nada
+    /// diario, lo mensual»— y no un error. Aquí se prueba con una regla semanal informada y
+    /// las otras dos a cero, y lo que se afirma es que la retención **se aplica**: no falla,
+    /// conserva lo que dice la regla que sí está y retira el resto.
+    ///
+    /// Se usan las tres fechas de [`FECHAS`], que caen en la **misma semana** —el 1, el 2 y
+    /// el 3 de enero de 2026—, así que una regla semanal de una conserva exactamente la más
+    /// reciente y retira las otras dos. Es determinista y no depende del reloj.
+    #[test]
+    fn un_cero_suelto_sigue_siendo_una_retencion_valida() {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio");
+        let siembra = sembrar_snapshots(&ruta, PASSPHRASE_DE_PRUEBA, &FECHAS);
+
+        let repositorio = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+
+        // Las reglas: un cero suelto no es el caso del guardarraíl.
+        reglas(&Retencion {
+            keep_daily: 0,
+            keep_weekly: 1,
+            keep_monthly: 0,
+        })
+        .expect(
+            "`keep_daily = 0` con una regla semanal informada es una decisión y no un error: \
+             un cero suelto no puede caer por el guardarraíl de las tres a cero",
+        );
+
+        let informe = aplicar(
+            &repositorio,
+            &Retencion {
+                keep_daily: 0,
+                keep_weekly: 1,
+                keep_monthly: 0,
+            },
+        )
+        .expect("la retención con un solo cero se aplica");
+
+        assert_eq!(
+            informe.retirados.len(),
+            2,
+            "las tres fechas caen en la misma semana, así que una regla semanal de una tiene \
+             que retirar dos instantáneas y retiró {}",
+            informe.retirados.len()
+        );
+        assert_eq!(
+            la_que_queda(&repositorio),
+            siembra.identificadores[2],
+            "la instantánea que se conserva no es la más reciente de la semana"
+        );
+        assert!(informe.purgado, "la retención se aplicó y no purgó");
+    }
+
+    /// **6.** El plan de purga se calcula **sin escribir nada** en el destino.
+    ///
+    /// Es la mitad medible del escenario «el plan se calcula antes de tocar nada»: el plan se
+    /// calcula con el destino entero en **solo lectura** —directorios y ficheros sin permiso
+    /// de escritura— y aun así sale. Si el cálculo del plan necesitara escribir algo, esto no
+    /// pasaría.
+    ///
+    /// La otra mitad —que la purga va **después** del plan— no se puede medir con un backend
+    /// contador, y no por falta de ganas: envolver el destino obliga a implementar
+    /// `rustic_core::WriteBackend`, y esa implementación pide nombrar el tipo que devuelve
+    /// `read_full`, que es un `Bytes` que la biblioteca **no re-exporta**. Literal:
+    ///
+    /// ```text
+    /// // FALLO MEDIDO:
+    /// error[E0603]: module `backend` is private
+    ///    --> src/rustic/retencion.rs:309:45
+    ///     |
+    /// 309 |     type BytesDeLaBiblioteca = rustic_core::backend::Bytes;
+    ///     |                                             ^^^^^^^  ----- struct `Bytes` is not
+    ///     |                                                         publicly re-exported
+    ///     |                                             |
+    ///     |                                             private module
+    /// ```
+    ///
+    /// Así que no hay forma de observarlo desde aquí sin tocar las dependencias. Lo que
+    /// sostiene esa mitad es el tipo: `prune` recibe el `PrunePlan` **por valor**, así que no
+    /// se puede purgar sin haberlo calculado. Y el dato que el plan produce llega al informe
+    /// ([`InformeDeRetencion::bytes_a_reclamar`]), que es lo que fija que el plan se lee de
+    /// verdad y no se calcula para tirarlo.
+    ///
+    /// ⚠️ La prueba lleva su **control**, y sin él no mediría nada: con el destino en solo
+    /// lectura, una escritura de verdad tiene que fallar. Si el backend ignorara los permisos
+    /// —y una máquina que corriera esto como `root` los ignora todos—, las dos aserciones
+    /// pasarían por vacío, así que lo que se comprueba primero es que el solo lectura muerde.
+    #[test]
+    fn el_plan_de_purga_se_calcula_sin_escribir_en_el_destino() {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio");
+        let siembra = sembrar_snapshots(&ruta, PASSPHRASE_DE_PRUEBA, &FECHAS);
+
+        // El repositorio se abre **antes** de quitar los permisos: lo que se mide es el plan,
+        // no la apertura.
+        let repositorio = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+
+        let solo_lectura = SoloLectura::nuevo(&ruta);
+
+        // El control: una escritura de verdad tiene que fallar con el destino así.
+        let escritura = repositorio
+            .delete_snapshots(&[snapshot_id(&siembra.identificadores[0])])
+            .expect_err(
+                "el destino está en solo lectura y la biblioteca retiró una instantánea: los \
+                 permisos no están mordiendo, así que la comprobación del plan pasaría sin \
+                 medir nada —¿se está corriendo esto como `root`?—",
+            );
+        assert!(
+            !escritura.display_log().is_empty(),
+            "el fallo de escritura no trae motivo"
+        );
+
+        // Y el plan, que es lo que se mide: se calcula igual, en solo lectura.
+        repositorio.prune_plan(&PruneOptions::default()).expect(
+            "medido: calcular el plan de purga no escribe nada en el destino —solo lee los \
+                 ficheros de índice y lista los paquetes—, así que tiene que salir con el \
+                 destino en solo lectura. Que esto falle significa que el cálculo del plan \
+                 escribe, y entonces «el plan se calcula antes de tocar nada» es falso",
+        );
+
+        drop(solo_lectura);
+        drop(repositorio);
+    }
+
+    /// Un identificador de instantánea desde su forma en hex completo.
+    fn snapshot_id(hex: &str) -> rustic_core::repofile::SnapshotId {
+        hex.parse()
+            .expect("el identificador de una instantánea sembrada es un hex válido")
+    }
+
+    /// El destino entero en **solo lectura**, con la vuelta puesta en su `Drop`.
+    ///
+    /// Los permisos se quitan de forma recursiva —los directorios sin escribir, los ficheros
+    /// sin escribir— y se devuelven al soltarse, **incluido** el caso de que la prueba entre
+    /// en pánico: sin la vuelta, el `Drop` de la guarda del directorio temporal no podría
+    /// borrarlo —`remove_dir_all` necesita escribir— y quedaría basura en el directorio
+    /// temporal del sistema, que aquí es RAM.
+    struct SoloLectura {
+        /// Las entradas a las que hay que devolverles los permisos, con los suyos.
+        originales: Vec<(PathBuf, std::fs::Permissions)>,
+    }
+
+    impl SoloLectura {
+        /// Deja `raiz` y todo lo que cuelga de ella sin permiso de escritura.
+        fn nuevo(raiz: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut originales = Vec::new();
+
+            for entrada in caminos(raiz) {
+                let originales_de_la_entrada = std::fs::metadata(&entrada)
+                    .expect("cada entrada del destino tiene metadatos")
+                    .permissions();
+                let mut de_solo_lectura = originales_de_la_entrada.clone();
+                let modo = if entrada.is_dir() { 0o555 } else { 0o444 };
+                de_solo_lectura.set_mode(modo);
+                std::fs::set_permissions(&entrada, de_solo_lectura)
+                    .expect("los permisos del destino se pueden cambiar");
+
+                originales.push((entrada, originales_de_la_entrada));
+            }
+
+            Self { originales }
+        }
+    }
+
+    impl Drop for SoloLectura {
+        fn drop(&mut self) {
+            // Al revés de como se quitaron: primero los ficheros, después los directorios que
+            // los contienen. Con el orden contrario, un directorio que recupera su escritura
+            // antes que sus ficheros no impide nada, pero devolver la escritura al padre
+            // mientras un hijo sigue sin ella tampoco ayuda a nadie; el orden inverso es el
+            // que deja el árbol escribible en cuanto termina la primera vuelta.
+            for (entrada, permisos) in self.originales.drain(..).rev() {
+                let _ = std::fs::set_permissions(&entrada, permisos);
+            }
+        }
+    }
+
+    /// `raiz` y todo lo que cuelga de ella, los directorios **antes** que su contenido.
+    fn caminos(raiz: &Path) -> Vec<PathBuf> {
+        fn recorrer(actual: &Path, vistos: &mut Vec<PathBuf>) {
+            vistos.push(actual.to_path_buf());
+
+            if let Ok(entradas) = std::fs::read_dir(actual) {
+                for entrada in entradas.flatten() {
+                    recorrer(&entrada.path(), vistos);
+                }
+            }
+        }
+
+        let mut vistos = Vec::new();
+        recorrer(raiz, &mut vistos);
+        vistos
     }
 }

@@ -71,8 +71,61 @@ pub enum Error {
     DestinoNoAlcanzable { destino: String, motivo: String },
 
     /// El repositorio existe y la passphrase no lo abre.
+    ///
+    /// Dice «la passphrase no lo abre» y **no** «la passphrase es la equivocada», porque lo
+    /// único medido es lo primero: lo que la biblioteca sabe decir es que **no hay ninguna
+    /// clave del repositorio que se deje abrir con esta contraseña**, y eso cubre dos cosas
+    /// que se arreglan de forma distinta.
+    ///
+    /// 1. La passphrase no es la del repositorio: el operador la revisa y ya está.
+    /// 2. El repositorio **no tiene ninguna clave utilizable** —le falta el fichero de
+    ///    claves, o lo tiene corrupto, o quedó a medio inicializar—. Aquí la passphrase
+    ///    puede ser la correcta y no haber forma de comprobarlo: no hay clave contra la que
+    ///    contrastarla.
+    ///
+    /// Está **medido** con un destino que conserva su `config` y al que se le han retirado
+    /// los ficheros de `keys/`: la biblioteca cae por el mismo camino que con una
+    /// contraseña equivocada y devuelve el mismo código `C002`, así que este módulo —que
+    /// distingue los desenlaces por ese código y no por el texto— reporta el caso 2 como si
+    /// fuera el 1. La variante dice, por eso, lo único que se puede afirmar sin mentir: que
+    /// **no hay ninguna clave que abra con esta passphrase**. El `motivo` es el de la
+    /// biblioteca, y nombra la comprobación que falló —«no suitable key found»—, no la
+    /// causa que la hizo fallar.
+    ///
+    /// La consecuencia, para quien lea esto en un informe: este error manda a mirar la
+    /// passphrase **y** el destino, en ese orden; no autoriza a dar por buena la passphrase
+    /// ni a suponer que el repositorio está entero.
     #[error("la passphrase no abre el repositorio de `{destino}`: {motivo}")]
     PassphraseNoAbre { destino: String, motivo: String },
+
+    /// El nombre del volcado de la copia y el del origen **no coinciden**.
+    ///
+    /// Es el fallo que deja una instantánea que **declara** contener una cosa y contiene
+    /// otra: [`Copia::nombre`](crate::rustic::Copia) es el `path` que la instantánea
+    /// publica, y el del origen es el del nodo que el puente fabrica de verdad dentro del
+    /// árbol. Si los dos nombres divergen, el listado dice que hay un
+    /// `volcado-de-tienda.sql` donde hay un `volcado-de-otra-cosa.sql`, y quien vaya a
+    /// restaurar buscará un fichero que no está.
+    ///
+    /// Importa porque es la versión en metadatos del fallo que este módulo existe para no
+    /// cometer: la copia existe, ocupa sitio y devuelve algo que no es lo que su ficha
+    /// promete. Se comprueba **antes** de archivar, así que de aquí no sale nada escrito.
+    ///
+    /// El error es de la pareja, no de uno de los dos nombres: cada uno puede ser
+    /// perfectamente válido por separado —los dos pasan la validación de
+    /// [`tunel_del_volcado`](crate::rustic::tunel_del_volcado)— y lo que está mal es que
+    /// sean distintos.
+    #[error(
+        "la copia declara el volcado `{en_la_copia}` y el origen que se le entrega trae \
+         `{en_el_origen}`: el nombre que la instantánea publica tiene que ser el del nodo que \
+         se archiva, o la copia quedará diciendo que contiene lo que no tiene"
+    )]
+    NombreDeVolcadoIncoherente {
+        /// El nombre que la copia declara: el que queda escrito en la instantánea.
+        en_la_copia: String,
+        /// El nombre del origen: el del nodo que el puente archiva de verdad.
+        en_el_origen: String,
+    },
 
     /// La copia no declara ninguna ruta.
     ///
@@ -95,6 +148,30 @@ pub enum Error {
     /// falla **no** cambia el resultado de la copia: la copia ya está hecha y es correcta.
     #[error("ha fallado la retención: {motivo}")]
     RetencionFallida { motivo: String },
+
+    /// Las tres reglas de retención valen cero, así que la retención no conserva **nada**.
+    ///
+    /// Es un guardarraíl y no una validación de estilo: un `0` suelto es una instrucción
+    /// legítima —`keep_daily = 0` con `keep_monthly = 12` es «no me guardes nada diario,
+    /// guárdame lo mensual»—, pero **las tres a la vez** no son una retención que conserva
+    /// de menos: son la destrucción de todo el historial del repositorio, incluida la copia
+    /// que se acaba de hacer. Las reglas son válidas para la biblioteca y la biblioteca las
+    /// obedece, así que sin este rechazo el motor retiraría y purgaría todo sin que nada lo
+    /// delatara.
+    ///
+    /// Y es alcanzable: el §3 pone `DEFAULT 7` en las tres columnas pero **sin cota**, así
+    /// que un `0` entra por la API y entra a mano con `sqlite3`.
+    ///
+    /// Lo que **no** se hace aquí es corregir el valor: no se sube un cero ni se cambia por
+    /// el defecto. Corregir en silencio sería decidir por el operador qué copias se tiran,
+    /// y la dirección de la corrección —conservar de más o de menos— no es la misma en los
+    /// dos casos. El motor rechaza y quien lo lea decide.
+    #[error(
+        "las tres reglas de retención valen cero (`keep_daily`, `keep_weekly` y \
+         `keep_monthly`): eso no conserva de menos, borra el historial entero del \
+         repositorio —incluida la copia recién hecha—, así que no se aplica"
+    )]
+    RetencionQueLoBorraTodo,
 
     /// No se han podido listar las instantáneas del repositorio.
     #[error("no se han podido listar las instantáneas de `{destino}`: {motivo}")]
