@@ -80,30 +80,162 @@ pub async fn shutdown_signal() {
     tracing::info!("señal de cierre recibida: se deja de aceptar conexiones");
 }
 
+/// El objetivo de registro del motor de contenedores.
+///
+/// `bollard` registra con el `log` de siempre, así que el destino de sus llamadas es su
+/// `module_path!()` —`bollard`, `bollard::docker`, …—. Lo que hay que silenciar, por tanto,
+/// es el prefijo `bollard` entero, no un módulo suyo.
+const OBJETIVO_DEL_MOTOR: &str = "bollard";
+
+/// La directiva de registro que silencia al motor de contenedores, y **por qué** la pone el
+/// proceso.
+///
+/// `bollard` registra a `DEBUG` el cuerpo serializado de cada petición —medido:
+/// `serialize_payload` en `bollard-0.18.1/src/docker.rs:1227`—, y el cuerpo de un
+/// `create_exec` lleva el `env` **entero**, con `MYSQL_PWD` o `PGPASSWORD` dentro. El valor
+/// no pasa por ningún tipo de este crate, así que no hay `Debug` propio que lo proteja: lo
+/// único que corta esa exposición es el filtro de registro. Y por eso la directiva la pone
+/// el **proceso** y no la receta con la que se le lance: con `RUST_LOG=debug` a secas —una
+/// forma perfectamente normal de arrancar— el registro imprime la contraseña de la base.
+///
+/// Es el requisito «la credencial no aparece en el registro del proceso» de
+/// `openspec/changes/backup-engine/specs/extraction/`, que exige que la directiva esté
+/// declarada donde arranca el proceso y no dejada a la memoria de quien lo ejecute.
+pub const DIRECTIVA_DEL_MOTOR: &str = "bollard=warn";
+
+/// Los niveles que ya dejan el motor de contenedores en silencio.
+///
+/// Es lo que distingue «el operador pidió el objetivo del motor y el proyecto lo tapa» —que
+/// se avisa— de «el operador pidió lo mismo que el proyecto» —que no se avisa, porque no hay
+/// nada que tapar—. Sin esta distinción, `RUST_LOG=debug,bollard=warn`, que es lo que
+/// recetan `just dev` y `just run`, daría un aviso en cada arranque y convertiría un aviso
+/// útil en ruido que se aprende a ignorar.
+const NIVELES_QUE_YA_LO_SILENCIAN: [&str; 3] = ["warn", "error", "off"];
+
+/// El filtro que se aplica de verdad, con la directiva del proyecto **detrás**, y el aviso
+/// que merezca el filtro que llegó.
+///
+/// El orden no es estilo: medido en `tracing-subscriber-0.3.23`, su `DirectiveSet::add`
+/// sustituye la directiva anterior cuando la nueva es igual de específica —mismo destino y
+/// sin campos— (`src/filter/directive.rs:88`), y para un mismo evento gana la más específica
+/// primero (`enabled` toma la primera que casa). La del proyecto va la última, así que es la
+/// que manda sobre cualquier otra que nombre el mismo objetivo. La contrapartida, que el
+/// aviso de [`aviso_del_filtro`] deja por escrito: un sub-objetivo más largo
+/// (`bollard::docker=debug`) es más específico y sigue por delante.
+fn componer_el_filtro(lo_que_puso: &str) -> (String, Option<String>) {
+    (
+        format!("{lo_que_puso},{DIRECTIVA_DEL_MOTOR}"),
+        aviso_del_filtro(lo_que_puso),
+    )
+}
+
+/// El aviso que merece el filtro que llegó, si merece alguno.
+///
+/// Se avisa cuando el filtro pide el motor —él o un sub-objetivo suyo— **más hablador** que
+/// lo que el proyecto deja: eso no es una preferencia de estilo que se pueda pisar en
+/// silencio, porque lo que ese objetivo registra es el `env` del `exec`, que lleva la
+/// contraseña de la base. Y hay dos desenlaces distintos, con avisos distintos: el objetivo
+/// exacto lo pisa la directiva del proyecto —que va detrás y gana—, mientras que un
+/// sub-objetivo más específico **no** lo tapa nadie y es el caso que de verdad hay que mirar.
+///
+/// El `[span{campo}]=nivel` se analiza hasta los corchetes: lo que importa es el destino. Lo
+/// que no se interpreta aquí —y da igual, porque el aviso es una constancia y no la
+/// protección— es el `span` y el campo de dentro.
+fn aviso_del_filtro(lo_que_puso: &str) -> Option<String> {
+    let mut pidio_el_objetivo = false;
+    let mut pidio_un_sub_objetivo = false;
+
+    for directiva in lo_que_puso.split(',') {
+        let (destino, nivel) = match directiva.split_once('=') {
+            Some((destino, nivel)) => (destino, Some(nivel.trim())),
+            // Un destino sin `=` es el nivel más hablador que hay, así que pasa el filtro de
+            // abajo como si hubiera pedido `trace`.
+            None => (directiva, None),
+        };
+        let destino = destino.split('[').next().unwrap_or(destino).trim();
+
+        let hablador = nivel.is_none_or(|nivel| !NIVELES_QUE_YA_LO_SILENCIAN.contains(&nivel));
+        if !hablador {
+            continue;
+        }
+
+        if destino == OBJETIVO_DEL_MOTOR {
+            pidio_el_objetivo = true;
+        } else if destino
+            .strip_prefix(OBJETIVO_DEL_MOTOR)
+            .is_some_and(|resto| resto.starts_with("::"))
+        {
+            pidio_un_sub_objetivo = true;
+        }
+    }
+
+    if pidio_un_sub_objetivo {
+        return Some(format!(
+            "el filtro de registro pide un sub-objetivo de `{OBJETIVO_DEL_MOTOR}` más hablador \
+             que `warn`: esa directiva es más específica que `{DIRECTIVA_DEL_MOTOR}` y sigue por \
+             delante, así que ese objetivo puede escribir en el registro el `env` del `exec` de \
+             la extracción, donde viaja la contraseña de la base"
+        ));
+    }
+
+    if pidio_el_objetivo {
+        return Some(format!(
+            "el filtro de registro pide `{OBJETIVO_DEL_MOTOR}` más hablador que `warn`, y el \
+             proceso lo pisa con `{DIRECTIVA_DEL_MOTOR}`: ese objetivo registra el `env` del \
+             `exec` de la extracción, donde viaja la contraseña de la base, así que la directiva \
+             del proyecto no se toca"
+        ));
+    }
+
+    None
+}
+
 /// Inicializa el registro con el filtro ya resuelto por la configuración.
 ///
-/// El filtro entra por parámetro en vez de volver a leer el entorno: el
-/// `EnvFilter` que se aplica y el que se vuelca en el arranque tienen que ser
-/// el mismo, o el volcado miente.
+/// El filtro entra por parámetro en vez de volver a leer el entorno: el `EnvFilter` que se
+/// aplica y el que se vuelca en el arranque tienen que ser el mismo, o el volcado miente.
+///
+/// Lo que se aplica **no** es el filtro tal cual: es el de quien arranca con la directiva del
+/// proyecto detrás —ver [`componer_el_filtro`]—, y el que se publica en el registro es el
+/// compuesto, que es el que de verdad manda. Así el volcado de arranque, que lleva el
+/// `log_filter` de la configuración —lo que puso el operador— se puede comparar con el
+/// efectivo sin adivinar nada.
 ///
 /// Si la cadena no es un filtro válido, se cae a
-/// [`crate::config::DEFAULT_LOG_FILTER`] avisando por `stderr`: un `RUST_LOG`
-/// mal escrito no puede dejar el proceso sin registro.
+/// [`crate::config::DEFAULT_LOG_FILTER`] avisando por `stderr`: un `RUST_LOG` mal escrito no
+/// puede dejar el proceso sin registro —ni reabrir la puerta que el proyecto cierra, así que
+/// el filtro de reserva también lleva la directiva—.
 fn init_tracing(filtro: &str) {
-    let filter = match tracing_subscriber::EnvFilter::try_new(filtro) {
+    let (aplicado, aviso) = componer_el_filtro(filtro);
+
+    let filter = match tracing_subscriber::EnvFilter::try_new(&aplicado) {
         Ok(filter) => filter,
         Err(error) => {
             eprintln!(
-                "el filtro de registro {filtro:?} no es válido: {error}; se usa {}",
+                "el filtro de registro {aplicado:?} no es válido: {error}; se usa {}",
                 crate::config::DEFAULT_LOG_FILTER
             );
 
-            tracing_subscriber::EnvFilter::new(crate::config::DEFAULT_LOG_FILTER)
+            tracing_subscriber::EnvFilter::new(
+                componer_el_filtro(crate::config::DEFAULT_LOG_FILTER).0,
+            )
         }
     };
 
+    // Un fallo de instalación no impide dejar constancia por el registro —que en ese caso no
+    // recoge nada— ni por `stderr`, que es donde va el propio mensaje del fallo.
     if let Err(error) = tracing_subscriber::fmt().with_env_filter(filter).try_init() {
         eprintln!("no se pudo inicializar el registro: {error}");
+    }
+
+    // El filtro **efectivo**, que no es el que puso quien arranca: es el de arriba. Se publica
+    // aquí porque el volcado de arranque publica el `log_filter` de la configuración —lo que
+    // pidió el operador— y con las dos líneas a la vista se ve qué se está aplicando de
+    // verdad; con una sola, el volcado mentiría.
+    tracing::info!(filtro = %aplicado, "filtro de registro efectivo");
+
+    if let Some(aviso) = aviso {
+        tracing::warn!("{aviso}");
     }
 }
 
@@ -193,8 +325,131 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use super::{DIRECTIVA_DEL_MOTOR, aviso_del_filtro, componer_el_filtro};
     use crate::db;
     use crate::test_support::{config_con_dsn, directorio_de_prueba, migrador_roto};
+
+    /// El filtro que se aplica lleva la directiva del motor, **detrás** de lo que se pidió.
+    ///
+    /// Es la prueba que fija la decisión, y no una de integración: comprobar que el valor no
+    /// aparece en el registro de un volcado de verdad costaría un contenedor, una base y un
+    /// socket, y lo que hay que sujetar aquí es que el **proceso** componga así el filtro
+    /// —el requisito exige que la directiva esté declarada donde arranca el proceso y no
+    /// dejada a la receta con la que se le lance—. Que el valor no salga de verdad se mide
+    /// con `just dev`, que es donde se midió que salía.
+    #[test]
+    fn el_filtro_que_se_aplica_lleva_la_directiva_del_motor_detras() {
+        for (puesto, esperado) in [
+            // El defecto del proceso, y el caso que motivó la corrección: `debug` a secas
+            // —una forma normal de arrancar— dejaba el `env` del `exec` en el registro.
+            ("info", "info,bollard=warn"),
+            ("debug", "debug,bollard=warn"),
+            // Y si el operador ya pedía el motor, la del proyecto va detrás: es la que gana.
+            ("debug,bollard=debug", "debug,bollard=debug,bollard=warn"),
+        ] {
+            let (aplicado, _) = componer_el_filtro(puesto);
+
+            assert_eq!(aplicado, esperado, "el filtro compuesto no es el esperado");
+            assert!(
+                aplicado.contains(DIRECTIVA_DEL_MOTOR),
+                "el filtro que se aplica no lleva la directiva del motor: {aplicado}"
+            );
+            assert!(
+                aplicado.ends_with(DIRECTIVA_DEL_MOTOR),
+                "la directiva del proyecto tiene que ir la última para ganar: {aplicado}"
+            );
+            // Y el compuesto tiene que ser un filtro de verdad: uno que `EnvFilter` no sepa
+            // leer caería al de reserva, y el de reserva es otro camino.
+            assert!(
+                tracing_subscriber::EnvFilter::try_new(&aplicado).is_ok(),
+                "el filtro compuesto no lo acepta EnvFilter: {aplicado}"
+            );
+        }
+
+        // Y el orden hace lo que dice: la biblioteca sustituye la directiva anterior cuando
+        // la nueva es igual de específica —medido en `tracing-subscriber-0.3.23`—, así que lo
+        // que queda para `bollard` es la del proyecto y no la del operador. Se comprueba por
+        // el camino de la biblioteca, imprimiendo el filtro que ella misma construye.
+        let (aplicado, _) = componer_el_filtro("debug,bollard=debug");
+        let interpretado = tracing_subscriber::EnvFilter::try_new(&aplicado)
+            .expect("el filtro compuesto es válido")
+            .to_string();
+
+        assert!(
+            interpretado.contains(DIRECTIVA_DEL_MOTOR),
+            "el filtro interpretado no lleva la directiva del motor: {interpretado}"
+        );
+        assert!(
+            !interpretado.contains("bollard=debug"),
+            "la directiva del operador sobrevivió a la del proyecto, que va detrás y tiene que \
+             sustituirla: {interpretado}"
+        );
+    }
+
+    /// El filtro de reserva —el que se aplica cuando `RUST_LOG` no se puede leer— también
+    /// lleva la directiva.
+    ///
+    /// Un `RUST_LOG` mal escrito no puede reabrir la puerta que el proyecto cierra: si el
+    /// filtro de reserva no la llevara, un error de configuración dejaría el registro del
+    /// motor a merced de lo que pida cualquier otra variable.
+    #[test]
+    fn el_filtro_de_reserva_lleva_la_directiva() {
+        let (reserva, _) = componer_el_filtro(crate::config::DEFAULT_LOG_FILTER);
+
+        assert!(
+            reserva.contains(DIRECTIVA_DEL_MOTOR),
+            "el filtro de reserva no lleva la directiva del motor: {reserva}"
+        );
+    }
+
+    /// Un filtro que pide el motor **más hablador** que el proyecto deja constancia, y uno
+    /// que pide lo mismo no dice nada.
+    ///
+    /// El aviso es lo único que separa «el proyecto lo tapa» de «el proyecto lo tapa y no lo
+    /// cuenta»: como la exposición se corta por filtro y no por tipos, pisar en silencio la
+    /// directiva de quien arranca sería esconderle que su registro iba a llevar la
+    /// credencial. Y el caso del sub-objetivo es el que de verdad hay que mirar, porque ahí
+    /// la directiva del proyecto **no** lo tapa.
+    #[test]
+    fn un_filtro_que_pide_el_motor_mas_hablador_deja_constancia() {
+        for ruidoso in ["debug,bollard=debug", "trace,bollard=trace", "bollard"] {
+            let aviso = aviso_del_filtro(ruidoso).unwrap_or_else(|| {
+                panic!("un filtro que pide el motor tiene que avisar: {ruidoso}")
+            });
+
+            assert!(
+                aviso.contains("bollard") && aviso.contains("contraseña"),
+                "el aviso no dice de qué va: {aviso}"
+            );
+            assert!(
+                aviso.contains(DIRECTIVA_DEL_MOTOR),
+                "el aviso no nombra la directiva del proyecto: {aviso}"
+            );
+        }
+
+        // El sub-objetivo es un desenlace distinto: la directiva del proyecto no lo alcanza.
+        let del_sub_objetivo = aviso_del_filtro("debug,bollard::docker=debug")
+            .expect("un sub-objetivo del motor más hablador tiene que avisar");
+        assert!(
+            del_sub_objetivo.contains("sub-objetivo"),
+            "el aviso no distingue el sub-objetivo, que es el que queda abierto: {del_sub_objetivo}"
+        );
+
+        // Y lo que ya está en silencio no avisa: si no, `just dev` —que receta
+        // `debug,bollard=warn`— daría un aviso en cada arranque.
+        for silencioso in [
+            "debug",
+            "info",
+            "debug,bollard=warn",
+            "info,bollard=error",
+            "info,bollard=off",
+        ] {
+            assert!(
+                aviso_del_filtro(silencioso).is_none(),
+                "un filtro que no pide nada hablador del motor no puede avisar: {silencioso}"
+            );
+        }
+    }
 
     /// 1.52 — El arranque deja la base preparada antes de aceptar peticiones.
     ///

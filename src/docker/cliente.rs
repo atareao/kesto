@@ -5,6 +5,10 @@ use std::time::Duration;
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+// El modelo de la inspección se importa de `bollard::models` —el reexport de la biblioteca—
+// y no de `bollard::exec`: en `exec` el nombre está **privado**, así que la ruta corta no
+// compila.
+use bollard::models::ExecInspectResponse;
 use futures_util::StreamExt;
 
 use super::{Canal, Error, Orden, Trozo};
@@ -95,9 +99,12 @@ impl Cliente {
     /// `serialize_payload` en `bollard-0.18.1/src/docker.rs:1227`—, y el cuerpo de un
     /// `create_exec` lleva el `env` con la contraseña de la base dentro. El `Debug` de
     /// [`Orden`] no protege de esto, porque el valor no pasa por él: pasa por la biblioteca.
-    /// La exposición se corta **por filtro** —`RUST_LOG=debug,bollard=warn`, que es lo que
-    /// receta el `.justfile`— y no hay otra forma de cortarla. Cualquier código que suba el
-    /// nivel de `bollard` a `debug` está publicando credenciales.
+    /// La exposición se corta **por filtro**, y de eso se encarga el **proceso**: el arranque
+    /// añade `bollard=warn` detrás del filtro que pida quien lance el binario —ver
+    /// [`crate::DIRECTIVA_DEL_MOTOR`]—, así que no depende de la receta con la que se
+    /// arranque. Queda un hueco, y el arranque lo avisa: un sub-objetivo **más específico**
+    /// (`bollard::docker=debug`) va por delante de esa directiva y sí publicaría el valor.
+    /// Cualquier código que suba el nivel de `bollard` a `debug` está publicando credenciales.
     ///
     /// ## El runtime que conduce esto tiene que seguir vivo
     ///
@@ -263,18 +270,41 @@ impl Cliente {
             .await
             .map_err(|causa| Error::del_contenedor(contenedor, causa))?;
 
-        // Un `exit_code` ausente significa que el motor no lo informó, y darlo por cero
-        // convertiría un fallo en un éxito: para una copia, eso es la peor de las salidas
-        // —existe, ocupa sitio y no se puede restaurar—. Un valor que no cabe en un `i32`
-        // tampoco es un código de salida, y por eso los dos desenlaces van a la misma
-        // variante: en ninguno de los dos se puede decir cómo acabó el proceso.
-        estado
-            .exit_code
-            .and_then(|codigo| i32::try_from(codigo).ok())
-            .ok_or_else(|| Error::SinCodigoDeSalida {
-                contenedor: contenedor.to_owned(),
-            })
+        // La decisión de si lo que informa el motor es un código de salida o no vive en
+        // [`codigo_de_salida`], que es donde están los tres desenlaces que no lo son.
+        codigo_de_salida(&estado).ok_or_else(|| Error::SinCodigoDeSalida {
+            contenedor: contenedor.to_owned(),
+        })
     }
+}
+
+/// El código de salida de un `exec` ya inspeccionado, o `None` si no se puede decir cómo acabó.
+///
+/// Son **tres** los desenlaces que no dan código, y los tres tienen que caer del mismo lado
+/// —`None`—, porque darlos por cero convertiría un fallo en un éxito: para una copia, eso es
+/// la peor de las salidas —existe, ocupa sitio y no se puede restaurar—.
+///
+/// Uno: el motor no informó el código. Dos: el código no cabe en un `i32`, que tampoco es un
+/// código de salida.
+///
+/// Y tres, que es el que faltaba: **el proceso seguía en marcha** cuando se le preguntó. El
+/// campo `running` es opcional y nada obliga al motor a informar el código solo cuando el
+/// proceso ha muerto: un `exec` que sigue corriendo llega con `exit_code: 0` —lo señala la
+/// auditoría de esta capa, y el modelo lo permite, porque `exit_code` es un `Option`—, así que
+/// un flujo que cerrara **antes** del fin del proceso devolvería `0`, y con un `0` el motor
+/// declara el final del volcado: entrega **completa** con el volcado truncado. El camino
+/// normal no lo alcanza —el flujo cierra cuando el proceso muere—, de modo que esto es un
+/// hueco de defensa y no un fallo reproducido: lo que se cierra es la pregunta, no el caso.
+/// Un `running` que el motor **no** informe (`None`) no se lee como «sigue en marcha»: no
+/// saberlo no es saber que sí, y ese desenlace ya está cubierto por el `exit_code` ausente.
+fn codigo_de_salida(estado: &ExecInspectResponse) -> Option<i32> {
+    if estado.running == Some(true) {
+        return None;
+    }
+
+    estado
+        .exit_code
+        .and_then(|codigo| i32::try_from(codigo).ok())
 }
 
 impl std::fmt::Debug for Cliente {
@@ -296,7 +326,9 @@ impl std::fmt::Debug for Cliente {
 mod tests {
     use std::time::Duration;
 
-    use super::Cliente;
+    use bollard::models::ExecInspectResponse;
+
+    use super::{Cliente, codigo_de_salida};
     use crate::docker::{Canal, Error, Orden, Trozo};
     use crate::test_support::{
         ContenedorDePrueba, TIMEOUT_DEL_MOTOR, cliente_del_motor, directorio_de_prueba,
@@ -398,6 +430,69 @@ mod tests {
              quedarse con el socket y el tiempo máximo: el del motor mide {}",
             del_motor.len()
         );
+    }
+
+    /// Un `exec` que **seguía en marcha** no da un código de salida que valga.
+    ///
+    /// Es el hueco que la auditoría de esta capa señaló, y aquí se fija sobre el modelo de la
+    /// biblioteca porque con un `exec` real **no se puede provocar**: el flujo cierra cuando
+    /// el proceso muere, así que la inspección del código llega siempre con el proceso
+    /// acabado. Lo que sí se puede fijar es lo que decide la función, que es donde está la
+    /// mentira del motor: un `exec` vivo llega con `exit_code: 0`, y con un `0` el motor
+    /// declararía el final del volcado —entrega completa con el volcado truncado—.
+    #[test]
+    fn un_proceso_que_sigue_en_marcha_no_da_codigo_de_salida() {
+        let en_marcha = ExecInspectResponse {
+            running: Some(true),
+            exit_code: Some(0),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            codigo_de_salida(&en_marcha),
+            None,
+            "un proceso que sigue en marcha no puede dar un código de salida: el `0` que \
+             informa el motor no significa «salió bien», significa «todavía corre»"
+        );
+
+        // Y la otra mitad: un proceso terminado sí da su código, que es lo que hace que esta
+        // guarda no se lleve por delante el camino bueno.
+        let terminado_mal = ExecInspectResponse {
+            running: Some(false),
+            exit_code: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(codigo_de_salida(&terminado_mal), Some(3));
+
+        // Un `running` que el motor no informa no es «sigue en marcha»: no saberlo no es
+        // saber que sí, y ahí sigue mandando el `exit_code`.
+        let sin_running = ExecInspectResponse {
+            running: None,
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(codigo_de_salida(&sin_running), Some(0));
+
+        // Y los dos desenlaces de siempre siguen sin dar código: no lo informó, o no cabe.
+        for sin_codigo in [
+            ExecInspectResponse {
+                running: Some(false),
+                exit_code: None,
+                ..Default::default()
+            },
+            ExecInspectResponse {
+                running: Some(false),
+                exit_code: Some(i64::from(i32::MAX) + 1),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                codigo_de_salida(&sin_codigo),
+                None,
+                "un código que no se puede decir es un código que no se puede decir: \
+                 {sin_codigo:?}"
+            );
+        }
     }
 
     /// Ejecuta una orden y devuelve su código de salida y todos sus trozos, en orden.

@@ -48,8 +48,10 @@
 //! contenedor la repita al fallar. Y dos: el valor del entorno no puede acabar en un
 //! registro. Lo segundo **no se arregla aquí**: está medido que la biblioteca del motor
 //! registra a `DEBUG` el cuerpo serializado de la petición, con el `env` dentro, así que se
-//! corta por **filtro** de registro en el arranque. Ver el `# Seguridad` de [`Orden`] y el de
-//! [`Cliente::ejecutar`].
+//! corta por **filtro** de registro —y de eso se encarga el **arranque declarado**:
+//! [`crate::DIRECTIVA_DEL_MOTOR`] lo añade el proceso detrás de lo que pida quien lo lance,
+//! de modo que no depende de la receta con la que se arranque—. Ver el `# Seguridad` de
+//! [`Orden`] y el de [`Cliente::ejecutar`].
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -108,6 +110,30 @@ pub const INACTIVIDAD_MAXIMA: Duration = Duration::from_secs(300);
 /// para lo que un cliente de volcado dice al fallar —el error, la base y el usuario están en
 /// las primeras líneas—, así que lo que venga después es texto que nadie va a leer.
 const LIMITE_DEL_MOTIVO: usize = 1024;
+
+/// Bytes que puede ocupar un carácter UTF-8: el margen del tope de acumulación.
+///
+/// Está aquí y no dentro de la cuenta del tope porque es lo que explica el margen: lo que se
+/// acumula son **bytes** y el recorte se hace **por carácter**, así que el tope tiene que
+/// dejar sitio a los peores caracteres que existen.
+const BYTES_POR_CARACTER: usize = 4;
+
+/// Tope de bytes que se acumulan del canal de error del proceso.
+///
+/// El `stderr` es el motivo, y el motivo se recorta a [`LIMITE_DEL_MOTIVO`] caracteres: lo que
+/// hace falta retener es, como mucho, lo que el recorte va a conservar —mil caracteres, que
+/// en el peor caso son `LIMITE_DEL_MOTIVO × BYTES_POR_CARACTER` bytes— más un margen de un
+/// carácter, que es lo que cubre el caso en que el tope caiga **en mitad** de un carácter de
+/// cuatro bytes. Lo que se tira al llegar aquí es lo que no cabría en el motivo: no se pierde
+/// ni un carácter que el recorte hubiera conservado, y a cambio un contenedor que escriba sin
+/// parar por su canal de error no infla un vector en el proceso del motor sin tope —el resto
+/// del diseño ya está acotado: el canal son [`CAPACIDAD_DEL_CANAL`] trozos de 8 KiB—.
+///
+/// Que el tope pueda partir un carácter multibyte **no importa**: lo que se acumula son bytes
+/// y el recorte por carácter va después, y el margen garantiza que el corte caiga más allá de
+/// los mil caracteres que se conservan. Decisión escrita aquí para que nadie «arregle» el
+/// tope recortando por dentro.
+const TOPE_DEL_CRUDO: usize = LIMITE_DEL_MOTIVO * BYTES_POR_CARACTER + BYTES_POR_CARACTER;
 
 /// Lo que hay que extraer, ya leído de la fila del §3.
 ///
@@ -209,10 +235,13 @@ pub enum Ruta {
 /// # Errors
 ///
 /// Devuelve [`ErrorDeExtraccion::CampoQueFalta`] si el objetivo no trae un campo que su tipo
-/// necesita —`host_path` para un directorio, `container_name` y `db_user` para una base— y
-/// [`ErrorDeExtraccion::CampoEnBlanco`] si lo trae informado y no sirve. Un `db_user` ausente
-/// en un target de base es un objetivo incoherente y **no** un comando a medias: sin usuario,
-/// el cliente de volcado no sabe con quién conectar.
+/// necesita —`host_path` para un directorio, `container_name` y `db_user` para una base—,
+/// [`ErrorDeExtraccion::CampoEnBlanco`] si lo trae informado y no sirve, y
+/// [`ErrorDeExtraccion::ValorQuePareceBandera`] si el valor de un campo que acaba en la línea
+/// de comandos empieza por `-` —y entonces el cliente de volcado lo leería como una opción y
+/// el alcance del volcado cambiaría sin que nada lo note—. Un `db_user` ausente en un target
+/// de base es un objetivo incoherente y **no** un comando a medias: sin usuario, el cliente de
+/// volcado no sabe con quién conectar.
 pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
     match objetivo.tipo {
         // Un target de directorio **no pasa por Docker**: no hay ningún proceso que ejecutar,
@@ -304,7 +333,40 @@ fn datos_de_una_base(objetivo: &Objetivo) -> Result<(&str, &str, Option<&str>), 
     let usuario = exigido(objetivo, "db_user", objetivo.db_user.as_deref())?;
     let base = campo_opcional(objetivo, "db_name", objetivo.db_name.as_deref())?;
 
+    // Y los dos campos que acaban en la línea de comandos pasan por la guarda de las banderas:
+    // el usuario y la base son argumentos de un `argv`, y uno que empiece por `-` no es un
+    // nombre sino una opción. El `container_name` **no** pasa por ahí —es un parámetro de la
+    // API, no un argumento— y por eso no se le aplica.
+    let usuario = sin_ser_bandera(objetivo, "db_user", usuario)?;
+    let base = base
+        .map(|base| sin_ser_bandera(objetivo, "db_name", base))
+        .transpose()?;
+
     Ok((contenedor, usuario, base))
+}
+
+/// Rechaza un valor que la línea de comandos leería como una bandera.
+///
+/// Es la guarda de los dos campos que acaban en el `cmd` —`db_user` y `db_name`—: no hay
+/// intérprete de por medio, así que un `db_name` como `--all-databases` se pega como argumento
+/// suelto y **el cliente lo lee como una opción**, de modo que el alcance que decidió la fila
+/// del §3 se salta sin que nada lo note. Un nombre de base o de usuario que empiece por `-` no
+/// es un nombre: se rechaza con un error propio —no se cita, ni se recorta, ni se escapa—,
+/// porque una corrección silenciosa convertiría un error de la fila en un comando distinto al
+/// que el operador cree haber pedido.
+fn sin_ser_bandera<'a>(
+    objetivo: &Objetivo,
+    campo: &'static str,
+    valor: &'a str,
+) -> Result<&'a str, ErrorDeExtraccion> {
+    if valor.starts_with('-') {
+        return Err(ErrorDeExtraccion::ValorQuePareceBandera {
+            tipo: nombre_del_tipo(objetivo.tipo),
+            campo,
+        });
+    }
+
+    Ok(valor)
 }
 
 /// Lo que dejó una extracción.
@@ -351,6 +413,15 @@ pub struct Resultado {
 /// tres casos no hay hechos que devolver —la cuenta de bytes está a medias— y el productor se
 /// suelta sin declarar el final, así que el puente lee el cierre como un volcado truncado:
 /// falla cerrado.
+///
+/// Y en los dos últimos desenlaces —el transporte que se rompe y el archivado que se rinde— el
+/// error se lleva además lo que el contenedor alcanzó a decir por su canal de error **ya sin
+/// la credencial** (ver [`motivo_para_guardar`]): en un fallo a mitad de volcado, esa última
+/// frase suele ser la única pista de por qué se quedó a medias, y hasta esta corrección se
+/// tiraba con el `return`. El desenlace del contenedor ausente no lleva nada, y no es un
+/// olvido: cuando el `exec` no llega a arrancar no hay canal de error del que leer, y en cuanto
+/// lo hay el `404` viaja con el motivo en vez de por el camino del contenedor ausente —ver
+/// [`ErrorDeExtraccion::del_transporte`]—.
 ///
 /// # El runtime que conduce esto tiene que seguir vivo
 ///
@@ -404,14 +475,16 @@ pub async fn volcar(
                 }
             }
             // El canal de error **no** es volcado: es el motivo de un fallo, y va al sitio de
-            // los motivos. Se acumula tal cual —sin recortar y sin normalizar— porque lo que
-            // hay que hacer con él se hace de una vez al final.
+            // los motivos. Se acumula tal cual —sin recortar y sin normalizar, que de eso se
+            // encarga el final— pero **acotado**: el recorte llega cuando el proceso ya acabó,
+            // así que sin tope este vector crecería mientras el contenedor escriba. El tope y
+            // su margen están en [`acumular_el_motivo`].
             //
             // Y no se registra nada de lo que llega por aquí: el `Debug` de `Trozo` publica
             // sus bytes —está escrito en `src/docker`—, así que un trozo de este canal en un
             // registro sería el `stderr` del contenedor —con la credencial dentro, si el
             // contenedor la repite— escrito en el registro de Kesto.
-            Canal::Error => crudo.extend_from_slice(&trozo.bytes),
+            Canal::Error => acumular_el_motivo(&mut crudo, &trozo.bytes),
         };
 
         cliente
@@ -425,16 +498,28 @@ pub async fn volcar(
     // truncado: falla cerrado.
     let codigo = match codigo {
         Ok(codigo) => codigo,
-        Err(causa) => return Err(ErrorDeExtraccion::del_transporte(contenedor, causa)),
+        // Y el error se lleva el motivo acumulado —ya depurado, sin la credencial, y vacío si
+        // el contenedor no llegó a decir nada—: es el desenlace en el que más tiene que decir,
+        // porque el transporte se rompió con un volcado en marcha.
+        Err(causa) => {
+            return Err(ErrorDeExtraccion::del_transporte(
+                contenedor,
+                causa,
+                motivo_para_guardar(crudo, orden),
+            ));
+        }
     };
 
     // El archivado se rindió a mitad: el volcado no tiene destino y lo que ocurra con el
     // proceso ya no cambia nada de la copia. El `Err` se lleva la causa para que el motivo que
-    // acabe en la base diga **por qué** la ejecución no acabó, en vez de un «no se entregó».
+    // acabe en la base diga **por qué** la ejecución no acabó, en vez de un «no se entregó», y
+    // el motivo del contenedor por la misma razón que arriba: es la última frase que se
+    // escribió antes de que el volcado se quedara sin destino.
     if let Some(causa) = sin_destino {
         return Err(ErrorDeExtraccion::ArchivadoSeRindio {
             contenedor: contenedor.to_owned(),
             causa,
+            motivo: motivo_para_guardar(crudo, orden),
         });
     }
 
@@ -501,6 +586,33 @@ pub enum ErrorDeExtraccion {
         campo: &'static str,
     },
 
+    /// El objetivo trae un valor que la línea de comandos leería como una bandera.
+    ///
+    /// Los campos que acaban en la línea de comandos —`db_user` y `db_name`— los escribe un
+    /// operador autenticado, pero eso no los hace inofensivos: no hay intérprete de por medio,
+    /// así que un valor como `--all-databases` se pega como argumento suelto y **el cliente lo
+    /// lee como una opción**, y el alcance que había decidido la fila del §3 se salta sin que
+    /// nada lo note. No es una inyección de shell —no hay shell—, es una entrada que se
+    /// interpreta como control, y se rechaza en vez de citarse: no hay forma de escribir un
+    /// nombre de base o de usuario que empiece por `-` que sea legítima, y una cita silenciosa
+    /// convertiría un error de la fila en un comando distinto al que el operador cree.
+    ///
+    /// El valor **no** se publica —ni aquí ni en el motivo—: lo que se nombra es el campo, que
+    /// es lo que hace falta para encontrar la fila que se editó mal. El valor es una cadena
+    /// que empieza por `-`, y publicarla sería meter un trozo de línea de comandos en el
+    /// registro y en `job_executions.error_message`; `CampoEnBlanco` toma la misma decisión y
+    /// por la misma razón.
+    #[error(
+        "el `{campo}` de un objetivo de tipo `{tipo}` empieza por `-`: la línea de comandos lo \
+         leería como una bandera y el alcance del volcado cambiaría sin que nada lo note"
+    )]
+    ValorQuePareceBandera {
+        /// Tipo del objetivo, con el texto que guarda el `CHECK` del §3.
+        tipo: &'static str,
+        /// El campo cuyo valor parece una bandera.
+        campo: &'static str,
+    },
+
     /// El contenedor del objetivo no está en el motor de contenedores.
     ///
     /// El motivo del motor se conserva —hoy dice «no such container», y es su texto—, y el
@@ -519,16 +631,38 @@ pub enum ErrorDeExtraccion {
     /// Cubre los otros desenlaces del transporte: el socket que no está, el motor que no
     /// contesta, y la orden que deja de producir salida. Los distingue el transporte, y aquí
     /// se conservan: el diagnóstico de cada uno se hace en un sitio distinto.
-    #[error(transparent)]
-    Transporte(#[from] crate::docker::Error),
+    ///
+    /// Y lleva además lo que el contenedor alcanzó a escribir por su canal de error **ya
+    /// depurado** —la salida de [`motivo_para_guardar`], nunca el `stderr` crudo, así que
+    /// aquí no hay credencial que publicar—: en un fallo a mitad de volcado, la última frase
+    /// del contenedor suele ser la única pista de por qué se quedó a medias. Vacío cuando no
+    /// dijo nada, que es el caso del socket que se cae antes de arrancar el `exec`.
+    ///
+    /// No se deriva `#[from]` desde [`crate::docker::Error`] a propósito: el `?` construiría
+    /// esta variante con el motivo vacío **sin que nadie se entere**, que es exactamente la
+    /// pérdida que esta corrección viene a cerrar. Se construye por
+    /// [`ErrorDeExtraccion::del_transporte`], que sí recibe el motivo.
+    #[error("{causa}{}", lo_que_dijo_el_contenedor(.motivo))]
+    Transporte {
+        /// La causa del transporte, tal y como la informó la biblioteca.
+        #[source]
+        causa: crate::docker::Error,
+        /// Lo que el contenedor dijo por su canal de error, sin la credencial; vacío si no
+        /// llegó a decir nada.
+        motivo: String,
+    },
 
     /// El archivado dejó de leer y el volcado se quedó sin destino.
     ///
     /// No es un fallo del contenedor ni del proceso: es que el otro extremo del puente se
     /// rindió. La extracción lo detecta en cuanto un envío falla, y esta variante lleva la
-    /// causa para que el motivo que se guarde diga **por qué** la ejecución no acabó.
+    /// causa para que el motivo que se guarde diga **por qué** la ejecución no acabó —y el
+    /// motivo del contenedor, depurado igual que en [`ErrorDeExtraccion::Transporte`], porque
+    /// su última frase es la pista de qué estaba pasando cuando el volcado se quedó sin
+    /// destino—.
     #[error(
-        "la extracción de `{contenedor}` se ha quedado sin destino: el archivado del volcado dejó de leer ({causa})"
+        "la extracción de `{contenedor}` se ha quedado sin destino: el archivado del volcado dejó de leer ({causa}){}",
+        lo_que_dijo_el_contenedor(.motivo)
     )]
     ArchivadoSeRindio {
         /// Contenedor del que se estaba extrayendo.
@@ -536,7 +670,28 @@ pub enum ErrorDeExtraccion {
         /// La causa, tal y como la informó el puente.
         #[source]
         causa: crate::rustic::Error,
+        /// Lo que el contenedor dijo por su canal de error, sin la credencial; vacío si no
+        /// llegó a decir nada.
+        motivo: String,
     },
+}
+
+/// Lo que un error añade con lo que dijo el contenedor, si dijo algo.
+///
+/// Es la mitad de la decoración de [`ErrorDeExtraccion::Transporte`] y de
+/// [`ErrorDeExtraccion::ArchivadoSeRindio`], y vive aquí para que las dos variantes lo digan
+/// igual: vacío cuando no hay nada que decir —un motivo que no existe no puede dejar un «el
+/// contenedor dijo:» colgado en el mensaje, que se leería como que sí dijo—, y con el motivo
+/// detrás cuando lo hay.
+///
+/// Lo que entra aquí ya viene de [`motivo_para_guardar`]: sin la credencial y recortado. Es la
+/// única forma de que un error pueda llevar lo que dijo el contenedor sin publicar un secreto.
+fn lo_que_dijo_el_contenedor(motivo: &str) -> String {
+    if motivo.trim().is_empty() {
+        return String::new();
+    }
+
+    format!("; el contenedor dijo: {motivo}")
 }
 
 impl ErrorDeExtraccion {
@@ -547,7 +702,16 @@ impl ErrorDeExtraccion {
     /// no se arreglan igual: uno es un `container_name` que no corresponde a ningún
     /// contenedor en marcha —se corrige la fila del §3— y el otro es un motor al que no se
     /// llega —se corrige el despliegue—.
-    fn del_transporte(contenedor: &str, causa: crate::docker::Error) -> Self {
+    ///
+    /// El `motivo` es lo que el contenedor dijo por su canal de error, ya depurado. Y decide el
+    /// desenlace del `404`: cuando el `exec` no llegó a arrancar —el `create_exec` contesta que
+    /// el contenedor no está, y entonces el búfer del canal de error está vacío por
+    /// construcción— el desenlace es «el contenedor no está». Un `404` que llegue **con** algo
+    /// escrito por el canal de error es otro caso —el contenedor desapareció a mitad del
+    /// drenaje, o al preguntarle por el código— y ahí lo que el contenedor dijo tiene el mismo
+    /// valor que en cualquier otro fallo del transporte, así que va con él: el `404` sigue
+    /// dicho dentro de la causa, que es lo que el diagnóstico necesita.
+    fn del_transporte(contenedor: &str, causa: crate::docker::Error, motivo: String) -> Self {
         match causa {
             // El 404 es el motor diciendo que ese contenedor no está. Se reconoce aquí para
             // que el operador lea «el contenedor `x` no está» y no un código de estado: el
@@ -556,15 +720,16 @@ impl ErrorDeExtraccion {
                 status_code: 404,
                 message,
                 ..
-            } => Self::ContenedorQueNoEsta {
+            } if motivo.is_empty() => Self::ContenedorQueNoEsta {
                 contenedor: contenedor.to_owned(),
                 motivo: message,
             },
 
             // Todo lo demás se conserva tal cual, con la variante del transporte: es donde
             // están el socket que no existe, el motor que no contesta y la orden que dejó de
-            // producir salida, y cada uno se diagnostica en un sitio distinto.
-            causa => Self::Transporte(causa),
+            // producir salida, y cada uno se diagnostica en un sitio distinto. Con lo que el
+            // contenedor alcanzó a decir, que es la mitad que faltaba para diagnosticarlo.
+            causa => Self::Transporte { causa, motivo },
         }
     }
 }
@@ -685,6 +850,21 @@ fn entorno_del_exec(tipo: TipoDeTarget, contrasena: Option<&SecretString>) -> Ve
     vec![format!("{variable}={valor}")]
 }
 
+/// Acumula lo que el proceso escribió por su canal de error, hasta [`TOPE_DEL_CRUDO`].
+///
+/// Acotado y no «todo lo que llegue»: el motivo se recorta al final —cuando el proceso ya
+/// acabó—, así que retener más de lo que el recorte va a conservar no compra nada y sí deja a
+/// un contenedor que escriba sin parar inflando memoria en el proceso del motor. Lo que se
+/// tira aquí es exactamente lo que no cabría en el motivo, y el margen de [`TOPE_DEL_CRUDO`]
+/// cubre que el corte caiga en mitad de un carácter: el recorte por carácter va después y el
+/// margen garantiza que ese corte quede más allá de los caracteres que se conservan.
+fn acumular_el_motivo(crudo: &mut Vec<u8>, bytes: &[u8]) {
+    let libres = TOPE_DEL_CRUDO.saturating_sub(crudo.len());
+    let hasta = libres.min(bytes.len());
+
+    crudo.extend_from_slice(&bytes[..hasta]);
+}
+
 /// El motivo del contenedor listo para guardarse: **sin la credencial** y **recortado**.
 ///
 /// El orden de las dos cosas no es indiferente, y por eso están en la misma función: primero
@@ -697,6 +877,11 @@ fn entorno_del_exec(tipo: TipoDeTarget, contrasena: Option<&SecretString>) -> Ve
 /// El búfer crudo entra **por valor** y no sale de aquí: es lo único que lleva el `stderr` sin
 /// depurar, y consumirlo en esta función deja claro que no sobrevive a ella. Lo que sale es un
 /// [`String`] que ya no lleva la credencial.
+///
+/// Y de dónde viene: lo acumula [`acumular_el_motivo`], que lo deja acotado a
+/// [`TOPE_DEL_CRUDO`]. Lo que se tiró allí es lo que no cabría en el motivo, así que esta
+/// función nunca ve el `stderr` entero sino su principio —que es justo lo que el recorte
+/// conservaría— y el llamante no tiene que acordarse de nada.
 fn motivo_para_guardar(crudo: Vec<u8>, orden: &Orden) -> String {
     // El `stderr` de un contenedor no tiene por qué ser UTF-8 válido —una base puede
     // escribirlo en la codificación de su idioma—, así que lo que no lo sea se sustituye en
@@ -723,17 +908,32 @@ fn motivo_para_guardar(crudo: Vec<u8>, orden: &Orden) -> String {
 /// Lo que **no** se hace con el valor: copiarlo. La comparación y la sustitución trabajan
 /// sobre el `&str` que ya vive en la orden, sin pasar por ninguna estructura nueva que un
 /// `Debug` pueda publicar y sin construir una segunda copia del secreto.
+///
+/// # El orden: de mayor a menor longitud
+///
+/// La sustitución va del valor **más largo** al más corto, y no en el orden del entorno. La
+/// razón es concreta: dos valores en los que uno es **prefijo** del otro —`Zq7-clave` y
+/// `Zq7-clave-de-base`— dejan la punta del largo en el texto si primero se sustituye el corto,
+/// porque después la sustitución del largo ya no encuentra su cadena entera y lo que sobrevive
+/// es su cola. Del más largo al más corto, el largo se va antes de que nadie le corte nada y
+/// lo que queda del corto son sus apariciones de verdad.
+///
+/// Hoy no es alcanzable —una orden lleva cero o una variable—, pero el contrato de esta red es
+/// el día en que una orden lleve otra credencial, y una red que no cubre ese caso es peor que
+/// no tenerla: se creería cubierto. Dos valores de la **misma** longitud no pueden ser prefijo
+/// uno del otro, así que el orden entre iguales da igual.
 fn quitar_los_valores_del_entorno(texto: &str, orden: &Orden) -> String {
     let mut limpio = texto.to_owned();
 
-    for valor in valores_del_entorno(&orden.env) {
+    let mut valores: Vec<&str> = valores_del_entorno(&orden.env)
         // El valor vacío se salta: `replace("")` insertaría la marca **entre todos** los
         // caracteres del motivo y lo dejaría ilegible. Y como una contraseña vacía no llega a
         // entrar en el entorno, las dos mitades van juntas.
-        if valor.is_empty() {
-            continue;
-        }
+        .filter(|valor| !valor.is_empty())
+        .collect();
+    valores.sort_by_key(|valor| std::cmp::Reverse(valor.len()));
 
+    for valor in valores {
         // Y el valor se usa **prestado**, desde el `&str` que ya vive en la orden: no se
         // construye ninguna copia del secreto que pueda acabar en un `Debug` o en un registro,
         // y la única cadena nueva es la que sale con la marca dentro.
@@ -762,6 +962,11 @@ fn valores_del_entorno(env: &[String]) -> impl Iterator<Item = &str> {
 /// El `…` final no es adorno: es la única señal de que el motivo está incompleto. Sin él, un
 /// error cortado se leería como el error entero y el operador buscaría una frase que no está
 /// en ninguna parte.
+///
+/// Y el borde, escrito para que no lo «arregle» nadie: un motivo que mida **exactamente** el
+/// límite no se toca —cabe—, y uno que mida uno más se corta a [`LIMITE_DEL_MOTIVO`] caracteres
+/// contando el `…`, así que pierde un carácter respecto a lo que traía. El resultado mide el
+/// límite en los dos casos, que es lo que el campo de la base puede guardar.
 fn recortar(motivo: &str) -> String {
     if motivo.chars().count() <= LIMITE_DEL_MOTIVO {
         return motivo.to_owned();
@@ -782,10 +987,12 @@ fn recortar(motivo: &str) -> String {
 mod tests {
     use std::io::Read;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::{
         CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, LIMITE_DEL_MOTIVO, Objetivo,
-        Resultado, Ruta, motivo_para_guardar, nombre_del_tipo, recortar, ruta, volcar,
+        Resultado, Ruta, TOPE_DEL_CRUDO, acumular_el_motivo, motivo_para_guardar, nombre_del_tipo,
+        recortar, ruta, volcar,
     };
     use crate::db::entities::{Target, TipoDeTarget};
     use crate::docker::{Cliente, Orden};
@@ -801,6 +1008,13 @@ mod tests {
     /// una de ellas busca los **prefijos** de la contraseña y un prefijo que coincidiera con
     /// el texto de al lado daría un falso positivo.
     const CONTRASENA: &str = "Zq7-clave-de-base-distinguible";
+
+    /// Plazo de inactividad del estancamiento: tiene que vencer, así que es corto.
+    ///
+    /// Dos segundos y no los 500 ms que usa el transporte: aquí la prueba necesita que el
+    /// contenedor alcance a escribir su motivo por el canal de error **antes** de callarse, y
+    /// lo que mide es el estancamiento, no la carrera de arranque del `exec`.
+    const PLAZO_ESTANCADO: Duration = Duration::from_secs(2);
 
     // ── Ayudantes ────────────────────────────────────────────────────────────
 
@@ -1161,6 +1375,90 @@ mod tests {
         por_contenedor(&objetivo_postgresql(None));
     }
 
+    /// Un valor que **parece una bandera** se rechaza, y el motivo nombra el campo.
+    ///
+    /// Es la corrección de la auditoría: no hay intérprete de por medio, así que un `db_name`
+    /// como `--all-databases` se pega como argumento suelto y el cliente lo lee como una
+    /// opción —el alcance que `db_name` venía a decidir se salta sin que nada lo note—. Se
+    /// rechaza con un error propio, y no se cita ni se escapa: una corrección silenciosa
+    /// convertiría un error de la fila en un comando distinto al que el operador cree pedir.
+    #[test]
+    fn un_valor_que_parece_bandera_se_rechaza() {
+        let caso = |objetivo: Objetivo, campo: &'static str, valor: &str| {
+            let error =
+                ruta(&objetivo).expect_err("un valor que parece una bandera no da un comando");
+            let mensaje = error.to_string();
+
+            assert!(
+                matches!(
+                    &error,
+                    ErrorDeExtraccion::ValorQuePareceBandera { campo: cual, .. } if *cual == campo
+                ),
+                "el fallo tiene que nombrar el campo `{campo}`: {error:?}"
+            );
+            assert!(
+                mensaje.contains(campo),
+                "el motivo no nombra el campo `{campo}`: {mensaje}"
+            );
+            // Y no publica el valor: lo que hace falta para encontrar la fila mal editada es el
+            // campo, no un trozo de línea de comandos en el registro y en la base.
+            assert!(
+                !mensaje.contains(valor),
+                "el motivo publica el valor que se rechazó: {mensaje}"
+            );
+        };
+
+        caso(
+            Objetivo {
+                db_name: Some("--all-databases".to_owned()),
+                ..objetivo_mariadb(None)
+            },
+            "db_name",
+            "--all-databases",
+        );
+        caso(
+            Objetivo {
+                db_name: Some("-d".to_owned()),
+                ..objetivo_postgresql(None)
+            },
+            "db_name",
+            "-d",
+        );
+        caso(
+            Objetivo {
+                db_user: Some("--user".to_owned()),
+                ..objetivo_mariadb(None)
+            },
+            "db_user",
+            "--user",
+        );
+        caso(
+            Objetivo {
+                db_user: Some("-uperador".to_owned()),
+                ..objetivo_postgresql(None)
+            },
+            "db_user",
+            "-uperador",
+        );
+    }
+
+    /// El `container_name` **no** pasa por la guarda de las banderas: no es un argumento.
+    ///
+    /// La guarda es de los campos que acaban en la línea de comandos, y el contenedor no acaba
+    /// ahí: es un parámetro de la API de Docker. Rechazarlo sería inventar una restricción que
+    /// el motor no tiene, y el diagnóstico de un contenedor mal escrito ya está en el motor.
+    #[test]
+    fn el_nombre_del_contenedor_no_pasa_por_la_guarda_de_las_banderas() {
+        let objetivo = Objetivo {
+            container_name: Some("-contenedor".to_owned()),
+            ..objetivo_mariadb(None)
+        };
+
+        let (contenedor, _) = por_contenedor(&objetivo);
+
+        assert_eq!(contenedor, "-contenedor");
+    }
+
     /// Un target de `directory` sale por el sistema de ficheros y **nunca** por un contenedor.
     ///
     /// La ruta es la de `host_path`, que es la que el proceso ve —el `compose` del §8 es
@@ -1196,6 +1494,81 @@ mod tests {
                 }
             ),
             "el fallo no nombra la ruta que falta: {error:?}"
+        );
+    }
+
+    /// **El motivo del contenedor va en el error**, y el `404` que llega con motivo no se lee
+    /// como «el contenedor no está».
+    ///
+    /// Es la decisión de la corrección, fijada sin motor: un fallo del transporte con algo
+    /// escrito por el canal de error lleva ese algo —depurado, que es lo que entra aquí—, y un
+    /// `404` **sin** nada escrito sigue siendo el contenedor ausente del `create_exec`, que es
+    /// el único camino en el que el búfer puede estar vacío por construcción.
+    #[test]
+    fn el_motivo_del_contenedor_viaja_en_el_error_del_transporte() {
+        let no_esta = || crate::docker::Error::MotorContesta {
+            contenedor: "contenedor-de-la-base".to_owned(),
+            status_code: 404,
+            message: "no such container".to_owned(),
+        };
+
+        // Sin nada que el contenedor haya dicho: el desenlace de siempre.
+        assert!(
+            matches!(
+                ErrorDeExtraccion::del_transporte(
+                    "contenedor-de-la-base",
+                    no_esta(),
+                    String::new()
+                ),
+                ErrorDeExtraccion::ContenedorQueNoEsta { .. }
+            ),
+            "un 404 sin nada escrito sigue siendo el contenedor ausente"
+        );
+
+        // Con algo dicho: el motivo no se tira, y el 404 sigue dicho dentro de la causa.
+        let error = ErrorDeExtraccion::del_transporte(
+            "contenedor-de-la-base",
+            no_esta(),
+            format!("; el contenedor dijo: no puedo con {REDACTED}"),
+        );
+        let mensaje = error.to_string();
+
+        assert!(
+            matches!(&error, ErrorDeExtraccion::Transporte { motivo, .. } if motivo.contains(REDACTED)),
+            "el motivo del contenedor se tiró por el camino: {error:?}"
+        );
+        assert!(
+            mensaje.contains("el contenedor dijo"),
+            "el motivo no llega al mensaje, que es lo que se guarda: {mensaje}"
+        );
+        assert!(
+            mensaje.contains("404"),
+            "el 404 se perdió al no reconocerse como contenedor ausente: {mensaje}"
+        );
+    }
+
+    /// Un motivo **vacío** no deja un «el contenedor dijo:» colgado en el mensaje.
+    ///
+    /// Un motivo que no existe se leería como que el contenedor sí dijo algo, y mandaría a
+    /// buscar una frase que no está en ninguna parte.
+    #[test]
+    fn un_motivo_vacio_no_deja_la_frase_del_contenedor_colgando() {
+        let causa = crate::docker::Error::ExtraccionEstancada {
+            contenedor: "contenedor-de-la-base".to_owned(),
+            inactividad: INACTIVIDAD_MAXIMA,
+        };
+
+        let error =
+            ErrorDeExtraccion::del_transporte("contenedor-de-la-base", causa, String::new());
+        let mensaje = error.to_string();
+
+        assert!(
+            !mensaje.contains("el contenedor dijo"),
+            "el mensaje dice que el contenedor habló sin que lo hiciera: {mensaje}"
+        );
+        assert!(
+            !mensaje.ends_with(' '),
+            "el mensaje deja un hueco donde iría el motivo: {mensaje:?}"
         );
     }
 
@@ -1280,6 +1653,134 @@ mod tests {
         let motivo = "mariadb-dump: Got error: 1045: Access denied for user 'operador'";
 
         assert_eq!(recortar(motivo), motivo);
+    }
+
+    /// **El límite del motivo no tiene un `off-by-one`**: el que lo mide entero cabe, y el que
+    /// mide uno más se corta.
+    ///
+    /// Es la frontera exacta, y por eso se fijan los dos lados: el `…` se lleva un carácter del
+    /// límite, así que el corte conserva `LIMITE_DEL_MOTIVO - 1` y el resultado mide el límite
+    /// —ni uno más, que no cabría en el campo, ni uno menos, que tiraría texto que cabe—. Sin
+    /// las dos aserciones, un `take` de más o de menos no se notaría: la prueba del borde no es
+    /// la del recorte.
+    #[test]
+    fn el_limite_del_motivo_no_tiene_un_off_by_one() {
+        let justo = "a".repeat(LIMITE_DEL_MOTIVO);
+
+        assert_eq!(
+            recortar(&justo),
+            justo,
+            "un motivo que mide exactamente el límite cabe entero: no se recorta ni se le añade \
+             nada"
+        );
+
+        let recortado = recortar(&"a".repeat(LIMITE_DEL_MOTIVO + 1));
+
+        assert_eq!(
+            recortado,
+            format!("{}…", "a".repeat(LIMITE_DEL_MOTIVO - 1)),
+            "el motivo que mide uno más no se corta donde debe: conserva el límite menos el \
+             sitio del `…`"
+        );
+        assert_eq!(
+            recortado.chars().count(),
+            LIMITE_DEL_MOTIVO,
+            "el motivo recortado tiene que medir exactamente el límite"
+        );
+    }
+
+    /// **La punta del valor más largo no sobrevive** cuando dos valores del entorno se solapan.
+    ///
+    /// Es la corrección de la auditoría, y el fallo era de orden: sustituyendo en el orden del
+    /// entorno, `Zq7-clave` parte `Zq7-clave-de-base` y su cola queda en el motivo
+    /// —`<redactado>-de-base`—, que es publicar la mitad larga de una credencial creyendo
+    /// haberla quitado. Del más largo al más corto, el largo se va entero.
+    #[test]
+    fn dos_valores_solapados_no_dejan_la_punta_del_mas_largo() {
+        let orden = Orden {
+            cmd: argv(&["mariadb-dump"]),
+            // El corto va **primero**, que es el orden del entorno que destapaba el fallo.
+            env: argv(&["OTRA=Zq7-clave", "MYSQL_PWD=Zq7-clave-de-base"]),
+        };
+
+        let motivo =
+            motivo_para_guardar("no puedo con Zq7-clave-de-base".as_bytes().to_vec(), &orden);
+
+        assert_eq!(
+            motivo,
+            format!("no puedo con {REDACTED}"),
+            "el motivo no quedó redactado entero: {motivo}"
+        );
+        assert!(
+            !motivo.contains("de-base"),
+            "el motivo guarda la cola del valor más largo: {motivo}"
+        );
+    }
+
+    /// El motivo se acumula **acotado**, y el tope no parte nada que el recorte conserve.
+    ///
+    /// Sin tope, un contenedor que escriba sin parar por su canal de error deja a este vector
+    /// creciendo en el proceso del motor hasta que el proceso acabe: el resto del diseño está
+    /// acotado —el canal son [`CAPACIDAD_DEL_CANAL`] trozos de 8 KiB— y esto no lo estaba. Lo
+    /// que se tira en el tope es lo que no cabría en el motivo, y el margen cubre el caso en
+    /// que el corte caiga **en mitad** de un carácter, que es lo que la última aserción fija.
+    #[test]
+    fn el_motivo_se_acumula_acotado() {
+        let trozo: Vec<u8> = "x".repeat(1024).into_bytes();
+        let mut crudo = Vec::new();
+
+        for _ in 0..64 {
+            acumular_el_motivo(&mut crudo, &trozo);
+        }
+
+        assert!(
+            crudo.len() <= TOPE_DEL_CRUDO,
+            "el búfer del motivo pasó del tope: {} bytes",
+            crudo.len()
+        );
+        assert_eq!(
+            crudo.len(),
+            TOPE_DEL_CRUDO,
+            "el búfer no llegó al tope, así que 64 trozos de 1 KiB no bastan para llenarlo"
+        );
+        assert!(
+            crudo.iter().all(|byte| *byte == b'x'),
+            "el búfer no guarda el principio de lo que escribió el contenedor"
+        );
+
+        // Y una vez lleno no vuelve a crecer: lo que se tira es lo que no cabría en el motivo.
+        acumular_el_motivo(&mut crudo, b"cola que no cabe en el motivo");
+        assert_eq!(
+            crudo.len(),
+            TOPE_DEL_CRUDO,
+            "el búfer creció después de llenarse"
+        );
+
+        // El caso del carácter partido, que es el que justifica el margen: con un carácter de
+        // tres bytes, el corte del tope cae **dentro** de uno. El búfer lo lleva —son bytes—,
+        // pero el recorte, que va por carácter, no llega a verlo: lo que se conserva son mil
+        // caracteres buenos.
+        let mut crudo = Vec::new();
+        acumular_el_motivo(&mut crudo, &"€".repeat(TOPE_DEL_CRUDO).into_bytes());
+
+        let texto = String::from_utf8_lossy(&crudo);
+        assert!(
+            texto.contains(char::REPLACEMENT_CHARACTER),
+            "el corte del tope no partió ningún carácter, así que esta prueba no está midiendo \
+             lo que dice"
+        );
+
+        let motivo = recortar(&texto);
+        assert_eq!(
+            motivo.chars().count(),
+            LIMITE_DEL_MOTIVO,
+            "el motivo recortado no mide el límite"
+        );
+        assert!(
+            !motivo.contains(char::REPLACEMENT_CHARACTER),
+            "el tope partió un carácter dentro de los que el recorte conserva: el margen de \
+             `TOPE_DEL_CRUDO` no está haciendo su trabajo"
+        );
     }
 
     /// El motivo **no** lleva la credencial: la marca sustituye a todas sus apariciones.
@@ -1417,6 +1918,21 @@ mod tests {
         orden: Orden,
         productor: ProductorDelVolcado,
     ) -> std::thread::JoinHandle<Result<Resultado, ErrorDeExtraccion>> {
+        volcar_en_su_hilo_con_plazo(contenedor, orden, productor, INACTIVIDAD_MAXIMA)
+    }
+
+    /// La misma conducción, con el plazo que se le pida.
+    ///
+    /// Existe por la prueba del estancamiento, que es la única que necesita un plazo **corto**:
+    /// todas las demás fijan que el plazo de producción no estorba a una extracción que avanza,
+    /// y ahí el número que interesa es el de verdad. El ayudante es el mismo y el camino es el
+    /// mismo: lo único que cambia es el número.
+    fn volcar_en_su_hilo_con_plazo(
+        contenedor: &str,
+        orden: Orden,
+        productor: ProductorDelVolcado,
+        inactividad_maxima: Duration,
+    ) -> std::thread::JoinHandle<Result<Resultado, ErrorDeExtraccion>> {
         let socket = socket_del_motor().expect("las pruebas del motor necesitan un socket");
         let contenedor = contenedor.to_owned();
 
@@ -1431,7 +1947,7 @@ mod tests {
                 let cliente =
                     Cliente::conectar(&socket, TIMEOUT_DEL_MOTOR).expect("el socket existe");
 
-                volcar(&cliente, &contenedor, &orden, productor, INACTIVIDAD_MAXIMA).await
+                volcar(&cliente, &contenedor, &orden, productor, inactividad_maxima).await
             })
         })
     }
@@ -1683,5 +2199,169 @@ mod tests {
             error.to_string().contains(AUSENTE),
             "el motivo no nombra el contenedor: {error}"
         );
+    }
+
+    /// **Un fallo sin una gota en la salida no es una base vacía.**
+    ///
+    /// Es el caso «no hay cliente de volcado en la imagen», que es justo el que hay que
+    /// distinguir de una base sin datos: los dos dejan el `stdout` en cero bytes, y lo único
+    /// que los separa es el código de salida y el motivo. El contenedor de prueba es un
+    /// `alpine`, que no trae `mariadb-dump`, así que el comando de verdad de un volcado global
+    /// sale con un código distinto de cero, no escribe nada por su salida y sí deja un motivo
+    /// por su canal de error. La señal de la entrega tiene que quedarse **en falso**: darla por
+    /// buena sería dar por buena una copia vacía, que existe, ocupa sitio y no se puede
+    /// restaurar.
+    ///
+    /// La prueba que ya había escribe bytes antes de fallar; ésta no escribe ninguno, que es la
+    /// forma en que un fallo de extracción se parece a una base vacía y la razón de que el
+    /// código de salida y el canal de error sean lo único que los distingue.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    async fn un_proceso_que_falla_sin_escribir_en_la_salida_no_es_una_base_vacia() {
+        let contenedor = ContenedorDePrueba::nuevo(
+            "un_proceso_que_falla_sin_escribir_en_la_salida_no_es_una_base_vacia",
+        )
+        .await;
+        let TunelDelVolcado {
+            origen,
+            productor,
+            entrega,
+        } = tunel_de_prueba("volcado-sin-cliente.sql");
+
+        // El comando de un volcado global de MariaDB, con la forma que le da `ruta`: en `alpine`
+        // ese binario no está, que es exactamente lo que pasa cuando la imagen de la base no
+        // trae el cliente de volcado.
+        let orden = Orden {
+            cmd: argv(&["mariadb-dump", "--single-transaction", "--all-databases"]),
+            env: Vec::new(),
+        };
+        let hilo = volcar_en_su_hilo(contenedor.nombre(), orden, productor);
+
+        let mut lector = lector_del_volcado(&origen);
+        let mut leido = Vec::new();
+        let lectura = lector.read_to_end(&mut leido);
+
+        let resultado = hilo
+            .join()
+            .expect("el hilo que conduce el `exec` no puede entrar en pánico")
+            .expect("el proceso llegó a su término: hay hechos que contar");
+
+        assert_ne!(
+            resultado.codigo, 0,
+            "el binario no está en la imagen, así que el proceso no puede salir con cero"
+        );
+        assert_eq!(
+            resultado.bytes_leidos, 0,
+            "un binario ausente no escribe nada por su salida: la cuenta de bytes sería el \
+             volcado y aquí no hay ninguno"
+        );
+        assert!(
+            leido.is_empty(),
+            "al lector no puede llegarle nada: {} bytes",
+            leido.len()
+        );
+        assert!(
+            !resultado.motivo_del_contenedor.is_empty(),
+            "el motivo del contenedor se perdió, y es la única mitad que distingue este fallo de \
+             una base vacía"
+        );
+        assert!(
+            lectura.is_err(),
+            "el lector devolvió un fin de fichero limpio sobre un volcado que nunca se escribió: \
+             la biblioteca lo leería como «el volcado se acabó» y daría la copia por buena"
+        );
+        assert!(
+            !entrega.completa(),
+            "una extracción que falló sin escribir nada no puede darse por entregada"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// **Una orden que se calla acaba en estancamiento, y la entrega queda en falso.**
+    ///
+    /// Es el otro camino que el contrato exige distinguir de una extracción que terminó sin
+    /// escribir nada: la orden deja de producir salida durante más que el plazo, `volcar` lo
+    /// propaga con el plazo que se le dio, y el lector del puente se encuentra el cierre
+    /// **sin** la señal del final, así que el volcado no queda entregado. Sin acotar la
+    /// inactividad, esto no sería un fallo con nombre: sería una ejecución en `running` para
+    /// siempre, con el worker de su repositorio ocupado y todo su trabajo posterior haciendo
+    /// cola detrás.
+    ///
+    /// Y es además la prueba, extremo a extremo, de lo que el error **lleva**: el guion escribe
+    /// la credencial por su canal de error antes de callarse, así que el motivo del contenedor
+    /// viaja en el error —la mitad que cerró la auditoría, porque antes se tiraba con el
+    /// `return`— y viaja **sin la credencial**, que es la mitad que no se puede romper.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    async fn una_orden_que_se_calla_acaba_en_estancamiento_y_sin_entrega() {
+        let contenedor = ContenedorDePrueba::nuevo(
+            "una_orden_que_se_calla_acaba_en_estancamiento_y_sin_entrega",
+        )
+        .await;
+        let TunelDelVolcado {
+            origen,
+            productor,
+            entrega,
+        } = tunel_de_prueba("volcado-estancado.sql");
+
+        let orden = Orden {
+            env: vec![format!("MYSQL_PWD={CONTRASENA}")],
+            ..orden_de_shell("printf 'no puedo con %s' \"$MYSQL_PWD\" >&2; sleep 600")
+        };
+        let hilo =
+            volcar_en_su_hilo_con_plazo(contenedor.nombre(), orden, productor, PLAZO_ESTANCADO);
+
+        let mut lector = lector_del_volcado(&origen);
+        let mut leido = Vec::new();
+        let lectura = lector.read_to_end(&mut leido);
+
+        let error = hilo
+            .join()
+            .expect("el hilo que conduce el `exec` no puede entrar en pánico")
+            .expect_err("una orden que se calla más que el plazo no puede darse por buena");
+
+        assert!(
+            matches!(
+                &error,
+                ErrorDeExtraccion::Transporte {
+                    causa: crate::docker::Error::ExtraccionEstancada {
+                        contenedor: cual,
+                        inactividad,
+                    },
+                    ..
+                } if cual == contenedor.nombre() && *inactividad == PLAZO_ESTANCADO
+            ),
+            "el vencimiento no llegó como estancamiento con el plazo que se le dio: {error:?}"
+        );
+
+        // Lo que el contenedor dijo antes de callarse viaja en el error, y sin la credencial.
+        let mensaje = error.to_string();
+        assert!(
+            mensaje.contains("no puedo con"),
+            "el error se dejó lo que el contenedor alcanzó a decir por su canal de error: \
+             {mensaje}"
+        );
+        assert!(
+            !mensaje.contains(CONTRASENA),
+            "el error publica la credencial de la base: {mensaje}"
+        );
+
+        assert!(
+            leido.is_empty(),
+            "el guion no escribe nada por su salida: {} bytes",
+            leido.len()
+        );
+        assert!(
+            lectura.is_err(),
+            "el lector devolvió un fin de fichero limpio sobre un volcado que no se declaró \
+             terminado"
+        );
+        assert!(
+            !entrega.completa(),
+            "el volcado no se declaró terminado y la señal dice que se entregó entero"
+        );
+
+        contenedor.retirar().await;
     }
 }

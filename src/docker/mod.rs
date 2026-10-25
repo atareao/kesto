@@ -49,9 +49,12 @@ pub use cliente::Cliente;
 ///
 /// Es decir: **la exposición se corta por filtro, no por este `Debug`**. Quien lea esto y se
 /// quede tranquilo por no usar `#[derive(Debug)]` se queda tranquilo en el sitio que no
-/// toca. Lo que hay que hacer es no registrar el target `bollard` a `debug`: el `.justfile`
-/// lo silencia con `RUST_LOG=debug,bollard=warn` y explica allí por qué. Ver también el
-/// `# Seguridad` de [`Cliente::ejecutar`], que es donde se pide el `exec`.
+/// toca. Lo que hay que hacer es no registrar el target `bollard` a `debug`, y de eso se
+/// encarga el **proceso**: el arranque pone la directiva del proyecto detrás del filtro que
+/// pida quien lance el binario —[`crate::DIRECTIVA_DEL_MOTOR`]—, de modo que no queda a la
+/// memoria de quien lo ejecute; el `.justfile` la repite en `just dev` y en `just run`, y
+/// explica allí por qué. Ver también el `# Seguridad` de [`Cliente::ejecutar`], que es donde
+/// se pide el `exec`.
 pub struct Orden {
     /// La orden, ya troceada en argumentos.
     pub cmd: Vec<String>,
