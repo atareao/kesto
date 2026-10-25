@@ -14,6 +14,7 @@ pub mod config;
 pub mod db;
 pub mod docker;
 pub mod error;
+pub mod rustic;
 pub mod secret;
 pub mod state;
 
