@@ -23,6 +23,26 @@
 //! nadie mejor que este módulo. Lo que sí cambia según el tamaño del panel es el cliente, y el
 //! cliente no decide esto.
 //!
+//! # El cierre, y por qué el emisor es **uno solo**
+//!
+//! El hub se puede cerrar —[`Hub::cerrar`]—, y eso es lo que hace que el apagado ordenado del
+//! proceso no se cuelgue con un cliente conectado al stream: el cierre de `axum` no resuelve hasta
+//! que todas las conexiones terminan, y el cuerpo de un `text/event-stream` solo termina cuando el
+//! canal se cierra. Sin cerrarlo, el proceso se queda vivo hasta que el período de gracia del
+//! orquestador lo mata con `SIGKILL`, con el hilo de trabajo a mitad de archivar: exactamente lo
+//! que la parada acotada existe para evitar.
+//!
+//! Y por eso el emisor **no** puede ser un `Sender` por clon, que es lo que parecería natural en un
+//! tipo `Clone`. Los clones del hub no son todos de un momento: `EnVivo` —el estado de una
+//! ejecución en curso— guarda el suyo mientras su copia corre, así que cerrar desde uno dejaría el
+//! otro en pie, el canal seguiría abierto y el apagado volvería a colgarse igual. Con un único
+//! extremo de envío compartido —`Arc<Mutex<Option<…>>>`— soltarlo lo cierra para todos, incluido el
+//! de una copia en vuelo.
+//!
+//! Cerrar **no** es una tercera vía de terminación del flujo: es la que ya estaba. [`Hub::cerrar`]
+//! suelta el emisor, los receptores reciben su `Closed` y el stream termina por el camino que su
+//! rustdoc ya explica.
+//!
 //! # Aquí no vive el cable
 //!
 //! El nombre del evento —`execution_progress`— y los nombres de los campos **no** están en este
@@ -34,6 +54,8 @@
 //! `failed`—, así que el texto del cable lo pone quien publica el evento, no el evento. Con una
 //! cadena, un `status` inventado no sería un error de compilación sino un evento que el panel
 //! pinta como pueda.
+
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -106,15 +128,26 @@ pub struct EventoDeEjecucion {
 ///
 /// Se construye vacío con [`Hub::nuevo`] y se comparte —es `Clone`, y clonarlo no copia ni un
 /// evento: por dentro hay un `Arc`—. Publicar nunca falla y nunca bloquea: ver
-/// [`Hub::publicar`].
+/// [`Hub::publicar`]. Y se puede **cerrar** —[`Hub::cerrar`]—, que es lo que deja terminar a los
+/// clientes del stream cuando el proceso se apaga.
 #[derive(Clone)]
 pub struct Hub {
-    /// El extremo de envío del `broadcast`.
+    /// El extremo de envío del `broadcast`: **uno solo** para todos los clones del hub.
     ///
-    /// Es todo el estado del hub: los receptores los crea [`Hub::suscribir`], y el canal se queda
-    /// con el último extremo de envío aunque no quede ningún receptor, de modo que suscribirse
-    /// después de que todos se hayan ido sigue funcionando.
-    emisor: broadcast::Sender<EventoDeEjecucion>,
+    /// Los receptores los crea [`Hub::suscribir`], y el canal se queda con el último extremo de
+    /// envío aunque no quede ningún receptor, de modo que suscribirse después de que todos se hayan
+    /// ido sigue funcionando.
+    ///
+    /// El `Option` es el cierre: [`Hub::cerrar`] lo vacía, y al soltar el `Sender` el canal queda
+    /// cerrado de golpe para todos los receptores. El `Arc` es lo que hace que el cierre alcance a
+    /// **todos** los clones —el de `EnVivo`, que vive lo que dura una copia—; el porqué, en el
+    /// encabezado del módulo.
+    ///
+    /// El candado es de `std` y no de Tokio a propósito: protege tres operaciones instantáneas
+    /// —mirar el `Option`, suscribir y publicar—, no se mantiene nunca a lo largo de un `await`, y
+    /// [`Hub::publicar`] tiene que poder llamarse desde los hilos del motor, que no están dentro de
+    /// un runtime.
+    emisor: Arc<Mutex<Option<broadcast::Sender<EventoDeEjecucion>>>>,
 }
 
 impl Hub {
@@ -124,18 +157,38 @@ impl Hub {
         // extremo de envío, y cada cliente pide el suyo con `suscribir`.
         let (emisor, _) = broadcast::channel(CAPACIDAD_DEL_HUB);
 
-        Self { emisor }
+        Self {
+            emisor: Arc::new(Mutex::new(Some(emisor))),
+        }
     }
 
-    /// Un receptor para un cliente del stream.
+    /// Un receptor para un cliente del stream, o `None` si el hub ya está cerrado.
     ///
     /// Cada cliente tiene el suyo: el `broadcast` reparte una copia a cada uno, así que dos
     /// clientes conectados a la vez ven los mismos eventos y ninguno ve algo que el otro no vea.
     /// Un cliente que se queda atrás pierde eventos —su receptor devuelve
     /// [`Lagged`](tokio::sync::broadcast::error::RecvError::Lagged) con cuántos se dejó— y **no**
     /// frena a nadie: eso es exactamente lo que la capacidad acotada compra.
-    pub fn suscribir(&self) -> broadcast::Receiver<EventoDeEjecucion> {
-        self.emisor.subscribe()
+    ///
+    /// # Por qué devuelve un `Option`, y no un receptor siempre
+    ///
+    /// Porque el hub se puede cerrar **a la vez** que llega una petición: una que ya estaba dentro
+    /// cuando llegó el `SIGTERM` puede llamar aquí justo después de [`Hub::cerrar`], y con un
+    /// `Receiver` a secas habría que devolver algo inventado —un canal recién hecho, cuyo emisor
+    /// habría que soltar en el acto para que la primera lectura diera `Closed`—. El `Option` pone
+    /// ese estado en el **tipo**: quien llama sabe que no hay stream que servir, y la capa HTTP
+    /// contesta un cuerpo que termina en el acto en vez de fingir una suscripción.
+    ///
+    /// El candado envenenado devuelve `None` por el mismo motivo que [`Hub::cerrar`] no entra en
+    /// pánico: un cierre a medias no puede dejar a un cliente esperando eventos que ya no van a
+    /// llegar.
+    pub fn suscribir(&self) -> Option<broadcast::Receiver<EventoDeEjecucion>> {
+        let emisor = self
+            .emisor
+            .lock()
+            .unwrap_or_else(|envenenado| envenenado.into_inner());
+
+        emisor.as_ref().map(broadcast::Sender::subscribe)
     }
 
     /// Publica un aviso. **Nunca bloquea y nunca falla**: sin suscriptores se descarta.
@@ -146,8 +199,60 @@ impl Hub {
     /// devuelve —error solo cuando no queda ningún receptor vivo— se descarte: «no hay nadie
     /// escuchando» no es un fallo del motor, es una pestaña cerrada, y tratarlo como un fallo
     /// obligaría a decidir qué hacer con una copia por el hecho de que nadie mire.
+    ///
+    /// Después de [`Hub::cerrar`] esto es un **no-op silencioso**, y esa es la tercera mitad del
+    /// contrato durante el apagado: no hay a quién publicar —los clientes ya tienen su `Closed`— y
+    /// un trabajador que esté a mitad de una copia sigue avisando hasta que su ejecución acabe.
+    /// Negarse aquí obligaría a decidir qué hacer con una copia en curso por el hecho de que el
+    /// proceso se esté apagando, que es justo lo que `publicar` existe para no hacer.
+    ///
+    /// El candado se mantiene **durante el `send`**, y no es un descuido: clonar el `Sender` para
+    /// soltarlo antes de enviar dejaría un extremo de envío vivo un instante más, y un
+    /// [`Hub::cerrar`] que cayera en ese hueco no cerraría nada —el clon mantendría el canal
+    /// abierto y los receptores no verían su `Closed`, que es el cuelgue que esto viene a
+    /// arreglar—. Publicar dura microsegundos y ningún `await` cabe dentro.
     pub fn publicar(&self, evento: EventoDeEjecucion) {
-        let _ = self.emisor.send(evento);
+        let emisor = self
+            .emisor
+            .lock()
+            .unwrap_or_else(|envenenado| envenenado.into_inner());
+
+        if let Some(emisor) = emisor.as_ref() {
+            let _ = emisor.send(evento);
+        }
+    }
+
+    /// Cierra el hub: los clientes del stream terminan, y publicar deja de hacer nada.
+    ///
+    /// Es lo que el apagado ordenado llama **antes** de esperar a que las conexiones terminen, y
+    /// existe porque ese cierre no resuelve hasta que todas lo hacen: con un cliente conectado al
+    /// stream, su cuerpo no termina nunca —la única salida del flujo es el `Closed` del canal— y
+    /// el proceso se quedaría vivo hasta que el orquestador lo matara con `SIGKILL`, con el hilo
+    /// de trabajo a mitad de archivar. Lo llama [`Motor::cerrar_el_hub`](crate::engine::Motor::cerrar_el_hub),
+    /// una vez, dentro del futuro de apagado del servidor.
+    ///
+    /// Es **idempotente** —la segunda vez no queda nada que soltar— y no entra en pánico si el
+    /// candado quedó envenenado: el trabajo se hace igual, con el candado recogido, porque un
+    /// cierre que se cae no cierra nada.
+    ///
+    /// # El límite que esto **no** cubre, y que hay que saber
+    ///
+    /// Un cliente que además **deje de leer** —el socket lleno, el portátil cerrado— puede seguir
+    /// retrasando el cierre: con el búfer de escritura lleno, el cuerpo no se puede vaciar y esa
+    /// conexión no termina. Eso no está en manos del hub: aquí se cierra el canal, que es lo que sí
+    /// lo está. Poner un plazo de escritura sería inventarse una segunda vía de terminación —y, con
+    /// ella, un cliente al que se corta sin que nadie lo haya decidido—; el contrato pide que el
+    /// apagado no se cuelgue por culpa del motor, no que un cliente roto se pueda ignorar.
+    pub fn cerrar(&self) {
+        let mut emisor = self
+            .emisor
+            .lock()
+            .unwrap_or_else(|envenenado| envenenado.into_inner());
+
+        // El `take` **es** el cierre: al soltar el último extremo de envío del `broadcast` el canal
+        // se cierra y todos los receptores —los conectados y los que lleguen tarde— reciben
+        // `Closed`. Y es idempotente por construcción: la segunda vez devuelve `None`.
+        let _ = emisor.take();
     }
 
     /// La capacidad del hub, en eventos.
@@ -187,7 +292,7 @@ impl std::fmt::Debug for Hub {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     use uuid::Uuid;
 
     use super::{EventoDeEjecucion, Hub};
@@ -222,8 +327,12 @@ mod tests {
         // Sin nadie escuchando: no falla, se descarta.
         hub.publicar(evento("antes de que nadie escuche"));
 
-        let mut uno = hub.suscribir();
-        let mut otro = hub.suscribir();
+        let mut uno = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+        let mut otro = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         let publicado = evento("archivando");
         hub.publicar(publicado.clone());
@@ -258,7 +367,9 @@ mod tests {
     fn el_hub_no_crece_sin_tope_y_el_cliente_lento_no_frena_al_motor() {
         let hub = Hub::nuevo();
         let capacidad = hub.capacidad();
-        let mut lento = hub.suscribir();
+        let mut lento = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         // El cronómetro va aquí solo para dejar constancia de la otra mitad del contrato: con un
         // búfer acotado y descartando, publicar no puede quedarse esperando a que alguien lea.
@@ -317,7 +428,9 @@ mod tests {
     #[test]
     fn dos_avisos_seguidos_llegan_los_dos_y_en_orden() {
         let hub = Hub::nuevo();
-        let mut cliente = hub.suscribir();
+        let mut cliente = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         hub.publicar(evento("extrayendo el volcado"));
         hub.publicar(evento("archivando"));
@@ -346,14 +459,18 @@ mod tests {
         let hub = Hub::nuevo();
 
         {
-            let cliente = hub.suscribir();
+            let cliente = hub
+                .suscribir()
+                .expect("el hub no está cerrado en esta prueba");
             drop(cliente);
         }
 
         hub.publicar(evento("sin nadie escuchando"));
 
         // Y el que llegue después sigue recibiendo: el hub no se cierra porque se vayan todos.
-        let mut tardio = hub.suscribir();
+        let mut tardio = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
         hub.publicar(evento("el que llega tarde"));
 
         assert!(
@@ -370,7 +487,9 @@ mod tests {
     #[tokio::test]
     async fn un_receptor_sin_nada_que_leer_espera() {
         let hub = Hub::nuevo();
-        let mut cliente = hub.suscribir();
+        let mut cliente = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), cliente.recv())
@@ -392,5 +511,91 @@ mod tests {
             "el aviso no llegó después de la espera"
         );
         assert!(matches!(cliente.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// **El cierre suelta el canal**: el cliente que estaba esperando recibe `Closed` sin que nadie
+    /// publique nada, y el que llega después ya no se puede suscribir.
+    ///
+    /// Es la mitad del arreglo del apagado que se puede medir aquí: `Closed` es la **única** salida
+    /// del flujo de la capa HTTP, así que un receptor que lo recibe es un stream que termina y una
+    /// conexión que se puede cerrar. Se mide con un `recv` de verdad —no con un `try_recv`— porque
+    /// el flujo real está esperando en ese `recv`: lo que hay que comprobar es que el cierre
+    /// **despierta** a quien espera, no solo que el estado cambie.
+    #[tokio::test]
+    async fn el_cierre_despierta_al_cliente_que_esperaba_y_no_deja_suscribir_a_nadie_mas() {
+        let hub = Hub::nuevo();
+        let mut cliente = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        hub.cerrar();
+
+        let desenlace =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cliente.recv()).await;
+
+        assert!(
+            matches!(desenlace, Ok(Err(RecvError::Closed))),
+            "el cierre no despertó al cliente con su `Closed`: el cuerpo del stream no terminaría y \
+             el apagado ordenado se quedaría esperándolo ({desenlace:?})"
+        );
+
+        assert!(
+            hub.suscribir().is_none(),
+            "un hub cerrado sigue dando receptores: una petición que llegue durante el apagado \
+             tendría un stream abierto que ya no puede recibir nada"
+        );
+    }
+
+    /// `cerrar` es **idempotente** y, después, publicar es un no-op silencioso.
+    ///
+    /// El apagado puede pasar por aquí más de una vez y ninguna de esas veces puede ser un error ni
+    /// un pánico: lo que cierra el proceso no es un camino que se pueda permitir fallar. Y publicar
+    /// después del cierre tiene que seguir sin fallar, porque un trabajador a mitad de una copia
+    /// sigue avisando hasta que su ejecución acabe.
+    #[test]
+    fn cerrar_es_idempotente_y_publicar_despues_no_falla() {
+        let hub = Hub::nuevo();
+        let mut receptor = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        hub.cerrar();
+        hub.cerrar();
+
+        // Publicar después del cierre no entra en pánico y no le llega a nadie: el receptor solo
+        // puede ver el `Closed` del cierre.
+        hub.publicar(evento("después del cierre"));
+
+        assert!(matches!(receptor.try_recv(), Err(TryRecvError::Closed)));
+    }
+
+    /// El cierre alcanza también a los **clones** del hub, que es lo que `EnVivo` guarda.
+    ///
+    /// Es la mitad del arreglo que un hub de un solo dueño no necesitaría, y la que hace que el
+    /// apagado no se cuelgue con una copia en curso: el estado en vivo de una ejecución guarda su
+    /// propio clon del hub y publica por él, así que con un extremo de envío por clon ese clon
+    /// mantendría el canal abierto. Aquí se sujeta con un clon explícito que se conserva vivo
+    /// después del cierre.
+    #[tokio::test]
+    async fn el_cierre_alcanza_a_los_clones_del_hub() {
+        let hub = Hub::nuevo();
+        let en_vivo = hub.clone();
+        let mut cliente = hub
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        hub.cerrar();
+
+        // El clon sigue ahí, y sigue publicando: es lo que hace `EnVivo` mientras su copia corre.
+        en_vivo.publicar(evento("el aviso de una copia en vuelo"));
+
+        let desenlace =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cliente.recv()).await;
+
+        assert!(
+            matches!(desenlace, Ok(Err(RecvError::Closed))),
+            "un clon del hub mantuvo el canal abierto después del cierre: es exactamente el caso de \
+             `EnVivo`, y con él el apagado se cuelga aunque el motor cierre su hub ({desenlace:?})"
+        );
     }
 }

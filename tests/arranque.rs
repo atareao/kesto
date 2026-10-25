@@ -733,10 +733,9 @@ fn un_socket_de_docker_inalcanzable_no_impide_arrancar_y_el_motor_va_antes_del_l
 ///
 /// La mitad que se mide: que la señal **se atiende**, que el cierre ordenado **recorre** sus pasos
 /// —el registro trae la señal y la parada del motor— y que el proceso **termina** sin quedarse
-/// colgado. Lo último tiene tres aserciones distintas y cada una dice lo suyo: que terminó dentro
-/// del plazo, que tardó lo que se esperaba de un apagado sin nada en vuelo, y que acabó con código
-/// `0` en vez de morir por la señal —un código de señal sería un `SIGTERM` que atendió el sistema,
-/// no Kesto, y la prueba no habría medido nada—.
+/// colgado. Lo último tiene dos aserciones distintas y cada una dice lo suyo: que terminó dentro
+/// del plazo y que acabó con código `0` en vez de morir por la señal —un código de señal sería un
+/// `SIGTERM` que atendió el sistema, no Kesto, y la prueba no habría medido nada—.
 ///
 /// La mitad que **no** se puede medir aquí, y se declara en vez de fingirse: «con una ejecución en
 /// curso». Reproducirla exigiría una copia de verdad dentro del motor, y el binario **no** tiene el
@@ -818,4 +817,148 @@ fn un_sigterm_acaba_con_el_proceso_dentro_del_plazo() {
          conexiones. Salida:\n{}",
         en_marcha.registro()
     );
+}
+
+/// Abre `GET /api/v1/events` en un socket crudo y **deja al cliente ahí**.
+///
+/// Lo que la prueba de abajo necesita de un cliente del stream no es leer eventos: es que haya una
+/// conexión **viva** con un cuerpo abierto que no termina. Así que se pide el stream, se comprueba
+/// que se abrió de verdad —`200` y `text/event-stream`, que es lo que lo distingue de una respuesta
+/// normal, que ya habría terminado— y no se vuelve a leer: el cuerpo de un `text/event-stream` no
+/// tiene final, así que leerlo entero sería colgarse. El socket se queda abierto hasta el final de
+/// la prueba, y su `Drop` —el del llamante, al salir de ámbito— es lo último que lo cierra.
+///
+/// Se lee **solo la cabecera**, hasta la primera línea vacía: sin leer nada no se sabría si el
+/// stream llegó a abrirse —una petición rechazada también dejaría el socket abierto, y entonces la
+/// prueba no mediría lo que dice medir— y leer más sería meterse en el cuerpo, que es justo lo que
+/// aquí se quiere dejar a medias. El `Connection: close` no se manda: un cliente del stream lo
+/// mantiene abierto, y esa es la conexión que tiene que retener el apagado.
+fn abrir_el_stream(puerto: u16) -> TcpStream {
+    let direccion = SocketAddr::from(([127, 0, 0, 1], puerto));
+
+    let mut conexion = TcpStream::connect_timeout(&direccion, PLAZO_DE_LA_PETICION)
+        .unwrap_or_else(|error| panic!("no se pudo abrir la conexión con {direccion}: {error}"));
+
+    conexion
+        .set_read_timeout(Some(PLAZO_DE_LA_PETICION))
+        .unwrap_or_else(|error| panic!("no se pudo acotar la lectura: {error}"));
+
+    conexion
+        .write_all(
+            b"GET /api/v1/events HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Accept: text/event-stream\r\n\r\n",
+        )
+        .unwrap_or_else(|error| panic!("no se pudo escribir la petición del stream: {error}"));
+
+    let mut recibido = Vec::new();
+    let mut tramo = [0_u8; 1024];
+
+    while !String::from_utf8_lossy(&recibido).contains("\r\n\r\n") {
+        match conexion.read(&mut tramo) {
+            Ok(0) => break,
+            Ok(leidos) => recibido.extend_from_slice(&tramo[..leidos]),
+            Err(error) => panic!("la cabecera del stream no llegó entera: {error}"),
+        }
+    }
+
+    let cabecera = String::from_utf8_lossy(&recibido).into_owned();
+
+    assert!(
+        cabecera.starts_with("HTTP/1.1 200"),
+        "el stream no se abrió: se esperaba un `200` en la línea de estado para poder decir que hay \
+         un cliente conectado, y llegó:\n{cabecera}"
+    );
+
+    assert!(
+        cabecera.contains("text/event-stream"),
+        "la respuesta del stream no es un `text/event-stream`, así que no es el cliente que esta \
+         prueba necesita: el cuerpo de esa respuesta habría terminado. Cabecera:\n{cabecera}"
+    );
+
+    conexion
+}
+
+/// 1.34 (escenario 2, con un cliente conectado) — **Un `SIGTERM` acaba con el proceso aunque haya
+/// un cliente en el stream.**
+///
+/// Es la mitad del requisito que faltaba, y faltaba de verdad: el cierre ordenado de `axum` **no
+/// resuelve hasta que todas las conexiones terminan**, y un `text/event-stream` no termina nunca
+/// —el cuerpo se acaba cuando el emisor del hub se suelta, y durante el apagado nadie lo soltaba—,
+/// así que el proceso se quedaba vivo y lo mataba el `SIGKILL` del período de gracia **con el hilo
+/// de trabajo a mitad de archivar**. Es exactamente lo que la parada acotada existía para evitar, y
+/// el caso que lo rompía no era una esquina: es la única configuración en la que el stream sirve
+/// para algo.
+///
+/// Las cuatro aserciones, y por qué ninguna sobra:
+///
+/// 1. el stream **se abrió** —lo comprueba [`abrir_el_stream`]—: sin un cliente conectado esto
+///    sería la prueba de arriba, que ya pasaba;
+/// 2. el proceso **acaba dentro del plazo**, que es la mitad que estaba roja;
+/// 3. acaba con código `0`, y no por la señal: un `SIGKILL` del período de gracia da un código de
+///    señal, que es justo el desenlace que no se quiere;
+/// 4. y el cierre **recorrió sus pasos**, con la señal atendida y el motor parado en el registro.
+///    Sin las dos marcas, un proceso que muriera de cualquier otra forma colaría.
+///
+/// **Lo que no se mide aquí, y se declara**: un cliente que además **deje de leer** —un socket
+/// lleno, un portátil cerrado— puede seguir retrasando el cierre, porque el cuerpo no se puede
+/// escribir. Eso no está en manos del motor: lo que el arreglo cierra es el canal, que es lo que sí
+/// lo está. El límite está escrito en el rustdoc de [`Hub::cerrar`](crate::engine::Hub::cerrar).
+#[test]
+fn un_sigterm_acaba_con_el_proceso_aunque_haya_un_cliente_en_el_stream() {
+    let mut en_marcha = arrancar(&socket_muerto(), &[ARRANCADO]);
+
+    // (1) El cliente, conectado **antes** de la señal. Que la respuesta sea un `200` con
+    // `text/event-stream` prueba de paso que el servidor está atendiendo, así que no hace falta
+    // preguntar por la salud como en la prueba de arriba.
+    let cliente = abrir_el_stream(en_marcha.puerto);
+
+    if let Err(motivo) = en_marcha.sigterm() {
+        panic!("no se pudo mandar `SIGTERM` al proceso: {motivo}");
+    }
+
+    // (2) La mitad que estaba roja: con un cliente en el stream, el proceso tiene que acabar
+    // igualmente, y dentro del plazo.
+    let estado = match en_marcha.esperar_el_final(PLAZO_DE_LA_PARADA) {
+        Some(estado) => estado,
+        None => panic!(
+            "el proceso no acabó dentro de {PLAZO_DE_LA_PARADA:?} tras el `SIGTERM` con un cliente \
+             conectado al stream: el cierre ordenado espera a que las conexiones terminen, y el \
+             cuerpo de un `text/event-stream` no termina mientras el hub siga teniendo su emisor. \
+             El proceso sigue vivo y el `Drop` de la guarda lo matará. Salida:\n{}",
+            en_marcha.registro()
+        ),
+    };
+
+    // (3) Y acabó por su propio cierre, no por la señal.
+    assert_eq!(
+        estado.code(),
+        Some(0),
+        "el proceso acabó de otra forma que por su cierre ordenado: {estado}. Se esperaba el código \
+         `0`; un código de señal quiere decir que lo mató el período de gracia, que es el desenlace \
+         que la parada acotada existe para evitar. Salida:\n{}",
+        en_marcha.registro()
+    );
+
+    en_marcha.drenar();
+
+    // (4) El cierre recorrió sus pasos: la señal atendida y el motor parado.
+    assert!(
+        en_marcha.contiene(SENAL_DE_CIERRE),
+        "el proceso acabó sin dejar constancia de la señal de cierre: se esperaba que el `SIGTERM` \
+         lo hubiera atendido el apagado ordenado. Salida:\n{}",
+        en_marcha.registro()
+    );
+
+    assert!(
+        en_marcha.contiene(MOTOR_PARADO),
+        "el apagado no paró el motor con un cliente en el stream: se esperaba la constancia de la \
+         parada del motor detrás de la señal, porque el cierre ordenado lo para **después** de que \
+         el servidor deje de aceptar conexiones. Salida:\n{}",
+        en_marcha.registro()
+    );
+
+    // El cliente se suelta aquí, con el proceso ya muerto y sus aserciones ya hechas: el socket
+    // tiene que haber estado abierto todo el tiempo para que la prueba midiera lo que mide.
+    drop(cliente);
 }

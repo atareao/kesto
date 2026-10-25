@@ -553,6 +553,25 @@ impl Motor {
         &self.0.contexto.hub
     }
 
+    /// Cierra el hub de eventos: los clientes del stream terminan y publicar deja de hacer nada.
+    ///
+    /// Es la pieza que el apagado ordenado necesita **antes** de esperar a que las conexiones
+    /// terminen, y sin ella el apagado se cuelga: el cierre del servidor no resuelve hasta que
+    /// todas las conexiones lo hacen, y el cuerpo de un `text/event-stream` solo termina cuando el
+    /// canal se cierra. Con un cliente conectado —la única configuración en la que el stream sirve
+    /// para algo— el proceso se quedaría vivo hasta que el período de gracia del orquestador lo
+    /// matara con `SIGKILL`, con el hilo de trabajo a mitad de archivar. El porqué entero, y el
+    /// límite que esto no cubre, en [`Hub::cerrar`].
+    ///
+    /// Es **idempotente** y no falla nunca: se puede llamar más de una vez y desde cualquier hilo.
+    /// Y no confundirla con [`Motor::parar`]: esta cierra **el reparto** —lo que deja terminar a los
+    /// clientes conectados— y aquella cierra **el trabajo**. El orden entre las dos lo decide quien
+    /// apaga el proceso, y es el del `main`: primero el hub, para que el servidor pueda terminar de
+    /// apagarse, y después la parada del motor.
+    pub fn cerrar_el_hub(&self) {
+        self.0.contexto.hub.cerrar();
+    }
+
     /// Abre —o inicializa— el repositorio que describe el acceso, **fuera del runtime de Tokio**.
     ///
     /// Es la mitad del motor que no es una copia: la necesita la capa HTTP para el alta, que no
@@ -730,7 +749,7 @@ mod tests {
 
     use rustic_core::repofile::SnapshotId;
     use sqlx::SqlitePool;
-    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     use uuid::Uuid;
 
     use super::cola::CAPACIDAD_DE_LA_COLA;
@@ -2159,7 +2178,10 @@ mod tests {
 
         // 1. Con total declarado: el porcentaje es un número, y los dos contadores están.
         let motor = aparato.motor_con(abridor_con_total);
-        let mut receptor = motor.hub().suscribir();
+        let mut receptor = motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         let ejecucion = motor.encolar(tarea_con).await.expect("tiene que entrar");
         let fila = aparato.esperar_el_final(&ejecucion.id).await;
@@ -2216,7 +2238,10 @@ mod tests {
 
         // 2. Sin total: el porcentaje es nulo y los bytes procesados siguen informados.
         let motor = aparato.motor_con(abridor_sin_total);
-        let mut receptor = motor.hub().suscribir();
+        let mut receptor = motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         let ejecucion = motor.encolar(tarea_sin).await.expect("tiene que entrar");
         let fila = aparato.esperar_el_final(&ejecucion.id).await;
@@ -2303,6 +2328,81 @@ mod tests {
             aparato.esperar_el_final(&ejecucion.id).await.status,
             Estado::Failed,
             "la copia abandonada por la parada no llegó a escribir su final"
+        );
+    }
+
+    // ── El cierre del hub ────────────────────────────────────────────────────
+
+    /// **16.** `cerrar_el_hub` termina el stream **aunque haya una ejecución en vuelo**.
+    ///
+    /// Es la mitad del arreglo del apagado que un hub de un solo dueño no necesitaría, y la que
+    /// hacía falta de verdad: `EnVivo` —el estado de una ejecución en curso— guarda un clon del hub
+    /// y publica por él, así que un extremo de envío por clon mantendría el canal abierto aunque el
+    /// motor cerrara el suyo. El cuerpo del `text/event-stream` no terminaría, el cierre de `axum`
+    /// esperaría a esa conexión y el proceso acabaría con el `SIGKILL` del período de gracia, con
+    /// el hilo de trabajo a mitad de archivar.
+    ///
+    /// La copia se deja **en vuelo** a propósito —el abridor no termina dentro del plazo de
+    /// parada—, así que su `EnVivo` existe en el momento del cierre: es el escenario que hace falta
+    /// y no una aproximación. Lo que se mide es un `recv` de verdad, que es donde el flujo real
+    /// está esperando: el `Closed` tiene que **despertarlo**.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cerrar_el_hub_termina_el_stream_aunque_haya_una_ejecucion_en_vuelo() {
+        let mut aparato = Aparato::nuevo().await;
+        let target = aparato.target_de_directorio(&[("uno.txt", "uno")]).await;
+        let tarea = aparato.tarea_normal(target).await;
+
+        let motor = aparato.motor_con(abridor_que_no_termina);
+        let mut cliente = motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado antes de la ejecución");
+
+        let ejecucion = motor.encolar(tarea).await.expect("tiene que entrar");
+        esperar_el_estado(&aparato, &ejecucion.id, Estado::Running).await;
+
+        motor.cerrar_el_hub();
+
+        // La copia sigue viva: si hubiera terminado antes, este cierre no estaría midiendo el caso
+        // del `EnVivo`, que es el único donde el clon del hub importa.
+        assert_eq!(
+            aparato.estado_en_la_base(&ejecucion.id).await,
+            Estado::Running.texto(),
+            "la copia terminó antes del cierre: esta prueba solo mide el caso del estado en vivo si \
+             la ejecución sigue en vuelo cuando se cierra el hub"
+        );
+
+        // El desenlace se busca **hasta el `Closed`**, y no en una sola lectura: el receptor
+        // entrega primero lo que tuviera en el búfer —los avisos del encolado y del paso a
+        // `running`—, igual que el flujo real, que sigue leyendo hasta que el canal se cierra. Lo
+        // que se mide es que ese `Closed` llega con la copia todavía en vuelo.
+        let limite = Instant::now() + Duration::from_secs(5);
+
+        let desenlace = loop {
+            let restante = limite.saturating_duration_since(Instant::now());
+
+            match tokio::time::timeout(restante, cliente.recv()).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => break error,
+                Err(caducado) => panic!(
+                    "el cierre del hub no despertó al cliente con una ejecución en vuelo dentro del \
+                     plazo: el clon del hub que guarda su estado en vivo mantiene el canal abierto, \
+                     el cuerpo del stream no termina y el apagado ordenado se queda esperándolo \
+                     ({caducado})"
+                ),
+            }
+        };
+
+        assert!(
+            matches!(desenlace, RecvError::Closed),
+            "el cliente del stream no vio su canal cerrado, sino {desenlace:?}"
+        );
+
+        // Y el cliente que llegue después del cierre tampoco tiene stream: el estado está en el
+        // tipo, no en una suscripción que ya no puede servir nada.
+        assert!(
+            motor.hub().suscribir().is_none(),
+            "un hub cerrado siguió dando receptores"
         );
     }
 

@@ -242,15 +242,30 @@ impl Config {
             AuthMode::Disabled => lookup.get(ENV_KESTO_SECRET).map(SecretString::new),
         };
 
-        // El socket del motor de contenedores. A diferencia de `RUST_LOG`, el
-        // vacío **no** falla: cae al defecto. La diferencia no es capricho —aquí
-        // el valor vacío no degrada nada en silencio, porque el defecto es una
-        // ruta usable y el motor avisa si no contesta al arrancar—. Y es el
-        // desenlace que de verdad ocurre: un `compose` que interpola una variable
-        // que no definiste deja la cadena vacía, y negarse a arrancar por eso
-        // convertiría un error de configuración en ausencia de copias.
+        // El socket del motor de contenedores. A diferencia de `RUST_LOG`, un
+        // valor inservible **no** falla: cae al defecto. La diferencia no es
+        // capricho —aquí el valor inservible no degrada nada en silencio, porque
+        // el defecto es una ruta usable y el motor avisa si no contesta al
+        // arrancar—. Y es el desenlace que de verdad ocurre: un `compose` que
+        // interpola una variable que no definiste deja la cadena vacía, y
+        // negarse a arrancar por eso convertiría un error de configuración en
+        // ausencia de copias.
+        //
+        // El recorte está por eso mismo, y cubre lo que el razonamiento del vacío
+        // **no** cubre: el vacío de `compose` es `""`, pero una variable que solo
+        // lleva espacios no es ni el vacío ni una ruta, y sin recortar pasaría el
+        // filtro y viajaría como socket —contra el que nadie conecta, con el aviso
+        // genérico del motor como único rastro, que no distingue «aquí no hay
+        // motor» de «la ruta es basura»—. Se recorta y se filtra sobre el valor
+        // ya recortado, igual que `RUST_LOG`, para que las dos variables del
+        // entorno se lean igual. Recortar una ruta no la estropea: un camino con
+        // espacios deliberados al principio o al final no existe en la práctica
+        // —habría que crear a propósito un directorio que acabe en espacio—,
+        // mientras que el espacio pegado al copiar una variable es lo corriente, y
+        // el recorte no toca los espacios de en medio.
         let docker_host = lookup
             .get(ENV_DOCKER_HOST)
+            .map(|valor| valor.trim().to_owned())
             .filter(|valor| !valor.is_empty())
             .unwrap_or_else(|| DEFAULT_DOCKER_HOST.to_owned());
 
@@ -646,12 +661,18 @@ mod tests {
         assert_eq!(config.master_key.expose(), "clave-maestra-inyectada");
     }
 
-    /// 1.32 — `DOCKER_HOST` se respeta, su ausencia cae al defecto y su vacío también.
+    /// 1.32 — `DOCKER_HOST` se respeta, su ausencia cae al defecto y su blanco también.
     ///
-    /// Cubre `config`, requisito 1, los tres escenarios: la variable informada
-    /// manda, sin ella el socket es la ruta por defecto de la plataforma, y una
-    /// variable informada pero vacía —una interpolación de `compose` sin
-    /// variable— también cae al defecto.
+    /// Cubre `config`, requisito 1, los escenarios del socket: la variable
+    /// informada manda, sin ella el socket es la ruta por defecto de la
+    /// plataforma, y una variable informada pero **inservible** —una
+    /// interpolación de `compose` sin variable, o un valor que solo lleva
+    /// espacios— también cae al defecto. El blanco se comprueba aquí, con el
+    /// vacío, porque los dos desenlaces son el mismo por la misma razón: un valor
+    /// recortado que queda en nada no es una ruta, así que no hay a dónde
+    /// conectarse y el defecto es lo único que puede funcionar. Y un valor con
+    /// espacios **alrededor** de una ruta de verdad se recorta y se usa: ése es
+    /// el caso que separa el recorte del descarte.
     ///
     /// La prueba mira el **volcado** (`describe`) y no un campo del `Config`: el
     /// volcado es lo que el arranque registra y lo que un operador lee, así que
@@ -694,6 +715,39 @@ mod tests {
             config.describe()["docker_host"],
             "unix:///var/run/docker.sock",
             "una DOCKER_HOST vacía no cae a la ruta por defecto"
+        );
+
+        // El escenario del blanco: tampoco es una ruta, así que el desenlace es
+        // el mismo que el del vacío. Sin el recorte, `" "` pasaría el filtro y
+        // viajaría como ruta de socket: nadie conecta contra ella y el único
+        // rastro sería el aviso del motor al no contestar el socket, que no
+        // distingue «aquí no hay motor» de «la ruta es basura».
+        let lookup = lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY), ("DOCKER_HOST", " ")]);
+
+        let config =
+            Config::from_lookup(&lookup).expect("una DOCKER_HOST en blanco no impide arrancar");
+
+        assert_eq!(
+            config.describe()["docker_host"],
+            "unix:///var/run/docker.sock",
+            "una DOCKER_HOST en blanco no cae a la ruta por defecto"
+        );
+
+        // Y el otro lado del recorte: los espacios **alrededor** de una ruta de
+        // verdad no la invalidan. Es el caso de pegar una variable desde un
+        // `compose`, y el motivo de recortar en vez de limitarse a descartar el
+        // vacío.
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("DOCKER_HOST", " unix:///run/user/1000/podman/podman.sock "),
+        ]);
+
+        let config = Config::from_lookup(&lookup).expect("una DOCKER_HOST con espacios es válida");
+
+        assert_eq!(
+            config.describe()["docker_host"],
+            "unix:///run/user/1000/podman/podman.sock",
+            "el blanco alrededor de una DOCKER_HOST de verdad no se recorta"
         );
     }
 

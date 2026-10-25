@@ -202,6 +202,13 @@ Que un socket de Docker inalcanzable **no** impida arrancar es deliberado y va e
 - **THEN** NO SHALL aceptarse trabajo nuevo
 - **AND** el proceso SHALL acabar tras la espera acotada, aunque la ejecución no termine
 
+#### Scenario: El cierre ordenado termina con un cliente conectado al stream
+- **GIVEN** el proceso con un cliente conectado a `GET /api/v1/events`
+- **WHEN** llega `SIGTERM`
+- **THEN** el stream SHALL cerrarse
+- **AND** el proceso SHALL acabar dentro del plazo acotado, pese a la conexión abierta
+- **AND** SHALL hacerlo por su cuenta, sin que el período de gracia del orquestador tenga que matarlo con `SIGKILL`
+
 #### Scenario: Un socket de Docker inalcanzable no impide arrancar
 - **GIVEN** un arranque en el que el socket configurado no responde
 - **WHEN** el proceso arranca

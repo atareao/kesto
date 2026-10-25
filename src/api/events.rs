@@ -33,6 +33,22 @@
 //! intermediario no corte una conexión ociosa, **eso es un cambio que se declara en la
 //! especificación**, no algo que se añade en silencio.
 //!
+//! # El stream termina cuando el hub se cierra, y por eso el apagado no se cuelga
+//!
+//! El cierre ordenado del proceso cierra el hub —[`Hub::cerrar`](crate::engine::Hub::cerrar), desde
+//! [`Motor::cerrar_el_hub`](crate::engine::Motor::cerrar_el_hub)— **antes** de esperar a que las
+//! conexiones terminen, y esa mitad no es un adorno: el cierre del servidor no resuelve hasta que
+//! todas las conexiones lo hacen, y el cuerpo de un `text/event-stream` no tiene final propio. Su
+//! única salida es el `Closed` del canal —ver [`flujo`]—, así que sin cerrar el hub el proceso se
+//! quedaría vivo hasta que el período de gracia del orquestador lo matara con `SIGKILL`, con el
+//! hilo de trabajo a mitad de archivar: exactamente lo que la parada acotada del motor existe para
+//! evitar.
+//!
+//! El límite que esto **no** cubre, y que hay que saber: un cliente que **deje de leer** —el socket
+//! lleno, el portátil cerrado— puede retrasar el cierre de su conexión, porque el cuerpo no se puede
+//! vaciar. Eso no está en manos del hub, que es lo que sí lo está: el porqué entero, en el rustdoc
+//! de [`Hub::cerrar`](crate::engine::Hub::cerrar).
+//!
 //! # Un cliente que se queda atrás pierde eventos, y no frena a nadie
 //!
 //! Cada cliente es un receptor del [`broadcast`] del hub, con su capacidad acotada y su descarte:
@@ -99,8 +115,29 @@ pub fn router() -> Router<AppState> {
 /// `/api/v1/executions`—.
 ///
 /// El `Sse` sale sin latido a propósito; el porqué está en la documentación del módulo.
+///
+/// # Un hub ya cerrado no abre un stream
+///
+/// El hub se cierra durante el apagado ordenado —[`Hub::cerrar`](crate::engine::Hub::cerrar)— para que los clientes conectados
+/// terminen y el proceso pueda acabar; ver [`flujo`]. Una petición que ya estaba dentro cuando eso
+/// pasa llamaría aquí **después** del cierre, y entonces no hay nada que servir: el cuerpo sale
+/// vacío y termina en el acto, igual que le pasa al cliente que ya estaba conectado. El estado está
+/// en el tipo —[`Hub::suscribir`](crate::engine::Hub::suscribir) devuelve `Option`— y no se disfraza con una suscripción a un canal
+/// que nadie va a cerrar: eso dejaría una conexión abierta sin final esperando eventos que ya no
+/// existen, que es justo el cuelgue que el cierre viene a evitar.
 pub async fn stream(State(estado): State<AppState>) -> Sse<FlujoDelStream> {
-    Sse::new(Box::pin(flujo(estado.motor.hub().suscribir())))
+    match estado.motor.hub().suscribir() {
+        Some(receptor) => Sse::new(Box::pin(flujo(receptor))),
+        None => {
+            tracing::info!(
+                "el stream se pide con el hub ya cerrado: se contesta un cuerpo vacío, que termina \
+                 en el acto, en vez de dejar la conexión abierta esperando eventos que no van a \
+                 llegar"
+            );
+
+            Sse::new(Box::pin(stream::empty::<Result<Event, Infallible>>()))
+        }
+    }
 }
 
 /// El flujo de eventos de **un** cliente, leído del hub hasta que el canal se cierre.
@@ -111,8 +148,11 @@ pub async fn stream(State(estado): State<AppState>) -> Sse<FlujoDelStream> {
 /// de cerrar, porque un cliente conectado vale más que la perfección de un aviso.
 ///
 /// `Closed` sí termina el flujo, y es la forma correcta de terminar: significa que el extremo de
-/// envío del hub ya no existe —el motor se soltó—, así que no va a llegar nada más y dejar la
-/// conexión abierta sería dejar a un cliente esperando algo que ya no puede ocurrir.
+/// envío del hub ya no existe, así que no va a llegar nada más y dejar la conexión abierta sería
+/// dejar a un cliente esperando algo que ya no puede ocurrir. Y es también **cómo termina el apagado
+/// ordenado**: el proceso cierra el hub —[`Hub::cerrar`](crate::engine::Hub::cerrar)— justo antes de esperar a que las
+/// conexiones acaben, y este `Closed` es lo que hace que la de este cliente acabe. Sin él, el
+/// cierre del servidor esperaría para siempre a un cuerpo que no tiene final.
 fn flujo(
     receptor: broadcast::Receiver<EventoDeEjecucion>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -580,6 +620,12 @@ mod tests {
     /// Lo que se compara es el evento entero —su `data`— y no solo que los dos reciban algo: dos
     /// clientes que recibieran dos avisos distintos del mismo momento estarían viendo dos verdades
     /// distintas de la misma ejecución.
+    ///
+    /// Y además se comprueba **qué** evento es el primero, sobre el del primer cliente: el
+    /// identificador de la ejecución que acaba de dispararse y su estado `pending`. Sin esto, un
+    /// evento constante con los siete campos y cualquier valor pasaría la prueba —la igualdad entre
+    /// los dos clientes la cumpliría igual—, y lo que mide el escenario es que el aviso sea **de esa
+    /// ejecución** y **del momento en que nace**, no de cualquier cosa que llegue dos veces.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dos_clientes_del_stream_ven_el_mismo_evento() {
         let aparato = AparatoDelStream::nuevo().await;
@@ -596,7 +642,7 @@ mod tests {
         let mut primero = primer_cliente.into_body();
         let mut segundo = segundo_cliente.into_body();
 
-        let _ = aparato.disparar().await;
+        let ejecucion = aparato.disparar().await;
 
         let de_uno = siguiente_evento(&mut primero, PLAZO_DEL_EVENTO)
             .await
@@ -612,6 +658,21 @@ mod tests {
             datos_uno, datos_otro,
             "dos clientes conectados a la vez recibieron eventos distintos: el primero {de_uno:?} y el \
              segundo {de_otro:?}"
+        );
+
+        // Y el evento es el del nacimiento **de esta** ejecución: el aviso del encolado lo publica
+        // el motor antes de contestar el `202`, así que es el primero que ven los dos.
+        assert_eq!(
+            datos_uno["execution_id"], ejecucion,
+            "el primer evento de los dos clientes no habla de la ejecución que se acaba de encolar: \
+             {de_uno:?}"
+        );
+
+        assert_eq!(
+            datos_uno["status"], "pending",
+            "el primer evento de una ejecución recién encolada tiene que decir `pending`, y dijo \
+             {:?}: el panel pintaría un estado que la ejecución todavía no tiene",
+            datos_uno["status"]
         );
     }
 

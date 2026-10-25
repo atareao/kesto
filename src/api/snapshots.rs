@@ -120,6 +120,23 @@ pub struct ConsultaDelCable {
 /// pregunta al destino. El encabezado del módulo cuenta por qué el listado no lo resuelve este
 /// módulo por su cuenta.
 ///
+/// # Este `GET` **puede crear el repositorio** en el destino
+///
+/// El listado abre el repositorio por la misma fachada que el alta
+/// —[`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots)—, y esa apertura
+/// **inicializa** el destino cuando no lo encuentra: si la fila existe pero el repositorio no está
+/// allí, esta petición lo crea con la passphrase de la fila y contesta `200` con la lista vacía. Un
+/// `GET` con efecto de escritura, y se dice aquí, donde está la ruta, porque es lo que un operador
+/// tiene que poder leer: el día que encuentre un repositorio donde no lo había, no lo ha traído el
+/// alta necesariamente.
+///
+/// No se arregla en esta capa a propósito: distinguir «abre» de «crea» pide una variante de la
+/// apertura que no inicialice, y eso es reabrir `src/rustic`, que está auditado y cerrado. El efecto
+/// acaba ocurriendo igual —el alta y la primera copia crean ese repositorio—, así que lo que no
+/// puede ocurrir es **en silencio**. Lo que sí se elige aquí es el otro extremo: la fila resuelve
+/// **qué** destino abrir y su ausencia es un `404` **antes** de tocar el almacenamiento, así que un
+/// repositorio inventado no crea nada en ninguna parte.
+///
 /// # Los tres rechazos, y por qué son ésos
 ///
 /// * **`400` si falta `repository_id`, nombrando el parámetro**: un explorador mira **un**
@@ -642,6 +659,12 @@ mod tests {
     /// sin que Kesto interviniera, así que no tiene ninguna fila en el histórico y solo puede aparecer
     /// si alguien ha leído el almacenamiento. Las dos sembradas cubren lo otro: que las copias de Kesto
     /// están, cada una con la etiqueta con la que se identificó su tarea.
+    ///
+    /// Y dos cosas más, que son las dos mitades que la prueba de la ventana **no** puede medir por
+    /// estar en el otro extremo del contrato: el **orden** de la más reciente a la más antigua —lo
+    /// único que el explorador garantiza del subconjunto que devuelve—, comprobado sobre la
+    /// secuencia entera de fechas, y `truncated: false` con un listado que cabe entero, porque allí
+    /// la ventana se llena y el campo es `true`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cada_elemento_trae_sus_seis_datos_y_el_listado_sale_del_repositorio() {
         let router = router_desarrollo().await;
@@ -690,6 +713,42 @@ mod tests {
         for (indice, elemento) in listado.iter().enumerate() {
             comprobar_elemento(elemento, &format!("en la posición {indice}"));
         }
+
+        // El orden, que es **lo único** que el explorador garantiza del listado: de la más
+        // reciente a la más antigua. Se comprueba la secuencia entera de fechas y no la pertenencia
+        // de cada elemento —que ya está arriba—, porque un listado que devolviera las mismas
+        // instantáneas en cualquier orden pasaría todas las aserciones anteriores, y el panel
+        // pintaría la tabla del revés. Las tres fechas son distintas —dos fijas y la de la
+        // instantánea ajena, que es el momento de archivarla—, así que el orden tiene que ser
+        // **estrictamente** decreciente: con dos fechas iguales, un orden «decreciente» a secas no
+        // diría nada.
+        let fechas: Vec<OffsetDateTime> = listado
+            .iter()
+            .map(|elemento| {
+                let fecha = elemento["time"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("un elemento llegó sin fecha: {elemento}"));
+
+                OffsetDateTime::parse(fecha, &Rfc3339).unwrap_or_else(|error| {
+                    panic!("la fecha `{fecha}` del listado no es RFC3339: {error}")
+                })
+            })
+            .collect();
+
+        assert!(
+            fechas.windows(2).all(|par| par[0] > par[1]),
+            "el explorador promete el orden de la más reciente a la más antigua, y llegó {fechas:?}: \
+             un listado desordenado enseña las copias al revés"
+        );
+
+        // Y el listado está por debajo de la ventana, así que **no** viene recortado: si el número
+        // cabe, decir que hay más sería mentir sobre el contenido del repositorio. Es la mitad que
+        // el otro caso —la ventana llena— no puede medir: allí `truncated` es `true` y un campo
+        // cableado a `true` pasaría la suite entera.
+        assert_eq!(
+            cuerpo["data"]["truncated"], false,
+            "un listado por debajo de la ventana no puede venir recortado: {cuerpo}"
+        );
 
         let identificadores: Vec<&str> = listado
             .iter()

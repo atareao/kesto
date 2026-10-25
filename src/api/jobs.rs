@@ -702,7 +702,7 @@ mod tests {
     /// tarea no guarda ninguna, porque las dos del sistema viven en su target y en su repositorio—
     /// y ningún nombre inventado que el panel no sepa pintar.
     #[tokio::test]
-    async fn el_alta_devuelve_los_campos_con_los_nombres_del_s3() {
+    async fn el_alta_devuelve_los_campos_con_los_nombres_del_esquema() {
         let router = api_router(estado_desarrollo().await);
 
         let target = target_de_prueba(&router, "target-de-1-13j").await;

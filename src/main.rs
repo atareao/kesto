@@ -31,6 +31,15 @@ use crate::state::{AppState, EstadoDeBase};
 
 /// Arranca el servidor sobre `state.config.bind_address` y devuelve cuando
 /// `shutdown` se resuelve, dando salida antes a las peticiones en curso.
+///
+/// # Lo que `shutdown` tiene que hacer **antes** de resolver
+///
+/// El apagado ordenado de `axum` no resuelve hasta que **todas** las conexiones terminan, y una del
+/// stream no termina sola: el cuerpo de un `text/event-stream` solo acaba cuando el hub se cierra.
+/// Así que el futuro que se le pasa tiene que **cerrar el hub** —[`Motor::cerrar_el_hub`]— antes de
+/// resolver, que es lo que hace [`apagado_ordenado`]. Uno que se limite a esperar la señal deja el
+/// apagado esperando a un cuerpo sin final, y el proceso acaba con el `SIGKILL` del período de
+/// gracia del orquestador, con los trabajadores del motor a mitad de una copia.
 pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -40,6 +49,28 @@ pub async fn serve(
     axum::serve(listener, api::api_router(state))
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// El apagado del servidor: espera la señal, **cierra el hub** y resuelve.
+///
+/// Es lo que se le pasa a [`serve`], y la composición importa tanto como las piezas: el cierre del
+/// hub tiene que ocurrir **dentro** de este futuro y antes de que resuelva, para que cuando el
+/// servidor empiece su apagado ordenado los clientes del stream ya sepan que se acabó. El porqué
+/// entero, en el rustdoc de [`serve`] y en el de [`Motor::cerrar_el_hub`].
+///
+/// La señal entra por parámetro —en vez de llamar aquí a [`shutdown_signal`]— para que la
+/// composición se pueda medir sin mandar una señal de verdad, que es lo único de este camino que una
+/// prueba unitaria no puede recorrer; el binario de verdad, con su `SIGTERM`, lo mide
+/// `tests/arranque.rs`.
+async fn apagado_ordenado(motor: Motor, senal: impl Future<Output = ()>) {
+    senal.await;
+
+    // Y con la señal dentro, se cierra el reparto: a partir de aquí los clientes conectados al
+    // stream reciben su `Closed`, su cuerpo termina y sus conexiones se cierran, que es lo que deja
+    // a `serve` resolver. El motor sigue vivo y aceptando lo que ya está dentro —lo para el paso 9,
+    // **después** de `serve`—, así que una petición anterior al apagado se sirve y no encuentra un
+    // `503`.
+    motor.cerrar_el_hub();
 }
 
 /// Señal de cierre del proceso: `SIGTERM` o `SIGINT`.
@@ -357,7 +388,7 @@ async fn main() -> std::process::ExitCode {
 
     tracing::info!(%address, "escuchando");
 
-    let resultado = serve(state, shutdown_signal()).await;
+    let resultado = serve(state, apagado_ordenado(motor.clone(), shutdown_signal())).await;
 
     // 9. La parada del motor va **después** del servidor, y el orden es la mitad del
     //    contrato: `serve` resuelve cuando la señal llega y las peticiones en curso han
@@ -365,6 +396,13 @@ async fn main() -> std::process::ExitCode {
     //    se llega aquí nadie puede pedir una copia. Al revés, una petición que ya estaba
     //    dentro habría encontrado el motor parado y habría contestado `503` en vez de
     //    servirse: el apagado convertiría en error una petición anterior a él.
+    //
+    //    «Terminado de salir» incluye el stream: el hub se cierra dentro del futuro de
+    //    apagado —ver `apagado_ordenado`—, así que el cuerpo del `text/event-stream` de cada
+    //    cliente termina y su conexión se cierra, que es lo que deja a este `serve` resolver.
+    //    Sin ese cierre, un solo cliente conectado al stream dejaría la espera abierta para
+    //    siempre: el `SIGKILL` del período de gracia del orquestador llegaría con el hilo de
+    //    trabajo a mitad de archivar, que es justo lo que la parada acotada evita.
     //
     //    Y va en `spawn_blocking` porque `Motor::parar` es **bloqueante**: espera, hasta
     //    `espera_de_parada`, a que los trabajadores suelten. Llamarlo aquí mismo dejaría
@@ -417,9 +455,13 @@ fn dependencias_del_motor(db: &EstadoDeBase) -> Dependencias {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIRECTIVA_DEL_MOTOR, aviso_del_filtro, componer_el_filtro};
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::{DIRECTIVA_DEL_MOTOR, apagado_ordenado, aviso_del_filtro, componer_el_filtro};
     use crate::db;
-    use crate::test_support::{config_con_dsn, directorio_de_prueba, migrador_roto};
+    use crate::test_support::{
+        config_con_dsn, directorio_de_prueba, estado_desarrollo, migrador_roto,
+    };
 
     /// El filtro que se aplica lleva la directiva del motor, **detrás** de lo que se pidió.
     ///
@@ -541,6 +583,44 @@ mod tests {
                 "un filtro que no pide nada hablador del motor no puede avisar: {silencioso}"
             );
         }
+    }
+
+    /// 1.34 — El futuro del apagado cierra el hub **antes** de resolver.
+    ///
+    /// Es la composición del paso 6, que ningún test puede observar dentro de `main`: lo que se
+    /// afirma es que el cierre del hub está **dentro** del futuro que `serve` recibe y antes de que
+    /// resuelva, y no después. La mitad de verdad —un cliente conectado, un `SIGTERM` y el proceso
+    /// acabando dentro del plazo— la mide `tests/arranque.rs` con el binario; aquí se fija sin
+    /// señales, que es lo que permite que la prueba corra en cualquier sitio.
+    ///
+    /// Las dos aserciones van juntas por eso: la primera dice que el canal **no** se cierra solo
+    /// —sin ella, un `Closed` llegado de cualquier otra parte pasaría por un acierto de esta
+    /// composición—, y la segunda que lo cierra este futuro.
+    #[tokio::test]
+    async fn el_apagado_cierra_el_hub_antes_de_resolver() {
+        let estado = estado_desarrollo().await;
+        let motor = estado.motor.clone();
+
+        let mut cliente = motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado antes de apagarse");
+
+        // Antes de la señal: el stream está vivo, y ningún apagado lo ha tocado.
+        assert!(
+            matches!(cliente.try_recv(), Err(TryRecvError::Empty)),
+            "el canal del hub ya estaba cerrado antes del apagado: la aserción de abajo no diría \
+             nada sobre este futuro"
+        );
+
+        apagado_ordenado(motor, std::future::ready(())).await;
+
+        assert!(
+            matches!(cliente.try_recv(), Err(TryRecvError::Closed)),
+            "el apagado no cerró el hub, así que el cuerpo del stream de un cliente conectado no \
+             terminaría y el cierre ordenado se quedaría esperándolo hasta el `SIGKILL` del período \
+             de gracia"
+        );
     }
 
     /// 1.52 — El arranque deja la base preparada antes de aceptar peticiones.
