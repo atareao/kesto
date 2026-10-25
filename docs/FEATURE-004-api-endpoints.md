@@ -2,6 +2,7 @@
 
 > Implementación del change proposal `api-endpoints`, en `openspec/changes/archive/2026-10-25-api-endpoints/` — **11 requisitos y 33 escenarios** en la capability nueva `api-resources`, más tres deltas: `api-shell` (2 requisitos / 7 escenarios), `db` (1 / 3) y `secrets` (2 / 5). `openspec validate api-endpoints --strict` válido.
 > Cerrada el 2026-10-25. Rama: `feature/api-endpoints`, desde `development`. Plan: `plans/PLAN-004-COMPLETED.md`. Especificación de origen: `docs/DEFINITION.md` §5 (API REST), con el §3 (modelo de datos) y el §7 (layout).
+> PR: [#9 — `feature/api-endpoints` → `development`](https://github.com/atareao/kesto/pull/9) · CI en verde (run [`40170430143`](https://github.com/atareao/kesto/actions/runs/40170430143)). **Sin release a `main`.**
 > **Sin release a `main`**: se publica solo hasta `development`.
 > Diff contra `development`: **28 ficheros, +7755 / −135**, en **15 commits**. `Cargo.lock`: **302** paquetes, **sin tocar** — el change no estrena ni una dependencia.
 > Estado: **cerrado** — **214 tests** (213 en el binario y 1 de integración, `tests/arranque.rs`), **58 nuevos** sobre los 156 de `db-schema`. `tasks.md`: **99** tareas.
