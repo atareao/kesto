@@ -908,9 +908,31 @@ fn abrir_el_stream(puerto: u16) -> TcpStream {
 fn un_sigterm_acaba_con_el_proceso_aunque_haya_un_cliente_en_el_stream() {
     let mut en_marcha = arrancar(&socket_muerto(), &[ARRANCADO]);
 
-    // (1) El cliente, conectado **antes** de la señal. Que la respuesta sea un `200` con
-    // `text/event-stream` prueba de paso que el servidor está atendiendo, así que no hace falta
-    // preguntar por la salud como en la prueba de arriba.
+    // Antes de abrir el stream hay que esperar a la **boca** del servidor, y la marca `ARRANCADO`
+    // no sirve para eso: `main` la emite una línea antes de que `serve` ate el puerto, así que
+    // verla solo dice que el proceso llegó hasta ahí —lo mismo que documenta [`esperar_la_salud`]—.
+    // Sin preguntar de verdad, `abrir_el_stream` hace su `connect` contra un puerto que todavía no
+    // existe y recibe un `Connection refused`, que es lo que le pasó a esta prueba en un runner de
+    // dos núcleos y no en la máquina de quien la escribió: la marca llegaba antes de que el hilo de
+    // la prueba despertara y conectara.
+    //
+    // Y lo que cierra esa ventana no es un margen de tiempo —que es justo lo que fallaba, porque no
+    // se puede dimensionar para toda máquina—: es una **precondición establecida**. Una vez que una
+    // petición HTTP ha respondido, el listener está atado y lo sigue estando hasta el apagado, que
+    // ocurre mucho después, así que el `connect` de `abrir_el_stream` ya no puede ser rechazado. La
+    // respuesta de la salud **no** se afirma aquí: lo que esta prueba necesita de esa llamada es que
+    // el servidor esté escuchando, y el `200` con `text/event-stream` lo afirma ya
+    // [`abrir_el_stream`] —un `200` de la salud no diría nada del stream—.
+    if let Err(motivo) = esperar_la_salud(en_marcha.puerto, ESPERA) {
+        panic!(
+            "el proceso no llegó a atender `GET /api/v1/health` antes de abrir el stream ({motivo}): \
+             se esperaba que ya estuviera escuchando, porque la marca `ARRANCADO` se emite antes de \
+             atar el puerto y un `connect` contra un puerto sin atar se rechaza. Salida:\n{}",
+            en_marcha.registro()
+        );
+    }
+
+    // (1) El cliente, conectado **antes** de la señal, sobre un servidor que ya escucha.
     let cliente = abrir_el_stream(en_marcha.puerto);
 
     if let Err(motivo) = en_marcha.sigterm() {
