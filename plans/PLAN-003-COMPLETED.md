@@ -2,6 +2,7 @@
 
 > **Estado:** **cerrado** (implementado, auditado y verificado el 2026-10-25; change archivado en `openspec/changes/archive/2026-10-25-db-schema/`).
 > **Rama:** `feature/db-schema`, desde `development`.
+> **PR:** [#8 — `feature/db-schema` → `development`](https://github.com/atareao/kesto/pull/8) · CI en verde (run [`40162918376`](https://github.com/atareao/kesto/actions/runs/40162918376), `attempt 1`, `Backend (fmt, clippy, test)` ✅; `Frontend` saltado por diseño — `ui/package.json` no existe todavía). **Sin release a `main`**: se publica solo hasta `development`.
 > **Change de OpenSpec:** `openspec/changes/archive/2026-10-25-db-schema/` — **11 requisitos y 50 escenarios** (`db` 7/34, capability **nueva**; `secrets` 4/16, que crece con el cifrado en reposo), `openspec validate db-schema --strict` válido.
 > **Especificación de origen:** `docs/DEFINITION.md` §3 (modelo de datos) y §7 (layout). La retención del §4.B es del motor y **no** entra aquí.
 > **Cambio anterior:** `auth-capability` (`PLAN-002-COMPLETED.md`, `docs/FEATURE-002-auth-capability.md`, 93 tests).
@@ -106,4 +107,4 @@ Si el fichero de la base no existe, **se crea**. Si **el directorio** del DSN no
 - [x] Redactar el `Purpose` de `openspec/specs/db/spec.md`: es capability **nueva** y no puede quedarse en `TBD`. → hecho: se redactó al archivar.
 - [x] `openspec archive db-schema`. → `just spec-validate db-schema` pasó en estricto, comprobado **antes** del archivado (el change ya archivado, el comando deja de encontrarlo); archivado en `openspec/changes/archive/2026-10-25-db-schema/`, 11 requisitos aplicados (`db` 7 creados, `secrets` 4 añadidos).
 - [x] Renombrar este fichero a `plans/PLAN-003-COMPLETED.md` con `just plan-done 3`. → hecho.
-- [x] PR `feature/db-schema` → `development` con el CI en verde. **Sin release a `main`**: se publica solo hasta `development`. → PR a `development` abierto al cerrar el change; **sin release**: no se abre PR a `main` ni se etiqueta nada. El número del PR se anota en el commit de cierre.
+- [x] PR `feature/db-schema` → `development` con el CI en verde. **Sin release a `main`**: se publica solo hasta `development`. → [#8](https://github.com/atareao/kesto/pull/8), abierto contra `development`; **sin release**: no se abre PR a `main` ni se etiqueta nada. CI en verde (run [`40162918376`](https://github.com/atareao/kesto/actions/runs/40162918376), `attempt 1`): `Preflight` y `Backend (fmt, clippy, test)` en verde, y `Frontend` **saltado por diseño** —`ui/package.json` no existe todavía, así que el workflow se lo salta solo; no es un job olvidado—.

@@ -1,10 +1,11 @@
 # FEATURE-003 — db-schema
 
-> Implementación del change proposal `db-schema`, en `openspec/changes/db-schema/` — **11 requisitos y 50 escenarios** (`db` 7/34, capability **nueva**; `secrets` 4/16, que crece con el cifrado en reposo), `openspec validate db-schema --strict` válido.
-> Cerrada el 2026-10-25. Rama: `feature/db-schema`, desde `development`. Plan: `plans/PLAN-003.md`. Especificación de origen: `docs/DEFINITION.md` §3 (modelo de datos) y §7 (layout).
+> Implementación del change proposal `db-schema`, en `openspec/changes/archive/2026-10-25-db-schema/` — **11 requisitos y 50 escenarios** (`db` 7/34, capability **nueva**; `secrets` 4/16, que crece con el cifrado en reposo), `openspec validate db-schema --strict` válido.
+> Cerrada el 2026-10-25. Rama: `feature/db-schema`, desde `development`. Plan: `plans/PLAN-003-COMPLETED.md`. Especificación de origen: `docs/DEFINITION.md` §3 (modelo de datos) y §7 (layout).
+> PR: [#8 — `feature/db-schema` → `development`](https://github.com/atareao/kesto/pull/8) · CI en verde (run [`40162918376`](https://github.com/atareao/kesto/actions/runs/40162918376)). **Sin release a `main`.**
 > Diff contra `development`: **22 ficheros, +7288 / −16**. `Cargo.lock`: **302** paquetes.
 > Estado: **cerrado** — **156 tests** (155 en el binario y 1 de integración, `tests/arranque.rs`), **62 nuevos** sobre los 93 de `auth-capability`. `tasks.md`: **98** tareas.
-> El delta **no** se ha archivado todavía: `db` es capability nueva y no puede quedarse con el `Purpose` en `TBD`. El change vive en `openspec/changes/db-schema/`, y su fusión en `openspec/specs/` es el último paso del cierre, todavía abierto en `plans/PLAN-003.md`.
+> El delta **ya** se ha archivado: el change vive en `openspec/changes/archive/2026-10-25-db-schema/`, y sus specs están fusionadas en `openspec/specs/` —`db`, capability nueva, con su `Purpose` redactado tras el archivado, y `secrets`, que creció.
 
 **El archivo está hecho.** Hasta este change `DATABASE_URL` era una cadena decorativa: el proceso arrancaba con un DSN que no llevaba a ninguna parte —no había `migrations/`, ni pool, ni entidades, ni cifrado—, y los tres secretos del §3 se habrían guardado **en claro** en el fichero que los custodia. Ahora `src/db/` existe, el esquema del §3 se aplica al arrancar, el pool abre con WAL y claves foráneas, cada tabla tiene su entidad y su capa de acceso, y las tres columnas de secreto guardan un sobre cifrado.
 
@@ -251,4 +252,4 @@ El repositorio compila **sin red**, así que las versiones no son preferencia si
 - **Los ayudantes internos están copiados en las cuatro capas.**
 - Las **tablas** las garantiza el `CHECK` de la base, pero el módulo de cifrado **sólo** protege las tres columnas declaradas: una columna de secreto nueva que nadie registre se guardaría en claro sin que nada avise.
 
-Este documento es el hermano de `plans/PLAN-003.md` y continúa a `docs/FEATURE-002-auth-capability.md`.
+Este documento es el hermano de `plans/PLAN-003-COMPLETED.md` y continúa a `docs/FEATURE-002-auth-capability.md`.
