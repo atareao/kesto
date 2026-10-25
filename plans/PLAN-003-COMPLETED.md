@@ -27,7 +27,7 @@ Y cierra **cuatro cabos sueltos** del SRS anotados como deuda desde `FEATURE-001
 6. La semántica de `db_name`: informado ⇒ esa sola base; `NULL` ⇒ dump global. Se fija aquí, en el esquema; la ejecuta el change del motor.
 7. `main.rs` abre la base y la migra **antes** de escuchar, una sola vez. El traspaso del pool al `AppState` queda **aplazado** al change de los endpoints, y está declarado abajo como deuda.
 
-**Fuera:** los nueve endpoints del §5 (change propio, con su contrato y sus escenarios); motor, Docker, Rustic y planificador; cifrado del repositorio Rustic; rotación de `KESTO_MASTER_KEY` o clave de datos envuelta; SQLCipher; `VACUUM` programado y retención de `job_executions`; `Dockerfile` y volumen del `compose`.
+**Fuera:** los **diez** endpoints del §5 (change propio, con su contrato y sus escenarios), que entrega `api-endpoints` —siete ahora y tres después, porque `POST /api/v1/jobs/:id/run` y `GET /api/v1/events` necesitan el motor, y `GET /api/v1/snapshots?repository_id=<id>` necesita Rustic—; motor, Docker, Rustic y planificador; cifrado del repositorio Rustic; rotación de `KESTO_MASTER_KEY` o clave de datos envuelta; SQLCipher; `VACUUM` programado y retención de `job_executions`; `Dockerfile` y volumen del `compose`.
 
 ## Módulos
 
@@ -45,7 +45,7 @@ El **orden de entrega** es 1 → 3 → 2, y no el de la numeración: la capa de 
 
 ### Alcance: persistencia, sin HTTP
 
-Los nueve endpoints del §5 **no** entran: van a un change propio. Aquí se escribe el esquema, su cifrado y la capa que el motor y el planificador consumirán. Es la decisión que mantiene cada change auditable y con una sola responsabilidad.
+Los **diez** endpoints del §5 **no** entran: van a un change propio —`api-endpoints`, que entrega siete y difiere los tres que necesitan el motor o Rustic—. Aquí se escribe el esquema, su cifrado y la capa que el motor y el planificador consumirán. Es la decisión que mantiene cada change auditable y con una sola responsabilidad.
 
 ### Cifrado en reposo
 

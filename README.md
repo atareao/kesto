@@ -13,13 +13,14 @@ Kesto ("caja" en esperanto) es un contenedor único que:
 
 ## Estado
 
-Proyecto **en construcción**, pero el código ya ha empezado y los tres primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado), `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada) y `db-schema` (esquema del §3 aplicado por migraciones embebidas, pool de conexiones, capa de acceso de las cuatro tablas y cifrado en reposo de los tres secretos), con **156 tests en verde**. Lo siguiente son los endpoints del §5, el motor de ejecución y el planificador. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
+Proyecto **en construcción**, pero el código ya ha empezado y los cuatro primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado), `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada), `db-schema` (esquema del §3 aplicado por migraciones embebidas, pool de conexiones, capa de acceso de las cuatro tablas y cifrado en reposo de los tres secretos) y `api-endpoints` (el estado de base dentro del estado de la aplicación, los tres recursos del §5 con cinco rutas cada uno y el listado de ejecuciones con filtros y paginación acotada), con **214 tests en verde**. Lo siguiente son el motor de ejecución y el planificador. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
 
 | Pieza | Estado |
 |---|---|
 | Arranque y API | Cerrado: configuración desde el entorno, envoltura JSON única, salud, `404`/`405` y apagado ordenado (25 tests) |
 | Autenticación | Cerrado: sesión firmada con `KESTO_SECRET` en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y todo `/api/v1/*` bajo puerta salvo la salud y el flujo de entrada (93 tests acumulados) |
-| Base de datos | Cerrado: esquema del §3 por migraciones embebidas, pool de conexiones, capa de acceso de las cuatro tablas y cifrado en reposo de los tres secretos (**156 tests** en total), sin endpoints nuevos todavía |
+| Base de datos | Cerrado: esquema del §3 por migraciones embebidas, pool de conexiones, capa de acceso de las cuatro tablas y cifrado en reposo de los tres secretos |
+| Superficie del §5 | Cerrado a medias: siete de los diez endpoints —los tres recursos con cinco rutas cada uno y el listado de ejecuciones—; `POST /jobs/:id/run` y `GET /events` llegan con el motor y `GET /snapshots` con Rustic (**214 tests** en total) |
 | CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) | Verde: `cargo fmt --check`, `cargo clippy -- -D warnings` y `cargo test --locked` |
 | Imagen | Pendiente de `Dockerfile`; el job del pipeline se salta solo hasta que exista |
 | Crate | `publish = false` a propósito, para no dejar un placeholder permanente en crates.io |
@@ -97,7 +98,7 @@ Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features 
 
 ```text
 src/     backend Rust (Axum)
-  api/       endpoints: la salud, el flujo de entrada y la sesión
+  api/       los recursos del §5, la salud, el flujo de entrada y la sesión
   auth/      el flujo OIDC, la sesión y el gate (módulo propio, no del §7)
   db/        pool, migraciones embebidas, cifrado en reposo y entidades del §3
   config.rs  configuración desde el entorno

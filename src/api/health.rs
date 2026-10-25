@@ -27,11 +27,13 @@ mod tests {
 
     use crate::api::api_router;
     use crate::config::Config;
-    use crate::state::AppState;
+    use crate::state::{AppState, EstadoDeBase};
     // El emisor de ejemplo se toma de `test_support` en vez de redeclararlo: era
     // una segunda fuente de verdad del mismo literal, y cambiar una y no la otra
     // dejaría los dos tests mintiendo en silencio.
-    use crate::test_support::{OIDC_ISSUER_URL, body_json, body_text, get, lookup_from};
+    use crate::test_support::{
+        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_con_base, get, lookup_from,
+    };
 
     /// Versión que tiene que declarar la salud: la del binario.
     const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -54,20 +56,29 @@ mod tests {
     const DATABASE_FILE: &str = "kesto-distinguible.db";
 
     /// Construye el estado a partir de una lectura inyectada.
-    fn state(pares: &[(&str, &str)]) -> AppState {
+    ///
+    /// El estado lleva la base **ya abierta y migrada**, como en producción: el pool llega
+    /// de una base temporal de verdad —es el patrón de la prueba 1.1 de `src/state.rs`— y
+    /// su guarda se retiene durante la corrida, porque el pool sobrevive al ayudante. La
+    /// configuración entra por la lectura inyectada tal cual, así que su `DATABASE_URL`
+    /// puede ser la que la prueba declare: lo que el estado usa es el pool, no la cadena.
+    async fn state(pares: &[(&str, &str)]) -> AppState {
         let lookup = lookup_from(pares);
         let config = Config::from_lookup(&lookup).expect("configuración de prueba válida");
 
-        AppState::new(config).expect("el estado de prueba se construye")
+        let (_directorio, pool, clave) = base_con_clave().await;
+
+        AppState::new(config, EstadoDeBase::nuevo(pool, clave))
+            .expect("el estado de prueba se construye")
     }
 
     /// Configuración de desarrollo: sin OIDC.
-    fn desarrollo() -> AppState {
-        state(&[("KESTO_MASTER_KEY", MASTER_KEY)])
+    async fn desarrollo() -> AppState {
+        state(&[("KESTO_MASTER_KEY", MASTER_KEY)]).await
     }
 
     /// Configuración con la autenticación encendida.
-    fn con_oidc() -> AppState {
+    async fn con_oidc() -> AppState {
         state(&[
             ("KESTO_MASTER_KEY", MASTER_KEY),
             ("KESTO_SECRET", SESSION_SECRET),
@@ -75,11 +86,12 @@ mod tests {
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
         ])
+        .await
     }
 
     /// Configuración con la autenticación encendida y un despliegue distinguible:
     /// es la que tiene algo que callar, tanto de OIDC como del entorno.
-    fn con_oidc_y_despliegue_propio() -> AppState {
+    async fn con_oidc_y_despliegue_propio() -> AppState {
         state(&[
             ("KESTO_MASTER_KEY", MASTER_KEY),
             ("KESTO_SECRET", SESSION_SECRET),
@@ -89,11 +101,12 @@ mod tests {
             ("BIND_ADDRESS", BIND_ADDRESS),
             ("DATABASE_URL", DATABASE_URL),
         ])
+        .await
     }
 
     #[tokio::test]
     async fn la_salud_contesta_sin_credenciales() {
-        let router = api_router(desarrollo());
+        let router = api_router(desarrollo().await);
 
         let respuesta = get(router, "/api/v1/health").await;
 
@@ -113,16 +126,20 @@ mod tests {
 
     #[tokio::test]
     async fn la_salud_declara_el_modo_de_autenticacion() {
-        let cuerpo = body_json(get(api_router(desarrollo()), "/api/v1/health").await).await;
+        let cuerpo = body_json(get(api_router(desarrollo().await), "/api/v1/health").await).await;
         assert_eq!(cuerpo["data"]["auth_mode"], "disabled");
 
-        let cuerpo = body_json(get(api_router(con_oidc()), "/api/v1/health").await).await;
+        let cuerpo = body_json(get(api_router(con_oidc().await), "/api/v1/health").await).await;
         assert_eq!(cuerpo["data"]["auth_mode"], "oidc");
     }
 
     #[tokio::test]
     async fn la_salud_no_describe_el_despliegue() {
-        let respuesta = get(api_router(con_oidc_y_despliegue_propio()), "/api/v1/health").await;
+        let respuesta = get(
+            api_router(con_oidc_y_despliegue_propio().await),
+            "/api/v1/health",
+        )
+        .await;
 
         assert_eq!(respuesta.status(), StatusCode::OK);
 
@@ -175,7 +192,7 @@ mod tests {
             "una clave maestra débil debe avisar: {avisos:?}"
         );
 
-        let estado = AppState::new(config).expect("el estado de prueba se construye");
+        let estado = estado_con_base(config).await;
 
         let respuesta = get(api_router(estado), "/api/v1/health").await;
 

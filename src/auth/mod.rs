@@ -45,7 +45,7 @@ mod tests {
     #[tokio::test]
     async fn un_descubrimiento_fallido_no_impide_arrancar() {
         // Escenario 1.5.
-        let estado = estado_oidc_con_emisor(&emisor_caido());
+        let estado = estado_oidc_con_emisor(&emisor_caido()).await;
         let auth = estado
             .auth
             .as_ref()
@@ -94,7 +94,7 @@ mod tests {
         // desapareciera, el segundo login volvería a pedirlo y el contador
         // subiría a dos.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let primera = get(router.clone(), "/api/v1/auth/login").await;
 

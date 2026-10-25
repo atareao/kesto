@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
 use crate::secret::SecretString;
-use crate::state::{AppState, AuthState};
+use crate::state::{AppState, AuthState, EstadoDeBase};
 
 pub(crate) mod proveedor_falso;
 
@@ -155,6 +155,64 @@ pub(crate) async fn base_con_clave() -> (DirectorioDePrueba, SqlitePool, Arc<Cla
     (directorio, pool, clave)
 }
 
+/// Guardas de los directorios de base que el arnés abre y **retiene** hasta que el
+/// proceso de pruebas termina.
+///
+/// [`DirectorioDePrueba`] borra su directorio al soltarse, y el pool que un ayudante
+/// entrega dentro del estado lo **sobrevive**: soltar la guarda al terminar el ayudante
+/// dejaría el fichero de la base sin enlazar bajo una conexión abierta. Eso no falla en
+/// el acto —POSIX mantiene el fichero vivo mientras haya un descriptor abierto—, así
+/// que el síntoma no es «el fichero no está» sino un fallo **intermitente**: en cuanto
+/// el pool abre la siguiente conexión no encuentra el directorio, y la petición que lo
+/// provocó contesta `404` sobre una fila que existe. Retener la guarda lo elimina por
+/// construcción.
+///
+/// Lo que se paga, y hay que saberlo: los directorios del arnés **no se borran** durante
+/// la corrida y quedan en el directorio temporal del sistema, que es quien los recoge.
+/// Se prefiere eso a un fallo intermitente: un directorio que no se borra se ve con
+/// `ls`, y una petición que contesta `404` sobre una fila que existe no se ve en
+/// ninguna parte. Esta decisión se revisa el día que el arnés se replantee.
+static GUARDAS_DEL_ARNES: OnceLock<Mutex<Vec<DirectorioDePrueba>>> = OnceLock::new();
+
+/// Retiene la guarda de un directorio de base del arnés. Ver [`GUARDAS_DEL_ARNES`].
+fn retener(directorio: DirectorioDePrueba) {
+    GUARDAS_DEL_ARNES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("el registro de guardas del arnés no puede envenenarse")
+        .push(directorio);
+}
+
+/// Base de prueba del arnés: el DSN, el pool ya migrado y la clave, con el directorio
+/// **retenido**.
+///
+/// La guarda viaja al registro de [`GUARDAS_DEL_ARNES`] porque lo que se entrega aquí
+/// sobrevive a esta función: el estado que la recibe se lleva el pool, y el pool vive
+/// más que el ayudante que lo abrió.
+async fn base_del_arnes() -> (String, SqlitePool, Arc<Clave>) {
+    let (directorio, pool, clave) = base_con_clave().await;
+    let dsn = directorio.dsn();
+
+    retener(directorio);
+
+    (dsn, pool, clave)
+}
+
+/// Estado de prueba con una base **ya abierta y migrada**.
+///
+/// Es el equivalente de lo que hace `main` al arrancar: quien abre la base y aplica el
+/// esquema es de fuera, y el constructor del estado la recibe hecha. La configuración
+/// entra tal cual —una prueba que compruebe **qué** no se publica necesita una
+/// configuración distinguible, con su propio `DATABASE_URL`—, así que su cadena de base
+/// puede no ser la de la base que se entrega: lo que el estado usa es el pool, no la
+/// cadena.
+pub(crate) async fn estado_con_base(config: Config) -> AppState {
+    let (_dsn, pool, clave) = base_del_arnes().await;
+
+    AppState::new(config, EstadoDeBase::nuevo(pool, clave))
+        .expect("el estado de prueba se construye")
+}
+
 /// Migrador que falla: su única migración no es SQL.
 ///
 /// Es lo que permite ejercitar «una migración que falla es error de arranque» sin
@@ -177,14 +235,23 @@ pub(crate) fn migrador_roto() -> Migrator {
 }
 
 /// Estado con la autenticación apagada: el modo de desarrollo.
-pub(crate) fn estado_desarrollo() -> AppState {
+///
+/// Su `DATABASE_URL` es el de la base que se le entrega, para que la configuración del
+/// arnés no mienta sobre dónde está la base. Las bases de los ayudantes se abren en un
+/// directorio temporal y su guarda se **retiene** (ver [`retener`]): la base sobrevive
+/// al ayudante, así que la guarda también tiene que sobrevivir.
+pub(crate) async fn estado_desarrollo() -> AppState {
+    let (dsn, pool, clave) = base_del_arnes().await;
+
     let config = Config::from_lookup(&lookup_from(&[
         ("KESTO_MASTER_KEY", MASTER_KEY),
         ("BIND_ADDRESS", BIND_ADDRESS),
+        ("DATABASE_URL", dsn.as_str()),
     ]))
     .expect("la configuración de desarrollo es válida");
 
-    AppState::new(config).expect("el estado de desarrollo se construye")
+    AppState::new(config, EstadoDeBase::nuevo(pool, clave))
+        .expect("el estado de desarrollo se construye")
 }
 
 /// Estado con la autenticación encendida.
@@ -194,15 +261,17 @@ pub(crate) fn estado_desarrollo() -> AppState {
 /// `127.0.0.1` al instante, sin resolver un DNS ni salir a la red. Las pruebas
 /// que quieren un descubrimiento que funcione usan
 /// [`estado_oidc_con_emisor`] con el proveedor falso.
-pub(crate) fn estado_oidc() -> AppState {
-    estado_oidc_con_emisor(&emisor_caido())
+pub(crate) async fn estado_oidc() -> AppState {
+    estado_oidc_con_emisor(&emisor_caido()).await
 }
 
 /// Lectura inyectada con las variables `OIDC_*`, apuntando a un emisor dado.
 ///
 /// Es lo que permite que una prueba hable con el proveedor falso local: el
-/// emisor entra por parámetro en vez de fijarse en el entorno del proceso.
-pub(crate) fn lookup_oidc_con_emisor(emisor: &str) -> impl Lookup + use<> {
+/// emisor entra por parámetro en vez de fijarse en el entorno del proceso. El `dsn`
+/// entra por el mismo camino, para que la configuración apunte a la base que el estado
+/// lleva de verdad.
+pub(crate) fn lookup_oidc_con_emisor(emisor: &str, dsn: &str) -> impl Lookup + use<> {
     let variables: HashMap<String, String> = [
         ("KESTO_MASTER_KEY", MASTER_KEY),
         ("KESTO_SECRET", SESSION_SECRET),
@@ -210,6 +279,7 @@ pub(crate) fn lookup_oidc_con_emisor(emisor: &str) -> impl Lookup + use<> {
         ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
         ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
         ("BIND_ADDRESS", BIND_ADDRESS),
+        ("DATABASE_URL", dsn),
     ]
     .into_iter()
     .map(|(nombre, valor)| (nombre.to_owned(), valor.to_owned()))
@@ -219,16 +289,18 @@ pub(crate) fn lookup_oidc_con_emisor(emisor: &str) -> impl Lookup + use<> {
 }
 
 /// Estado en modo `Oidc` con el emisor indicado.
-pub(crate) fn estado_oidc_con_emisor(emisor: &str) -> AppState {
-    let config = Config::from_lookup(&lookup_oidc_con_emisor(emisor))
+pub(crate) async fn estado_oidc_con_emisor(emisor: &str) -> AppState {
+    let (dsn, pool, clave) = base_del_arnes().await;
+
+    let config = Config::from_lookup(&lookup_oidc_con_emisor(emisor, &dsn))
         .expect("la configuración OIDC es válida");
 
-    AppState::new(config).expect("el estado OIDC se construye")
+    AppState::new(config, EstadoDeBase::nuevo(pool, clave)).expect("el estado OIDC se construye")
 }
 
 /// Router de producción en modo `Oidc`, apuntando al emisor indicado.
-pub(crate) fn router_oidc_con_emisor(emisor: &str) -> Router {
-    crate::api::api_router(estado_oidc_con_emisor(emisor))
+pub(crate) async fn router_oidc_con_emisor(emisor: &str) -> Router {
+    crate::api::api_router(estado_oidc_con_emisor(emisor).await)
 }
 
 /// Emisor al que nada contesta: un puerto local que se reserva **y no se suelta**.
@@ -292,20 +364,21 @@ pub(crate) fn parametros_de_consulta(url: &str) -> HashMap<String, String> {
 }
 
 /// Estado de autenticación suelto, para colgar el *gate* de un router de prueba.
-pub(crate) fn auth_oidc() -> AuthState {
+pub(crate) async fn auth_oidc() -> AuthState {
     estado_oidc()
+        .await
         .auth
         .expect("el modo Oidc construye estado de autenticación")
 }
 
 /// Router de producción con la autenticación apagada.
-pub(crate) fn router_desarrollo() -> Router {
-    crate::api::api_router(estado_desarrollo())
+pub(crate) async fn router_desarrollo() -> Router {
+    crate::api::api_router(estado_desarrollo().await)
 }
 
 /// Router de producción con la autenticación encendida.
-pub(crate) fn router_oidc() -> Router {
-    crate::api::api_router(estado_oidc())
+pub(crate) async fn router_oidc() -> Router {
+    crate::api::api_router(estado_oidc().await)
 }
 
 /// Cabecera `Cookie` con la cookie de sesión y el token dado.
@@ -406,6 +479,78 @@ pub(crate) async fn get(router: Router, uri: &str) -> Response {
 /// Lanza un `POST` sin cuerpo contra `router` sin abrir un socket.
 pub(crate) async fn post(router: Router, uri: &str) -> Response {
     request(router, Method::POST, uri).await
+}
+
+/// Lanza un `POST` con un cuerpo JSON contra `router` sin abrir un socket.
+///
+/// Es lo que hace falta para ejercitar el camino real de un alta: el cuerpo lleva el
+/// `Content-Type` que axum exige para extraerlo con `Json`, y se serializa del `Value`
+/// que da la prueba, sin declarar un segundo tipo de cuerpo en el arnés.
+pub(crate) async fn post_json(router: Router, uri: &str, cuerpo: &serde_json::Value) -> Response {
+    let peticion = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cuerpo.to_string()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `PUT` con un cuerpo JSON contra `router` sin abrir un socket.
+///
+/// Es lo que hace falta para ejercitar la actualización, que es reemplazo completo: el
+/// cuerpo lleva los mismos campos que el de un alta y viaja con el `Content-Type` que axum
+/// exige para extraerlo con `Json`. Se serializa del `Value` que da la prueba, sin declarar
+/// un segundo tipo de cuerpo en el arnés, y la cabecera se pone aquí por el mismo motivo
+/// que en [`post_json`]: sin ella caería el extractor por la cabecera y la prueba mediría
+/// un caso distinto del que quiere medir.
+pub(crate) async fn put_json(router: Router, uri: &str, cuerpo: &serde_json::Value) -> Response {
+    let peticion = Request::builder()
+        .method(Method::PUT)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cuerpo.to_string()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `DELETE` contra `router` sin abrir un socket.
+///
+/// Se apoya en [`request`] —igual que [`get`]— porque un borrado no lleva cuerpo: lo que
+/// hay que ejercitar es el camino del manejador y el código que contesta, no un extractor
+/// de cuerpo que esta ruta no tiene.
+pub(crate) async fn delete(router: Router, uri: &str) -> Response {
+    request(router, Method::DELETE, uri).await
+}
+
+/// Lanza un `POST` con un cuerpo crudo contra `router` sin abrir un socket.
+///
+/// Es lo que hace falta para ejercitar un cuerpo que **no se puede construir** con
+/// [`post_json`]: una cadena suelta que no es un objeto, o texto que ni siquiera es JSON.
+/// El cuerpo viaja tal cual, sin serializar ni validar antes, y la cabecera
+/// `Content-Type` se pone a propósito: lo que se quiere provocar es el rechazo del
+/// **cuerpo** —su sintaxis o sus tipos—, no el de la cabecera, que si faltara haría caer
+/// al extractor por otra razón y la prueba mediría un caso distinto.
+pub(crate) async fn post_crudo(router: Router, uri: &str, cuerpo: &str) -> Response {
+    let peticion = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cuerpo.to_owned()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
 }
 
 /// Lanza una petición con una cabecera `Cookie` ya formada.

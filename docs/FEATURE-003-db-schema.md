@@ -19,7 +19,7 @@ Y cierra cuatro cabos sueltos del SRS anotados como deuda desde `FEATURE-001`: l
 
 **Fuera de este change**, y cada uno con su destinatario:
 
-- Los **nueve endpoints del §5** (change propio, con su contrato y sus escenarios).
+- Los **diez endpoints del §5** (change propio, con su contrato y sus escenarios): `api-endpoints` entrega siete —los tres recursos y el listado de ejecuciones— y los otros tres llegan con el motor (`POST /api/v1/jobs/:id/run` y `GET /api/v1/events`) y con Rustic (`GET /api/v1/snapshots?repository_id=<id>`).
 - El **motor**, **Docker**, **Rustic** y el **planificador**.
 - El **cifrado del repositorio Rustic**.
 - La **rotación de `KESTO_MASTER_KEY`** y cualquier clave de datos envuelta por una maestra rotable.

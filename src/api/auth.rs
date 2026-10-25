@@ -299,7 +299,7 @@ mod tests {
         // suite entera verde, y el fallo habría aparecido como un callback que
         // rechaza *todos* los state y parece un bug del callback.
         let proveedor = ProveedorFalso::servir().await;
-        let estado = estado_oidc_con_emisor(&proveedor.issuer);
+        let estado = estado_oidc_con_emisor(&proveedor.issuer).await;
         // El mapa vive tras un `Arc`, así que esta copia comparte el mismo mapa
         // que usa el router: no hace falta deformar el estado para poder mirarlo.
         let auth = estado
@@ -351,8 +351,12 @@ mod tests {
     #[tokio::test]
     async fn el_cierre_borra_la_cookie() {
         // Escenario 1.33.
-        let respuesta =
-            post_with_cookie(router_oidc(), "/api/v1/auth/logout", &cookie_de_sesion()).await;
+        let respuesta = post_with_cookie(
+            router_oidc().await,
+            "/api/v1/auth/logout",
+            &cookie_de_sesion(),
+        )
+        .await;
 
         assert_eq!(respuesta.status(), StatusCode::OK);
 
@@ -386,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn sin_sesion_el_cierre_no_se_atiende() {
         // Escenario 1.34.
-        let respuesta = post(router_oidc(), "/api/v1/auth/logout").await;
+        let respuesta = post(router_oidc().await, "/api/v1/auth/logout").await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
 
@@ -404,8 +408,12 @@ mod tests {
     #[tokio::test]
     async fn el_cierre_no_se_declara_como_get() {
         // Escenario 1.35.
-        let respuesta =
-            get_with_cookie(router_oidc(), "/api/v1/auth/logout", &cookie_de_sesion()).await;
+        let respuesta = get_with_cookie(
+            router_oidc().await,
+            "/api/v1/auth/logout",
+            &cookie_de_sesion(),
+        )
+        .await;
 
         assert_eq!(respuesta.status(), StatusCode::METHOD_NOT_ALLOWED);
 
@@ -423,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn sin_sesion_no_se_aprende_que_metodos_hay() {
         // Escenario 1.45.
-        let respuesta = get(router_oidc(), "/api/v1/auth/logout").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/logout").await;
 
         assert_ne!(
             respuesta.status(),
@@ -445,8 +453,12 @@ mod tests {
     #[tokio::test]
     async fn con_sesion_se_contesta_la_identidad() {
         // Escenario 1.36.
-        let respuesta =
-            get_with_cookie(router_oidc(), "/api/v1/auth/session", &cookie_de_sesion()).await;
+        let respuesta = get_with_cookie(
+            router_oidc().await,
+            "/api/v1/auth/session",
+            &cookie_de_sesion(),
+        )
+        .await;
 
         assert_eq!(respuesta.status(), StatusCode::OK);
 
@@ -471,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn sin_sesion_el_401_es_la_respuesta() {
         // Escenario 1.37.
-        let respuesta = get(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
 
@@ -499,7 +511,7 @@ mod tests {
         // proveedor no contesta—, no de Kesto. Y como todo `5xx`, el cuerpo
         // lleva el mensaje genérico: la causa se queda en el registro del
         // servidor y no se estrena un mensaje que nombre al proveedor.
-        let router = router_oidc_con_emisor(&emisor_caido());
+        let router = router_oidc_con_emisor(&emisor_caido()).await;
 
         let respuesta = get(router, "/api/v1/auth/login").await;
 
@@ -542,7 +554,7 @@ mod tests {
         // un `302`. La `Location` no puede arrastrar el código de autorización
         // (escenario «La vuelta al panel no arrastra el código»).
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
@@ -578,7 +590,7 @@ mod tests {
         // `api-shell`: salía `text/plain` —no la envoltura— y con el detalle de
         // serde, que publica la estructura interna del struct. Un `code`
         // duplicado lo provoca cualquier cliente, no es un borde teórico.
-        let respuesta = get(router_oidc(), "/api/v1/auth/callback?code=a&code=b").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/callback?code=a&code=b").await;
 
         assert_eq!(
             respuesta.status(),
@@ -627,7 +639,7 @@ mod tests {
         // extractor —todos los campos son `Option`, así que se leen vacíos—, y el
         // handler contesta su `400`. El escenario 1.4 de `src/api/mod.rs` depende
         // de que esta ruta no conteste `401`, y por eso se deja candado aquí.
-        let respuesta = get(router_oidc(), "/api/v1/auth/callback").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/callback").await;
 
         assert_ne!(
             respuesta.status(),
@@ -685,7 +697,7 @@ mod tests {
 
         // ── Un rechazo del propio callback ───────────────────────────────────
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let rechazo = get(
             router.clone(),
@@ -701,7 +713,7 @@ mod tests {
 
         // ── El camino de error del canje, con un cuerpo ajeno ────────────────
         let proveedor_caido = ProveedorFalso::servir().await;
-        let router_caido = router_oidc_con_emisor(&proveedor_caido.issuer);
+        let router_caido = router_oidc_con_emisor(&proveedor_caido.issuer).await;
         // El cuerpo del `502` es hostil a propósito: lleva credenciales de verdad,
         // para que registrarlo quedara en evidencia. Kesto ni lo lee —solo mira
         // el código de estado—, así que lo que aquí se fija es que no lo lea

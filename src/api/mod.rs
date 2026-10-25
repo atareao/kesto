@@ -1,15 +1,66 @@
 //! API HTTP de Kesto: el router de `/api/v1` y la partición de su superficie.
 
 pub mod auth;
+pub mod executions;
+pub mod extract;
 pub mod health;
+pub mod jobs;
+pub mod repositories;
 pub mod response;
+pub mod targets;
+
+#[cfg(test)]
+mod secretos;
+
+#[cfg(test)]
+mod particion;
 
 use axum::Router;
 use axum::routing::{get, post};
+use serde::Serialize;
 
+use crate::api::response::Data;
 use crate::auth::middleware;
 use crate::error::AppError;
 use crate::state::{AppState, AuthState};
+
+/// Deja constancia de que una petición se atendió, sin su cuerpo.
+///
+/// Lo exige el requisito «Un manejador no registra el cuerpo de la petición» del delta `secrets`:
+/// el registro tiene que decir **qué** ocurrió —el método, la ruta y el código de la respuesta, que
+/// llevan la identidad del recurso afectado— y **nunca** el contenido del cuerpo, que es por donde
+/// viajan las credenciales y que, mientras está en crudo, no pasa por ningún `SecretString` que lo
+/// redacte.
+///
+/// Va a **`debug`** y no a `info`: una línea por petición atendida es ruido de operación —el panel
+/// manda una petición por clic—, y a `debug` está disponible cuando hace falta sin inundar el
+/// registro que se lee de verdad.
+///
+/// Va en **un solo sitio** —una capa sobre el router— y no en cada manejador: son quince rutas, y
+/// quince llamadas a mano son quince sitios donde olvidarse. Aquí cubre por construcción cualquier
+/// ruta que se declare mañana.
+///
+/// Se registra **después** de atender, con el código de la respuesta, para que la línea diga el
+/// desenlace y no solo el intento. La ruta se registra tal cual llegó: en las rutas del §5 el
+/// identificador es un UUID, y no hay ningún otro dato del cliente en la URI.
+async fn trazar(
+    peticion: axum::extract::Request,
+    siguiente: axum::middleware::Next,
+) -> axum::response::Response {
+    let metodo = peticion.method().clone();
+    let ruta = peticion.uri().path().to_owned();
+
+    let respuesta = siguiente.run(peticion).await;
+
+    tracing::debug!(
+        %metodo,
+        %ruta,
+        estado = respuesta.status().as_u16(),
+        "petición atendida"
+    );
+
+    respuesta
+}
 
 /// Router de `/api/v1`.
 ///
@@ -32,16 +83,32 @@ pub fn api_router(state: AppState) -> Router {
                 .route("/api/v1/auth/login", get(auth::login))
                 .route("/api/v1/auth/callback", get(auth::callback));
 
+            // La superficie de negocio: las rutas del flujo de entrada y las de los
+            // recursos, **declaradas aquí** y no en la mitad pública. No hay ninguna
+            // excepción a la lista blanca: una ruta de negocio cuelga de esta mitad por
+            // construcción, así que el *gate* de sesión la alcanza sin que nadie tenga
+            // que acordarse de colgarlo.
             let negocio = Router::new()
                 .route("/api/v1/auth/logout", post(auth::logout))
-                .route("/api/v1/auth/session", get(auth::session));
+                .route("/api/v1/auth/session", get(auth::session))
+                .merge(repositories::router())
+                .merge(targets::router())
+                .merge(jobs::router())
+                .merge(executions::router());
 
             public.merge(protected_router(negocio, auth))
         }
-        // En desarrollo no se monta la mitad protegida: sin proveedor no hay
-        // flujo que ofrecer, así que `/api/v1/auth/*` **no** se declara y
-        // contesta el `404` de la envoltura en vez de un `401`.
-        None => public,
+        // En desarrollo no se monta la mitad protegida —no hay proveedor, así que
+        // `/api/v1/auth/*` **no** se declara y contesta el `404` de la envoltura en vez
+        // de un `401`—, pero **sí** la superficie de recursos: en este modo no se monta
+        // ninguna capa, así que las rutas de negocio quedan públicas, que es lo que el
+        // modo de desarrollo significa. Sin esto, `just dev` contestaría `404` en cada
+        // recurso y no habría forma de dar de alta nada sin un proveedor de identidad.
+        None => public
+            .merge(repositories::router())
+            .merge(targets::router())
+            .merge(jobs::router())
+            .merge(executions::router()),
     };
 
     router
@@ -55,6 +122,7 @@ pub fn api_router(state: AppState) -> Router {
         // protegida— y sustituir solo se sustituye el de por defecto.
         .fallback(not_found)
         .method_not_allowed_fallback(metodo_no_permitido)
+        .layer(axum::middleware::from_fn(trazar))
         .with_state(state)
 }
 
@@ -128,6 +196,26 @@ async fn metodo_no_permitido() -> AppError {
     AppError::MethodNotAllowed("el método no está permitido en esta ruta".to_owned())
 }
 
+/// Serializa una vista del cable al `data` de la envoltura.
+///
+/// Vive aquí, y no en cada módulo de recurso, porque **los cuatro** recursos lo necesitan
+/// igual: una copia por recurso serían cuatro sitios donde arreglar el mismo fallo. Existe
+/// porque `serde_json::to_value` devuelve `Result` y un manejador no puede abortar con
+/// `panic!`: un fallo aquí es un `500` con la causa al registro, que es lo que el resto de la
+/// API hace con lo que no debería ocurrir.
+///
+/// El mensaje **no** lleva el valor serializado, y eso no es una garantía de `serde_json`
+/// sino de estos tipos: `serde_json` mete en su error el texto que le dé un serializador
+/// propio —`ser::Error::custom`—, así que la propiedad se sostiene mientras ninguna vista del
+/// cable declare un `serialize_with` que formatee un valor. La red de verdad es de antes: una
+/// respuesta que llevara un secreto no compila, porque [`crate::secret::SecretString`] no
+/// implementa `Serialize`.
+pub(crate) fn contenido<T: Serialize>(vista: &T) -> Result<Data, AppError> {
+    serde_json::to_value(vista)
+        .map(Data::Some)
+        .map_err(|error| AppError::Other(format!("la respuesta no se pudo serializar: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -149,8 +237,8 @@ mod tests {
         ApiResponse::new(StatusCode::OK, "atendida", Data::None)
     }
 
-    #[test]
-    fn los_estados_de_prueba_no_heredan_el_puerto_por_defecto() {
+    #[tokio::test]
+    async fn los_estados_de_prueba_no_heredan_el_puerto_por_defecto() {
         // Es un candado del arnés, no del router, y nace de una regresión real:
         // `crate::serve` abre un socket de verdad, así que un estado de prueba
         // que herede el puerto por defecto pone la suite roja por `AddrInUse` en
@@ -158,7 +246,10 @@ mod tests {
         // eso es un fallo del entorno disfrazado de fallo del código. El puerto
         // `0` es el efímero: lo elige el sistema y no hay que acordarse test a
         // test.
-        for (modo, estado) in [("desarrollo", estado_desarrollo()), ("Oidc", estado_oidc())] {
+        for (modo, estado) in [
+            ("desarrollo", estado_desarrollo().await),
+            ("Oidc", estado_oidc().await),
+        ] {
             assert_eq!(
                 estado.config.bind_address.port(),
                 0,
@@ -171,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn en_modo_oidc_el_flujo_protegido_no_se_atiende_sin_sesion() {
         // Escenario 1.2.
-        let respuesta = get(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
 
@@ -194,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn en_desarrollo_el_flujo_no_esta_montado_y_contesta_404() {
         // Escenario 1.1.
-        let respuesta = get(router_desarrollo(), "/api/v1/auth/session").await;
+        let respuesta = get(router_desarrollo().await, "/api/v1/auth/session").await;
 
         assert_ne!(
             respuesta.status(),
@@ -216,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn la_salud_sigue_siendo_publica_con_la_autenticacion_encendida() {
         // Escenario 1.3.
-        let respuesta = get(router_oidc(), "/api/v1/health").await;
+        let respuesta = get(router_oidc().await, "/api/v1/health").await;
 
         assert_eq!(respuesta.status(), StatusCode::OK);
 
@@ -243,7 +334,7 @@ mod tests {
             "/api/v1/auth/login",
             "/api/v1/auth/callback",
         ] {
-            let respuesta = get(router_oidc(), ruta).await;
+            let respuesta = get(router_oidc().await, ruta).await;
 
             assert_ne!(
                 respuesta.status(),
@@ -254,7 +345,7 @@ mod tests {
 
         let eventos = protected_router(
             Router::new().route("/api/v1/events", axum::routing::get(negocio)),
-            &auth_oidc(),
+            &auth_oidc().await,
         );
 
         let sin_cookie = get(eventos.clone(), "/api/v1/events").await;
@@ -277,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn las_rutas_publicas_no_pasan_por_el_gate_y_la_superficie_de_negocio_si() {
         // Escenario 1.41.
-        let salud = get(router_oidc(), "/api/v1/health").await;
+        let salud = get(router_oidc().await, "/api/v1/health").await;
 
         assert_eq!(salud.status(), StatusCode::OK);
         assert_ne!(salud.status(), StatusCode::UNAUTHORIZED);
@@ -286,7 +377,7 @@ mod tests {
         // estará la de verdad.
         let negocio_router = protected_router(
             Router::new().route("/api/v1/targets", axum::routing::get(negocio)),
-            &auth_oidc(),
+            &auth_oidc().await,
         );
 
         let sin_cookie = get(negocio_router.clone(), "/api/v1/targets").await;
@@ -311,7 +402,7 @@ mod tests {
         // contestar `401`, no `405`: el *gate* precede al enrutado por método.
         // Este es el único test que cae si las dos líneas de `protected_router`
         // se invierten; el de con sesión pasa en los dos órdenes.
-        let respuesta = post(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = post(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_ne!(
             respuesta.status(),
@@ -339,8 +430,12 @@ mod tests {
     #[tokio::test]
     async fn un_metodo_no_declarado_con_sesion_contesta_405() {
         // Escenario 1.43.
-        let respuesta =
-            post_with_cookie(router_oidc(), "/api/v1/auth/session", &cookie_de_sesion()).await;
+        let respuesta = post_with_cookie(
+            router_oidc().await,
+            "/api/v1/auth/session",
+            &cookie_de_sesion(),
+        )
+        .await;
 
         assert_eq!(respuesta.status(), StatusCode::METHOD_NOT_ALLOWED);
 
@@ -363,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn una_ruta_no_declarada_no_pasa_por_el_gate() {
         // Escenario 1.44.
-        let respuesta = get(router_oidc(), "/api/v1/no-existe").await;
+        let respuesta = get(router_oidc().await, "/api/v1/no-existe").await;
 
         assert_ne!(
             respuesta.status(),
@@ -385,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn el_401_no_es_una_redireccion_ni_un_cuerpo_vacio() {
         // Escenario 1.32.
-        let respuesta = get(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
         assert!(
@@ -409,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn una_ruta_desconocida_contesta_404_con_envoltura() {
-        let respuesta = get(api_router(estado_desarrollo()), "/api/v1/no-existe").await;
+        let respuesta = get(api_router(estado_desarrollo().await), "/api/v1/no-existe").await;
 
         assert_eq!(respuesta.status(), StatusCode::NOT_FOUND);
 
@@ -431,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn un_metodo_no_declarado_contesta_405_con_envoltura() {
-        let respuesta = post(api_router(estado_desarrollo()), "/api/v1/health").await;
+        let respuesta = post(api_router(estado_desarrollo().await), "/api/v1/health").await;
 
         assert_eq!(respuesta.status(), StatusCode::METHOD_NOT_ALLOWED);
 
@@ -456,7 +551,7 @@ mod tests {
         let (senal, espera) = tokio::sync::oneshot::channel::<()>();
 
         let servidor = tokio::spawn(async move {
-            crate::serve(estado_desarrollo(), async move {
+            crate::serve(estado_desarrollo().await, async move {
                 let _ = espera.await;
             })
             .await
