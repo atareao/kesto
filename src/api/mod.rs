@@ -8,6 +8,9 @@ pub mod repositories;
 pub mod response;
 pub mod targets;
 
+#[cfg(test)]
+mod secretos;
+
 use axum::Router;
 use axum::routing::{get, post};
 use serde::Serialize;
@@ -16,6 +19,44 @@ use crate::api::response::Data;
 use crate::auth::middleware;
 use crate::error::AppError;
 use crate::state::{AppState, AuthState};
+
+/// Deja constancia de que una petición se atendió, sin su cuerpo.
+///
+/// Lo exige el requisito «Un manejador no registra el cuerpo de la petición» del delta `secrets`:
+/// el registro tiene que decir **qué** ocurrió —el método, la ruta y el código de la respuesta, que
+/// llevan la identidad del recurso afectado— y **nunca** el contenido del cuerpo, que es por donde
+/// viajan las credenciales y que, mientras está en crudo, no pasa por ningún `SecretString` que lo
+/// redacte.
+///
+/// Va a **`debug`** y no a `info`: una línea por petición atendida es ruido de operación —el panel
+/// manda una petición por clic—, y a `debug` está disponible cuando hace falta sin inundar el
+/// registro que se lee de verdad.
+///
+/// Va en **un solo sitio** —una capa sobre el router— y no en cada manejador: son quince rutas, y
+/// quince llamadas a mano son quince sitios donde olvidarse. Aquí cubre por construcción cualquier
+/// ruta que se declare mañana.
+///
+/// Se registra **después** de atender, con el código de la respuesta, para que la línea diga el
+/// desenlace y no solo el intento. La ruta se registra tal cual llegó: en las rutas del §5 el
+/// identificador es un UUID, y no hay ningún otro dato del cliente en la URI.
+async fn trazar(
+    peticion: axum::extract::Request,
+    siguiente: axum::middleware::Next,
+) -> axum::response::Response {
+    let metodo = peticion.method().clone();
+    let ruta = peticion.uri().path().to_owned();
+
+    let respuesta = siguiente.run(peticion).await;
+
+    tracing::debug!(
+        %metodo,
+        %ruta,
+        estado = respuesta.status().as_u16(),
+        "petición atendida"
+    );
+
+    respuesta
+}
 
 /// Router de `/api/v1`.
 ///
@@ -75,6 +116,7 @@ pub fn api_router(state: AppState) -> Router {
         // protegida— y sustituir solo se sustituye el de por defecto.
         .fallback(not_found)
         .method_not_allowed_fallback(metodo_no_permitido)
+        .layer(axum::middleware::from_fn(trazar))
         .with_state(state)
 }
 

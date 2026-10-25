@@ -62,8 +62,16 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            // El cliente necesita saber qué traía mal la petición: el motivo se explica.
-            Self::InvalidInput(motivo) => (StatusCode::BAD_REQUEST, motivo),
+            // El cliente necesita saber qué traía mal la petición: el motivo se explica. Se
+            // repite a `debug` porque el contrato del delta `secrets` pide que quede la traza
+            // del campo que no cumplía, y el motivo lo nombra. Se registra **solo** el motivo y
+            // **nunca** el cuerpo: el mensaje de esta variante se construye nombrando el campo y
+            // jamás su valor —es una invariante de la casa, no una casualidad—, así que
+            // registrarlo no puede publicar lo que el cliente mandó.
+            Self::InvalidInput(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición rechazada");
+                (StatusCode::BAD_REQUEST, motivo)
+            }
             Self::NotFound(motivo) => (StatusCode::NOT_FOUND, motivo),
             // El cliente se equivocó de método, no de recurso: se le explica.
             Self::MethodNotAllowed(motivo) => (StatusCode::METHOD_NOT_ALLOWED, motivo),
@@ -134,6 +142,17 @@ impl IntoResponse for AppError {
 /// en un caso de uso normal, la comprobación previa no está haciendo su trabajo.
 fn traducir_base(causa: DbError) -> (StatusCode, String) {
     if let DbError::SecretoVacio { campo } = &causa {
+        // El `400` que nombra el campo es un rechazo de validación como el de
+        // `AppError::InvalidInput`, y el contrato del delta `secrets` pide la traza del
+        // campo que no cumplía **también aquí**: el camino real de un formulario con el
+        // secreto vacío no pasa por el manejador, baja hasta la capa de acceso —es ella
+        // la que rechaza el vacío— y vuelve traducido por esta función, así que
+        // instrumentar solo la rama de `InvalidInput` dejaría sin traza el rechazo más
+        // probable de un formulario. Se registra el **nombre** del campo y **nunca** su
+        // valor, y el mensaje de arriba se construye igual —nombrando el campo—, así que
+        // esto no puede publicar lo que el cliente mandó.
+        tracing::debug!(campo = %campo, "petición rechazada");
+
         return (
             StatusCode::BAD_REQUEST,
             format!("el campo `{campo}` no puede ir vacío"),
