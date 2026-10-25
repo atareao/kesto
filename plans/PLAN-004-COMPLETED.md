@@ -268,11 +268,11 @@ El «sin directorios nuevos en la raíz» de la tarea se cumple **para el change
 
 ## Cierre
 
-- [ ] `tasks.md` completo (obligatorio: `openspec archive` se niega si queda una casilla sin marcar).
-- [ ] `docs/FEATURE-004-api-endpoints.md` con lo que realmente quedó construido.
-- [ ] La cuenta corregida a **diez** endpoints en `AGENTS.md`, `plans/PLAN-003-COMPLETED.md` y `docs/FEATURE-003-db-schema.md`.
-- [ ] `AGENTS.md`: el estado —los módulos que siguen vacíos son cuatro— y la superficie HTTP nueva.
-- [ ] Redactar el `Purpose` de `openspec/specs/api-resources/spec.md`: es capability **nueva** y no puede quedarse en `TBD`.
-- [ ] `openspec archive api-endpoints`.
-- [ ] Renombrar este fichero a `plans/PLAN-004-COMPLETED.md` con `just plan-done 4`.
+- [x] `tasks.md` completo (obligatorio: `openspec archive` se niega si queda una casilla sin marcar). → las **99** tareas: **98** quedan tildadas en el `tasks.md` archivado y la única abierta es la `5.9` —el PR—, que se tilda en el commit siguiente, cuando el PR existe. Las puertas del repositorio en verde con `just check`: **214 tests** (213 en el binario + 1 de integración). `just check-all` **no aplica**: `ui/` no existe todavía.
+- [x] `docs/FEATURE-004-api-endpoints.md` con lo que realmente quedó construido. → escrito, **271 líneas**: la superficie de las dieciséis rutas, los dos extractores propios, la validación, el listado con su ventana, la verificación de operador medida, las tres auditorías y la deuda con su destinatario.
+- [x] La cuenta corregida a **diez** endpoints en `AGENTS.md`, `plans/PLAN-003-COMPLETED.md` y `docs/FEATURE-003-db-schema.md`. → hecho en los tres, y cada uno nombra los tres endpoints diferidos con su change. Las otras apariciones de «nueve» —las de las «nueve bifurcaciones» de RustCrypto, en el plan y en la feature de `db-schema`— se quedan: hablan de dependencias, no de endpoints.
+- [x] `AGENTS.md`: el estado —los módulos que siguen vacíos son cuatro— y la superficie HTTP nueva. → hecho: el párrafo de estado habla de «los cuatro changes», cuenta **214 tests** (**58 nuevos** sobre los 156 de `db-schema`), describe `api-endpoints`, saca a `api` de las medias tintas —ya tiene la superficie de los recursos— y sigue listando los cuatro módulos vacíos (`docker`, `engine`, `rustic`, `scheduler`). El `README.md` va con él: el párrafo de estado, la tabla de piezas —con la fila nueva «Superficie del §5»— y el árbol de directorios.
+- [x] Redactar el `Purpose` de `openspec/specs/api-resources/spec.md`: es capability **nueva** y no puede quedarse en `TBD`. → hecho: el `Purpose` viaja redactado en el delta y el archivado lo deja en `openspec/specs/api-resources/spec.md`; **cero** apariciones de `TBD` en el change y en la spec fusionada.
+- [x] `openspec archive api-endpoints`. → `just spec-validate api-endpoints` pasó en estricto **antes** del archivado (con el change archivado, el comando deja de encontrarlo). La capability nueva quedó en `openspec/specs/api-resources/spec.md` y lo añadido en `openspec/specs/{api-shell,db,secrets}/spec.md`, con el change en `openspec/changes/archive/2026-10-25-api-endpoints/`.
+- [x] Renombrar este fichero a `plans/PLAN-004-COMPLETED.md` con `just plan-done 4`. → hecho.
 - [ ] PR `feature/api-endpoints` → `development` con el CI en verde. **Sin release a `main`**: se publica solo hasta `development`.
