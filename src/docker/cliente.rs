@@ -544,7 +544,7 @@ mod tests {
     /// Es la prueba mínima de que el camino entero está en pie: crear el `exec`, arrancarlo,
     /// drenar el flujo y leer el código.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_echo_entrega_su_salida_y_el_codigo_es_cero() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor =
@@ -580,7 +580,7 @@ mod tests {
     /// Es lo que hace que un fallo de volcado se pueda contar: sin el canal de error, el
     /// motivo del fallo se perdería y solo quedaría un número.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_comando_que_falla_entrega_su_motivo_por_el_canal_de_error() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor = ContenedorDePrueba::nuevo(
@@ -615,7 +615,7 @@ mod tests {
     /// cuando el contenedor de la base no trae el cliente de volcado. Una base vacía sería
     /// un `0` con la salida vacía, que es otra cosa.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_binario_que_no_existe_da_127_y_el_motivo_por_el_canal_de_error() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor = ContenedorDePrueba::nuevo(
@@ -648,7 +648,7 @@ mod tests {
 
     /// Un contenedor que no existe: falla, y el motivo **nombra el contenedor**.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_contenedor_que_no_existe_falla_y_el_motivo_lo_nombra() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let nombre = "kesto-prueba-contenedor-que-no-existe";
@@ -682,7 +682,7 @@ mod tests {
     /// Es el camino por el que viajan las credenciales de la base, así que si no llegaran,
     /// el volcado fallaría con un error de autenticación que no diría nada de esto.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn las_variables_de_entorno_de_la_orden_llegan_al_proceso() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor =
@@ -718,7 +718,7 @@ mod tests {
     /// necesitar una base de datos: `yes a | head -c` escribe exactamente esa cantidad de
     /// bytes, así que la suma de los trozos tiene que dar ese número exacto.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_volumen_grande_llega_entero() {
         /// Bytes que escribe el comando de la prueba: cuatro mebibytes.
         const BYTES_ESCRITOS: usize = 4 * 1024 * 1024;
@@ -770,7 +770,7 @@ mod tests {
     /// No es una prueba `#[tokio::test]` a propósito: el runtime que la conduce es el que el
     /// hilo construye **dentro**, que es exactamente lo que hay que fijar.
     #[test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     fn el_exec_se_conduce_en_el_runtime_del_hilo_que_lo_lanza() {
         const PRUEBA: &str = "el_exec_se_conduce_en_el_runtime_del_hilo_que_lo_lanza";
 
@@ -863,7 +863,7 @@ mod tests {
     /// dos canales llegan, cada uno con su contenido entero y sin que un trozo traiga bytes
     /// del otro: si se cruzaran, el texto de abajo no cuadraría.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn los_dos_canales_de_una_misma_ejecucion_llegan_completos_y_en_su_orden() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor = ContenedorDePrueba::nuevo(
@@ -916,7 +916,7 @@ mod tests {
     /// bytes—, así que se hace por el código de salida y por el canal: `true` sale con `0` y
     /// no escribe **nada**, ni por la salida ni por el error.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn una_base_vacia_no_se_lee_como_fallo_ni_llama_al_callback() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor =
@@ -969,7 +969,7 @@ mod tests {
     /// cola detrás. `sleep 600` no escribe una sola línea: es exactamente ese cuelgue, sin
     /// necesitar una base de datos.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn una_orden_que_se_calla_mas_que_el_plazo_acaba_en_extraccion_estancada() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor = ContenedorDePrueba::nuevo(
@@ -1043,7 +1043,7 @@ mod tests {
     /// de algo: una función que siempre fallara pasaría el candado del fallo y dejaría el
     /// arranque avisando de un socket que está perfectamente vivo.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn comprobar_dice_que_si_cuando_el_motor_contesta() {
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
 

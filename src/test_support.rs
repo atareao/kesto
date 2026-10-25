@@ -36,7 +36,7 @@ use uuid::Uuid;
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
 use crate::docker::Cliente;
-use crate::rustic::{AvisoDeProgreso, BarrasDelMotor};
+use crate::rustic::BarrasDelMotor;
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState, EstadoDeBase};
 
@@ -236,9 +236,12 @@ pub(crate) fn backends_locales(ruta: &Path) -> RepositoryBackends {
 /// Barras del motor que no hacen nada con los avisos.
 ///
 /// El progreso tiene sus propias pruebas en `src/rustic/progreso.rs`: aquí estorba, pero
-/// no se puede omitir porque la biblioteca las pide en cada operación.
+/// no se puede omitir porque la biblioteca las pide en cada operación. Es el mismo
+/// [`BarrasDelMotor::mudas`](crate::rustic::BarrasDelMotor::mudas) que usan las dos operaciones de
+/// la fachada del motor que no son una copia —abrirlo y listarlo—, y se dice para que no parezcan
+/// dos cosas distintas.
 pub(crate) fn barras_mudas() -> BarrasDelMotor {
-    BarrasDelMotor::nuevas(Arc::new(|_aviso: AvisoDeProgreso| {}))
+    BarrasDelMotor::mudas()
 }
 
 /// El abridor de repositorios del motor, para las pruebas: abre un repositorio **local**.
@@ -262,6 +265,54 @@ pub(crate) fn abridor_local(
         backends_locales(Path::new(&acceso.endpoint)),
         barras,
     )
+}
+
+/// Un destino de S3 que **rechaza** en el acto, sin salir de la máquina.
+///
+/// Devuelve el `endpoint` de un oyente local que contesta `403` —con un error de S3 dentro y
+/// cerrando la conexión— a lo que le pidan. Es lo que hace falta para ejercitar el camino de
+/// **S3** —el único que entra en pánico si se llama a la biblioteca desde dentro de un runtime, y
+/// el que ninguna prueba automática tocaba— sin red y sin contenedores.
+///
+/// # Por qué un oyente y no un puerto donde no escucha nadie
+///
+/// Está medido, y es lo que decide la forma: contra un puerto muerto (`http://127.0.0.1:9`) la
+/// biblioteca tarda **entre 41 y 54 segundos** en decirlo, porque `rustic_backend` reintenta cinco
+/// veces con retroceso exponencial y temblor (`DEFAULT_RETRY = 5`); contra este oyente tarda
+/// **825 µs**, porque `opendal` clasifica el `403` como un fallo permanente y no lo reintenta. Lo
+/// que se mide en estas pruebas es el **desenlace** —que no hay pánico y que el error llega
+/// depurado—, no el reintento, y ese precio no lo debe pagar cada `cargo test`.
+///
+/// El oyente se queda escuchando hasta que el proceso termina, como el de [`emisor_caido`]: no hay
+/// forma de pararlo desde fuera y tampoco hace falta.
+pub(crate) fn destino_de_s3_que_rechaza() -> String {
+    let oyente = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("el oyente local de la prueba se abre en un puerto libre");
+    let puerto = oyente
+        .local_addr()
+        .expect("el oyente local tiene dirección")
+        .port();
+
+    std::thread::spawn(move || {
+        for conexion in oyente.incoming() {
+            let Ok(mut flujo) = conexion else { break };
+
+            // Se lee lo que mande el cliente —la petición entera cabe de sobra— y se contesta
+            // igual a todo: lo que la prueba necesita es un rechazo inmediato, no un S3.
+            let mut peticion = [0_u8; 4096];
+            let _ = std::io::Read::read(&mut flujo, &mut peticion);
+
+            let cuerpo = r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>prueba</RequestId></Error>"#;
+            let respuesta = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cuerpo}",
+                cuerpo.len()
+            );
+
+            let _ = std::io::Write::write_all(&mut flujo, respuesta.as_bytes());
+        }
+    });
+
+    format!("http://127.0.0.1:{puerto}")
 }
 
 /// Abre el repositorio local del directorio dado, con la biblioteca y sin pasar por el
@@ -1185,6 +1236,18 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturaGlobal {
 /// cuerpo de la petición que no esperaba, y el cuerpo del canje lleva el
 /// `client_secret`—, así que el puente metería credenciales en el buffer de
 /// captura y pondría en rojo las aserciones de ausencia.
+///
+/// Y la consecuencia de eso hay que tenerla presente, porque es una **trampa**:
+/// como el puente no está, un registro que una dependencia haya hecho con `log`
+/// **no llega a `tracing`** y no aparece en ningún buffer. Una prueba que busque ahí
+/// el valor de una credencial —la 1.37, «la contraseña no sale en el registro»—
+/// pasaría sin medir nada: no es que el registro no lleve el valor, es que el
+/// registro no llega. Quien necesite medir eso tiene que montar el puente **en su
+/// propia prueba**; ver
+/// `src/engine/extraccion.rs::tests::la_credencial_de_la_base_no_sale_en_el_registro_ni_al_nivel_mas_hablador`,
+/// que instala un puente propio —solo para el objetivo del motor, y reemitiendo el
+/// objetivo de cada registro, que es lo que el filtro mira— y comprueba con un
+/// **control** que lo que mide llega de verdad.
 fn instalar_suscriptor_global() {
     SUSCRIPTOR_GLOBAL.get_or_init(|| {
         let suscriptor = tracing_subscriber::fmt()
@@ -1290,11 +1353,18 @@ pub(crate) fn lector_del_volcado(
 
 // ── Motor de contenedores ────────────────────────────────────────────────────
 //
-// Las pruebas de `src/docker` que necesitan un motor de contenedores van marcadas
-// `#[ignore]`, porque el CI no levanta ninguno: el job `backend` de
-// `.github/workflows/ci.yml` no declara servicios, así que `cargo test` tiene que
-// quedar verde sin motor. Lo de abajo es el arnés de esa capa, y quien las lance con
-// `cargo test -- --ignored` necesita un motor de verdad en la máquina.
+// Las pruebas que necesitan un motor de contenedores van marcadas `#[ignore]`, y hoy son
+// **veinte**: once en `src/docker` (todas en `cliente.rs`) y nueve en `src/engine` (siete
+// en `extraccion.rs` y dos en `mod.rs`). El motivo de que estén marcadas y no se
+// ejecuten es el CI: el job `backend` de `.github/workflows/ci.yml` no declara
+// servicios, así que `cargo test` tiene que quedar verde sin motor. Lo de abajo es el
+// arnés de toda esa capa, y quien las lance con `cargo test -- --ignored` necesita un
+// motor de verdad en la máquina.
+//
+// El motivo completo va escrito **en cada** `#[ignore]` y no solo aquí: quien lee una
+// prueba ignorada lee su atributo, y una nota que vive en otro fichero es una nota que
+// no se lee. Aquí queda el conjunto —cuántas hay y en qué módulos—, que es lo que no se
+// puede saber mirando una sola prueba.
 
 /// Imagen del contenedor de prueba.
 ///

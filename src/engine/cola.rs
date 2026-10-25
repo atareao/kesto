@@ -79,11 +79,28 @@ struct EstadoDeLaCola {
 /// Lo que hace falta para hablarle a un trabajador y para esperarlo.
 struct Buzon {
     /// El extremo de envío de su canal. Soltarlo es lo que cierra el canal y termina al trabajador.
-    emisor: SyncSender<Ejecucion>,
+    emisor: SyncSender<Encolada>,
     /// La señal que el trabajador manda al salir de su bucle.
     terminado: Receiver<()>,
     /// El hilo que lo corre.
     hilo: JoinHandle<()>,
+}
+
+/// Lo que viaja por el buzón: la ejecución **y el repositorio con el que se encoló**.
+///
+/// Los dos van juntos y no es redundancia: el repositorio es el recurso que se serializa —el buzón
+/// de este canal es **el** trabajador de ese repositorio— y la tarea de la que salió la ejecución es
+/// una fila que se puede **editar** entre el encolado y la ejecución. Si al ejecutar se volviera a
+/// resolver el repositorio desde la tarea, una edición en esa ventana haría que la copia fuera a un
+/// destino distinto del que decidió la serialización, y dos ejecuciones podrían coincidir en el
+/// mismo repositorio sin que nadie las serializara —lo que `rustic_core` no admite, porque toma un
+/// bloqueo exclusivo—. Así que el repositorio se resuelve **una vez**, al encolar, y viaja con la
+/// ejecución.
+struct Encolada {
+    /// La ejecución que hay que hacer.
+    ejecucion: Ejecucion,
+    /// El repositorio con el que se resolvió su cola, leído al encolar.
+    repository_id: Uuid,
 }
 
 /// Un trabajador del que ya solo queda esperar: su emisor está soltado.
@@ -123,6 +140,10 @@ impl Cola {
     /// Nunca bloquea: el envío es un `try_send` y una cola llena se cuenta como un error con nombre
     /// propio. Quien llama —la petición HTTP del disparo manual— tiene que poder contestar, y
     /// bloquear un hilo del runtime esperando hueco es justo lo que no se puede hacer.
+    ///
+    /// El `repository_id` entra aquí y viaja con la ejecución ([`Encolada`]) porque este es el
+    /// punto en el que se decide qué trabajador la atiende, y esa decisión es la que no se puede
+    /// volver a tomar después.
     pub(crate) fn encolar(
         &self,
         contexto: &Contexto,
@@ -148,7 +169,10 @@ impl Cola {
 
         buzon
             .emisor
-            .try_send(ejecucion_a_encolar)
+            .try_send(Encolada {
+                ejecucion: ejecucion_a_encolar,
+                repository_id,
+            })
             .map_err(|causa| match causa {
                 mpsc::TrySendError::Full(_) => {
                     ErrorDelMotor::ColaDelRepositorioLlena { repository_id }
@@ -183,6 +207,7 @@ impl Cola {
 
         let limite = Instant::now() + espera;
         let mut terminados = Vec::new();
+        let mut abandonados = 0_usize;
 
         for trabajador in pendientes {
             let restante = limite.saturating_duration_since(Instant::now());
@@ -191,10 +216,14 @@ impl Cola {
                 Ok(()) => terminados.push(trabajador.hilo),
                 // Se cayó sin señalar: su hilo ya no está, así que unirlo no puede colgarse.
                 Err(RecvTimeoutError::Disconnected) => terminados.push(trabajador.hilo),
-                Err(RecvTimeoutError::Timeout) => tracing::warn!(
-                    "un trabajador no ha terminado dentro del plazo de parada: su copia sigue en \
-                     marcha y el proceso acaba sin esperarlo más"
-                ),
+                Err(RecvTimeoutError::Timeout) => {
+                    abandonados += 1;
+
+                    tracing::warn!(
+                        "un trabajador no ha terminado dentro del plazo de parada: su copia sigue \
+                         en marcha y el proceso acaba sin esperarlo más"
+                    );
+                }
             }
         }
 
@@ -204,7 +233,18 @@ impl Cola {
             }
         }
 
-        tracing::info!("motor parado: no queda ningún trabajador en vuelo dentro del plazo");
+        // El resumen dice lo que de verdad pasó: se emite el de «no queda ninguno» **solo** si no
+        // queda ninguno. Anunciarlo siempre era decir lo contrario de lo que se acababa de
+        // registrar, y un resumen que miente sobre su propio contenido se aprende a ignorar.
+        if abandonados == 0 {
+            tracing::info!("motor parado: no queda ningún trabajador en vuelo dentro del plazo");
+        } else {
+            tracing::warn!(
+                abandonados,
+                "motor parado: hay {abandonados} trabajadores todavía en vuelo y el proceso acaba \
+                 sin esperarlos más"
+            );
+        }
     }
 
     /// Suelta los buzones y devuelve lo que queda por esperar, o `None` si ya estaba parada.
@@ -288,9 +328,9 @@ impl Buzon {
 /// Se queda bloqueado en la recepción mientras no hay nada, así que no consume CPU, y sale del
 /// bucle cuando el canal se cierra —el motor soltó su buzón— avisando por `aviso` de que ha
 /// terminado. Ese aviso es lo que espera la parada, y va **al final**, después del último trabajo.
-fn trabajo_secuencial(contexto: Contexto, receptor: Receiver<Ejecucion>, aviso: mpsc::Sender<()>) {
-    while let Ok(ejecucion) = receptor.recv() {
-        atender(&contexto, &ejecucion);
+fn trabajo_secuencial(contexto: Contexto, receptor: Receiver<Encolada>, aviso: mpsc::Sender<()>) {
+    while let Ok(encolada) = receptor.recv() {
+        atender(&contexto, &encolada);
     }
 
     // El canal se cerró: el motor soltó el buzón de este repositorio. Se avisa y se sale, y si el
@@ -310,23 +350,23 @@ fn trabajo_secuencial(contexto: Contexto, receptor: Receiver<Ejecucion>, aviso: 
 /// Lo que **no** se hace con el pánico es publicar su texto: es arbitrario y acabaría en una
 /// columna que el panel muestra. Se apunta un motivo propio y el detalle se queda en el registro,
 /// donde la red de secretos no hace falta porque nadie lo lee desde fuera.
-fn atender(contexto: &Contexto, ejecucion: &Ejecucion) {
+fn atender(contexto: &Contexto, encolada: &Encolada) {
     let intento = panic::catch_unwind(AssertUnwindSafe(|| {
-        ejecucion::ejecutar(contexto, ejecucion);
+        ejecucion::ejecutar(contexto, &encolada.ejecucion, encolada.repository_id);
     }));
 
     if let Err(payload) = intento {
         let detalle = texto_del_panico(&payload);
 
         tracing::error!(
-            execution_id = %ejecucion.id,
-            job_id = %ejecucion.job_id,
+            execution_id = %encolada.ejecucion.id,
+            job_id = %encolada.ejecucion.job_id,
             detalle,
             "la ejecución se ha interrumpido por un pánico: se apunta como fallida y el \
              trabajador sigue con la siguiente"
         );
 
-        ejecucion::fallar_si_no_termino(contexto, &ejecucion.id, MOTIVO_DEL_PANICO);
+        ejecucion::fallar_si_no_termino(contexto, &encolada.ejecucion.id, MOTIVO_DEL_PANICO);
     }
 }
 

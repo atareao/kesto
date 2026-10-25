@@ -477,6 +477,20 @@ impl Repositorio {
     /// Construye el destino de S3 con los datos del [`Acceso`] y delega en
     /// [`poner_en_marcha_con`], que es donde viven los tres desenlaces.
     ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// Con el backend de S3 la biblioteca construye su **propio** runtime y bloquea el hilo
+    /// para hablar con el destino, así que llamar a esto desde dentro de otro runtime entra
+    /// en **pánico** —medido, literal: «Cannot start a runtime from within a runtime.»—, y un
+    /// pánico no es un error devuelto: se lleva por delante al hilo que lo sufre. Los sitios
+    /// desde los que sí se llama son el hilo del trabajador del motor —un `std::thread`
+    /// pelado, ver `src/engine/cola.rs`— y
+    /// [`Motor::abrir_repositorio`](crate::engine::Motor::abrir_repositorio), que saca el
+    /// trabajo del runtime antes de llegar aquí.
+    ///
+    /// El aviso va en este método y no solo en el motor porque este es el que se puede llamar
+    /// desde fuera: el motor lo dice de sí mismo y aquí hay que decirlo del módulo.
+    ///
     /// # Errors
     ///
     /// Devuelve [`Error::AccesoInvalido`] si la fila no describe un destino utilizable,
@@ -514,6 +528,14 @@ impl Repositorio {
     /// y el nodo que acaba dentro del árbol lo nombra el puente, así que dos nombres
     /// distintos dejan una copia que dice contener lo que no tiene. Se comprueba antes de
     /// `archive` y no después, porque después ya está guardada.
+    ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// El archivado bloquea el hilo y, con el backend de S3, la biblioteca construye su
+    /// **propio** runtime para hablar con el destino: llamar a esto desde dentro de otro
+    /// runtime entra en **pánico** —medido, literal: «Cannot start a runtime from within a
+    /// runtime.»—. Quien lo llama es el hilo del trabajador del motor, que es un `std::thread`
+    /// pelado y no está dentro de ninguno.
     ///
     /// # Errors
     ///
@@ -565,6 +587,14 @@ impl Repositorio {
     /// puede decidir por ellos qué ficheros cambiaron, que es lo que hace útil la
     /// deduplicación entre copias del mismo directorio.
     ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// El origen es local, pero el repositorio no: con el backend de S3 la biblioteca construye
+    /// su **propio** runtime y bloquea el hilo para hablar con el destino, así que llamar a esto
+    /// desde dentro de otro runtime entra en **pánico** —medido, literal: «Cannot start a runtime
+    /// from within a runtime.»—. Quien lo llama es el hilo del trabajador del motor, que es un
+    /// `std::thread` pelado y no está dentro de ninguno.
+    ///
     /// # Errors
     ///
     /// Las mismas dos que [`archivar_volcado`](Self::archivar_volcado), más el fallo de
@@ -598,6 +628,14 @@ impl Repositorio {
     /// Las tres operaciones viven en [`crate::rustic::retencion`], que es donde está
     /// escrito por qué son tres y no una.
     ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// Las tres operaciones van contra el repositorio, y con el backend de S3 la biblioteca
+    /// construye su **propio** runtime y bloquea el hilo para hablar con el destino: llamar a
+    /// esto desde dentro de otro runtime entra en **pánico** —medido, literal: «Cannot start a
+    /// runtime from within a runtime.»—. Quien lo llama es el hilo del trabajador del motor, que
+    /// es un `std::thread` pelado y no está dentro de ninguno.
+    ///
     /// # Errors
     ///
     /// Devuelve [`Error::RetencionQueLoBorraTodo`] si las tres reglas valen cero —no es una
@@ -629,6 +667,17 @@ impl Repositorio {
     ///
     /// Lo que sí se promete es que lo devuelto sale ordenado de la más reciente a la más
     /// antigua.
+    ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// Listar es leer del repositorio, y con el backend de S3 la biblioteca construye su
+    /// **propio** runtime y bloquea el hilo para hablar con el destino: llamar a esto desde
+    /// dentro de otro runtime entra en **pánico** —medido, literal: «Cannot start a runtime from
+    /// within a runtime.»—, y ese pánico no es un error devuelto. Y este es el caso más fácil de
+    /// cometer de los cinco: el listado lo pide una ruta de la API, que es `async` por
+    /// definición. Quien lo llama de verdad es
+    /// [`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots), que saca el trabajo
+    /// del runtime antes de llegar aquí.
     ///
     /// # Errors
     ///
@@ -2462,6 +2511,96 @@ mod tests {
         assert!(
             !publicado.contains(PASSPHRASE_DE_PRUEBA),
             "un error al construir el destino de S3 publicó la passphrase: {publicado}"
+        );
+    }
+
+    /// **El destino de S3 que no responde da un error limpio y sin secretos, y no un pánico.**
+    ///
+    /// Es la prueba que cierra el hueco que tenía la suite entera: todas las del motor abren un
+    /// repositorio **local** (`rustic_backend::local`, sin `opendal`), así que el camino de **S3**
+    /// —el único que construye su propio runtime y por tanto el único que entra en pánico si se le
+    /// llama desde dentro de un runtime— no lo ejercitaba ninguna prueba automática, y el CI no lo
+    /// habría cazado. Aquí sí: el backend es el de S3 de verdad, contra un destino donde nadie
+    /// escucha, y el desenlace tiene que ser un `Err` con su motivo.
+    ///
+    /// El desenlace está **medido** en las dos direcciones, y es el motivo de que el motor tenga
+    /// las dos operaciones que sacan el trabajo del runtime:
+    ///
+    /// - desde **dentro** de un runtime, la misma llamada entra en pánico —«`Cannot start a runtime
+    ///   from within a runtime`», en `opendal-core-0.58.2/src/blocking/operator.rs`—;
+    /// - desde un hilo **sin** runtime, que es donde corre una prueba `#[test]` y donde corre el
+    ///   hilo del trabajador del motor, devuelve el error de red.
+    ///
+    /// Por eso esta prueba es `#[test]` y **no** `#[tokio::test]`: lo que fija es el desenlace del
+    /// camino de S3 tal y como lo ve quien **no** está dentro de un runtime, que es el único sitio
+    /// desde el que se puede llamar. Para el otro lado está `Motor::abrir_repositorio`, que saca el
+    /// trabajo del runtime por su cuenta.
+    ///
+    /// # Los cinco reintentos de la biblioteca, apagados a propósito
+    ///
+    /// El único cambio sobre el mapa de opciones de producción es `retry = 0`, y está medido por
+    /// qué: `rustic_backend` reintenta **cinco** veces con retroceso exponencial y temblor
+    /// (`DEFAULT_RETRY = 5`), así que contra un puerto donde nadie escucha tarda **entre 41 y 54
+    /// segundos** en decirlo —medido—. Lo que aquí se mide es el **desenlace** y el motivo, no el
+    /// reintento, y con `retry = 0` la misma llamada tarda **13 ms**. Ver
+    /// `src/test_support.rs::destino_de_s3_que_rechaza` para la otra forma de ejercitarlo sin
+    /// pagarlos: un oyente local que contesta `403`.
+    #[test]
+    fn un_destino_de_s3_inalcanzable_da_un_error_limpio_y_sin_secretos() {
+        let acceso = Acceso {
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            bucket: "cubo-al-que-nadie-responde".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(OTRA_PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let mut opciones = opciones_de_s3(&acceso).expect("la fila describe un destino utilizable");
+        assert_eq!(
+            opciones.get("secret_access_key").map(String::as_str),
+            Some(CLAVE_SECRETA_DE_PRUEBA),
+            "el mapa tiene que llevar la clave secreta en claro —la dependencia la necesita así—, \
+             o la aserción de abajo no mediría lo que dice medir"
+        );
+        opciones.insert("retry".to_owned(), "0".to_owned());
+
+        let backend: std::sync::Arc<dyn rustic_core::WriteBackend> = std::sync::Arc::new(
+            OpenDALBackend::new(ESQUEMA_DE_S3, opciones)
+                .expect("el esquema de S3 construye el backend sin red"),
+        );
+        let backends = rustic_core::RepositoryBackends::new(backend, None);
+
+        let error = poner_en_marcha_con(&acceso, backends, barras_mudas())
+            .expect_err("un destino que no responde no puede poner nada en marcha");
+
+        // El desenlace tiene que ser el del **destino inalcanzable**, no el de una passphrase que
+        // no abre: son dos cosas que el operador arregla de forma distinta, y una prueba que
+        // aceptara cualquiera de las dos no mediría ninguna.
+        let (destino, motivo) = match error {
+            Error::DestinoNoAlcanzable { destino, motivo } => (destino, motivo),
+            otro => panic!(
+                "un destino que no se alcanza tiene que llegar como `DestinoNoAlcanzable` y llegó \
+                 como {otro:?}: confundirlo con una passphrase que no abre manda al operador a \
+                 revisar lo que no es"
+            ),
+        };
+
+        assert!(
+            destino.contains(&acceso.endpoint) && destino.contains(&acceso.bucket),
+            "el motivo no nombra el sitio al que no se llegó: {destino}"
+        );
+        assert!(
+            motivo.contains(&acceso.bucket),
+            "el motivo no nombra el cubo: {motivo}"
+        );
+        assert!(
+            !motivo.contains(CLAVE_SECRETA_DE_PRUEBA),
+            "el motivo de un fallo de S3 publica la clave secreta: {motivo}"
+        );
+        assert!(
+            !motivo.contains(OTRA_PASSPHRASE_DE_PRUEBA),
+            "el motivo de un fallo de S3 publica la passphrase: {motivo}"
         );
     }
 

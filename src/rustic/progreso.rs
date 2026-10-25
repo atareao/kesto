@@ -63,6 +63,17 @@ impl BarrasDelMotor {
     pub fn nuevas(al_avisar: Arc<dyn Fn(AvisoDeProgreso) + Send + Sync>) -> Self {
         Self { al_avisar }
     }
+
+    /// Barras que no informan a nadie.
+    ///
+    /// Es lo que necesitan las dos operaciones que **no** son una copia —abrir un repositorio y
+    /// listar sus instantáneas—: la biblioteca pide barras en cada operación que abre, y ahí no hay
+    /// panel que pintar ni ejecución a la que apuntar el avance, así que el aviso se descarta. No
+    /// es lo mismo que no pasar barras —no se puede: la biblioteca las exige— ni que callarlas por
+    /// un filtro: lo que se declara aquí es que no hay nadie a quien avisar.
+    pub fn mudas() -> Self {
+        Self::nuevas(Arc::new(|_aviso| {}))
+    }
 }
 
 impl std::fmt::Debug for BarrasDelMotor {

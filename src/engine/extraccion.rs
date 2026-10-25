@@ -1006,16 +1006,18 @@ mod tests {
 
     use super::{
         CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, LIMITE_DEL_MOTIVO, Objetivo,
-        Resultado, Ruta, TOPE_DEL_CRUDO, acumular_el_motivo, motivo_para_guardar, nombre_del_tipo,
-        recortar, ruta, volcar,
+        Resultado, Ruta, TOPE_DEL_CRUDO, acumular_el_motivo, entorno_del_exec, motivo_para_guardar,
+        nombre_del_tipo, recortar, ruta, volcar,
     };
     use crate::db::entities::{Target, TipoDeTarget};
     use crate::docker::{Cliente, Orden};
     use crate::rustic::{ProductorDelVolcado, TunelDelVolcado, tunel_del_volcado};
     use crate::secret::{REDACTED, SecretString};
     use crate::test_support::{
-        ContenedorDePrueba, TIMEOUT_DEL_MOTOR, lector_del_volcado, socket_del_motor,
+        BufferDeLog, ContenedorDePrueba, TIMEOUT_DEL_MOTOR, capturar_log, lector_del_volcado,
+        socket_del_motor,
     };
+    use tracing_subscriber::EnvFilter;
 
     /// Contraseña distinguible: si aparece en una salida, la salida es el fallo.
     ///
@@ -1974,7 +1976,7 @@ mod tests {
     /// ni un byte de más—, la cuenta de bytes tiene que cuadrar con lo escrito, el motivo
     /// tiene que ser el que escribió el contenedor, y la entrega tiene que quedar completa.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn la_extraccion_entrega_el_volcado_entero_y_su_motivo() {
         const VOLCADO: &[u8] = b"volcado";
         const MOTIVO: &str = "motivo";
@@ -2036,7 +2038,7 @@ mod tests {
     /// canal —el lector, que es quien marca la señal, se encuentra el cierre sin el final
     /// declarado y devuelve un error en vez de un fin de fichero—.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_proceso_que_falla_no_declara_el_final() {
         let contenedor =
             ContenedorDePrueba::nuevo("un_proceso_que_falla_no_declara_el_final").await;
@@ -2091,7 +2093,7 @@ mod tests {
     /// mientras la cuenta crece en el otro extremo. Un contador que sumara los bytes que no
     /// salieron, o que se perdiera trozos, no daría este número.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_volcado_grande_llega_entero_y_contado() {
         /// Bytes que escribe el comando: cuatro mebibytes.
         const BYTES_ESCRITOS: usize = 4 * 1024 * 1024;
@@ -2143,7 +2145,7 @@ mod tests {
     /// verdad: la credencial viaja por el entorno del `exec` y el proceso la escribe en su
     /// canal de error, que es el campo que se guarda en la base y se muestra en el panel.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn el_motivo_de_un_contenedor_que_repite_la_contrasena_no_la_publica() {
         let contenedor = ContenedorDePrueba::nuevo(
             "el_motivo_de_un_contenedor_que_repite_la_contrasena_no_la_publica",
@@ -2192,7 +2194,7 @@ mod tests {
     /// nombra un contenedor que no está» de «la base rechazó las credenciales», porque los dos
     /// fallos se arreglan en sitios distintos.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_contenedor_que_no_esta_no_se_confunde_con_un_fallo_de_volcado() {
         const AUSENTE: &str = "kesto-prueba-contenedor-que-no-existe-extraccion";
 
@@ -2236,7 +2238,7 @@ mod tests {
     /// forma en que un fallo de extracción se parece a una base vacía y la razón de que el
     /// código de salida y el canal de error sean lo único que los distingue.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn un_proceso_que_falla_sin_escribir_en_la_salida_no_es_una_base_vacia() {
         let contenedor = ContenedorDePrueba::nuevo(
             "un_proceso_que_falla_sin_escribir_en_la_salida_no_es_una_base_vacia",
@@ -2314,7 +2316,7 @@ mod tests {
     /// viaja en el error —la mitad que cerró la auditoría, porque antes se tiraba con el
     /// `return`— y viaja **sin la credencial**, que es la mitad que no se puede romper.
     #[tokio::test]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn una_orden_que_se_calla_acaba_en_estancamiento_y_sin_entrega() {
         let contenedor = ContenedorDePrueba::nuevo(
             "una_orden_que_se_calla_acaba_en_estancamiento_y_sin_entrega",
@@ -2385,5 +2387,198 @@ mod tests {
         );
 
         contenedor.retirar().await;
+    }
+    // ── La credencial en el registro (el requisito 7, tarea 1.37) ────────────
+
+    /// El puente `log` → `tracing`, **el que instala el arranque y el que el arnés NO instala**.
+    ///
+    /// Hace falta montarlo a mano por lo que dice la nota de `src/test_support.rs`: el arnés
+    /// instala su suscriptor con `set_global_default`, y el puente lo montan `init` / `try_init` de
+    /// `tracing-subscriber`, que es lo que usa `src/main.rs`. Sin puente, los registros de la
+    /// biblioteca del motor —los que hacen el daño: a `DEBUG`, el cuerpo serializado de la petición
+    /// con el `env` del `exec` dentro— no llegan a `tracing` y una prueba que los busque **pasa sin
+    /// medir nada**.
+    ///
+    /// Tiene dos diferencias con el puente de producción, y las dos son para medir sin tocar a
+    /// nadie: solo reemite los registros del **objetivo del motor** —lo demás no lo toca, así que
+    /// ninguna otra prueba del binario recibe registros que no son suyos—, y los reemite con **el
+    /// objetivo que traían**, que es lo que el filtro mira para aplicar la directiva del proyecto.
+    struct PuenteDelMotor;
+
+    impl log::Log for PuenteDelMotor {
+        fn enabled(&self, metadatos: &log::Metadata<'_>) -> bool {
+            metadatos.target().starts_with(crate::OBJETIVO_DEL_MOTOR)
+        }
+
+        fn log(&self, registro: &log::Record<'_>) {
+            if !self.enabled(registro.metadata()) {
+                return;
+            }
+
+            // El registro se reemite con el objetivo **tal y como lo nombra el proyecto**, que es
+            // el que la directiva del arranque silencia, y con su nivel. `tracing::event!` construye
+            // un `Callsite` **estático**, así que su objetivo y su nivel tienen que ser constantes
+            // y no se pueden tomar del registro: lo que el puente comprueba antes de reemitir es
+            // que el registro venga del objetivo del motor, así que el nombre no se inventa. Y el
+            // nivel va en un `match` por lo mismo: cada nivel es su propio `Callsite`, y de ahí
+            // sale que el filtro decida al registrar el `Callsite` —donde la directiva del
+            // proyecto enmudece el de `DEBUG`— y no después de construir el evento.
+            match registro.level() {
+                log::Level::Error => tracing::event!(
+                    target: crate::OBJETIVO_DEL_MOTOR,
+                    tracing::Level::ERROR,
+                    "{}",
+                    registro.args()
+                ),
+                log::Level::Warn => tracing::event!(
+                    target: crate::OBJETIVO_DEL_MOTOR,
+                    tracing::Level::WARN,
+                    "{}",
+                    registro.args()
+                ),
+                log::Level::Info => tracing::event!(
+                    target: crate::OBJETIVO_DEL_MOTOR,
+                    tracing::Level::INFO,
+                    "{}",
+                    registro.args()
+                ),
+                log::Level::Debug => tracing::event!(
+                    target: crate::OBJETIVO_DEL_MOTOR,
+                    tracing::Level::DEBUG,
+                    "{}",
+                    registro.args()
+                ),
+                log::Level::Trace => tracing::event!(
+                    target: crate::OBJETIVO_DEL_MOTOR,
+                    tracing::Level::TRACE,
+                    "{}",
+                    registro.args()
+                ),
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Lo instala **una sola vez por proceso**: `log` tiene un registrador global y admite uno.
+    fn instalar_el_puente_del_motor() {
+        static PUENTE: PuenteDelMotor = PuenteDelMotor;
+        static INSTALADO: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+        INSTALADO.get_or_init(|| {
+            // Si otro sitio del binario hubiera puesto un registrador de `log`, esto fallaría y el
+            // puente no llevaría nada: el **control** de la prueba de abajo lo delata.
+            let _ = log::set_logger(&PUENTE);
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+    }
+
+    /// **1.37 — la credencial de la base no sale en el registro, ni al nivel más hablador.**
+    ///
+    /// Es el requisito «la credencial no aparece en el registro del proceso» y su escenario: el
+    /// proceso con el registro a `debug`, una extracción con contraseña, y el valor **sin** aparecer
+    /// en el registro. La exposición es concreta y está medida en la biblioteca: el motor de
+    /// contenedores registra a `DEBUG` el cuerpo serializado de cada petición y ese cuerpo lleva el
+    /// `env` del `exec` —con `MYSQL_PWD` dentro—. El valor no pasa por ningún tipo de este crate, así
+    /// que no hay `Debug` propio que lo tape: lo único que corta la exposición es la **directiva de
+    /// filtro** que el arranque compone, y eso es lo que se mide aquí.
+    ///
+    /// # Cómo se mide, y por qué no vale la versión ingenua
+    ///
+    /// Se montan las tres piezas y ninguna es decorativa: el puente `log` → `tracing` (que el arnés
+    /// no instala), el filtro que el proceso aplica **de verdad** —el de
+    /// [`crate::componer_el_filtro`], no un filtro escrito aquí— y un buffer propio, porque el
+    /// suscriptor del arnés es global y `set_global_default` solo se puede usar una vez.
+    ///
+    /// El registro se emite con el **objetivo del motor**, que es el que la directiva del proyecto
+    /// nombra, y el `env` no se escribe a mano: sale de [`entorno_del_exec`], que es quien lo
+    /// construye en producción. Debajo va un **control** —el mismo texto a `warn`, un nivel que la
+    /// directiva sí deja pasar—: sin él, la aserción de ausencia pasaría también si el puente no
+    /// llevara nada a ninguna parte, que es justo la trampa que esta prueba existe para no cometer.
+    ///
+    /// # La mutación que la hace valer
+    ///
+    /// Quitando la directiva del motor de [`crate::componer_el_filtro`] —o subiendo el nivel de este
+    /// filtro— la prueba **cae**: el registro de `DEBUG` con el `env` llega al buffer. Medido.
+    #[test]
+    fn la_credencial_de_la_base_no_sale_en_el_registro_ni_al_nivel_mas_hablador() {
+        instalar_el_puente_del_motor();
+
+        // El suscriptor global del arnés se instala igualmente —dejarlo sin instalar es lo que
+        // envenena el interés de un callsite, ver `src/test_support.rs`—, pero el buffer que se
+        // mira es el de los suscriptores scoped de abajo.
+        let (_del_arnes, guardia) = capturar_log();
+
+        // El `env` del `exec` de verdad, que es donde viaja la credencial.
+        let env = entorno_del_exec(TipoDeTarget::Mariadb, Some(&secreto(CONTRASENA)));
+        assert!(
+            env.iter().any(|variable| variable.contains(CONTRASENA)),
+            "el entorno del `exec` no lleva la contraseña, así que esta prueba no mediría nada: \
+             {env:?}"
+        );
+
+        // ── 1. Con el filtro que el proceso aplica ───────────────────────────────
+        let (compuesto, _aviso) = crate::componer_el_filtro("debug");
+        let del_proceso = BufferDeLog::default();
+        let con_la_directiva = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_new(&compuesto).expect("el filtro del proceso es válido"),
+            )
+            .with_ansi(false)
+            .without_time()
+            .with_writer(del_proceso.clone())
+            .finish();
+
+        tracing::subscriber::with_default(con_la_directiva, || {
+            // Lo que la biblioteca registra a `DEBUG`: el cuerpo serializado de la petición, con
+            // el `env` del `exec` dentro.
+            log::debug!(
+                target: crate::OBJETIVO_DEL_MOTOR,
+                "serialize_payload: {{\"env\": {env:?}}}"
+            );
+        });
+
+        let registro_del_proceso = del_proceso.texto();
+
+        assert!(
+            !registro_del_proceso.contains(CONTRASENA),
+            "el registro del proceso publica la contraseña de la base con el nivel más hablador: \
+             {registro_del_proceso}"
+        );
+
+        // ── 2. El mismo registro, con un filtro al que le falta la directiva ─────
+        //
+        // Es el **control positivo**, y sin él la aserción de arriba no mediría nada: si el puente
+        // no llevara el registro a ninguna parte —o el buffer no lo recogiera—, la ausencia de la
+        // contraseña se cumpliría igual y la prueba pasaría por vacío, que es justo la trampa que
+        // esta prueba existe para no cometer. Con el filtro desnudo el mismo texto **tiene** que
+        // llegar, y llega: lo único que lo paraba era la directiva. Y es, además, la mutación que
+        // se hizo a mano sobre `componer_el_filtro`, aquí dentro y siempre: quitando la directiva
+        // del proceso, la fase 1 cae.
+        let desnudo = BufferDeLog::default();
+        let sin_la_directiva = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("debug"))
+            .with_ansi(false)
+            .without_time()
+            .with_writer(desnudo.clone())
+            .finish();
+
+        tracing::subscriber::with_default(sin_la_directiva, || {
+            log::debug!(
+                target: crate::OBJETIVO_DEL_MOTOR,
+                "serialize_payload: {{\"env\": {env:?}}}"
+            );
+        });
+
+        let registro_desnudo = desnudo.texto();
+
+        drop(guardia);
+
+        assert!(
+            registro_desnudo.contains(CONTRASENA),
+            "el mismo registro no llega ni con un filtro sin la directiva, así que el puente o el \
+             buffer no están midiendo nada y la ausencia de arriba no significa nada: \
+             {registro_desnudo}"
+        );
     }
 }

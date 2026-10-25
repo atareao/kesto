@@ -22,6 +22,13 @@
 //! trabajo va en hilos de sistema operativo creados por el motor, y quien vuelve al runtime de la
 //! aplicación lo hace **explícitamente** y **solo** para hablar con la base.
 //!
+//! Y la misma regla gobierna las dos operaciones que el motor presta **sin** ser una copia
+//! —[`Motor::abrir_repositorio`] y [`Motor::listar_snapshots`]—, que son las que necesita la capa
+//! HTTP para el alta de un repositorio y para el explorador de instantáneas. Las dos son `async`
+//! porque quien las llama es un manejador, y las dos sacan su trabajo del runtime por su cuenta
+//! ([`fuera_del_runtime`]): la restricción del pánico queda en **un** sitio, el módulo que la
+//! midió, en vez de repartida entre quien recuerde que existe.
+//!
 //! # Por dónde va el volcado, en una línea
 //!
 //! ```text
@@ -62,7 +69,7 @@ use crate::db::entities::{
     AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, Repositorios, Tareas, Targets,
 };
 use crate::docker::Cliente;
-use crate::rustic::{Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio};
+use crate::rustic::{Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
 
 use cola::Cola;
 pub use hub::{CAPACIDAD_DEL_HUB, EventoDeEjecucion, Hub};
@@ -262,6 +269,19 @@ pub enum ErrorDelMotor {
     /// Dos desenlaces con el mismo nombre porque para el operador son el mismo —no hay trabajador—:
     /// no se pudo crear su hilo, o el que había ya no está. El motivo dice cuál de los dos, y los
     /// dos se arreglan mirando el proceso, no la fila del §3.
+    ///
+    /// # Por qué esta variante no tiene prueba
+    ///
+    /// Y se dice en vez de dejarse sin mirar: los dos desenlaces están fuera del alcance de una
+    /// prueba, y por motivos distintos. El primero —no poder crear el hilo— solo ocurre si el
+    /// sistema operativo se queda sin recursos, y provocarlo exigiría agotar los hilos del proceso:
+    /// una prueba que fallaría por el entorno y no por el código. El segundo —el canal
+    /// desconectado— es **inalcanzable por construcción**, y el camino del encolado lo dice con
+    /// todas las letras: mientras el buzón siga en el mapa su emisor vive, y el emisor solo muere
+    /// cuando el buzón se suelta, que es lo que cierra el canal. No se le abre a la cola un gancho
+    /// de prueba solo para recorrerlo. Lo que sí queda cubierto es el `503` que el operador ve de
+    /// verdad en ese camino —el de [`ColaDelRepositorioLlena`](ErrorDelMotor::ColaDelRepositorioLlena)
+    /// y el de [`MotorParado`](ErrorDelMotor::MotorParado)—, que sí tienen prueba.
     #[error("el repositorio `{repository_id}` no tiene quien atienda su cola: {motivo}")]
     SinQuienAtiendaLaCola {
         /// El repositorio que se ha quedado sin trabajador.
@@ -288,6 +308,46 @@ pub enum ErrorDelMotor {
         /// El fallo del transporte, tal cual.
         #[source]
         causa: crate::docker::Error,
+    },
+
+    /// La biblioteca de copia no ha podido hacer su trabajo contra el repositorio.
+    ///
+    /// Lo devuelven las dos operaciones que el motor presta sin ser una copia
+    /// ([`Motor::abrir_repositorio`] y [`Motor::listar_snapshots`]): ahí no hay ejecución que
+    /// apuntar, así que el fallo se cuenta a quien preguntó y no queda escrito en ninguna fila.
+    ///
+    /// # La correspondencia con los códigos HTTP la elige quien llama
+    ///
+    /// Este es el único desenlace del motor en el que el código **no** se puede fijar aquí, y por
+    /// eso la [`causa`](Self::Repositorio::causa) viaja entera y con su tipo: el alta de un
+    /// repositorio de la API tiene que contestar `502` cuando el destino no se alcanza y `400`
+    /// cuando la passphrase no abre uno que ya existe —dos desenlaces que el operador arregla de
+    /// maneras distintas—, y distinguirlos exige mirar el error de la biblioteca, no su texto.
+    ///
+    /// Lo que **no** se publica es la causa: lo que sale de aquí hacia el operador es
+    /// [`motivo`](Self::Repositorio::motivo), que va ya pasado por la red de secretos de la
+    /// extracción —un error de un backend puede llevar dentro la URL del destino con su
+    /// credencial, y esto se guarda y se muestra—.
+    #[error("el repositorio no ha respondido: {motivo}")]
+    Repositorio {
+        /// El fallo de la biblioteca, para quien tenga que **decidir** con él.
+        #[source]
+        causa: crate::rustic::Error,
+        /// El mismo fallo, ya recortado y sin credenciales, para contarlo.
+        motivo: String,
+    },
+
+    /// El trabajo que hablaba con la biblioteca no llegó a término. **Corresponde a un `500`**.
+    ///
+    /// Es el desenlace de un hilo de trabajo que se cayó —un pánico dentro de la biblioteca, que
+    /// llama a código que este crate no controla— o de uno que no volvió, y por eso el motivo es
+    /// propio y **no** el del pánico: el texto de un pánico es arbitrario y acabaría publicado en
+    /// una respuesta, que es justo el sitio del que este módulo lo mantiene fuera. El detalle se
+    /// queda en el registro, donde nadie lo lee desde fuera.
+    #[error("el trabajo contra el repositorio se ha interrumpido: {motivo}")]
+    TrabajoInterrumpido {
+        /// Qué se sabe del hilo: que se cayó con un pánico, o que no llegó a término.
+        motivo: String,
     },
 
     /// El motor se ha montado fuera de un runtime de Tokio.
@@ -452,12 +512,23 @@ impl Motor {
         // Y si el encolado falla **después** de crear la fila, esa fila se marca como fallida antes
         // de devolver el error: una fila `pending` que nadie va a ejecutar se queda mintiendo en el
         // panel —«en cola»— para siempre, y eso es peor que un error que se ve.
+        //
+        // Se marca **desde aquí**, que es un `async` dentro del runtime, con la entrada
+        // `async` de esa marca: la otra —`ejecucion::fallar_si_no_termino`— entra en el runtime con
+        // un `block_on`, y un `block_on` dentro de un runtime es un **pánico**. Este camino lo
+        // cometía, y lo delató la prueba de la cola llena: el hallazgo era que esta mitad no estaba
+        // medida, y al medirla apareció el pánico.
         if let Err(causa) =
             interior
                 .cola
                 .encolar(&interior.contexto, tarea.repository_id, ejecucion.clone())
         {
-            ejecucion::fallar_si_no_termino(&interior.contexto, &ejecucion.id, &causa.to_string());
+            ejecucion::marcar_fallida_si_no_termino(
+                &interior.contexto,
+                &ejecucion.id,
+                &causa.to_string(),
+            )
+            .await;
 
             return Err(causa);
         }
@@ -480,6 +551,95 @@ impl Motor {
     /// El hub, para que la capa HTTP se suscriba.
     pub fn hub(&self) -> &Hub {
         &self.0.contexto.hub
+    }
+
+    /// Abre —o inicializa— el repositorio que describe el acceso, **fuera del runtime de Tokio**.
+    ///
+    /// Es la mitad del motor que no es una copia: la necesita la capa HTTP para el alta, que no
+    /// puede limitarse a escribir la fila —una fila que describe un cubo que no existe hace que el
+    /// panel lo liste como disponible y que el fallo aparezca mucho después, en la primera copia—.
+    /// Devuelve cuál de los dos desenlaces ocurrió —[`PuestaEnMarcha::Inicializado`] o
+    /// [`PuestaEnMarcha::Conectado`]—, que es lo que la respuesta del alta tiene que decir.
+    ///
+    /// El repositorio se **suelta** antes de volver: es de un solo uso práctico —reutilizarlo entre
+    /// dos copias desactiva la deduplicación, ver `src/rustic/repositorio.rs`— y aquí no hay copia
+    /// ninguna que hacer, solo saber si el destino contesta.
+    ///
+    /// Un acceso que no abre **no deja nada a medias**: no hay fila que escribir ni estado que
+    /// tocar —quien decide no escribir la fila es el manejador, y esta operación no la escribe—, y
+    /// lo que sale es el error. Ver [`ErrorDelMotor::Repositorio`] para a quién le toca elegir el
+    /// código HTTP.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorDelMotor::Repositorio`] si la biblioteca no puede poner el repositorio en marcha, y
+    /// [`ErrorDelMotor::TrabajoInterrumpido`] si el hilo que lo intentaba se cae.
+    ///
+    /// # Por qué el abridor es el inyectado y no el de S3 a pelo
+    ///
+    /// El abridor vive en [`Ajustes`] y es un puntero a función precisamente para esto: un
+    /// despliegue abre el de S3 y una prueba abre uno **local**, así que la capa HTTP no necesita
+    /// saber cómo se abre un repositorio y no puede equivocarse de runtime —la restricción del
+    /// pánico se cumple aquí, una vez, y no en cada manejador—.
+    pub async fn abrir_repositorio(&self, acceso: Acceso) -> Result<PuestaEnMarcha, ErrorDelMotor> {
+        let abridor = self.0.contexto.ajustes.abridor;
+
+        fuera_del_runtime(move || {
+            abridor(&acceso, BarrasDelMotor::mudas())
+                // El repositorio se suelta aquí: lo único que se quería saber es cuál de los dos
+                // desenlaces ocurrió.
+                .map(|(_repositorio, puesta)| puesta)
+                .map_err(|causa| ErrorDelMotor::Repositorio {
+                    motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                    causa,
+                })
+        })
+        .await
+    }
+
+    /// Lista las instantáneas de un repositorio, **fuera del runtime de Tokio**, hasta `ventana`.
+    ///
+    /// Es la otra mitad que la capa HTTP necesita: el explorador del §5 lee los snapshots del
+    /// **repositorio** y no del histórico de ejecuciones, así que hay que abrirlo y preguntarle.
+    /// Abre y suelta el repositorio en la misma llamada —por lo mismo que
+    /// [`Motor::abrir_repositorio`]— y devuelve las instantáneas ya resueltas y ordenadas de la más
+    /// reciente a la más antigua.
+    ///
+    /// Un repositorio que todavía no existe se **inicializa**, que es lo que hace la puesta en
+    /// marcha: la lista sale vacía y el destino queda creado. No se rechaza aquí porque quien
+    /// pregunta por un repositorio que no está tiene que mirar su fila, no el almacenamiento, y eso
+    /// el motor no lo sabe: el `404` del listado lo decide el manejador, que es quien puede leer la
+    /// fila.
+    ///
+    /// # Errors
+    ///
+    /// Las mismas dos que [`Motor::abrir_repositorio`], más el fallo del listado en sí —que la
+    /// biblioteca no pueda leer los identificadores o resolver una instantánea—, que llega también
+    /// como [`ErrorDelMotor::Repositorio`].
+    pub async fn listar_snapshots(
+        &self,
+        acceso: Acceso,
+        ventana: usize,
+    ) -> Result<Vec<ResumenDeSnapshot>, ErrorDelMotor> {
+        let abridor = self.0.contexto.ajustes.abridor;
+
+        fuera_del_runtime(move || {
+            let (repositorio, _puesta) =
+                abridor(&acceso, BarrasDelMotor::mudas()).map_err(|causa| {
+                    ErrorDelMotor::Repositorio {
+                        motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                        causa,
+                    }
+                })?;
+
+            repositorio
+                .listar_snapshots(ventana)
+                .map_err(|causa| ErrorDelMotor::Repositorio {
+                    motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                    causa,
+                })
+        })
+        .await
     }
 
     /// Deja de aceptar trabajo, espera lo acotado y une los hilos.
@@ -508,10 +668,63 @@ impl std::fmt::Debug for Motor {
     }
 }
 
+/// Corre un trabajo **fuera del runtime** y devuelve su desenlace.
+///
+/// Es la pieza que sostiene las dos operaciones de la fachada, y su forma está **medida**, no
+/// elegida. Se midieron los tres sitios donde se puede poner el trabajo, con una llamada real al
+/// abridor de S3 contra un destino que no responde:
+///
+/// | dónde corre el trabajo | `Handle::try_current()` | qué pasa |
+/// |---|---|---|
+/// | `spawn_blocking` | `Ok` | error limpio, **sin pánico** |
+/// | `std::thread` pelado | `Err` | error limpio |
+/// | `block_in_place` en un runtime `multi_thread` | `Ok` | error limpio |
+/// | `block_in_place` en un runtime `current_thread` | — | **pánico del runtime** |
+///
+/// Los dos primeros son seguros y el tercero **no** vale, y por eso el trabajo va a un hilo de
+/// bloqueo: `spawn_blocking` saca el trabajo de los hilos que despachan tareas —el hilo del
+/// conjunto de bloqueo no está dentro de un runtime, aunque el `Handle` siga a mano, que es lo que
+/// confunde— y no cuesta un hilo por llamada. El cuarto camino queda descartado por lo que mide la
+/// tabla: `#[tokio::test]` monta un runtime `current_thread` por defecto, así que un
+/// [`tokio::task::block_in_place`] haría caer media suite por un pánico del runtime y no por el
+/// código que se está probando.
+///
+/// Lo que **no** hace falta es que el trabajo devuelva un `Result`: devuelve lo que devuelva, y
+/// quien convierte el fallo de la biblioteca en un error del motor es el cierre que se le pasa.
+/// Lo que sí hace, y es la razón de que exista, es **no dejar que un pánico del hilo se
+/// propague**: un `join` caído se convierte en un error con nombre propio, igual que el cierre del
+/// trabajador (`src/engine/cola.rs`) convierte el pánico de una ejecución en una fila fallida.
+async fn fuera_del_runtime<T, F>(trabajo: F) -> Result<T, ErrorDelMotor>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ErrorDelMotor> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(trabajo).await {
+        Ok(desenlace) => desenlace,
+        Err(caida) => {
+            // El detalle del pánico se queda en el registro, que es lo que hacen también el
+            // cierre del trabajador y la parada: es arbitrario y no puede acabar publicado.
+            tracing::error!(
+                %caida,
+                "el hilo que hablaba con el repositorio no ha llegado a término"
+            );
+
+            Err(ErrorDelMotor::TrabajoInterrumpido {
+                motivo: if caida.is_panic() {
+                    "el hilo que hablaba con el repositorio se ha caído con un pánico".to_owned()
+                } else {
+                    "el hilo que hablaba con el repositorio no ha llegado a término".to_owned()
+                },
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -520,6 +733,7 @@ mod tests {
     use tokio::sync::broadcast::error::TryRecvError;
     use uuid::Uuid;
 
+    use super::cola::CAPACIDAD_DE_LA_COLA;
     use super::hub::EventoDeEjecucion;
     use super::{Ajustes, Dependencias, ErrorDelMotor, Motor, ejecucion};
     use crate::db::entities::{
@@ -530,15 +744,22 @@ mod tests {
     use crate::secret::SecretString;
     use crate::test_support::{
         CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, abridor_local,
-        abrir_local, base_con_clave, directorio_de_prueba, sembrar_snapshots, snapshot_guardado,
-        volcado_guardado,
+        abrir_local, base_con_clave, destino_de_s3_que_rechaza, directorio_de_prueba,
+        sembrar_snapshots, snapshot_guardado, volcado_guardado,
     };
 
     /// Un plazo generoso para esperar a que una ejecución termine.
     ///
-    /// Treinta segundos: los abridores de estas pruebas duermen a lo sumo tres, así que un fallo
-    /// por este plazo es un cuelgue y no una prueba lenta.
-    const PLAZO_DE_ESPERA: Duration = Duration::from_secs(30);
+    /// Noventa segundos, y el número está **medido**: lo que tarda una ejecución no lo decide el
+    /// abridor —los de estas pruebas duermen a lo sumo tres segundos— sino la propia biblioteca al
+    /// abrir el repositorio, y ahí `init` y `open` tardan **6,4 s** cada uno en la compilación de
+    /// pruebas (es el coste de derivar la clave del repositorio, sin optimizar). Un ciclo completo
+    /// abre el repositorio tres o cuatro veces —al copiar y al leer lo copiado—, así que un test
+    /// sano ronda los veinte segundos **en solitario**, y la suite corre dieciséis tests a la vez:
+    /// con treinta segundos, el plazo lo agotaba una copia perfectamente correcta bajo carga, y el
+    /// fallo se leía como un cuelgue que no era. Lo que sigue midiendo este plazo es un cuelgue de
+    /// verdad: una ejecución que no acaba **nunca** no acaba ni en noventa segundos.
+    const PLAZO_DE_ESPERA: Duration = Duration::from_secs(90);
 
     /// El plazo de las pruebas que **usan un contenedor de verdad**.
     ///
@@ -580,6 +801,21 @@ mod tests {
         std::thread::sleep(Duration::from_secs(1));
 
         Err(no_alcanzable(acceso))
+    }
+
+    /// Un abridor que entra en **pánico**.
+    ///
+    /// Es el instrumento de la prueba que mide que un pánico del hilo de trabajo **no se propaga**:
+    /// lo recoge el hilo de bloqueo y llega como un error del motor con nombre propio. El texto es
+    /// explícito a propósito —lo imprime el gancho de pánicos del proceso y hay que poder saber que
+    /// lo provocó la prueba—, y no debe parecerse a nada que la biblioteca diga.
+    fn abridor_que_panica(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<(Repositorio, PuestaEnMarcha), Error> {
+        panic!(
+            "el abridor de esta prueba se cae a propósito, y el pánico no puede llegar a quien pregunta"
+        );
     }
 
     /// Un abridor que siempre falla, sin entretenerse.
@@ -740,6 +976,74 @@ mod tests {
         Err(no_alcanzable(acceso))
     }
 
+    // ── Los dos abridores que necesitan los hallazgos de la auditoría ────────
+
+    /// El destino que la prueba espera que el motor resuelva, y el que el abridor recibió.
+    static DESTINO_ESPERADO: OnceLock<String> = OnceLock::new();
+    static DESTINO_RECIBIDO: OnceLock<String> = OnceLock::new();
+    static EL_DESTINO_ERA_EL_ESPERADO: AtomicBool = AtomicBool::new(false);
+    static DENTRO_DEL_ABRIDOR: AtomicBool = AtomicBool::new(false);
+    static PUEDE_SEGUIR_EL_ABRIDOR: AtomicBool = AtomicBool::new(false);
+
+    /// Un abridor que **apunta el destino que recibe** y se queda esperando una señal.
+    ///
+    /// Es el instrumento de la prueba de la serialización: lo que hay que medir es **contra qué
+    /// repositorio** acaba copiando una ejecución cuya tarea se edita mientras su trabajador está
+    /// parado. El destino entra por el `Acceso` —es lo único que el motor le resuelve a la
+    /// biblioteca—, así que se apunta el `endpoint` y se compara con el que se esperaba; y la
+    /// espera es lo que ensancha la ventana hasta que se puede medir sin cronometrar nada: la
+    /// prueba edita la tarea **dentro** del abridor.
+    ///
+    /// Al soltarla abre el repositorio **de verdad** (`abridor_local`) para que la copia llegue a su
+    /// final: así lo que se afirma no es lo que el abridor vio, sino dónde acabó la instantánea.
+    fn abridor_que_apunta_el_destino_y_espera_la_senal(
+        acceso: &Acceso,
+        barras: BarrasDelMotor,
+    ) -> Result<(Repositorio, PuestaEnMarcha), Error> {
+        let _ = DESTINO_RECIBIDO.set(acceso.endpoint.clone());
+        EL_DESTINO_ERA_EL_ESPERADO.store(
+            DESTINO_ESPERADO
+                .get()
+                .is_some_and(|esperado| *esperado == acceso.endpoint),
+            Ordering::SeqCst,
+        );
+        DENTRO_DEL_ABRIDOR.store(true, Ordering::SeqCst);
+
+        let limite = Instant::now() + Duration::from_secs(5);
+        while !PUEDE_SEGUIR_EL_ABRIDOR.load(Ordering::SeqCst) && Instant::now() < limite {
+            std::thread::yield_now();
+        }
+
+        abridor_local(acceso, barras)
+    }
+
+    /// Si el abridor que se atasca ya está dentro de su primera llamada.
+    static ATASCADO_EN_EL_ABRIDOR: AtomicBool = AtomicBool::new(false);
+    static PUEDE_SOLTARSE_EL_ABRIDOR: AtomicBool = AtomicBool::new(false);
+    static LLAMADAS_AL_ABRIDOR: AtomicUsize = AtomicUsize::new(0);
+
+    /// Un abridor que **se atasca la primera vez** y falla en el acto las siguientes.
+    ///
+    /// Es el instrumento de la prueba de la cola llena: para llenarla, el trabajador tiene que
+    /// quedarse dentro de un trabajo mientras entran los demás, y para que la prueba no deje
+    /// sesenta y cuatro copias lentas detrás, a partir de la segunda el abridor falla sin esperar
+    /// nada: en cuanto la prueba lo suelta, el trabajador recorre lo que quedaba en el acto.
+    fn abridor_que_se_atasca_la_primera(
+        acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<(Repositorio, PuestaEnMarcha), Error> {
+        if LLAMADAS_AL_ABRIDOR.fetch_add(1, Ordering::SeqCst) == 0 {
+            ATASCADO_EN_EL_ABRIDOR.store(true, Ordering::SeqCst);
+
+            let limite = Instant::now() + Duration::from_secs(5);
+            while !PUEDE_SOLTARSE_EL_ABRIDOR.load(Ordering::SeqCst) && Instant::now() < limite {
+                std::thread::yield_now();
+            }
+        }
+
+        Err(no_alcanzable(acceso))
+    }
+
     // ── El aparato de prueba ─────────────────────────────────────────────────
 
     /// La base, un repositorio **local** y las cuatro capas que el motor necesita.
@@ -764,6 +1068,8 @@ mod tests {
         /// Se retienen todos: un directorio que se borrara al soltar su guarda dejaría la copia
         /// leyendo un camino que ya no está.
         fuentes: Vec<DirectorioDePrueba>,
+        /// Los destinos **de más** que haya dado de alta la prueba: se retienen por lo mismo.
+        otros_destinos: Vec<DirectorioDePrueba>,
         /// El repositorio de la primera fila, el que usa casi todo.
         repositorio: Uuid,
     }
@@ -792,6 +1098,7 @@ mod tests {
                 _destino: destino_guardado,
                 destino,
                 fuentes: Vec::new(),
+                otros_destinos: Vec::new(),
                 repositorio: Uuid::nil(),
             };
 
@@ -802,13 +1109,21 @@ mod tests {
             aparato
         }
 
-        /// Da de alta un repositorio cuyo `endpoint` es la ruta que se le diga.
-        async fn dar_de_alta_el_repositorio(&self, nombre: &str, endpoint: &Path) -> Uuid {
+        /// Da de alta un repositorio cuyo `endpoint` es la cadena que se le diga, **tal cual**.
+        ///
+        /// Existe aparte del que toma una ruta porque un destino de S3 es una **URL**, no un camino
+        /// del sistema de ficheros: meterla en un `Path` para reutilizar aquél sería escribir
+        /// «parece una ruta» sobre un dato que no lo es.
+        async fn dar_de_alta_el_repositorio_con_endpoint(
+            &self,
+            nombre: &str,
+            endpoint: &str,
+        ) -> Uuid {
             self.dependencias
                 .repositorios
                 .alta(AltaDeRepositorio {
                     name: nombre.to_owned(),
-                    endpoint: endpoint.to_string_lossy().into_owned(),
+                    endpoint: endpoint.to_owned(),
                     bucket: "cubo-de-prueba".to_owned(),
                     region: "region-de-prueba".to_owned(),
                     access_key_id: "clave-de-acceso-de-prueba".to_owned(),
@@ -818,6 +1133,83 @@ mod tests {
                 .await
                 .expect("el alta del repositorio no puede fallar")
                 .id
+        }
+
+        /// Da de alta un repositorio cuyo `endpoint` es la ruta que se le diga.
+        async fn dar_de_alta_el_repositorio(&self, nombre: &str, endpoint: &Path) -> Uuid {
+            self.dar_de_alta_el_repositorio_con_endpoint(nombre, &endpoint.to_string_lossy())
+                .await
+        }
+
+        /// Un **segundo** destino local: otro directorio temporal, con su fila de repositorio.
+        ///
+        /// Es lo que necesita la prueba de la serialización, que edita una tarea para apuntarla a
+        /// «otro» repositorio y comprueba que la copia **no** fue a él. El directorio se retiene en
+        /// `otros_destinos`: si se soltara, la copia que fuera a parar ahí escribiría en un camino
+        /// que ya no está y la prueba mediría un fallo del entorno.
+        async fn segundo_destino(&mut self) -> Uuid {
+            let guardado = directorio_de_prueba();
+            let ruta = guardado.ruta().to_path_buf();
+
+            let id = self
+                .dar_de_alta_el_repositorio_con_endpoint(
+                    "repositorio-de-al-lado",
+                    &ruta.to_string_lossy(),
+                )
+                .await;
+
+            self.otros_destinos.push(guardado);
+
+            id
+        }
+
+        /// El [`Acceso`] de un repositorio: su fila con los dos secretos **ya descifrados**.
+        ///
+        /// Es exactamente lo que tendrá que hacer el manejador de la capa HTTP —leer la fila y armar
+        /// con ella el acceso—, así que la prueba lo hace igual y no por un atajo: si el día que se
+        /// escriba el manejador resulta que esto no se puede hacer así, aquí se verá.
+        async fn acceso_de(&self, repository_id: &Uuid) -> Acceso {
+            let fila = self
+                .dependencias
+                .repositorios
+                .leer(repository_id)
+                .await
+                .expect("la lectura del repositorio no puede fallar")
+                .expect("el repositorio de la prueba tiene que estar");
+
+            Acceso {
+                endpoint: fila.endpoint,
+                bucket: fila.bucket,
+                region: fila.region,
+                access_key_id: fila.access_key_id,
+                secret_access_key: fila.secret_access_key,
+                passphrase: fila.passphrase,
+            }
+        }
+
+        /// Apunta una tarea a otro repositorio, como lo haría `PUT /api/v1/jobs/:id`.
+        async fn apuntar_la_tarea_a(&self, tarea: &Uuid, repositorio: Uuid) {
+            let mut fila = self
+                .dependencias
+                .tareas
+                .leer(tarea)
+                .await
+                .expect("la lectura de la tarea no puede fallar")
+                .expect("la tarea de la prueba tiene que estar");
+            fila.repository_id = repositorio;
+
+            let editada = self
+                .dependencias
+                .tareas
+                .actualizar(&fila)
+                .await
+                .expect("la edición de la tarea no puede fallar");
+
+            assert!(
+                editada,
+                "la tarea de la prueba tiene que haber quedado editada, o la ventana que se mide \
+                 no se habría abierto"
+            );
         }
 
         /// Un **segundo** repositorio, con una ruta que no existe: lo usan las pruebas cuyo
@@ -1045,6 +1437,25 @@ mod tests {
                 Instant::now() < limite,
                 "la ejecución no llegó a `{}` en {PLAZO_DE_ESPERA:?}",
                 estado.texto()
+            );
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Espera a que una señal de las pruebas se ponga, con el plazo de siempre.
+    ///
+    /// Es lo que permite escribir las pruebas de la serialización y de la cola llena **sin
+    /// cronometrar nada**: se espera a que el trabajador esté donde tiene que estar —dentro del
+    /// abridor, con la tarea ya resuelta— y solo entonces se actúa, en vez de dormir un rato a ver
+    /// si ya llegó.
+    async fn esperar_a(señal: &AtomicBool, que: &str) {
+        let limite = Instant::now() + PLAZO_DE_ESPERA;
+
+        while !señal.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < limite,
+                "no ha ocurrido {que} dentro de {PLAZO_DE_ESPERA:?}"
             );
 
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1883,6 +2294,449 @@ mod tests {
         );
     }
 
+    // ── El final de una ejecución que no llega a empezar ─────────────────────
+
+    /// **Una ejecución que no puede pasar a `running` acaba en `failed`, y su tarea se puede
+    /// volver a disparar.**
+    ///
+    /// Es uno de los dos hallazgos bloqueantes de la auditoría del motor: un fallo de escritura al
+    /// pasar la fila a `running` la dejaba en `pending` **sin `finished_at` y sin motivo**, y esa
+    /// fila huérfana no es un apunte inofensivo. La guarda del `409` cuenta como «en curso» toda
+    /// ejecución en `pending` **o** `running`, así que el disparo de esa tarea se quedaba en un
+    /// `409` para siempre —el panel la pinta «en cola» indefinidamente— y la única salida era
+    /// borrar la fila a mano.
+    ///
+    /// El fallo se fuerza con un **disparador de SQLite** que aborta solo las actualizaciones que
+    /// intentan dejar la fila en `running`: el paso a `running` falla de verdad, que es el fallo de
+    /// escritura que se quiere medir, y la escritura del final sigue funcionando, que es el caso en
+    /// el que el remedio tiene que servir. El caso extremo —que tampoco se pueda escribir el
+    /// `failed`— está documentado en el rustdoc de `ejecucion::ejecutar` y no se puede provocar
+    /// desde una prueba sin dejar la base inservible para el resto de la medición.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_ejecucion_que_no_puede_empezar_acaba_en_failed_y_no_bloquea_su_tarea() {
+        let mut aparato = Aparato::nuevo().await;
+        let target = aparato.target_de_directorio(&[("uno.txt", "uno")]).await;
+        let tarea = aparato.tarea_normal(target).await;
+
+        sqlx::query(
+            "CREATE TRIGGER bloquea_el_running BEFORE UPDATE ON job_executions \
+             FOR EACH ROW WHEN NEW.status = 'running' \
+             BEGIN SELECT RAISE(ABORT, 'el paso a `running` está bloqueado por la prueba'); END",
+        )
+        .execute(&aparato.pool)
+        .await
+        .expect("el disparador de la prueba se crea");
+
+        let motor = aparato.motor_con(abridor_local);
+        let ejecucion = motor
+            .encolar(tarea)
+            .await
+            .expect("el alta tiene que entrar");
+
+        let fila = aparato.esperar_el_final(&ejecucion.id).await;
+
+        assert_eq!(
+            fila.status,
+            Estado::Failed,
+            "la fila se quedó en {:?} con `finished_at` {:?}: una ejecución que no puede empezar \
+             tiene que acabar en `failed`, o su tarea no se puede volver a disparar y el panel \
+             miente diciendo que está en cola",
+            fila.status,
+            fila.finished_at
+        );
+        assert!(
+            fila.finished_at.is_some(),
+            "una ejecución que acaba tiene que llevar su `finished_at`, y ésta no lo llevaba"
+        );
+        let motivo = fila.error_message.clone().unwrap_or_default();
+        assert!(
+            motivo.contains("`running`"),
+            "el motivo tiene que decir que no se pudo pasar a `running`: {motivo}"
+        );
+
+        // Y la tarea vuelve a entrar, que es la mitad que importa: es lo que el `409` eterno
+        // impedía.
+        let segunda = motor.encolar(tarea).await.expect(
+            "la tarea tiene que poder volver a dispararse después de una ejecución que no empezó",
+        );
+        assert_eq!(segunda.status, Estado::Pending);
+        assert_eq!(
+            aparato.esperar_el_final(&segunda.id).await.status,
+            Estado::Failed
+        );
+    }
+
+    // ── La cola llena ────────────────────────────────────────────────────────
+
+    /// **La cola llena da un `503` con nombre propio, y su fila no se queda mintiendo.**
+    ///
+    /// La capacidad es de [`CAPACIDAD_DE_LA_COLA`](super::cola::CAPACIDAD_DE_LA_COLA) ejecuciones y
+    /// el trabajador atiende de una en una en el orden en que se encoló, así que llenarla son 65
+    /// que caben —una en la mano y 64 esperando— y una **sexagésimo sexta** que no cabe. Se miden
+    /// las dos mitades del contrato: que el encolado que no cabe devuelve
+    /// [`ErrorDelMotor::ColaDelRepositorioLlena`], y que la fila que el alta había creado para él
+    /// acaba en `failed` con su `finished_at` —`Motor::encolar` la marca antes de devolver el error
+    /// «para que no quede mintiendo»—, y no en `pending`.
+    ///
+    /// Hacen falta tareas **distintas** porque la guarda del `409` no deja encolar dos veces la
+    /// misma, y el abridor se atasca solo la primera vez: al soltarlo, las demás fallan en el acto y
+    /// el trabajador vuelve a su recepción.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_cola_llena_da_un_error_con_nombre_y_su_fila_no_se_queda_en_pending() {
+        let mut aparato = Aparato::nuevo().await;
+        let target = aparato.target_de_directorio(&[("uno.txt", "uno")]).await;
+        let motor = aparato.motor_con(abridor_que_se_atasca_la_primera);
+
+        // El trabajador se queda dentro del primer trabajo, y la cola empieza a llenarse.
+        let primera = aparato.tarea_normal(target).await;
+        let mut encoladas = vec![motor.encolar(primera).await.expect("tiene que entrar")];
+        esperar_a(
+            &ATASCADO_EN_EL_ABRIDOR,
+            "que el trabajador se atasque dentro del abridor",
+        )
+        .await;
+
+        for _ in 0..CAPACIDAD_DE_LA_COLA {
+            let tarea = aparato.tarea_normal(target).await;
+            encoladas.push(
+                motor
+                    .encolar(tarea)
+                    .await
+                    .expect("tiene que caber en la cola"),
+            );
+        }
+
+        assert_eq!(
+            aparato.filas_en(Estado::Pending).await,
+            CAPACIDAD_DE_LA_COLA as i64,
+            "la cola no quedó llena de verdad, así que el encolado de abajo no mediría lo que dice"
+        );
+
+        // Y la que no cabe:
+        let de_mas = aparato.tarea_normal(target).await;
+        let error = motor
+            .encolar(de_mas)
+            .await
+            .expect_err("con la cola llena, la siguiente no puede entrar");
+
+        assert!(
+            matches!(
+                error,
+                ErrorDelMotor::ColaDelRepositorioLlena { repository_id }
+                    if repository_id == aparato.repositorio
+            ),
+            "el error de una cola llena no es el que la nombra: {error:?}"
+        );
+
+        // La fila que el alta creó para esa ejecución se marcó como fallida: no se queda «en cola».
+        let (estado, finished_at): (String, Option<String>) =
+            sqlx::query_as("SELECT status, finished_at FROM job_executions WHERE job_id = ?1")
+                .bind(de_mas.hyphenated().to_string())
+                .fetch_one(&aparato.pool)
+                .await
+                .expect("la fila de la ejecución que no cupo tiene que existir");
+
+        assert_eq!(
+            estado, "failed",
+            "la fila de la ejecución que no cupo se quedó en `{estado}`: el panel la pintaría \
+             esperando una copia que nadie va a hacer"
+        );
+        assert!(
+            finished_at.is_some(),
+            "la fila de la ejecución que no cupo no llevaba `finished_at`"
+        );
+
+        // Y se suelta el trabajador, para que no quede nada en vuelo al acabar la prueba. La
+        // última de la cola es la última que se atiende —el orden es el de encolado—, así que
+        // esperarla es esperarlas todas.
+        PUEDE_SOLTARSE_EL_ABRIDOR.store(true, Ordering::SeqCst);
+
+        let ultima = encoladas.last().expect("la prueba encoló al menos una");
+        assert_eq!(
+            aparato.esperar_el_final(&ultima.id).await.status,
+            Estado::Failed
+        );
+    }
+
+    // ── La serialización y el repositorio que se editó entre medias ──────────
+
+    /// **La copia va al repositorio con el que se encoló, aunque la tarea se edite mientras
+    /// espera.**
+    ///
+    /// Es el otro hallazgo medio de la auditoría y la mitad que faltaba del requisito «un worker
+    /// secuencial por repositorio»: la ejecución se encolaba en el buzón de un repositorio —leído al
+    /// encolar— y la copia se hacía con el repositorio que la tarea tuviera al ejecutar, que es una
+    /// fila **editable** (`PUT /api/v1/jobs/:id`) y una ventana que puede durar horas si hay cola.
+    /// Con las dos lecturas separadas, una tarea editada entre medias copiaba contra un repositorio
+    /// distinto del que eligió el trabajador que la atiende, y dos copias podían coincidir en el
+    /// mismo repositorio **sin que nadie las hubiera serializado** —lo que `rustic_core` no admite:
+    /// toma un bloqueo exclusivo—.
+    ///
+    /// La ventana se ensancha **sin cronometrar nada**: el abridor se queda parado apuntando el
+    /// destino que recibió, y la tarea se edita mientras el trabajador está dentro. Se afirman las
+    /// dos cosas: que el destino que recibió el abridor es el del encolado, y que la copia acabó
+    /// **ahí** —una instantánea en el repositorio de la cola, ninguna en el otro—.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_copia_va_al_repositorio_del_encolado_aunque_la_tarea_se_edite_entre_medias() {
+        let mut aparato = Aparato::nuevo().await;
+        let al_lado = aparato.segundo_destino().await;
+        let target = aparato.target_de_directorio(&[("uno.txt", "uno")]).await;
+        let repositorio = aparato.repositorio;
+        let tarea = aparato.tarea(target, repositorio, (7, 4, 12), true).await;
+        let motor = aparato.motor_con(abridor_que_apunta_el_destino_y_espera_la_senal);
+
+        let _ = DESTINO_ESPERADO.set(aparato.destino.to_string_lossy().into_owned());
+
+        let ejecucion = motor.encolar(tarea).await.expect("tiene que entrar");
+
+        // El trabajador está dentro del abridor: la cola ya eligió su repositorio.
+        esperar_a(&DENTRO_DEL_ABRIDOR, "que el trabajador entre en el abridor").await;
+
+        // Y ahora la tarea se apunta al otro repositorio, que es lo que hace `PUT /jobs/:id`.
+        aparato.apuntar_la_tarea_a(&tarea, al_lado).await;
+
+        PUEDE_SEGUIR_EL_ABRIDOR.store(true, Ordering::SeqCst);
+
+        let fila = aparato.esperar_el_final(&ejecucion.id).await;
+
+        assert_eq!(
+            fila.status,
+            Estado::Success,
+            "la copia tenía que acabar bien y acabó en {:?}: {:?}",
+            fila.status,
+            fila.error_message
+        );
+        assert!(
+            EL_DESTINO_ERA_EL_ESPERADO.load(Ordering::SeqCst),
+            "el abridor recibió el destino {:?} y el que decidió la serialización era {:?}: la \
+             copia fue a un repositorio que nadie serializó",
+            DESTINO_RECIBIDO.get(),
+            DESTINO_ESPERADO.get()
+        );
+        assert_eq!(
+            aparato.instantaneas(),
+            1,
+            "la instantánea no está en el repositorio que decidió la serialización"
+        );
+    }
+
+    // ── La fachada: abrir y listar fuera del runtime ─────────────────────────
+
+    /// **`abrir_repositorio` inicializa el destino que no está y conecta con el que está.**
+    ///
+    /// Es la operación que la capa HTTP necesita para el alta —que conecta o inicializa, y tiene que
+    /// poder decir cuál de los dos—, y se recorre **como la va a llamar el manejador**: desde un
+    /// `async`, con el repositorio inyectado y con el acceso construido desde su fila. Lo que se
+    /// mide es el camino entero —el `async` de la fachada, el trabajo fuera del runtime, el abridor
+    /// y la vuelta— y no una función interna.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abrir_repositorio_inicializa_el_que_no_esta_y_conecta_con_el_que_esta() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_local);
+
+        let primera = motor
+            .abrir_repositorio(aparato.acceso_de(&aparato.repositorio).await)
+            .await
+            .expect("un destino vacío y alcanzable se inicializa");
+
+        assert_eq!(
+            primera,
+            PuestaEnMarcha::Inicializado,
+            "un destino sin repositorio se inicializa, y dijo otra cosa"
+        );
+
+        let segunda = motor
+            .abrir_repositorio(aparato.acceso_de(&aparato.repositorio).await)
+            .await
+            .expect("un destino que ya tiene repositorio se abre");
+
+        assert_eq!(
+            segunda,
+            PuestaEnMarcha::Conectado,
+            "un destino que ya tiene repositorio se conecta, y dijo otra cosa"
+        );
+    }
+
+    /// **`listar_snapshots` lee del repositorio y respeta la ventana.**
+    ///
+    /// Es la otra mitad que necesita la capa HTTP —el explorador del §5 lee del **repositorio**, no
+    /// del histórico de ejecuciones—, y lo que fija es que sale de ahí y que la ventana acota.
+    ///
+    /// Las dos cosas se afirman en **una sola** llamada, y no es un ahorro de líneas: en el
+    /// repositorio hay tres instantáneas sembradas y en `job_executions` no hay **ninguna** fila,
+    /// así que pedir dos y recibir dos dice a la vez que la lista sale del repositorio —de la base
+    /// habría salido vacía— y que la ventana acota. Y los resúmenes traen lo que el panel pinta.
+    ///
+    /// Se pide una sola vez porque cada llamada abre y cierra un repositorio, y abrirlo cuesta
+    /// segundos: medido, `init` y `open` tardan **6,4 s** cada uno en la compilación de pruebas —es
+    /// el coste de derivar la clave del repositorio—, y una prueba que llama dos veces paga dos
+    /// veces por lo mismo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listar_snapshots_lee_del_repositorio_y_respeta_la_ventana() {
+        let aparato = Aparato::nuevo().await;
+        sembrar_snapshots(
+            &aparato.destino,
+            PASSPHRASE_DE_PRUEBA,
+            &[
+                "2026-01-01T10:00:00Z",
+                "2026-01-02T10:00:00Z",
+                "2026-01-03T10:00:00Z",
+            ],
+        );
+        let motor = aparato.motor_con(abridor_local);
+
+        let devueltas = motor
+            .listar_snapshots(aparato.acceso_de(&aparato.repositorio).await, 2)
+            .await
+            .expect("el repositorio sembrado se lista");
+
+        assert_eq!(
+            devueltas.len(),
+            2,
+            "el repositorio tiene tres instantáneas y `job_executions` está vacía: pedir dos y \
+             recibir {} dice a la vez que la ventana acota y de dónde sale la lista",
+            devueltas.len()
+        );
+
+        // Y cada resumen trae lo que el panel pinta —identificador, fecha, rutas, etiqueta y
+        // resumen—, ordenado de la más reciente a la más antigua, que es lo que el módulo promete.
+        for resumen in &devueltas {
+            assert!(
+                !resumen.id.is_empty() && !resumen.rutas.is_empty() && resumen.etiqueta.is_some(),
+                "el resumen no trae lo que pide el panel: {resumen:?}"
+            );
+        }
+        assert!(
+            devueltas.windows(2).all(|par| par[0].fecha >= par[1].fecha),
+            "el listado no viene de la más reciente a la más antigua: {:?}",
+            devueltas
+                .iter()
+                .map(|resumen| resumen.fecha)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// **Abrir un repositorio de S3 desde el runtime no entra en pánico.**
+    ///
+    /// Es la prueba que justifica la fachada entera, y la que el CI no podía tener: el abridor es
+    /// **el de producción** —el de S3, el que entra en pánico si se le llama desde dentro de un
+    /// runtime—, la llamada sale de un `async` (como saldrá del manejador del alta) y el destino es
+    /// un oyente local que rechaza. Medido: esa misma llamada desde dentro de un runtime panica con
+    /// «`Cannot start a runtime from within a runtime`», así que lo que se mide aquí es que la
+    /// fachada saca el trabajo del runtime antes de llamar a la biblioteca.
+    ///
+    /// El endpoint es un oyente local que contesta `403` y no un puerto muerto por lo que está
+    /// medido en `src/test_support.rs::destino_de_s3_que_rechaza`: contra un puerto donde nadie
+    /// escucha, los cinco reintentos con retroceso exponencial de la biblioteca hacen que el fallo
+    /// tarde entre 41 y 54 segundos, y eso no lo debe pagar cada `cargo test`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abrir_repositorio_de_s3_desde_el_runtime_no_entra_en_panico() {
+        let aparato = Aparato::nuevo().await;
+        let endpoint = destino_de_s3_que_rechaza();
+        let repositorio = aparato
+            .dar_de_alta_el_repositorio_con_endpoint("destino-que-rechaza", &endpoint)
+            .await;
+
+        // Los ajustes de **producción**: su abridor es el de S3 (`Repositorio::poner_en_marcha`).
+        let motor = aparato.motor_y_ajustes(Ajustes::nuevos(SOCKET_QUE_NO_EXISTE));
+        let acceso = aparato.acceso_de(&repositorio).await;
+
+        let error = motor
+            .abrir_repositorio(acceso)
+            .await
+            .expect_err("un destino que rechaza no pone nada en marcha");
+
+        // El fallo llega **con su tipo y con su motivo depurado**: el tipo es lo que el manejador
+        // mira para elegir el código —un destino inalcanzable no es una passphrase que no abre—, y
+        // el motivo es lo que sale hacia el operador.
+        let (causa, motivo) = match error {
+            ErrorDelMotor::Repositorio { causa, motivo } => (causa, motivo),
+            otro => panic!(
+                "el fallo de la biblioteca tiene que llegar como `ErrorDelMotor::Repositorio` y \
+                 llegó como {otro:?}"
+            ),
+        };
+
+        assert!(
+            matches!(causa, Error::DestinoNoAlcanzable { .. }),
+            "el destino que rechaza tiene que llegar como un fallo de destino y no como una \
+             passphrase que no abre: {causa:?}"
+        );
+        assert!(
+            motivo.contains(&endpoint),
+            "el motivo tiene que nombrar el destino al que no se llegó: {motivo}"
+        );
+        assert!(
+            !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
+            "el motivo de la fachada publica un secreto del repositorio: {motivo}"
+        );
+    }
+
+    // ── El pánico del hilo de trabajo ────────────────────────────────────────
+
+    /// **Un pánico del hilo de trabajo no se propaga: llega como un error del motor.**
+    ///
+    /// Es la otra mitad de «sacar el trabajo del runtime», y la que hace que la fachada se pueda
+    /// usar desde un manejador sin que un pánico de dentro de la biblioteca —que es código que este
+    /// crate no controla— se lleve por delante la petición: el hilo de bloqueo recoge el pánico y lo
+    /// devuelve como [`ErrorDelMotor::TrabajoInterrumpido`], con un motivo propio que **no** publica
+    /// el texto del pánico —es arbitrario y acabaría en una respuesta—. Un `join` con un `unwrap`
+    /// habría matado al que preguntó.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_panico_del_hilo_de_trabajo_llega_como_error_y_no_se_propaga() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_panica);
+        let acceso = aparato.acceso_de(&aparato.repositorio).await;
+
+        let error = motor
+            .abrir_repositorio(acceso)
+            .await
+            .expect_err("un hilo que se cae con un pánico no puede dar un repositorio abierto");
+
+        let motivo = match error {
+            ErrorDelMotor::TrabajoInterrumpido { motivo } => motivo,
+            otro => panic!(
+                "el pánico del hilo de trabajo tiene que llegar como `TrabajoInterrumpido` y llegó \
+                 como {otro:?}"
+            ),
+        };
+
+        assert!(
+            motivo.contains("pánico"),
+            "el motivo tiene que decir que el hilo se cayó con un pánico: {motivo}"
+        );
+        assert!(
+            !motivo.contains("se cae a propósito"),
+            "el motivo publica el texto del pánico, que es arbitrario y no puede salir hacia \
+             fuera: {motivo}"
+        );
+    }
+
+    // ── El latido del motor de contenedores ──────────────────────────────────
+
+    /// **`comprobar` dice que el motor de contenedores no contesta.**
+    ///
+    /// Es el punto de entrada que usa el arranque para **avisar** de un socket caído y el único que
+    /// no tenía prueba. Lo que se fija es que el fallo llega como tal: el arranque decide con él qué
+    /// contar y, sobre todo, **no** decide con él si el proceso arranca —un socket que no responde
+    /// no puede dejar al operador sin la herramienta con la que diagnosticarlo—. Se mide con un
+    /// socket que no existe, así que no hace falta ningún motor de contenedores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn comprobar_dice_que_el_motor_de_contenedores_no_contesta() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_local);
+
+        let error = motor
+            .comprobar()
+            .await
+            .expect_err("un socket que no existe no puede contestar al latido");
+
+        assert!(
+            matches!(error, ErrorDelMotor::MotorDeContenedores { .. }),
+            "el fallo del motor de contenedores no llega como tal: {error:?}"
+        );
+    }
+
     // ── Con motor de contenedores: `cargo test -- --ignored` ─────────────────
 
     /// El binario del volcado que se instala dentro del contenedor de prueba.
@@ -1922,7 +2776,7 @@ mod tests {
     /// que tiene que quedar dentro de la instantánea son esos bytes, y la cuenta de bytes procesados
     /// tiene que cuadrar con ellos.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn el_motor_copia_un_volcado_de_punta_a_punta() {
         const GUION: &str = r##"printf "#!/bin/sh\nseq 1 200000\n" > /usr/local/bin/mariadb-dump; chmod +x /usr/local/bin/mariadb-dump"##;
 
@@ -1994,7 +2848,7 @@ mod tests {
     /// del `exec` —nunca en la línea de comandos—, el proceso la escribe en su canal de error al
     /// fallar, y el campo donde acabaría se muestra en el panel y se guarda en la base.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
     async fn el_motivo_de_un_fallo_que_repite_la_contrasena_no_la_publica() {
         /// La contraseña de la prueba: distinguible y con el prefijo que el marcador delata.
         const CONTRASENA: &str = "Zq7-clave-de-base-distinguible-motor";

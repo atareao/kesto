@@ -125,21 +125,63 @@ const INTERVALO_MINIMO_DE_AVISO: Duration = Duration::from_secs(1);
 /// Ejecuta una ejecución **en el hilo del trabajador**, de principio a fin.
 ///
 /// Es el único punto de entrada de este módulo, y **nunca deja la fila en `running`**: cada camino
-/// de error escribe `failed` con su motivo y su `finished_at`. El único desenlace que se sale de
-/// esa regla es no poder hablar con la base, y entonces no hay nada que escribir en ninguna parte
-/// —se registra y se sigue, que es todo lo que se puede hacer—.
-pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion) {
+/// de error escribe `failed` con su motivo y su `finished_at`.
+///
+/// # El precio de una fila que no arranca, y por qué el final se intenta igualmente
+///
+/// El único desenlace que se sale de esa regla es no poder hablar con la base: si ni siquiera se
+/// puede pasar la fila a `running`, no hay nada que escribir en ninguna parte, y se registra y se
+/// sigue. Pero lo que queda entonces **no** es un apunte inofensivo, y por eso antes de volver se
+/// **intenta** escribir el final ([`fallar_si_no_termino`]): la guarda del `409` cuenta como «en
+/// curso» toda ejecución en `pending` **o** `running`, así que una fila huérfana en `pending`
+/// convierte el disparo de esa tarea en un `409` para siempre y el panel la pinta como «en cola»
+/// indefinidamente, sin que nada lo delate.
+///
+/// Si el fallo de escritura es transitorio —lo normal—, ese intento recupera la fila y libera el
+/// `409`. Si es tan persistente que tampoco se puede escribir el `failed`, al operador no le queda
+/// otra salida que **borrar la fila a mano**: el remedio está escrito aquí porque un `pending` que
+/// no se puede cerrar es un desenlace que hay que saber reconocer.
+///
+/// # El repositorio entra por parámetro y **no** se vuelve a resolver de la tarea
+///
+/// `repository_id` es el repositorio con el que se **encoló** esta ejecución —viaja con ella en el
+/// mensaje del buzón—, no el que la tarea tenga ahora: entre el encolado y este instante cabe una
+/// edición de la tarea (`PUT /api/v1/jobs/:id`) y con ella una ventana que puede durar horas si hay
+/// cola. Volver a resolverlo aquí haría que la copia fuera a un repositorio distinto del que eligió
+/// el trabajador que la atiende, y que dos copias pudieran caer a la vez en el mismo repositorio
+/// **sin que nadie las hubiera serializado** —lo que `rustic_core` no admite: toma un bloqueo
+/// exclusivo—. La tarea sí se vuelve a leer, porque el target y la retención son suyos y no deciden
+/// quién atiende a quién.
+pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion, repository_id: Uuid) {
     // 1. La ejecución pasa a `running`, entrando en el runtime de la aplicación **solo** para la
     //    base. Y se publica la transición: el panel tiene que ver el cambio de estado aunque el
     //    proceso muera en el paso siguiente.
     let en_curso = match marcar_en_curso(contexto, fila) {
-        Ok(en_curso) => en_curso,
+        Ok(Some(en_curso)) => en_curso,
+        // La fila ya no está: la borró alguien entre el encolado y la ejecución, y el
+        // `ON DELETE CASCADE` del §3 se llevó con ella su tarea. No hay nada que marcar ni nada que
+        // copiar, y desde luego no se inventa una fila para contarlo.
+        Ok(None) => {
+            tracing::warn!(
+                execution_id = %fila.id,
+                "la fila de la ejecución ya no estaba al ir a empezar: no hay nada que ejecutar"
+            );
+            return;
+        }
         Err(causa) => {
             tracing::error!(
                 execution_id = %fila.id,
                 %causa,
-                "no se ha podido pasar la ejecución a `running`: se queda como estaba"
+                "no se ha podido pasar la ejecución a `running`"
             );
+
+            // Y el final se intenta antes de volver: sin él la fila se queda en `pending`, y esa
+            // fila bloquea el disparo de su tarea para siempre. Ver el rustdoc de arriba.
+            let motivo = recortar(&format!(
+                "la ejecución no ha llegado a empezar: no se ha podido pasar a `running`: {causa}"
+            ));
+            fallar_si_no_termino(contexto, &fila.id, &motivo);
+
             return;
         }
     };
@@ -149,7 +191,7 @@ pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion) {
     en_vivo.publicar();
 
     // 2 a 7: la copia entera.
-    let cierre = correr(contexto, &en_curso, &en_vivo);
+    let cierre = correr(contexto, &en_curso, &en_vivo, repository_id);
 
     // 8. La fila, con lo que se haya medido: los contadores se escriben también cuando la copia
     //    falla, porque lo que hay que contar es lo que llegó a pasar. `started_at` no se toca —es
@@ -163,11 +205,49 @@ pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion) {
         .publicar(en_vivo.evento(cierre.estado, ACCION_TERMINANDO));
 }
 
-/// Escribe el final de una ejecución en su fila.
+/// Escribe el final de una ejecución en su fila, **desde el hilo del trabajador**.
 ///
-/// Va aparte para que el camino del pánico —que vive en el bucle del trabajador— escriba lo mismo
-/// sin duplicar la conversión de contadores ni la fecha.
+/// Es la mitad bloqueante de [`escribir_el_final_desde_el_runtime`]: quien llama no está dentro de
+/// un runtime, así que entra en el de la aplicación para escribir.
 fn escribir_el_final(contexto: &Contexto, fila: &Ejecucion, cierre: &Cierre, cifras: Cifras) {
+    let escrito = contexto.en_la_base(
+        contexto
+            .dependencias
+            .ejecuciones
+            .actualizar(&la_fila_final(fila, cierre, cifras)),
+    );
+
+    constancia_del_final(escrito, &fila.id);
+}
+
+/// La misma escritura del final, **desde dentro del runtime de la aplicación**.
+///
+/// Existe aparte porque `Motor::encolar` es un `async` y ya está dentro del runtime: desde ahí,
+/// entrar con un `block_on` es un **pánico**. Lo que se comparte es lo que se escribe
+/// ([`la_fila_final`]) y lo que se registra ([`constancia_del_final`]); lo único que cambia es cómo
+/// se llega a la base.
+async fn escribir_el_final_desde_el_runtime(
+    contexto: &Contexto,
+    fila: &Ejecucion,
+    cierre: &Cierre,
+    cifras: Cifras,
+) {
+    let escrito = contexto
+        .dependencias
+        .ejecuciones
+        .actualizar(&la_fila_final(fila, cierre, cifras))
+        .await;
+
+    constancia_del_final(escrito, &fila.id);
+}
+
+/// La fila con el final que hay que escribir: estado, instantánea, motivo, contadores y fecha.
+///
+/// Va aparte y es **pura** para que las dos escrituras —la del hilo del trabajador y la del
+/// runtime— escriban exactamente lo mismo: dos caminos que compusieran la fila por su cuenta se
+/// separarían el día que uno de los dos campos cambiara. `started_at` **no** se toca: es la fecha de
+/// nacimiento de la fila y la capa de acceso no la acepta en una actualización.
+fn la_fila_final(fila: &Ejecucion, cierre: &Cierre, cifras: Cifras) -> Ejecucion {
     let mut final_de_la_fila = fila.clone();
     final_de_la_fila.status = cierre.estado;
     final_de_la_fila.snapshot_id = cierre.snapshot_id.clone();
@@ -176,36 +256,57 @@ fn escribir_el_final(contexto: &Contexto, fila: &Ejecucion, cierre: &Cierre, cif
     final_de_la_fila.bytes_uploaded = como_entero(cifras.subidos);
     final_de_la_fila.finished_at = Some(OffsetDateTime::now_utc());
 
-    match contexto.en_la_base(
-        contexto
-            .dependencias
-            .ejecuciones
-            .actualizar(&final_de_la_fila),
-    ) {
+    final_de_la_fila
+}
+
+/// Deja constancia de lo que pasó al escribir el final de una ejecución.
+fn constancia_del_final(escrito: Result<bool, crate::db::DbError>, id: &Uuid) {
+    match escrito {
         Ok(true) => {}
         // La fila ya no está: la borró alguien entre el encolado y el final. No es un fallo de la
         // copia —la copia ocurrió— y desde luego no se inventa una fila para contarla.
         Ok(false) => tracing::warn!(
-            execution_id = %final_de_la_fila.id,
+            execution_id = %id,
             "la ejecución ha terminado y su fila ya no estaba: no hay dónde escribir el final"
         ),
         Err(causa) => tracing::error!(
-            execution_id = %final_de_la_fila.id,
+            execution_id = %id,
             %causa,
             "no se ha podido escribir el final de la ejecución"
         ),
     }
 }
 
-/// Marca una ejecución como **fallida** si no ha terminado ya.
+/// Marca una ejecución como **fallida** si no ha terminado ya, **desde el hilo del trabajador**.
+///
+/// Es el envoltorio que entra en el runtime de la versión que hace el trabajo:
+/// [`marcar_fallida_si_no_termino`].
+pub(crate) fn fallar_si_no_termino(contexto: &Contexto, id: &Uuid, motivo: &str) {
+    contexto.en_la_base(marcar_fallida_si_no_termino(contexto, id, motivo));
+}
+
+/// Marca una ejecución como **fallida** si no ha terminado ya, **desde dentro del runtime**.
 ///
 /// La usan los dos caminos en los que el motor descubre un fallo **fuera** del ciclo normal de la
 /// copia: el encolado que no llegó a su cola —una fila `pending` que nadie va a ejecutar es peor
-/// que un error— y el pánico del trabajador. El «si no ha terminado ya» no es una precaución de
-/// más: el pánico puede llegar **después** de que la fila se haya escrito —un fallo en un `Drop`,
-/// por ejemplo— y reescribir un `success` convertiría una copia buena en un fallo sin motivo.
-pub(crate) fn fallar_si_no_termino(contexto: &Contexto, id: &Uuid, motivo: &str) {
-    let fila = match contexto.en_la_base(contexto.dependencias.ejecuciones.leer(id)) {
+/// que un error— y el pánico del trabajador, además del fallo al pasar la fila a `running`. El «si
+/// no ha terminado ya» no es una precaución de más: el pánico puede llegar **después** de que la
+/// fila se haya escrito —un fallo en un `Drop`, por ejemplo— y reescribir un `success` convertiría
+/// una copia buena en un fallo sin motivo.
+///
+/// El motivo pasa por [`recortar`]: acaba en `error_message`, que es una columna que el panel
+/// muestra y que la spec acota.
+///
+/// # Por qué hay dos entradas y una sola implementación
+///
+/// Porque los dos llamantes viven en sitios distintos: el bucle del trabajador corre en un hilo
+/// propio **sin** runtime, y `Motor::encolar` es un `async` que ya está **dentro** del de la
+/// aplicación. No es una comodidad de estilo: [`Contexto::en_la_base`] es un `block_on`, y un
+/// `block_on` dentro de un runtime entra en **pánico** —está medido—. El camino del encolado que no
+/// cabe lo cometía, y lo delató la prueba de la cola llena, que hasta entonces no existía: el
+/// hallazgo era «esa mitad no está medida», y al medirla apareció esto.
+pub(crate) async fn marcar_fallida_si_no_termino(contexto: &Contexto, id: &Uuid, motivo: &str) {
+    let fila = match contexto.dependencias.ejecuciones.leer(id).await {
         Ok(Some(fila)) => fila,
         Ok(None) => {
             tracing::warn!(%id, "la ejecución que se quería marcar como fallida ya no está");
@@ -225,25 +326,36 @@ pub(crate) fn fallar_si_no_termino(contexto: &Contexto, id: &Uuid, motivo: &str)
         return;
     }
 
-    escribir_el_final(
+    escribir_el_final_desde_el_runtime(
         contexto,
         &fila,
-        &Cierre::fallida(motivo.to_owned()),
+        &Cierre::fallida(recortar(motivo)),
         Cifras::nada(),
-    );
+    )
+    .await;
 }
 
 /// Pasa una ejecución a `running` en la base y devuelve la fila tal y como queda.
 ///
 /// Devuelve la fila y no la escribe a medias para que el resto del ciclo trabaje sobre lo que
 /// **quedó escrito**: lo que se lee de aquí es lo que la base tiene, no lo que se creía tener.
-fn marcar_en_curso(contexto: &Contexto, fila: &Ejecucion) -> Result<Ejecucion, crate::db::DbError> {
+///
+/// Y devuelve `None` cuando la fila **ya no está**: la capa de acceso informa con un `false` de que
+/// no actualizó nada, y seguir adelante sería copiar para una ejecución que ya nadie puede leer. La
+/// fila solo desaparece por un borrado a mano —y con ella su tarea, por el `ON DELETE CASCADE`—,
+/// así que el caso es raro; lo que no es raro es lo que cuesta no distinguirlo, que es una línea.
+fn marcar_en_curso(
+    contexto: &Contexto,
+    fila: &Ejecucion,
+) -> Result<Option<Ejecucion>, crate::db::DbError> {
     let mut en_curso = fila.clone();
     en_curso.status = Estado::Running;
 
-    contexto.en_la_base(contexto.dependencias.ejecuciones.actualizar(&en_curso))?;
+    if !contexto.en_la_base(contexto.dependencias.ejecuciones.actualizar(&en_curso))? {
+        return Ok(None);
+    }
 
-    Ok(en_curso)
+    Ok(Some(en_curso))
 }
 
 /// El recorrido de la copia: de la fila a un [`Cierre`].
@@ -251,7 +363,21 @@ fn marcar_en_curso(contexto: &Contexto, fila: &Ejecucion) -> Result<Ejecucion, c
 /// Va aparte de [`ejecutar`] porque lo que pasa **antes** del veredicto —leer, abrir, copiar,
 /// retener— no necesita saber cómo se escribe un final, y al revés: el que escribe no necesita
 /// saber por dónde salió la copia.
-fn correr(contexto: &Contexto, fila: &Ejecucion, en_vivo: &Arc<EnVivo>) -> Cierre {
+///
+/// El `repository_id` que entra aquí es el que **decidió** la serialización, no el que la tarea
+/// declare ahora, y por eso el repositorio se lee con él: ver el rustdoc de [`ejecutar`]. La
+/// consecuencia, dicha para el operador: si entre el encolado y la copia alguien apunta la tarea a
+/// otro repositorio, **esta** ejecución copia contra el de antes y su `snapshot_id` —y con él la
+/// etiqueta de la instantánea, que sale del `job_id`— se refieren a ese. La tarea apunta ya a otro
+/// sitio, así que el panel muestra una ejecución cuyo snapshot no está en el repositorio que la
+/// tarea tiene hoy; lo que se elige con eso es la serialización, que es lo que `rustic_core` no
+/// perdona: releer aquí es lo que dejaría dos copias a la vez sobre el mismo destino.
+fn correr(
+    contexto: &Contexto,
+    fila: &Ejecucion,
+    en_vivo: &Arc<EnVivo>,
+    repository_id: Uuid,
+) -> Cierre {
     let ajustes = &contexto.ajustes;
 
     // 2. La tarea, su target y su repositorio. Cualquiera de las tres puede haber desaparecido
@@ -268,7 +394,10 @@ fn correr(contexto: &Contexto, fila: &Ejecucion, en_vivo: &Arc<EnVivo>) -> Cierr
         Err(motivo) => return Cierre::fallida(motivo),
     };
 
-    let repositorio = match leer_el_repositorio(contexto, &tarea.repository_id) {
+    // El repositorio sale del identificador que trajo el encolado y **no** de `tarea.repository_id`:
+    // ver el rustdoc de `ejecutar` para por qué. Es la única lectura del recorrido que no sale de
+    // la tarea, y es a propósito.
+    let repositorio = match leer_el_repositorio(contexto, &repository_id) {
         Ok(repositorio) => repositorio,
         Err(motivo) => return Cierre::fallida(motivo),
     };
@@ -373,9 +502,16 @@ fn correr(contexto: &Contexto, fila: &Ejecucion, en_vivo: &Arc<EnVivo>) -> Cierr
     en_vivo.publicar();
 
     if let Err(causa) = copia_del_repositorio.aplicar_retencion(&retencion) {
+        // El motivo pasa por la red de siempre, y no es un adorno de simetría: la retención va
+        // contra el repositorio, su causa es la de la biblioteca, y un error de un backend puede
+        // llevar dentro la URL del destino con su credencial. Que este registro no acabe en la fila
+        // no lo exime —un registro acaba en el informe de un fallo—, así que se registra el motivo
+        // depurado y no la causa en crudo.
+        let motivo = motivo_de_la_biblioteca(&causa.to_string(), &acceso);
+
         tracing::warn!(
             %etiqueta,
-            %causa,
+            %motivo,
             "la copia ha terminado bien y la retención ha fallado: lo que hay que mirar es la \
              retención, no la copia"
         );
@@ -392,7 +528,9 @@ fn leer_la_tarea(contexto: &Contexto, job_id: &Uuid) -> Result<crate::db::entiti
             "la tarea `{job_id}` ya no está: la ejecución se encoló para una fila que se ha \
              borrado entre el encolado y la ejecución"
         )),
-        Err(causa) => Err(format!("la tarea `{job_id}` no se ha podido leer: {causa}")),
+        Err(causa) => Err(recortar(&format!(
+            "la tarea `{job_id}` no se ha podido leer: {causa}"
+        ))),
     }
 }
 
@@ -406,9 +544,9 @@ fn leer_el_target(
         Ok(None) => Err(format!(
             "el target `{target_id}` de la tarea ya no está: sin él no hay nada que copiar"
         )),
-        Err(causa) => Err(format!(
+        Err(causa) => Err(recortar(&format!(
             "el target `{target_id}` no se ha podido leer: {causa}"
-        )),
+        ))),
     }
 }
 
@@ -422,9 +560,9 @@ fn leer_el_repositorio(
         Ok(None) => Err(format!(
             "el repositorio `{repository_id}` de la tarea ya no está: sin él no hay dónde copiar"
         )),
-        Err(causa) => Err(format!(
+        Err(causa) => Err(recortar(&format!(
             "el repositorio `{repository_id}` no se ha podido leer: {causa}"
-        )),
+        ))),
     }
 }
 
@@ -473,6 +611,16 @@ fn copiar_el_directorio(
 /// éste, la unión al final y, **después**, la consulta de la entrega. Un productor que corriera en
 /// el hilo del archivado se bloquearía en su primer `enviar` en cuanto el canal se llenara,
 /// esperando a un consumidor que estaría esperándole.
+///
+/// # Por qué lleva ocho parámetros, y por qué el `allow` se queda
+///
+/// Cada uno es un dato **distinto** de este camino y ninguno se puede deducir de otro: el
+/// repositorio ya abierto, el acceso para redactar los motivos, el contenedor, la orden, el nombre
+/// del nodo, la etiqueta de la tarea, el estado en vivo y los ajustes. Agruparlos en una estructura
+/// sería una estructura que existe para callar a un lint —son datos de un solo uso que se pasan y se
+/// sueltan aquí mismo—, y el día que alguien lea esa estructura tendría que reconstruir mentalmente
+/// la firma que se quería evitar. **Comprobado**: quitando el `allow`, clippy avisa «this function
+/// has too many arguments (8/7)», así que no es un atributo olvidado.
 #[allow(clippy::too_many_arguments)]
 fn copiar_el_volcado(
     repositorio: &crate::rustic::Repositorio,
@@ -818,11 +966,14 @@ fn motivo_del_volcado(causa: &ErrorDeExtraccion, orden: &Orden) -> String {
 /// llevar dentro la URL del destino con su credencial. Se guarda en una columna que el panel
 /// muestra, así que es texto que viene de fuera y se trata como tal.
 ///
+/// Lo usa también la fachada del motor —`super`, el alta de un repositorio y el listado de sus
+/// instantáneas—, que devuelve el mismo motivo ya depurado: es una red, y una sola.
+///
 /// El [`Orden`] que se construye aquí **no se ejecuta**: es la forma que tiene este crate de
 /// nombrar un conjunto de valores que no pueden aparecer en un texto, y los dos valores que hay
 /// que quitar de un motivo del repositorio son exactamente sus dos secretos. Su `Debug` publica
 /// los nombres y nunca los valores, así que ni un registro de esta línea los saca.
-fn motivo_de_la_biblioteca(texto: &str, acceso: &Acceso) -> String {
+pub(super) fn motivo_de_la_biblioteca(texto: &str, acceso: &Acceso) -> String {
     let a_quitar = Orden {
         cmd: Vec::new(),
         env: vec![
@@ -994,8 +1145,17 @@ impl EnVivo {
         // Nulo cuando no hay total, y nulo cuando el total es cero: un directorio vacío no tiene
         // nada que proporcionar, y un `0 %` o un `100 %` inventados serían una barra sobre una
         // cifra falsa.
+        //
+        // Y acotado a `100`, que no es una precaución de más: el total es un **pre-escaneo** —lo
+        // que el origen medía al empezar— mientras que lo que se cuenta son los bytes **leídos**,
+        // así que un fichero que crezca durante la copia —el caso normal de un directorio con un
+        // registro abierto, que es justo uno de los targets de esta herramienta— hace que la cuenta
+        // supere al total. Pasarse no es un error de cuentas: es una carrera con el fichero que
+        // crece, y el contrato del §5 promete «un número entre `0` y `100`».
         let percentage = match total {
-            Some(total) if total > 0 => Some(100.0 * subidos as f64 / total as f64),
+            Some(total) if total > 0 => {
+                Some((100.0 * subidos as f64 / total as f64).clamp(0.0, 100.0))
+            }
             _ => None,
         };
 

@@ -193,6 +193,13 @@ futures-util = "0.3.34"
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1"
+# `log` entra **solo** para las pruebas, y por un motivo concreto: el puente `log` → `tracing`
+# que la prueba 1.37 («la contraseña no sale en el registro») tiene que montar por su cuenta,
+# porque el arnés de captura no lo monta a propósito —ver `src/test_support.rs`—. En producción
+# se usa el puente de `tracing-subscriber`, así que este crate no necesita `log` en
+# `[dependencies]`. La versión es la que ya está en el árbol (la trae `bollard`), así que
+# promoverla no toca `Cargo.lock`.
+log = "0.4.34"
 # Local fake OIDC provider: it serves `authorization_endpoint`, `token_endpoint`
 # and `jwks_uri`, and no test ever reaches the internet.
 wiremock = "0.6.5"
