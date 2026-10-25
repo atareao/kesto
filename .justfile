@@ -111,9 +111,19 @@ ui-check: _require-ui ui-typecheck ui-lint ui-test ui-build
 
 # ── Desarrollo ─────────────────────────────────────────────────────────────
 
+# `bollard=warn` NO es ruido que se pueda quitar: `bollard` usa el crate `log` y
+# registra a DEBUG el cuerpo serializado de cada petición —`serialize_payload` en
+# `bollard-0.18.1/src/docker.rs:1227`, con el `env` del `exec` dentro, que es
+# justo por donde viaja `MYSQL_PWD`—, y `tracing_subscriber::fmt` instala el
+# puente `log` → `tracing`, así que ese DEBUG acaba en nuestra salida. Medido:
+# con `RUST_LOG=debug` a secas, `just dev` imprime la contraseña de la base; con
+# esta directiva, no. El módulo `src/docker` corta la exposición por **filtro**,
+# que es lo único que puede cortarla (ver el `# Seguridad` de `Cliente::ejecutar`
+# y el de `Orden`).
+#
 # Levanta el backend en local. El panel va aparte, en otra terminal: `just ui-dev`
 dev:
-    RUST_LOG=debug cargo run
+    RUST_LOG=debug,bollard=warn cargo run
 
 # ── Imagen y contenedor (podman-first) ─────────────────────────────────────
 # El Dockerfile todavía no existe; estas recetas abortan solas mientras falte.
@@ -136,6 +146,13 @@ build-nocache: _require-image
 #
 # Monta el socket en /var/run/docker.sock y un volumen para /app/data.
 #
+# `RUST_LOG=debug,bollard=warn`: la directiva sobre `bollard` no es cosmética, es
+# lo que impide que el registro del contenedor lleve la contraseña de la base
+# dentro. `bollard` registra a DEBUG el cuerpo serializado de cada petición —el
+# `env` del `exec` va ahí, y por ahí viaja `MYSQL_PWD`— y el suscriptor instala el
+# puente `log` → `tracing`, así que sin esa directiva el valor sale impreso. El
+# mismo motivo está explicado en la receta `dev`.
+#
 # Ejecuta la imagen en un contenedor de prueba.
 run: _require-image
     podman run --rm -d --name {{ name }} \
@@ -143,7 +160,7 @@ run: _require-image
         --userns=keep-id:uid=10001,gid=10001 \
         -v {{ podman_socket }}:/var/run/docker.sock \
         -v kesto_data:/app/data \
-        -e RUST_LOG=debug \
+        -e RUST_LOG=debug,bollard=warn \
         -e DATABASE_URL='sqlite:///app/data/kesto.db' \
         -e BIND_ADDRESS='0.0.0.0:8080' \
         {{ image_ref }}:latest

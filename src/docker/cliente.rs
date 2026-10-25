@@ -40,11 +40,27 @@ impl Cliente {
     /// eso es imposible, porque la variable es una sola para todo el proceso y mutarla
     /// deja de ser reproducible en cuanto la suite corre en paralelo.
     pub fn conectar(socket: &str, timeout: Duration) -> Result<Self, Error> {
-        // El tiempo de la biblioteca son segundos enteros, y cero no significa «sin tope»:
-        // se redondea hacia arriba a un segundo para que un `Duration` de milisegundos no
-        // se convierta en un tiempo máximo nulo sin que nadie lo haya pedido.
+        // El tiempo de la biblioteca son segundos enteros, y cero no significa «sin tope»: se
+        // garantiza un **mínimo de un segundo** para que un `Duration` de milisegundos no se
+        // convierta en un tiempo máximo nulo sin que nadie lo haya pedido. `as_secs()`
+        // **trunca** —no redondea—, así que lo que sale de aquí es «al menos un segundo», no
+        // «el múltiplo de arriba».
         let segundos = timeout.as_secs().max(1);
 
+        // La versión de API que se pasa aquí **hoy no llega al cable**, y conviene dejarlo
+        // escrito para que nadie lea esta línea creyendo que la versión está negociada.
+        // Medido en `bollard-0.18.1`: su `Uri::parse` compone la cadena con el prefijo
+        // —`{esquema}://{host}/v{major}.{minor}{path}`— y acto seguido hace `url.join(path)`
+        // con `path` absoluto, que **sustituye la ruta entera y se lleva el prefijo por
+        // delante**; el `Podman` de esta máquina, además, contesta `200` a cualquier prefijo,
+        // así que la elección es inerte y no se puede notar. Se deja como está porque
+        // `API_DEFAULT_VERSION` es también el defecto de la biblioteca, de modo que no se
+        // está eligiendo nada que ella no eligiera.
+        //
+        // El día que un parche de `bollard` restaure el prefijo, la salida **no** es fijar
+        // una constante más alta a mano —eso rompería contra un motor antiguo, que es lo que
+        // el propio aviso de la biblioteca advierte—, sino **negociar**: `Docker::negotiate_version`
+        // consulta `/version` y baja la versión del cliente a la que soporte el servidor.
         let docker = Docker::connect_with_socket(socket, segundos, bollard::API_DEFAULT_VERSION)
             .map_err(|causa| Error::del_socket(socket, causa))?;
 
@@ -72,6 +88,17 @@ impl Cliente {
     /// Ejecuta `orden` dentro de `contenedor`, entrega cada trozo a `al_llegar` **en cuanto
     /// llega**, y devuelve el código de salida del proceso.
     ///
+    /// # Seguridad
+    ///
+    /// Esta llamada **publica el valor del entorno** si el target `bollard` está registrado a
+    /// `debug`: la biblioteca registra el cuerpo serializado de la petición —medido:
+    /// `serialize_payload` en `bollard-0.18.1/src/docker.rs:1227`—, y el cuerpo de un
+    /// `create_exec` lleva el `env` con la contraseña de la base dentro. El `Debug` de
+    /// [`Orden`] no protege de esto, porque el valor no pasa por él: pasa por la biblioteca.
+    /// La exposición se corta **por filtro** —`RUST_LOG=debug,bollard=warn`, que es lo que
+    /// receta el `.justfile`— y no hay otra forma de cortarla. Cualquier código que suba el
+    /// nivel de `bollard` a `debug` está publicando credenciales.
+    ///
     /// ## El runtime que conduce esto tiene que seguir vivo
     ///
     /// Es una restricción **medida**, no una precaución: si el `exec` se lanza en un
@@ -83,6 +110,21 @@ impl Cliente {
     /// una prueba marcada `#[ignore]` que lo fija, y está ahí para que nadie «simplifique»
     /// esto a un `tokio::spawn`.
     ///
+    /// ## El `timeout` del cliente acota el apretón de manos, **no** el drenaje
+    ///
+    /// Es la trampa que hace falta conocer antes de elegir un tiempo máximo: el
+    /// `timeout` que la biblioteca le pone a `client.request(req)` se resuelve **cuando
+    /// llegan las cabeceras**, y el cuerpo lo drena después este bucle, **fuera** de ese
+    /// plazo. Un `mariadb-dump` colgado no lo caza ningún `timeout` del cliente: se queda
+    /// esperando en `output.next()` para siempre. Lo que acota el trabajo es
+    /// `inactividad_maxima`, y es lo único que lo acota.
+    ///
+    /// Por eso el parámetro es **inactividad** y no tiempo máximo: se mide entre trozos, así
+    /// que un volcado lento pero que avanza no puede fallar por esto —tarda lo que tarde— y
+    /// uno que se calla, sí: vence el plazo y sale [`Error::ExtraccionEstancada`]. El valor no
+    /// se elige aquí: lo pasa el motor, que es quien sabe cuánto puede tardar un volcado de
+    /// verdad en decir su primera palabra.
+    ///
     /// ## Lo que se entrega y lo que no
     ///
     /// El `stderr` llega por el **mismo** flujo que el `stdout`, solo que marcado con su
@@ -93,6 +135,7 @@ impl Cliente {
         &self,
         contenedor: &str,
         orden: &Orden,
+        inactividad_maxima: Duration,
         mut al_llegar: impl FnMut(Trozo),
     ) -> Result<i32, Error> {
         // `env` va **explícito** aunque la orden no traiga variables: es el campo por el que
@@ -151,17 +194,58 @@ impl Cliente {
         // El drenaje, con `StreamExt::next()` hasta el `None` del final y **en este mismo
         // runtime**: ver la nota de la firma. Un fallo del flujo es del motor, no del
         // comando: el comando ya dijo lo suyo por `stderr` y por su código de salida.
-        while let Some(trozo) = output.next().await {
-            let trozo = trozo.map_err(|causa| Error::del_contenedor(contenedor, causa))?;
+        //
+        // Cada lectura va envuelta en el plazo de inactividad, y esa es la única acotación
+        // del trabajo: el `timeout` del cliente ya se resolvió cuando llegaron las
+        // cabeceras. Y son **tres** desenlaces, no dos: `Ok(Some(..))` es un trozo, `Ok(None)`
+        // es que el flujo cerró —el proceso terminó— y `Err(Elapsed)` es que venció el plazo.
+        // Confundir los dos últimos convertiría un cierre limpio en un fallo —o al revés, que
+        // es peor: un colgado se leería como «terminó sin escribir nada» y acabaría en un
+        // snapshot vacío dado por bueno—.
+        loop {
+            let trozo = match tokio::time::timeout(inactividad_maxima, output.next()).await {
+                Ok(Some(trozo)) => {
+                    trozo.map_err(|causa| Error::del_contenedor(contenedor, causa))?
+                }
+                // El flujo cerró: el proceso acabó y no queda nada por leer. Se sale a leer
+                // el código de salida, que es lo que dice cómo acabó.
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(Error::ExtraccionEstancada {
+                        contenedor: contenedor.to_owned(),
+                        inactividad: inactividad_maxima,
+                    });
+                }
+            };
 
             let (canal, bytes) = match trozo {
                 LogOutput::StdOut { message } => (Canal::Salida, message),
                 LogOutput::StdErr { message } => (Canal::Error, message),
-                // Con tty —que aquí no se pide— no hay separación posible: todo sale como
-                // `Console`, y se entrega como salida para que activarlo no dejara la
-                // lectura sin nada. `StdIn` solo llegaría si se pidiera `attach_stdin`.
-                LogOutput::Console { message } => (Canal::Salida, message),
-                LogOutput::StdIn { message } => (Canal::Salida, message),
+                // Con tty —que aquí **no** se pide, y está pedido unas líneas más arriba—
+                // no hay separación posible: todo sale como `Console`, y `StdIn` solo
+                // llegaría si se pidiera `attach_stdin`. Ninguna de las dos debería
+                // aparecer, así que el caso se canda: si alguien enciende el tty, **todo**
+                // lo que salga se entregaría como volcado —el motivo de un fallo viajaría
+                // como bytes de copia, en silencio—, que es justo lo que el requisito de
+                // distinguir un fallo de una base vacía prohíbe. En depuración esto salta;
+                // en publicación se conserva el reparto de abajo, que es el menos malo de
+                // los dos.
+                LogOutput::Console { message } => {
+                    debug_assert!(
+                        false,
+                        "la biblioteca entregó un `Console`: alguien encendió el tty, y con \
+                         tty el motivo de un fallo viaja como bytes de copia"
+                    );
+                    (Canal::Salida, message)
+                }
+                LogOutput::StdIn { message } => {
+                    debug_assert!(
+                        false,
+                        "la biblioteca entregó un `StdIn`: alguien pidió `attach_stdin`, que \
+                         esta orden no necesita"
+                    );
+                    (Canal::Salida, message)
+                }
             };
 
             al_llegar(Trozo {
@@ -218,6 +302,17 @@ mod tests {
         ContenedorDePrueba, TIMEOUT_DEL_MOTOR, cliente_del_motor, directorio_de_prueba,
         socket_del_motor,
     };
+
+    /// Plazo de inactividad de las pruebas con motor.
+    ///
+    /// Holgado a propósito: lo que estas pruebas fijan es que la acotación **no** estorba a
+    /// una orden que avanza —incluido el volumen de cuatro mebibytes, que tarda lo suyo en
+    /// llegar—. El único test que usa un plazo corto es el del cuelgue, y ahí el plazo corto
+    /// **es** lo que se prueba.
+    const INACTIVIDAD_DE_PRUEBA: Duration = Duration::from_secs(60);
+
+    /// Plazo de inactividad del test del cuelgue: tiene que vencer, así que es corto.
+    const INACTIVIDAD_CORTA: Duration = Duration::from_millis(500);
 
     /// `conectar` con un socket que no existe falla, y el error **nombra el socket**.
     ///
@@ -309,6 +404,9 @@ mod tests {
     ///
     /// El cierre va **prestado** —un `&mut` de un `FnMut` es `FnMut`— y vive en su propio
     /// bloque para que el préstamo de `trozos` acabe con la llamada y se pueda leer después.
+    /// El plazo de inactividad es el de las pruebas —[`INACTIVIDAD_DE_PRUEBA`]—: ninguna de
+    /// estas órdenes calla tanto, así que lo que se está fijando es que la acotación no
+    /// estorba a una extracción que avanza.
     async fn ejecutar_recogiendo(
         cliente: &Cliente,
         contenedor: &str,
@@ -319,7 +417,9 @@ mod tests {
         let codigo = {
             let mut guardar = |trozo: Trozo| trozos.push(trozo);
 
-            cliente.ejecutar(contenedor, orden, &mut guardar).await?
+            cliente
+                .ejecutar(contenedor, orden, INACTIVIDAD_DE_PRUEBA, &mut guardar)
+                .await?
         };
 
         Ok((codigo, trozos))
@@ -461,7 +561,7 @@ mod tests {
         let orden = orden_de_shell("echo nunca-llega");
 
         let error = cliente
-            .ejecutar(nombre, &orden, |_| {})
+            .ejecutar(nombre, &orden, INACTIVIDAD_DE_PRUEBA, |_| {})
             .await
             .expect_err("un contenedor que no existe no puede ejecutar nada");
         let motivo = error.to_string();
@@ -623,11 +723,11 @@ mod tests {
         );
     }
 
-    /// El tiempo máximo por petición se guarda redondeado a segundos, nunca en cero.
+    /// El tiempo máximo por petición se guarda con **un mínimo de un segundo**, nunca en cero.
     ///
     /// Un `Duration` de milisegundos no puede convertirse en «sin tiempo máximo» sin que
-    /// nadie lo haya pedido: la biblioteca cuenta en segundos enteros y su cero no
-    /// significa «sin tope».
+    /// nadie lo haya pedido: la biblioteca cuenta en segundos enteros, su cero no significa
+    /// «sin tope», y `as_secs()` **trunca**, así que lo que hay que garantizar es el mínimo.
     #[test]
     fn un_tiempo_maximo_menor_de_un_segundo_no_queda_en_cero() {
         let directorio = directorio_de_prueba();
@@ -641,5 +741,220 @@ mod tests {
             format!("{cliente:?}").contains("timeout: 1s"),
             "el tiempo máximo quedó por debajo de un segundo: {cliente:?}"
         );
+    }
+
+    /// Un guion que **alterna los dos canales** en la misma ejecución: cada canal llega
+    /// completo y en el orden en que se escribió.
+    ///
+    /// Es el caso que las otras pruebas no ejercitan: una escribe solo en `stdout` y otra solo
+    /// en `stderr`, así que el camino mixto —donde el motor multiplexa los dos flujos en uno
+    /// y solo el tipo del trozo dice de cuál viene— no estaba cubierto. Y es el camino real de
+    /// un volcado: `mariadb-dump` escribe el volcado por `stdout` y sus avisos por `stderr`, a
+    /// la vez. Si los bytes se repartieran mal, el volcado llegaría incompleto al repositorio
+    /// —o el motivo de un fallo entraría como bytes de copia, que es la confusión que el
+    /// requisito prohíbe—.
+    ///
+    /// # Qué se mide y qué no
+    ///
+    /// El guion escribe `uno` (S), `dos` (E), `tres` (S) y `cuatro` (E), y el motor entrega
+    /// **dos** trozos: `uno\ntres\n` por la salida y `dos\ncuatro\n` por el error. Es decir,
+    /// **agrupa por canal**, y el entrelazado fino de cuatro trozos no existe. Está medido
+    /// cinco veces con el Podman de esta máquina, siempre `SE`.
+    ///
+    /// De ahí lo que la prueba afirma y lo que no: el orden **dentro** de cada canal es
+    /// contrato de este módulo —los bytes salen como llegaron—, y el orden **entre** canales
+    /// es del motor, que aquí agrupa; fijarlo sería fijar su troceado, que puede cambiar en
+    /// una versión suya sin que este módulo tenga nada que decir. Lo que sí se fija es que los
+    /// dos canales llegan, cada uno con su contenido entero y sin que un trozo traiga bytes
+    /// del otro: si se cruzaran, el texto de abajo no cuadraría.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    async fn los_dos_canales_de_una_misma_ejecucion_llegan_completos_y_en_su_orden() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::nuevo(
+            "los_dos_canales_de_una_misma_ejecucion_llegan_completos_y_en_su_orden",
+        )
+        .await;
+
+        let orden = orden_de_shell("echo uno; echo dos >&2; echo tres; echo cuatro >&2");
+
+        let (codigo, trozos) = ejecutar_recogiendo(&cliente, contenedor.nombre(), &orden)
+            .await
+            .expect("alternar los dos canales no es un fallo del transporte");
+
+        assert_eq!(codigo, 0, "el guion debe salir con cero");
+        assert!(
+            !trozos.is_empty(),
+            "una ejecución que escribe por los dos canales no puede no entregar nada"
+        );
+
+        // Cada canal con sus bytes y en su orden: si un trozo de un canal hubiera viajado con
+        // el otro —o si se hubiera perdido uno— este par de aserciones no cuadra.
+        assert_eq!(
+            texto_de(&trozos, Canal::Salida),
+            "uno\ntres\n",
+            "la salida no llegó completa y en orden por su canal: {trozos:?}"
+        );
+        assert_eq!(
+            texto_de(&trozos, Canal::Error),
+            "dos\ncuatro\n",
+            "el error no llegó completo y en orden por su canal: {trozos:?}"
+        );
+
+        // Y los dos canales están presentes: el caso mixto es el que se quería ejercitar, así
+        // que una ejecución que solo hubiera entregado uno no vale como esta prueba.
+        assert!(
+            trozos.iter().any(|trozo| trozo.canal == Canal::Salida)
+                && trozos.iter().any(|trozo| trozo.canal == Canal::Error),
+            "faltó uno de los dos canales: {trozos:?}"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// Una extracción **legítimamente vacía**: código `0`, ninguna llamada al callback y
+    /// ningún byte.
+    ///
+    /// Es el espejo del `127` que ya se prueba. Aquél fija que un fallo no se lea como base
+    /// vacía; éste fija lo contrario, que es la mitad que faltaba: que una base vacía no se
+    /// lea como fallo. La distinción no se puede hacer por el `stdout` —los dos son cero
+    /// bytes—, así que se hace por el código de salida y por el canal: `true` sale con `0` y
+    /// no escribe **nada**, ni por la salida ni por el error.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    async fn una_base_vacia_no_se_lee_como_fallo_ni_llama_al_callback() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor =
+            ContenedorDePrueba::nuevo("una_base_vacia_no_se_lee_como_fallo_ni_llama_al_callback")
+                .await;
+
+        let orden = orden_de_shell("true");
+
+        let mut llamadas = 0usize;
+        let mut del_canal_de_error = 0usize;
+
+        let codigo = {
+            let mut contar = |trozo: Trozo| {
+                llamadas += 1;
+                if trozo.canal == Canal::Error {
+                    del_canal_de_error += 1;
+                }
+            };
+
+            cliente
+                .ejecutar(
+                    contenedor.nombre(),
+                    &orden,
+                    INACTIVIDAD_DE_PRUEBA,
+                    &mut contar,
+                )
+                .await
+                .expect("una base vacía no es un fallo de extracción")
+        };
+
+        assert_eq!(codigo, 0, "una extracción vacía y correcta sale con cero");
+        assert_eq!(
+            llamadas, 0,
+            "el callback se llamó {llamadas} veces con una extracción que no escribió nada"
+        );
+        assert_eq!(
+            del_canal_de_error, 0,
+            "no puede haber nada por el canal de error: el comando salió con cero"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// Una orden que **se calla más que el plazo de inactividad** acaba en
+    /// [`Error::ExtraccionEstancada`], y el motivo nombra el contenedor y el plazo.
+    ///
+    /// Es el candado del requisito del motor que el `timeout` del cliente **no** cubre: un
+    /// `mariadb-dump` colgado deja la ejecución en `running` para siempre, y con ella el
+    /// worker de su repositorio, con todo el trabajo posterior de ese repositorio haciendo
+    /// cola detrás. `sleep 600` no escribe una sola línea: es exactamente ese cuelgue, sin
+    /// necesitar una base de datos.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    async fn una_orden_que_se_calla_mas_que_el_plazo_acaba_en_extraccion_estancada() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::nuevo(
+            "una_orden_que_se_calla_mas_que_el_plazo_acaba_en_extraccion_estancada",
+        )
+        .await;
+
+        let orden = orden_de_shell("sleep 600");
+
+        let error = cliente
+            .ejecutar(contenedor.nombre(), &orden, INACTIVIDAD_CORTA, |_| {})
+            .await
+            .expect_err("una orden que se calla más que el plazo no puede darse por buena");
+        let motivo = error.to_string();
+
+        assert!(
+            matches!(
+                &error,
+                Error::ExtraccionEstancada { contenedor: cual, inactividad }
+                    if cual == contenedor.nombre() && *inactividad == INACTIVIDAD_CORTA
+            ),
+            "el vencimiento no llegó como extracción estancada con su plazo: {error:?}"
+        );
+        assert!(
+            motivo.contains(contenedor.nombre()),
+            "el motivo no nombra el contenedor: {motivo}"
+        );
+        assert!(
+            motivo.contains("colgada"),
+            "el motivo no dice qué puede estar pasando: {motivo}"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// `comprobar` falla si al otro lado del socket no hay un motor, y lo nombra.
+    ///
+    /// Es el camino del aviso de arranque, y se ejercita **sin motor de contenedores**: basta
+    /// con apuntar el cliente a un fichero normal —como hace la prueba de las dos formas del
+    /// socket— porque el `ping` habla por la ruta y un fichero no contesta. Es el candado de
+    /// la única función del módulo que no lo tenía, y la que decide si el arranque avisa.
+    #[tokio::test]
+    async fn comprobar_falla_si_al_otro_lado_no_hay_motor() {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("fichero-que-no-es-un-socket");
+        std::fs::File::create(&ruta).expect("la ruta de la prueba debe poder crearse");
+        let ruta = ruta.to_string_lossy().into_owned();
+
+        let cliente = Cliente::conectar(&ruta, TIMEOUT_DEL_MOTOR)
+            .expect("la ruta existe, así que el cliente se construye");
+
+        let error = cliente
+            .comprobar()
+            .await
+            .expect_err("un fichero normal no contesta a un `ping`");
+        let motivo = error.to_string();
+
+        assert!(
+            matches!(&error, Error::MotorNoDisponible { socket, .. } if socket == &ruta),
+            "el fallo del `ping` no se reconoció como motor no disponible: {error:?}"
+        );
+        assert!(
+            motivo.contains(&ruta),
+            "el motivo no nombra el socket: {motivo}"
+        );
+    }
+
+    /// `comprobar` **dice que sí** cuando el motor contesta.
+    ///
+    /// La otra dirección de la prueba de arriba, y la que hace falta para que `comprobar` sirva
+    /// de algo: una función que siempre fallara pasaría el candado del fallo y dejaría el
+    /// arranque avisando de un socket que está perfectamente vivo.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores: se ejecuta con cargo test -- --ignored"]
+    async fn comprobar_dice_que_si_cuando_el_motor_contesta() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+
+        cliente
+            .comprobar()
+            .await
+            .expect("un motor vivo contesta al `ping`");
     }
 }

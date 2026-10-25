@@ -46,6 +46,24 @@ El canal es `sync_channel` y **acotado**: sin tope, un productor rápido contra 
 
 `size()` devuelve `Ok(None)` para un volcado por `stdout` —medido: el `StdinSource` de rustic hace lo mismo— y `Ok(Some(total))` para un directorio. Es la causa directa de que `percentage` sea nullable.
 
+## La acotación de la extracción: la inactividad, no la duración
+
+Hay una sola cosa que acota el trabajo, y no es la que parece. El `timeout` del cliente de la API de Docker se resuelve **cuando llegan las cabeceras** de la respuesta, así que el cuerpo del `exec` se drena **fuera** de él: el tiempo máximo cubre la conexión y el apretón de manos, no el volcado.
+
+Y la consecuencia de no acotar nada no es un fallo aislado, es un atasco permanente: un volcado colgado deja la lectura esperando indefinidamente, la ejecución se queda en `running`, y con ella queda ocupado el worker secuencial de su repositorio —de modo que todo el trabajo posterior de ese repositorio hace cola detrás para siempre—. Es exactamente la salida que la spec del motor prohíbe.
+
+Por eso lo que se acota es **el tiempo sin recibir salida**, no la duración total. Un volcado de cien gigabytes que avanza tarda lo que tenga que tardar y no puede fallar por tardar; uno que se cuelga falla con un motivo propio que nombra el contenedor y el plazo. El valor del plazo lo decide el motor y lo pasa el transporte, que no elige ninguno por su cuenta.
+
+Y el error tiene que ser distinguible de «terminó sin escribir nada», que es el otro desenlace posible de dejar de recibir trozos: los dos son silencio, y confundirlos convierte un colgado en un snapshot vacío dado por bueno.
+
+## La credencial y el registro del proceso
+
+La contraseña de la base viaja en el `env` del `exec` —es lo que fija el §4.A y lo que deja la credencial fuera de la línea de comandos del contenedor—, y eso tiene una consecuencia que **no** se cubre con tipos: la biblioteca de Docker usa el crate `log` y registra a `DEBUG` el **cuerpo serializado** de la petición, con el entorno dentro. El suscriptor de `tracing` instala el puente `log` → `tracing`, así que ese `DEBUG` acaba en el registro de Kesto.
+
+Está medido, y el resultado es que con el nivel más hablador la contraseña se imprime **en claro**: un `Debug` propio que no publique el valor del entorno es necesario —hay uno, y tiene prueba— pero **no suficiente**, porque el valor no pasa por ningún tipo de este crate. La exposición se corta por **filtro** de registro, y por eso la directiva que silencia ese objetivo está declarada donde arranca el proceso y no queda a la memoria de quien lo lance.
+
+La lección general sirve para el resto del change: una credencial puede salir por debajo de tus tipos, en el registro de una dependencia, y la única red que la caza es ejercitar el camino real con el registro hablador puesto.
+
 ## La cola y el worker por repositorio
 
 §2 lo exige —«un worker secuencial por repositorio S3 para garantizar el aislamiento de *locks*»— y el motivo está medido: `rustic_core` toma un **bloqueo exclusivo del repositorio**. Dos copias contra el mismo repositorio lanzadas a la vez no corren más: se bloquean entre sí, y el que pierde espera sin que nada lo diga.
@@ -138,6 +156,8 @@ En el router eso se consigue declarando la ruta fuera de las capas que envuelven
 10. **La ventana de `GET /snapshots` es 200**, como el listado de ejecuciones, y la respuesta indica que hay más.
 11. **Solo tres de las once familias `keep_*` tienen columna** (`keep_daily`, `keep_weekly`, `keep_monthly`); el resto se queda con el valor por defecto de la biblioteca. No se añaden columnas al §3 en este change.
 12. **El CI no tiene Docker.** Las pruebas van por capas para que el subconjunto que corre en CI no necesite un motor de contenedores, y lo que quede sin cubrir automáticamente se declara por escrito en `docs/FEATURE-005-backup-engine.md` en vez de fingirlo.
+13. **La extracción se acota por inactividad, no por duración.** El `timeout` de la biblioteca no cubre el drenaje y sin acotar nada un volcado colgado deja ocupado el worker de su repositorio para siempre. El plazo lo decide el motor; el transporte solo lo aplica. Un volcado lento que avanza no falla nunca.
+14. **La credencial de la base se protege por filtro de registro, además de por tipos.** La biblioteca registra el cuerpo de la petición a `DEBUG` con el `env` dentro, así que el arranque declara la directiva que lo corta. El `Debug` propio de la orden que lleva el entorno es necesario y no suficiente, y así queda escrito en el código.
 
 ## Trampas medidas de la biblioteca
 
@@ -155,6 +175,10 @@ Se dejan aquí porque cada una costaría una tarde a quien no las sepa:
 | `rustic_backend` pide `rustic_core = "0"` | Unifica en una sola copia; no duplica el árbol |
 | `rustic_core` re-exporta `jiff` | No hace falta añadirlo al manifiesto |
 | El `stream` de `bollard` es `Pin<Box<dyn Stream>>` | Hay que drenarlo con `StreamExt` y un runtime: `futures-util` pasa de transitiva a directa |
+| `bollard` registra a `DEBUG` el cuerpo serializado de la petición | Lleva el `env` del `exec` dentro, así que la contraseña de la base sale impresa con el registro hablador. Se corta por **filtro** (`bollard=warn`), no por un `Debug` nuestro |
+| El `timeout` de `bollard` se resuelve al llegar las cabeceras | No acota el drenaje: hay que acotar la **inactividad** entre trozos, o un volcado colgado bloquea el worker de su repositorio para siempre |
+| El prefijo de versión de API no llega al cable | `Uri::parse` compone la ruta y el `join` posterior se lleva el prefijo por delante: hoy fijar la versión es inerte, y el día que un parche lo restaure la salida es negociar la versión |
+| El motor de contenedores agrupa los trozos por canal | El entrelazado fino entre `stdout` y `stderr` **no** es observable. El orden dentro de cada canal sí es contrato; el de entre canales, no |
 
 ## Alternativas descartadas
 

@@ -19,6 +19,8 @@
 
 mod cliente;
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 pub use cliente::Cliente;
@@ -34,7 +36,22 @@ pub use cliente::Cliente;
 /// entregar la contraseña de la base por el entorno del `exec` (`MYSQL_PWD`,
 /// `PGPASSWORD`) en vez de por su línea de comandos, que es lo que fija el §4.A y lo que
 /// deja la credencial a la vista en el listado de procesos del contenedor.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// # Seguridad
+///
+/// El [`Debug`](std::fmt::Debug) de este tipo **no** publica los valores del entorno, y eso
+/// es necesario pero **no suficiente**: el `Debug` de aquí no es el único camino por el que
+/// el valor puede salir. `bollard` registra a `DEBUG` el **cuerpo serializado** de cada
+/// petición —medido: `serialize_payload` en `bollard-0.18.1/src/docker.rs:1227`—, y el
+/// cuerpo de un `create_exec` lleva el `env` **entero**, con la contraseña dentro. Como el
+/// suscriptor de registro instala el puente `log` → `tracing`, esas líneas acaban en
+/// nuestro registro con solo subir el nivel a `debug`.
+///
+/// Es decir: **la exposición se corta por filtro, no por este `Debug`**. Quien lea esto y se
+/// quede tranquilo por no usar `#[derive(Debug)]` se queda tranquilo en el sitio que no
+/// toca. Lo que hay que hacer es no registrar el target `bollard` a `debug`: el `.justfile`
+/// lo silencia con `RUST_LOG=debug,bollard=warn` y explica allí por qué. Ver también el
+/// `# Seguridad` de [`Cliente::ejecutar`], que es donde se pide el `exec`.
 pub struct Orden {
     /// La orden, ya troceada en argumentos.
     pub cmd: Vec<String>,
@@ -51,6 +68,9 @@ impl std::fmt::Debug for Orden {
     /// —`MYSQL_PWD`, `PGPASSWORD`—, así que un `#[derive(Debug)]` convertiría un
     /// `tracing::debug!(?orden)` de una línea en esa contraseña escrita en el registro del
     /// contenedor, que es justo de donde se copia a un informe de fallo.
+    ///
+    /// Necesario, pero **no suficiente**: el valor también sale por debajo de este módulo, en
+    /// la petición que serializa la biblioteca. Está contado en el `# Seguridad` de arriba.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let claves: Vec<&str> = self
             .env
@@ -86,7 +106,17 @@ pub enum Canal {
 /// interna de una dependencia. La copia por trozo es despreciable frente al cifrado en
 /// reposo del repositorio y frente a la red, y a cambio el volcado deja de compartir
 /// búfer con la biblioteca que lo leyó.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # El motor no debe registrar nunca un `Trozo`
+///
+/// Su `Debug` se deriva, y eso es deliberado: imprime los bytes del trozo tal cual —la prueba
+/// de los dos canales los enseña— y las pruebas de este módulo se apoyan en verlos. El precio
+/// es el que hay que saber: un `Trozo` es la **copia de los datos**, así que registrarlo
+/// escribe el volcado —las filas de las tablas, con sus datos personales— en el registro del
+/// proceso. El motor cuenta progreso con el **tamaño** de los trozos, no con su contenido:
+/// nunca `tracing::debug!(?trozo)`, ni el `Trozo` dentro de un evento, ni `{:?}` en un
+/// mensaje. Si hay que diagnosticar de verdad, el canal y el número de bytes bastan.
+#[derive(Debug)]
 pub struct Trozo {
     /// De qué canal salió.
     pub canal: Canal,
@@ -178,6 +208,27 @@ pub enum Error {
     SinCodigoDeSalida {
         /// Contenedor en el que se ejecutaba la orden.
         contenedor: String,
+    },
+
+    /// La orden dejó de producir salida y el plazo de inactividad venció.
+    ///
+    /// Es un fallo **con nombre propio** y no un tiempo máximo agotado, porque el tiempo
+    /// máximo del cliente no acota esto: acota el apretón de manos, y se resuelve cuando
+    /// llegan las cabeceras. Lo que se acota aquí es la **inactividad entre trozos**, que es
+    /// lo único que distingue un volcado lento de uno colgado: un volcado que avanza tarda
+    /// lo que haga falta y no puede fallar por esto.
+    ///
+    /// Que exista esta variante es un requisito del motor y no un adorno: sin acotar la
+    /// inactividad, un `mariadb-dump` colgado deja la ejecución en `running` para siempre y
+    /// **el worker de su repositorio ocupado**, con todo el trabajo posterior de ese
+    /// repositorio haciendo cola detrás. El motivo nombra el contenedor y el plazo, que es lo
+    /// que hace falta para saber cuánto estuvo callado antes de darlo por colgado.
+    #[error("la orden en `{contenedor}` no produjo salida en {inactividad:?}: puede estar colgada")]
+    ExtraccionEstancada {
+        /// Contenedor en el que se ejecutaba la orden.
+        contenedor: String,
+        /// Plazo de inactividad que venció.
+        inactividad: Duration,
     },
 }
 

@@ -929,6 +929,11 @@ pub(crate) struct ContenedorDePrueba {
 
 impl ContenedorDePrueba {
     /// Crea y arranca un contenedor de la imagen de prueba, con `sleep 600`.
+    ///
+    /// El guardián (`Self`) se construye **entre** el alta y el arranque: en cuanto el
+    /// contenedor existe en el motor hay algo que borrar, y construirlo al final dejaba el
+    /// arranque —y cualquier pánico intermedio— sin nadie que lo limpiara. Ver el comentario
+    /// de dentro.
     pub(crate) async fn nuevo(prueba: &str) -> Self {
         let socket = socket_del_motor()
             .expect("las pruebas del motor necesitan un socket de Docker o Podman");
@@ -969,16 +974,26 @@ impl ContenedorDePrueba {
             .await
             .expect("el contenedor de prueba debe poder crearse");
 
-        motor
-            .start_container(&nombre, None::<StartContainerOptions<String>>)
-            .await
-            .expect("el contenedor de prueba debe poder arrancarse");
-
-        Self {
+        // El guardián se construye **aquí**, en cuanto el contenedor existe en el motor, y no
+        // al final: a partir de esta línea el nombre está fijado y hay algo que borrar, así que
+        // cualquier camino de error posterior —el `start` que sigue, un pánico en medio—
+        // suelta el guardián y deja el contenedor limpio. Construirlo al final dejaba una
+        // **ventana sin dueño**: medido, un `timeout` bajo en el alta dejó un
+        // `kesto-prueba-…` en estado `Created` que ya nadie borraba, porque el `Self` que lo
+        // habría hecho no llegó a existir.
+        let contenedor = Self {
             motor,
             nombre,
             socket,
-        }
+        };
+
+        contenedor
+            .motor
+            .start_container(&contenedor.nombre, None::<StartContainerOptions<String>>)
+            .await
+            .expect("el contenedor de prueba debe poder arrancarse");
+
+        contenedor
     }
 
     /// Nombre del contenedor.

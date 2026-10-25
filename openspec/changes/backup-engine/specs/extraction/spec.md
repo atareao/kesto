@@ -130,6 +130,36 @@ Un `stdout` vacío es ambiguo: puede ser un fallo —no hay cliente de volcado e
 - **THEN** SHALL acabar en `failed`
 - **AND** el motivo SHALL nombrar el contenedor
 
+### Requirement: El motor acota la inactividad de la extracción, no su duración
+
+La extracción SHALL acotar el tiempo **sin recibir salida**, y NO SHALL acotar la duración total de la orden: un volcado que avanza tarda lo que tenga que tardar y no puede fallar por eso. Cuando la orden deje de producir salida durante más que un plazo que decide el motor, la extracción SHALL fallar con un motivo propio que nombre el contenedor y el plazo, y ese desenlace NO SHALL confundirse con una extracción que terminó sin escribir nada.
+
+El plazo no es una precaución, es lo único que acota el trabajo: el `timeout` del cliente de la API de Docker se resuelve **cuando llegan las cabeceras**, así que el cuerpo del `exec` se drena fuera de él y un `mariadb-dump` colgado deja la lectura esperando indefinidamente. La consecuencia de no acotar no es un fallo aislado: la ejecución se queda en `running`, y con ella ocupado el worker secuencial de su repositorio, de modo que todo el trabajo posterior de ese repositorio hace cola detrás para siempre. Es exactamente la salida que el requisito del motor prohíbe.
+
+#### Scenario: Una extracción lenta que avanza no falla
+- **GIVEN** una orden de volcado que produce salida a intervalos, todos menores que el plazo
+- **WHEN** la extracción termina
+- **THEN** SHALL completarse con su código de salida
+- **AND** el plazo NO SHALL haber vencido
+
+#### Scenario: Una orden que deja de producir salida falla con un motivo propio
+- **GIVEN** una orden que no escribe nada durante más que el plazo de inactividad
+- **WHEN** la extracción espera su salida
+- **THEN** SHALL fallar nombrando el contenedor y el plazo
+- **AND** el fallo NO SHALL confundirse con una extracción que terminó sin escribir nada
+
+### Requirement: La credencial no aparece en el registro del proceso
+
+La extracción NO SHALL dejar el valor de la contraseña de la base en el registro de Kesto, ni con el nivel de registro más hablador. La variable de entorno del `exec` lleva la credencial —es lo que fija el requisito de arriba—, y el valor NO SHALL salir por debajo de esta capa: la biblioteca del motor registra a `DEBUG` el **cuerpo serializado** de la petición, con el entorno dentro, así que la exposición se corta por **filtro** de registro y esa directiva SHALL estar declarada donde arranca el proceso, no dejada a la memoria de quien lo ejecute.
+
+Una credencial que aparece en un registro acaba en un informe de fallo, en una captura de pantalla y en un buscador de incidencias: el sitio donde menos conviene. Y no se puede arreglar con un `Debug` propio, porque el valor no pasa por ningún tipo de este crate: viaja dentro de una petición que serializa la biblioteca.
+
+#### Scenario: La contraseña no sale en un arranque con el registro hablador
+- **GIVEN** un proceso arrancado con el registro a `debug`
+- **WHEN** se ejecuta la extracción de un target con contraseña
+- **THEN** el registro NO SHALL contener el valor de esa contraseña
+- **AND** la directiva de registro que lo impide SHALL estar en el arranque declarado del proyecto
+
 ### Requirement: El volcado llega a la biblioteca de copia como un origen de lectura, no como un fichero
 
 El `stdout` del `exec` SHALL entregarse a la biblioteca de copia como un origen de lectura del tipo que su API acepta, y NO SHALL materializarse en un fichero para poder leerlo. La conexión entre el `stream` asíncrono de la API de Docker y esa interfaz SHALL ser explícita y SHALL estar acotada, de modo que la presión de memoria no dependa de lo rápido que lea una de las dos partes.

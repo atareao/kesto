@@ -2,7 +2,7 @@
 
 > **Estado:** en curso (change proposal aprobado el 2026-10-25; implementación TDD por arrancar).
 > **Rama:** `feature/backup-engine`, desde `development`.
-> **Change de OpenSpec:** `openspec/changes/backup-engine/` — **28 requisitos y 89 escenarios** (`engine` 9/27, `extraction` 6/19 y `repository` 5/17, las tres capabilities **nuevas**; `api-resources` 4/14, `config` 2/5 y `api-shell` 2/6, que crecen), más `design.md`. `openspec validate backup-engine --strict` válido. `tasks.md`: **76 tareas** (15 de preparación, 35 de RED, 5 de GREEN, 7 de REFACTOR, 8 de operador y 6 de cierre).
+> **Change de OpenSpec:** `openspec/changes/backup-engine/` — **30 requisitos y 92 escenarios** (`engine` 9/27, `extraction` 8/22 y `repository` 5/17, las tres capabilities **nuevas**; `api-resources` 4/14, `config` 2/5 y `api-shell` 2/6, que crecen), más `design.md`. `openspec validate backup-engine --strict` válido. `tasks.md`: **78 tareas** (15 de preparación, 37 de RED, 5 de GREEN, 7 de REFACTOR, 8 de operador y 6 de cierre). Los dos requisitos y las tres tareas que crecen salieron de la auditoría del módulo 1: la acotación por inactividad —que el `timeout` de la biblioteca no cubre— y la credencial que la biblioteca imprime a `DEBUG`.
 > **Especificación de origen:** `docs/DEFINITION.md` §2 (arquitectura de componentes), §4 (flujos de extracción y retención) y §5 (los tres endpoints que faltaban). §6, §7 y §8 se respetan sin entrar.
 > **Cambio anterior:** `api-endpoints` (`PLAN-004-COMPLETED.md`, `docs/FEATURE-004-api-endpoints.md`, 214 tests, fusionado en `development` como `932747c`).
 
