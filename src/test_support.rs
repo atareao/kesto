@@ -20,6 +20,14 @@ use axum::http::{HeaderName, Method, Request, header};
 use axum::response::Response;
 use bollard::container::{CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
 use http_body_util::BodyExt;
+use rustic_backend::local::LocalBackend;
+use rustic_core::repofile::{SnapshotFile, SnapshotId};
+use rustic_core::{
+    BackupOptions, ConfigOptions, Credentials, Excludes, KeyOptions, LocalSource,
+    LocalSourceFilterOptions, LocalSourceSaveOptions, OpenStatus, Repository, RepositoryBackends,
+    RepositoryOptions, SnapshotOptions, WriteBackend,
+    jiff::{Timestamp, Zoned, tz::TimeZone},
+};
 use sqlx::SqlitePool;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use tower::ServiceExt;
@@ -28,6 +36,7 @@ use uuid::Uuid;
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
 use crate::docker::Cliente;
+use crate::rustic::{AvisoDeProgreso, BarrasDelMotor};
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState, EstadoDeBase};
 
@@ -125,6 +134,298 @@ pub(crate) fn directorio_de_prueba() -> DirectorioDePrueba {
     std::fs::create_dir_all(&ruta).expect("el directorio temporal de la prueba debe crearse");
 
     DirectorioDePrueba { ruta }
+}
+
+// ── Repositorios Rustic de prueba ────────────────────────────────────────────
+//
+// Las pruebas de `src/rustic` hablan con un repositorio **local** —un directorio del
+// sistema de ficheros— y no con S3: `rustic_backend::local::LocalBackend` no está detrás
+// de ninguna feature, así que estas pruebas corren en el CI sin cubo, sin credenciales y
+// sin red. Lo que la API pública del módulo construye es el backend de S3; lo que se
+// prueba con esto es todo lo demás.
+//
+// Y se prueban las dos capas: la del módulo —con [`acceso_local`], [`backends_locales`] y
+// [`barras_mudas`], que es lo que `poner_en_marcha_con` recibe— y la de la biblioteca,
+// con [`abrir_local`] y las lecturas de [`snapshot_guardado`] y [`volcado_guardado`]. La
+// segunda es lo que permite **comprobar** lo que la primera guardó: restaurar un volcado
+// es leerlo del repositorio con la biblioteca, que es exactamente lo que hace un operador
+// que recupera una copia, y por eso una copia que solo pasa por el módulo no está probada.
+
+/// Passphrase de los repositorios locales de prueba.
+///
+/// Larga a propósito, como las del arranque: el aviso de credencial corta se dispara
+/// antes de los 32 caracteres y una prueba no debe leer avisos por su culpa.
+pub(crate) const PASSPHRASE_DE_PRUEBA: &str =
+    "passphrase-de-prueba-000000000000000000000000000000000000";
+
+/// La **otra** passphrase: la que no abre el repositorio de prueba.
+///
+/// Existe como constante y no como literal suelto porque la prueba que la usa tiene que
+/// comprobar además que **no** aparece en el motivo del error: con el literal repetido,
+/// esa comprobación podría pasar mirando la cadena equivocada.
+pub(crate) const OTRA_PASSPHRASE_DE_PRUEBA: &str =
+    "otra-passphrase-de-prueba-0000000000000000000000000000000000";
+
+/// Clave secreta del acceso de prueba.
+///
+/// Es distinguible y **no vale para nada**: con el backend local no hay firma de nadie,
+/// así que lo único que se comprueba de ella es que no sale publicada en ningún formato.
+pub(crate) const CLAVE_SECRETA_DE_PRUEBA: &str =
+    "clave-secreta-de-prueba-distinguible-000000000000000000000000000000000000";
+
+/// Etiqueta con la que se siembran los snapshots de prueba.
+pub(crate) const ETIQUETA_SEMBRADA: &str = "tarea-sembrada-de-prueba";
+
+/// El fichero que la semilla deja dentro del árbol.
+pub(crate) const SEMILLA: &str = "semilla.txt";
+
+/// El contenido de ese fichero, para poder afirmar que la restauración lo devuelve.
+pub(crate) const SEMILLA_CONTENIDO: &[u8] = b"contenido-de-la-semilla\n";
+
+/// Acceso a un repositorio **local** de prueba.
+///
+/// El [`Acceso`](crate::rustic::Acceso) describe un repositorio de S3 —es lo que el §3
+/// guarda y lo que la API pública construye—, así que los campos que solo tienen sentido
+/// para S3 se rellenan con valores de mentira. Los dos que sí se usan son la `passphrase`
+/// —la clave con la que se abre el repositorio— y el `endpoint`, que aquí lleva **la
+/// ruta** del directorio y es, por eso, el nombre con el que los motivos de error nombran
+/// el destino: una prueba tiene que poder comprobar que el motivo señala el sitio del que
+/// habla.
+pub(crate) fn acceso_local(ruta: &Path, passphrase: &str) -> crate::rustic::Acceso {
+    crate::rustic::Acceso {
+        endpoint: ruta.to_string_lossy().into_owned(),
+        bucket: "cubo-de-prueba".to_owned(),
+        region: "region-de-prueba".to_owned(),
+        access_key_id: "clave-de-acceso-de-prueba".to_owned(),
+        secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+        passphrase: SecretString::new(passphrase.to_owned()),
+    }
+}
+
+/// Los backends de un repositorio **local** sobre el directorio dado.
+///
+/// Es la mitad de la puesta en marcha que en producción construye el backend de S3: la
+/// función que los recibe ya construidos existe justo para que las pruebas puedan
+/// entregar éstos.
+pub(crate) fn backends_locales(ruta: &Path) -> RepositoryBackends {
+    let backend: Arc<dyn WriteBackend> = Arc::new(
+        LocalBackend::new(ruta.to_string_lossy().as_ref(), Vec::new())
+            .expect("el backend local del arnés se construye sobre cualquier ruta"),
+    );
+
+    RepositoryBackends::new(backend, None)
+}
+
+/// Barras del motor que no hacen nada con los avisos.
+///
+/// El progreso tiene sus propias pruebas en `src/rustic/progreso.rs`: aquí estorba, pero
+/// no se puede omitir porque la biblioteca las pide en cada operación.
+pub(crate) fn barras_mudas() -> BarrasDelMotor {
+    BarrasDelMotor::nuevas(Arc::new(|_aviso: AvisoDeProgreso| {}))
+}
+
+/// Abre el repositorio local del directorio dado, con la biblioteca y sin pasar por el
+/// módulo.
+///
+/// Es el camino del **lector**: un operador que recupera una copia no usa el motor de
+/// Kesto, usa la biblioteca. Que las pruebas lean por aquí es lo que hace que lo que
+/// comprueban sea el contenido del repositorio y no lo que el módulo dice haber escrito.
+pub(crate) fn abrir_local(ruta: &Path, passphrase: &str) -> Repository<OpenStatus> {
+    Repository::new(&RepositoryOptions::default(), &backends_locales(ruta))
+        .expect("el repositorio local se construye")
+        .open(&Credentials::Password(passphrase.to_owned()))
+        .expect("el repositorio local de prueba se abre con su passphrase")
+}
+
+/// El snapshot que el repositorio guarda con ese identificador, leído del repositorio.
+///
+/// El identificador entra en **hex completo**, nunca en la forma corta de ocho caracteres
+/// que da su `Display`: es un prefijo ambiguo y con dos snapshots que empiecen igual
+/// resolvería el que no es.
+pub(crate) fn snapshot_guardado(ruta: &Path, passphrase: &str, id: &str) -> SnapshotFile {
+    let repositorio = abrir_local(ruta, passphrase);
+
+    repositorio
+        .get_snapshots(&[id])
+        .expect("el snapshot del identificador dado se lee del repositorio")
+        .into_iter()
+        .next()
+        .expect("el identificador tiene que resolver exactamente un snapshot")
+}
+
+/// Los bytes del fichero `nombre` tal y como quedaron en el snapshot `id`.
+///
+/// Devuelve `None` cuando el snapshot **no tiene** ese fichero, y el `Option` no es
+/// comodidad: «el volcado no está dentro» es un desenlace real y medido —el archivado de
+/// la biblioteca descarta la entrada que falla y guarda el snapshot sin ella—, así que
+/// tiene que poder afirmarse sin que la prueba confunda «no está» con «no se pudo leer».
+pub(crate) fn volcado_guardado(
+    ruta: &Path,
+    passphrase: &str,
+    id: &str,
+    nombre: &str,
+) -> Option<Vec<u8>> {
+    let repositorio = abrir_local(ruta, passphrase);
+    let snapshot = repositorio
+        .get_snapshots(&[id])
+        .expect("el snapshot del identificador dado se lee del repositorio")
+        .into_iter()
+        .next()
+        .expect("el identificador tiene que resolver exactamente un snapshot");
+    let indexado = repositorio
+        .to_indexed()
+        .expect("el índice del repositorio de prueba se lee");
+
+    let Ok(nodo) = indexado.node_from_snapshot_and_path(&snapshot, nombre) else {
+        return None;
+    };
+
+    let mut salida = Vec::new();
+    indexado
+        .dump(&nodo, &mut salida)
+        .expect("un nodo de fichero se vuelca al buffer");
+
+    Some(salida)
+}
+
+/// El instante de una fecha escrita en RFC 3339, con la zona de `UTC` colgada.
+///
+/// La fecha entra como texto porque es la forma en que una prueba la nombra; la conversión
+/// pasa por el **instante** —que es lo que una fecha dice de verdad— y no por un análisis
+/// de fecha civil con zona, que exigiría escribir la zona dentro del propio texto.
+fn instante(fecha: &str) -> Zoned {
+    fecha
+        .parse::<Timestamp>()
+        .expect("la fecha de la prueba es un instante en RFC 3339")
+        .to_zoned(TimeZone::UTC)
+}
+
+/// Lo que dejó una siembra de instantáneas.
+///
+/// El camino del fichero dentro del árbol se devuelve porque **no se puede adivinar**: un
+/// origen local archiva las rutas tal y como se las da el sistema de ficheros, así que el
+/// árbol reproduce el camino de la fuente sin su barra inicial, y quien quiera restaurar el
+/// fichero necesita ese camino. Devolverlo aquí es lo que hace que las pruebas de retención
+/// comprueben que el contenido **sigue ahí** en vez de que la instantánea sigue listada.
+pub(crate) struct Siembra {
+    /// Los identificadores, en hex completo, en el orden de las fechas que se pidieron.
+    pub identificadores: Vec<String>,
+    /// El camino del fichero sembrado **dentro del árbol** de cada instantánea.
+    pub nodo: String,
+}
+
+/// Deja en el destino un snapshot por cada fecha, todos con el **mismo árbol real**, y
+/// devuelve sus identificadores en hex completo en el orden de `fechas`.
+///
+/// Se siembra con la **biblioteca** y no con el módulo por un motivo que decide la prueba:
+/// el sello de tiempo de un snapshot es el del momento en que se archivó, y un módulo que
+/// lo eligiera sería un módulo que miente sobre cuándo se copió. La retención, en cambio,
+/// se decide por fechas, así que una prueba de retención necesita fechas que no dependan
+/// del reloj: con tres días distintos, una regla diaria de uno solo puede conservar
+/// exactamente uno, corra la prueba a la hora que corra.
+///
+/// El árbol es de verdad —se archiva un directorio de verdad— porque la purga lo recorre
+/// para saber qué datos siguen referenciados: un árbol inventado haría que el `prune`
+/// fallara por una razón que no tiene nada que ver con lo que se prueba.
+///
+/// El destino tiene que estar **vacío**: esto inicializa el repositorio.
+pub(crate) fn sembrar_snapshots(ruta: &Path, passphrase: &str, fechas: &[&str]) -> Siembra {
+    let backends = backends_locales(ruta);
+    let credenciales = Credentials::Password(passphrase.to_owned());
+
+    let repositorio = Repository::new(&RepositoryOptions::default(), &backends)
+        .expect("el repositorio local se construye")
+        .init(
+            &credenciales,
+            &KeyOptions::default(),
+            &ConfigOptions::default(),
+        )
+        .expect("un destino vacío se inicializa");
+
+    // La fuente del árbol, en **su** directorio temporal: al soltarse se borra, y para
+    // entonces los datos ya están dentro del repositorio.
+    let fuente = directorio_de_prueba();
+    let fichero = fuente.ruta().join(SEMILLA);
+    std::fs::write(&fichero, SEMILLA_CONTENIDO).expect("el fichero de la semilla se escribe");
+    // El camino del nodo dentro del árbol: el de la fuente sin su barra inicial, que es
+    // como lo guarda la biblioteca.
+    let nodo = fichero.to_string_lossy().trim_start_matches('/').to_owned();
+
+    let instantanea = SnapshotFile::from_options(
+        &SnapshotOptions::default()
+            .label(ETIQUETA_SEMBRADA.to_owned())
+            .host("host-sembrado".to_owned())
+            .command("comando-sembrado".to_owned()),
+    )
+    .expect("la instantánea sembrada se construye");
+    let rutas = vec![fuente.ruta().to_path_buf()];
+    let origen = LocalSource::new(
+        LocalSourceSaveOptions::default(),
+        &Excludes::default(),
+        &LocalSourceFilterOptions::default(),
+        &rutas,
+    )
+    .expect("la fuente local de la semilla se construye");
+
+    let indexado = repositorio
+        .to_indexed()
+        .expect("el índice del repositorio recién creado se lee");
+    let modelo = indexado
+        .archive(&BackupOptions::default(), &origen, instantanea, &rutas)
+        .expect("la semilla se archiva");
+
+    // Las copias con fecha: mismo árbol, mismo resumen y misma etiqueta, otro sello de
+    // tiempo. El identificador se deja en blanco porque lo calcula la biblioteca al
+    // guardar —es el resumen del contenido, y el contenido cambia con la fecha—.
+    let copias: Vec<SnapshotFile> = fechas
+        .iter()
+        .map(|fecha| {
+            let mut copia = modelo.clone();
+            copia.time = instante(fecha);
+            copia.id = SnapshotId::default();
+            copia
+        })
+        .collect();
+
+    indexado
+        .save_snapshots(copias)
+        .expect("las copias sembradas se guardan");
+    indexado
+        .delete_snapshots(&[modelo.id])
+        .expect("la instantánea que sirvió de modelo se retira");
+
+    // Los identificadores, en el orden de `fechas`: el que la biblioteca calculó al
+    // guardar no se puede predecir desde aquí, así que se leen del repositorio y se
+    // emparejan por su fecha.
+    let identificadores: Vec<String> = indexado
+        .list::<SnapshotId>()
+        .expect("el repositorio lista sus snapshots")
+        .map(|id| id.to_hex().as_str().to_owned())
+        .collect();
+    let guardados = indexado
+        .get_snapshots(&identificadores)
+        .expect("los snapshots sembrados se leen del repositorio");
+
+    let identificadores = fechas
+        .iter()
+        .map(|fecha| {
+            let buscada = instante(fecha);
+
+            guardados
+                .iter()
+                .find(|snapshot| snapshot.time == buscada)
+                .expect("la fecha sembrada tiene que estar en el repositorio")
+                .id
+                .to_hex()
+                .as_str()
+                .to_owned()
+        })
+        .collect();
+
+    Siembra {
+        identificadores,
+        nodo,
+    }
 }
 
 /// Configuración válida que apunta a una base de datos dada.

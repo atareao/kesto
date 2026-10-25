@@ -73,37 +73,7 @@ use std::time::Duration;
 use rustic_core::repofile::{Metadata, Node, NodeType};
 use rustic_core::{ErrorKind, ReadSource, ReadSourceEntry, RusticError, RusticResult};
 
-/// Error del trato con la biblioteca de copia.
-///
-/// Es el tipo que la segunda mitad de este módulo hará crecer: aquí solo está lo que el puente
-/// puede rechazar **antes** de llegar a la biblioteca, más los dos desenlaces del productor —el
-/// archivado que se rinde y la espera que se agota—, que son la única clase de fallo que este
-/// módulo puede convertir en un error en vez de en un pánico.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// El nombre del volcado no sirve como nombre de fichero.
-    #[error("el nombre del volcado no puede estar vacío ni llevar separadores: {nombre:?}")]
-    NombreDeVolcadoInvalido { nombre: String },
-
-    /// El productor dejaría de esperar a un lector que ya no lee.
-    #[error(
-        "el archivado del volcado `{nombre}` se rindió y ya nadie lee del túnel: el productor \
-         tiene que terminar su bucle y morir, sin entrar en pánico —un pánico aquí deja el hilo \
-         envenenado y la unión de la copia se cuelga—"
-    )]
-    ElArchivadoSeRindio { nombre: String },
-
-    /// El lector llevaba demasiado tiempo sin recibir un solo byte.
-    #[error(
-        "el volcado `{nombre}` lleva más de {inactividad:?} sin entregar un solo byte: el \
-         productor puede estar muerto o atascado, y el canal sigue abierto porque su extremo vive \
-         en alguna parte —archivarlo así daría por buena una copia incompleta—"
-    )]
-    VolcadoEstancado {
-        nombre: String,
-        inactividad: Duration,
-    },
-}
+use super::Error;
 
 /// Las dos mitades de un origen de volcado, más la señal de si el volcado llegó entero.
 ///
@@ -793,9 +763,14 @@ mod tests {
     /// acierto sea `Debug`, y el túnel no lo lleva: lo único que publicaría de sí mismo es el
     /// nombre que el propio error ya trae consigo.
     ///
-    /// El `match` va **sin comodín**: si la segunda mitad añade casos a [`Error`], el compilador
-    /// señala este ayudante y quien lo toque tendrá que decidir qué espera de los casos nuevos,
-    /// en vez de que un `_` los diera por buenos en silencio.
+    /// El `Err(otro)` es un **comodín**, y hay que decirlo porque la versión anterior de este
+    /// comentario prometía lo contrario: `Error` tiene ahora **diez** variantes —las siete que
+    /// trajo la segunda mitad de este módulo están en `error.rs`— y el compilador no señaló
+    /// este ayudante al añadirlas, porque el comodín se las traga todas. Lo que este ayudante
+    /// comprueba es una sola cosa —que un nombre rechazado no llegue como otro fallo—, y para
+    /// eso el comodín basta; lo que **no** hace es avisar por compilación de una variante
+    /// nueva, así que quien añada una que también signifique «el nombre no sirve» tiene que
+    /// acordarse de mirar aquí.
     fn nombre_rechazado(tunel: Result<TunelDelVolcado, Error>) -> String {
         match tunel {
             Err(Error::NombreDeVolcadoInvalido { nombre }) => nombre,
