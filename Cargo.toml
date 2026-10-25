@@ -111,6 +111,85 @@ time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "ser
 # drags in is a second major and unavoidable -- it predates this change.
 base64 = "0.22.1"
 
+# Backup engine (backup-engine): the Docker API, the rustic backup library and
+# the stream plumbing between them. Unlike every block above, this one was NOT
+# resolved against an offline cache -- it is the first change in this repository
+# that needs the network to resolve, and the resulting `Cargo.lock` is part of
+# the deliverable, because CI runs `cargo test --locked`.
+#
+# `bollard` is the Docker API, and that is the whole reason it is here: the
+# extraction step in SRS section 4 runs the dump command with `docker exec` on
+# the database container, so the engine has to talk to the daemon rather than
+# shell out to a CLI. WHERE the daemon lives is deliberately not fixed in this
+# file nor in the code: this development machine has no Docker at all -- it runs
+# Podman, whose API is Docker-compatible, on
+# unix:///run/user/1000/podman/podman.sock -- so the endpoint is taken from
+# `DOCKER_HOST`, the conventional variable the library itself reads. Production
+# keeps the compose mount of /var/run/docker.sock, which is that variable's
+# default when it is unset.
+#
+# `rustic_core` 0.13.0 + `rustic_backend` 0.7.0 are the backup library, split in
+# two crates: the repository format and the backend transports. The pair is
+# declared at 0.x because that is how upstream ships it, and the important part
+# is that the two lines must not drift apart: `rustic_backend` declares
+# `rustic_core = "0"`, so any 0.x of `rustic_core` satisfies it and the resolver
+# unifies both on the SAME crate. Verified after resolving: one single
+# `rustic_core` in `Cargo.lock`. Pinning `rustic_core` to an exact minor is what
+# keeps a future `rustic_backend` bump from silently dragging a second copy in.
+#
+# `rustic_backend` with `default-features = false, features = ["opendal"]`: its
+# defaults are ["opendal", "rest", "rclone"], and this project only ever writes
+# to S3, which opendal is. `rest` and `rclone` are two transports -- an HTTP
+# REST server and a subprocess pipe to the rclone binary -- that Kesto never
+# speaks, so leaving them on would compile code that can never run and, in the
+# rclone case, imply an external binary the runtime image does not ship.
+#
+# `futures-util` is a PROMOTION, not a new crate in the tree: it is already
+# present as a transitive dependency (`futures-util` 0.3.34 sits in `Cargo.lock`
+# today, pulled in by axum/tower machinery). The version is pinned to the one
+# already there precisely so that promoting it does not fork it. The promotion
+# is needed because `bollard`'s log and progress endpoints return a `Stream`,
+# and draining that stream requires `StreamExt::next()` -- a trait method, so a
+# transitive dependency is not enough: the trait has to be in scope by name.
+# Same reasoning as the `base64` promotion above, and the same consequence: a
+# crate in `[dependencies]` is already available to tests, so it is not repeated
+# under `[dev-dependencies]`.
+#
+# MSRV: both libraries ask for 1.91 and this project is on `edition = "2024"`
+# (>= 1.85) with a toolchain of 1.97, so the floor is met with room to spare.
+#
+# NOT used, on purpose: `opendal` and `jiff`. `opendal` arrives through
+# `rustic_backend`'s `opendal` feature, and `jiff` is re-exported by
+# `rustic_core` -- the engine takes the clock from `rustic_core::jiff::Zoned::now()`
+# -- so neither needs a line here. `time` and `chrono` are NOT declared either:
+# `time` is already declared above and stays a single 0.3.55. Note the tree did
+# gain a `chrono` 0.4.45 that nothing here asked for -- it hangs off
+# `opendal-service-ftp` -> `suppaftp`, i.e. a transport Kesto never uses -- so
+# it is a passenger, not a decision. It does NOT make `time` and `chrono`
+# collide: no crate here feeds one into the other.
+#
+# MEASURED AFTER RESOLVING -- the RustCrypto fork did reopen, and this is the
+# data, not a suspicion. `rustic_core` 0.13.0 pulls `scrypt` 0.12.0 ->
+# `pbkdf2` 0.13 / `salsa20` 0.11 / `cipher` 0.5, and `opendal` 0.58.2 pulls
+# `reqsign-core` / `reqsign-aws-v4` / `opendal-service-swift`; both need the
+# `hybrid-array` generation, where the `aes-gcm` 0.10 / `hkdf` 0.12 / `sha2` 0.10
+# block above needs the `generic-array` one. The result, side by side in
+# `Cargo.lock`: `digest` 0.10.7 + 0.11.3, `crypto-common` 0.1.7 + 0.2.2,
+# `block-buffer` 0.10.4 + 0.12.1, `hmac` 0.12.1 + 0.13.0, `sha2` 0.10.9 + 0.11.1,
+# `sha1` 0.10.7 + 0.11.0, `md-5` 0.10.6 + 0.11.0, `pbkdf2` 0.12.2 + 0.13.0,
+# `scrypt` 0.11.0 + 0.12.0, `salsa20` 0.10.2 + 0.11.0, `cipher` 0.4.4 + 0.5.2,
+# `inout` 0.1.4 + 0.2.5, `const-oid` 0.9.6 + 0.10.2, `cpufeatures` 0.2.17 + 0.3.1,
+# and `rand_core` 0.6.4 + 0.9.5 + 0.10.1, all three now present. `generic-array`
+# 0.14.7 and `hybrid-array` 0.4.15 each stay single -- the fork is the two
+# generations coexisting, not a duplicate within one. This is RECORDED, not
+# fixed: no existing version line was changed to square the tree, because the
+# deduplication decision belongs to whoever owns the engine change. Read this
+# before touching a version in either block.
+bollard = "0.18.1"
+rustic_core = "0.13.0"
+rustic_backend = { version = "0.7.0", default-features = false, features = ["opendal"] }
+futures-util = "0.3.34"
+
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1"
