@@ -141,7 +141,7 @@ Tras un snapshot correcto, la retención SHALL aplicarse con los tres parámetro
 
 Las tres operaciones son la interfaz de la biblioteca y no un reparto de gusto: los parámetros de retención **no** son parámetros del `prune`. Viven en las reglas de retención, que se evalúan sobre los snapshots para producir la lista de los que hay que retirar; retirarlos es una operación aparte; y reclamar el espacio que ocupaban es el `prune`, que sí se calcula y se **mira** antes de ejecutarlo. Quien los confunda escribe un motor que purga datos que nunca dejaron de estar referenciados, o que retira snapshots sin reclamar nada. El SRS describe el flujo en dos tiempos —«evaluación del árbol de snapshots» y después «eliminación de datos huérfanos»—, que es esta misma secuencia con la retirada de los snapshots implícita en la primera mitad.
 
-Con ninguno de los tres informados la biblioteca rechaza la operación por no tener ninguna regla; aquí no puede pasar, porque las tres columnas del §3 son obligatorias. Y que la retención no tumbe la copia es lo que corresponde: si la copia terminó bien y la purga falla, lo que hay que reportar es que la copia está y la purga no, no que la copia falló.
+Con ninguno de los tres informados la biblioteca rechaza la operación por no tener ninguna regla; aquí no puede pasar, porque las tres columnas del §3 son obligatorias. Y que la retención no tumbe la copia es lo que corresponde: si la copia terminó bien y la purga falla, lo que hay que reportar es que la copia está y la purga no, no que la copia falló. Un cero suelto es una decisión —«de esta regla no conserves ninguna»— y el motor la respeta; lo que no es una decisión es que las **tres** sean cero, porque entonces no hay ninguna regla que conserve nada, la biblioteca acepta el juego por válido y el resultado no es una retención que conserva de menos sino la retirada de **todo** el historial del repositorio, incluida la copia que se acaba de hacer. El esquema, además, no pone cota a esas columnas: pone un valor por defecto, que no es lo mismo.
 
 #### Scenario: Los tres keep_ del esquema deciden qué snapshots se retiran
 - **GIVEN** una tarea con `keep_daily = 7`, `keep_weekly = 4` y `keep_monthly = 12` sobre un repositorio con snapshots de varias fechas
@@ -168,13 +168,20 @@ Con ninguno de los tres informados la biblioteca rechaza la operación por no te
 - **THEN** su estado SHALL ser `success`
 - **AND** el fallo de la retención SHALL quedar registrado
 
+#### Scenario: Una retención que no conservaría nada se rechaza
+- **GIVEN** una tarea con las tres reglas de retención a cero
+- **WHEN** se aplica la retención
+- **THEN** SHALL fallar con un motivo propio que nombre las tres columnas
+- **AND** NO SHALL retirarse ningún snapshot
+- **AND** un cero suelto acompañado de otra regla informada SHALL seguir siendo una retención válida
+
 ### Requirement: Los snapshots se listan desde el repositorio y no desde la base
 
 `GET /api/v1/snapshots?repository_id=<id>` SHALL obtener los snapshots preguntándole al **repositorio**, y NO SHALL deducirlos de las filas de `job_executions`. La lista SHALL estar acotada en número y SHALL informar de cada snapshot su identificador, su fecha, sus rutas, su etiqueta y su resumen de tamaño y número de ficheros.
 
 El §5 llama a esta ruta «explorador de snapshots en el almacenamiento S3», y esa frase decide de dónde sale la respuesta: del almacenamiento. La base sabe qué copias **se intentaron**; el repositorio sabe qué copias **están**. Son dos listas distintas y la diferencia es justamente lo que hace útil el explorador: un snapshot que está en el repositorio y no en el histórico es una copia que alguien hizo con otra herramienta, y una ejecución en el histórico sin snapshot en el repositorio es una copia que se dio por buena y no está. Deduplicar la segunda lista de la primera escondería ese caso.
 
-La lectura de la lista es la parte más cara de este change —hay que abrir el repositorio y recorrer su índice—, así que la ruta SHALL acotar la ventana y NO SHALL recorrer el repositorio entero para contestar.
+La lectura de la lista es la parte más cara de este change —hay que abrir el repositorio y recorrer su índice—, así que la ruta SHALL acotar la ventana y NO SHALL recorrer el repositorio entero para contestar. No es una limitación de conveniencia sino del formato: el identificador de un snapshot es el nombre de un fichero y no lleva fecha, así que acotar antes de resolver es la única forma de no recorrer el repositorio entero — y acotar antes de resolver implica que el subconjunto devuelto no tiene por qué ser el de los más recientes. Lo que sí se garantiza es el orden de lo que se devuelve, y que quien pregunte sepa que hay más.
 
 #### Scenario: El listado sale del repositorio
 - **GIVEN** un repositorio que contiene snapshots creados por Kesto y alguno creado por otra herramienta
@@ -192,6 +199,12 @@ La lectura de la lista es la parte más cara de este change —hay que abrir el 
 - **WHEN** se pide el listado
 - **THEN** el número devuelto NO SHALL superar la ventana
 - **AND** la respuesta SHALL indicar que hay más
+
+#### Scenario: La ventana acota el número y no promete antigüedad
+- **GIVEN** un repositorio con más snapshots que la ventana
+- **WHEN** se pide el listado
+- **THEN** lo devuelto SHALL venir ordenado de más reciente a más antigua
+- **AND** el subconjunto devuelto NO SHALL prometerse como el de los más recientes
 
 #### Scenario: Cada snapshot trae lo que pide el panel
 - **GIVEN** un repositorio con al menos un snapshot

@@ -110,3 +110,28 @@ Las tres son superficie de negocio: el disparo escribe, y el stream y el explora
 - **GIVEN** la lista de rutas que no exigen sesión
 - **WHEN** se revisa
 - **THEN** NO SHALL contener ninguna de las tres rutas nuevas
+
+### Requirement: El alta y la edición de una tarea rechazan una retención que no conservaría nada
+
+`POST /api/v1/jobs` y `PUT /api/v1/jobs/:id` SHALL rechazar con `400` y con la envoltura una tarea cuyas **tres** reglas de retención sean cero, nombrando las tres columnas. Un cero suelto acompañado de otra regla informada NO SHALL rechazarse.
+
+No es una validación de cortesía: con las tres a cero no hay ninguna regla que conserve nada, así que la retención no conserva de menos, **borra todo** el historial del repositorio en la siguiente copia —incluida la que se acaba de hacer—. El esquema del §3 pone un valor por defecto a esas tres columnas pero **no una cota**, así que el valor entra por la API y entra a mano; rechazarlo aquí es lo que evita que el error se cometa sin querer. El motor tiene además su propio guardarraíl, porque una fila escrita directamente en la base no pasa por aquí: las dos capas existen porque protegen de dos caminos distintos.
+
+#### Scenario: Una tarea con las tres reglas a cero se rechaza al darla de alta
+- **GIVEN** un cuerpo con las tres reglas de retención a cero
+- **WHEN** se da de alta la tarea
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el motivo SHALL nombrar las tres columnas
+- **AND** NO SHALL quedar fila en la base
+
+#### Scenario: Una tarea con las tres reglas a cero se rechaza al editarla
+- **GIVEN** una tarea existente y un cuerpo que pone sus tres reglas a cero
+- **WHEN** se edita
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** la fila SHALL quedar como estaba
+
+#### Scenario: Un cero suelto se acepta
+- **GIVEN** un cuerpo con una regla a cero y otra informada
+- **WHEN** se da de alta la tarea
+- **THEN** SHALL contestar `201` con la envoltura
+- **AND** SHALL quedar la fila con esos valores
