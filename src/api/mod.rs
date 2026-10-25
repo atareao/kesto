@@ -5,10 +5,13 @@ pub mod extract;
 pub mod health;
 pub mod repositories;
 pub mod response;
+pub mod targets;
 
 use axum::Router;
 use axum::routing::{get, post};
+use serde::Serialize;
 
+use crate::api::response::Data;
 use crate::auth::middleware;
 use crate::error::AppError;
 use crate::state::{AppState, AuthState};
@@ -42,7 +45,8 @@ pub fn api_router(state: AppState) -> Router {
             let negocio = Router::new()
                 .route("/api/v1/auth/logout", post(auth::logout))
                 .route("/api/v1/auth/session", get(auth::session))
-                .merge(repositories::router());
+                .merge(repositories::router())
+                .merge(targets::router());
 
             public.merge(protected_router(negocio, auth))
         }
@@ -52,7 +56,9 @@ pub fn api_router(state: AppState) -> Router {
         // ninguna capa, así que las rutas de negocio quedan públicas, que es lo que el
         // modo de desarrollo significa. Sin esto, `just dev` contestaría `404` en cada
         // recurso y no habría forma de dar de alta nada sin un proveedor de identidad.
-        None => public.merge(repositories::router()),
+        None => public
+            .merge(repositories::router())
+            .merge(targets::router()),
     };
 
     router
@@ -137,6 +143,26 @@ async fn not_found() -> AppError {
 /// Fallback de los métodos no declarados: `405` con la envoltura de error.
 async fn metodo_no_permitido() -> AppError {
     AppError::MethodNotAllowed("el método no está permitido en esta ruta".to_owned())
+}
+
+/// Serializa una vista del cable al `data` de la envoltura.
+///
+/// Vive aquí, y no en cada módulo de recurso, porque **los cuatro** recursos lo necesitan
+/// igual: una copia por recurso serían cuatro sitios donde arreglar el mismo fallo. Existe
+/// porque `serde_json::to_value` devuelve `Result` y un manejador no puede abortar con
+/// `panic!`: un fallo aquí es un `500` con la causa al registro, que es lo que el resto de la
+/// API hace con lo que no debería ocurrir.
+///
+/// El mensaje **no** lleva el valor serializado, y eso no es una garantía de `serde_json`
+/// sino de estos tipos: `serde_json` mete en su error el texto que le dé un serializador
+/// propio —`ser::Error::custom`—, así que la propiedad se sostiene mientras ninguna vista del
+/// cable declare un `serialize_with` que formatee un valor. La red de verdad es de antes: una
+/// respuesta que llevara un secreto no compila, porque [`crate::secret::SecretString`] no
+/// implementa `Serialize`.
+pub(crate) fn contenido<T: Serialize>(vista: &T) -> Result<Data, AppError> {
+    serde_json::to_value(vista)
+        .map(Data::Some)
+        .map_err(|error| AppError::Other(format!("la respuesta no se pudo serializar: {error}")))
 }
 
 #[cfg(test)]

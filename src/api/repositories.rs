@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::api::contenido;
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
 use crate::db::entities::{AltaDeRepositorio, Repositorio};
@@ -140,24 +141,6 @@ impl RepositorioDelCable {
             })?,
         })
     }
-}
-
-/// Serializa una vista del cable al `data` de la envoltura.
-///
-/// Existe porque `serde_json::to_value` devuelve `Result` y un manejador no puede abortar
-/// con `panic!`: un fallo aquí es un `500` con la causa al registro, que es lo que el resto
-/// de la API hace con lo que no debería ocurrir.
-///
-/// El mensaje no lleva el valor serializado, y eso **no** es una garantía de `serde_json`
-/// sino de estos tipos: `serde_json` sí mete en su error el texto que le dé un serializador
-/// propio —`ser::Error::custom`—, así que la propiedad se sostiene mientras ninguna vista
-/// del cable declare un `serialize_with` que formatee un valor. La red de verdad es de
-/// antes: una respuesta que llevara un secreto no compila, porque
-/// [`crate::secret::SecretString`] no implementa `Serialize`.
-fn contenido<T: Serialize>(vista: &T) -> Result<Data, AppError> {
-    serde_json::to_value(vista)
-        .map(Data::Some)
-        .map_err(|error| AppError::Other(format!("la respuesta no se pudo serializar: {error}")))
 }
 
 /// Convierte el identificador de la ruta en un `Uuid`, o contesta `400`.
