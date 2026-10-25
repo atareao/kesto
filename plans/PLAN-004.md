@@ -88,7 +88,20 @@ Medido: `axum` 0.8.9 trae `json` y `query` en sus features por defecto y este `C
 
 ## Auditado y corregido
 
-*(Se rellena al cerrar, con los hallazgos que devuelva la auditoría independiente de cada módulo y lo que se corrigió.)*
+### Módulo 1 — el estado, los tipos del cable y la traducción de los errores
+
+RED medido: **157 passed; 5 failed** de 162 en el binario —los dos rojos de `src/api/repositories.rs` y los tres de `src/error.rs`— y **1 passed** en la de integración. GREEN: **162 passed; 0 failed** más la de integración. Tras el incremento correctivo: **164 passed; 0 failed** más la de integración.
+
+La auditoría independiente encontró **un defecto de seguridad bloqueante** y lo midió **en vivo** contra el binario: el extractor `axum::Json` rechaza **antes** de entrar al manejador y su rechazo por defecto sale en `text/plain`, con `422` y con el valor del campo **ecoado dentro**. El director lo reprodujo sobre su propio binario y en un puerto limpio, con el cuerpo entero igual a la credencial —`Failed to deserialize the JSON body into the target type: invalid type: string "AKIAIOSFODNN7EXAMPLE", expected struct …`— y con la credencial como nombre de un campo de más. El registro del servidor **no** la llevaba: la fuga era al cliente.
+
+Corrección: un extractor propio, `src/api/extract.rs`, que envuelve a `axum::Json` para quedarse con su camino real de extracción —tipo de contenido, lectura del cuerpo y deserialización— y traduce el rechazo a la envoltura: `400` con `{status, message}` y un mensaje **nuestro** por clase de fallo, más un `tracing::warn!` que deja constancia de **que** una petición no se pudo interpretar, **sin** su texto. Lo usan los dos manejadores con cuerpo. Cerrado con las pruebas 1.23 y 1.24 y verificado otra vez en el cable real: `400` con `application/json`, cero apariciones de la credencial en el cuerpo **y** en el registro, y el alta válida intacta en `201`.
+
+Los demás hallazgos de esa auditoría, en corto:
+
+- **Una laguna de cobertura** que explicaba el bloqueante —ninguna prueba miraba el **tipo de contenido** de un rechazo, así que un `400` en texto plano pasaba inadvertido—: cerrada por 1.23 y 1.24.
+- **Una justificación falsa** en el doc-comment del booleano por credencial —decía que el formulario, el cuerpo y la columna se llaman igual, y el cuerpo informa `secret_access_key`, no `has_secret_access_key`—: reescrita, y la tensión entre el requisito que manda llamar a los campos como las columnas del §3 y el booleano del requisito 8 queda **declarada como añadido al SRS** en el `proposal` y en la spec, en vez de quedar como una contradicción.
+- **La precisión del doc-comment de `contenido`**: afirmaba que la causa de `serde_json` no lleva el valor, y eso no es una garantía del crate sino de estos tipos de respuesta; ahora lo dice así.
+- **Un hallazgo rechazado, con su motivo**: los `400` de validación del manejador no dejan rastro propio en el registro, y no se añade. Lo que el contrato manda registrar es **que** una petición no se pudo interpretar —el cuerpo ilegible, que es un defecto de integración de quien llama y cuyo texto no se le puede devolver porque puede ecoar el valor—, y no cada validación que falle: un formulario rellenado mal es el desenlace normal de un `400`, ya le dice al cliente qué campo estaba mal, y no hay acción que tomar por él. Registrar cada uno cambiaría el ruido del cliente por ruido del operador.
 
 ## Verificación
 
@@ -103,6 +116,7 @@ Medido: `axum` 0.8.9 trae `json` y `query` en sus features por defecto y este `C
 - **`PUT` es reemplazo completo, sin `PATCH`**: el panel siempre tiene el objeto entero porque lo ha leído antes.
 - **Los ayudantes internos de la capa de acceso siguen copiados en las cuatro capas** (heredado de `db-schema`).
 - **Las más de treinta construcciones de `AppState`** que hereda el arnés se ajustan a la firma nueva, y los siete ayudantes pasan a ser asíncronos: es un cambio ancho, mecánico y verificado por las 156 pruebas que ya existen, que tienen que seguir verdes afirmando lo mismo.
+- **Los tres manejadores que siguen sin implementar —`listado`, `actualizar` y `borrar` de `/repositories`— revientan si se alcanzan por la red**: son `todo!()` y llegan con el módulo 2. Medido: sin `CatchPanicLayer`, el `panic!` deja caer la tarea de la conexión, el cliente ve la conexión cerrada sin respuesta (`curl` contesta `000`) y el pánico sale en el registro del servidor. Queda declarado mientras dure la fase, para que nadie lo confunda con un fallo del servidor: ningún binario entregado debe tener un camino declarado y sin implementar.
 
 ## Cierre
 

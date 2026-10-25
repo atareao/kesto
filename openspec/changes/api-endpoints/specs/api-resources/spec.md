@@ -72,11 +72,13 @@ Los motivos están medidos y se escriben porque ninguno se deduce leyendo el có
 
 Los nombres de los campos SHALL ser los del §3, para que el formulario del panel, el cuerpo de la petición y la columna de la tabla se llamen igual y no haya tres vocabularios para un dato.
 
+La excepción son los booleanos por credencial del requisito «Un secreto no vuelve al cliente y la edición conserva el que no se envía»: `has_secret_access_key` y `has_passphrase` **no son campos del §3** —no hay ninguna columna con ese nombre, y el cuerpo del alta informa `secret_access_key`— y son un **añadido a este contrato**, como lo son las tres rutas de `/:id`. Su nombre antepone `has_` al de la columna para que se lean como un sí/no **sobre** ella —«el `secret_access_key` de la tabla, dicho como sí/no»— y no como un segundo vocabulario para el mismo dato.
+
 #### Scenario: El alta devuelve los campos con los nombres del §3
 - **GIVEN** un alta de repositorio atendida
 - **WHEN** se lee el cuerpo de la respuesta
 - **THEN** los campos SHALL llamarse como las columnas del §3 —`name`, `endpoint`, `bucket`, `region`, `access_key_id`—
-- **AND** NO SHALL aparecer ningún campo que no exista en la tabla
+- **AND** NO SHALL aparecer ningún campo que no exista en la tabla, salvo el booleano por credencial que exige el requisito «Un secreto no vuelve al cliente y la edición conserva el que no se envía»
 
 #### Scenario: El identificador llega como cadena con guiones
 - **GIVEN** un recurso dado de alta, con su identificador generado por la capa de acceso
