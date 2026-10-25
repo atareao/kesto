@@ -27,14 +27,14 @@ El planificador **no** entra en el `AppState`. El motor sí está ahí porque tr
 
 | Hecho | Medición |
 |---|---|
-| Versión | `tokio-cron-scheduler` **0.15.1**, publicada el 17-oct-2026 |
+| Versión | `tokio-cron-scheduler` **0.15.1**, publicada el 17-oct-2026, con `croner` **3.0.1**; **una sola copia** de cada uno en el árbol resuelto |
 | API del reloj | `JobScheduler::new()` → `add(Job) -> Uuid` → `start()` → `remove(&Uuid)` → `shutdown()`; además `next_tick_for_job()` y `time_till_next_job()` |
 | API que **no** se usa | `JobBuilder`, el trait `JobCode`, los almacenes `MetaDataStorage` / `NotificationStore` |
 | Analizador | depende de **`croner ^3.0.0`**, no del crate `cron` |
 | Fechas | depende de **`chrono` 0.4 y `chrono-tz`** de forma **no opcional** |
-| Segundos | `croner` acepta **cinco** campos (`0 3 * * *`) y **seis** (`0 0 3 * * *`) |
+| Segundos | el analizador **por defecto** de `croner` —`Seconds::Optional`, el `#[default]` del enum— acepta **cinco** campos (`0 3 * * *`) y **seis** (`0 0 3 * * *`); el que construye la **biblioteca del reloj** —`Seconds::Required` y `dom_and_dow(true)`, en sus cinco sitios— **rechaza** los de cinco con `ParseSchedule`. De ahí la normalización del módulo, que cuenta *La forma del cron* |
 | Caché local | ni `tokio-cron-scheduler` ni `croner` están en la caché de `~/.cargo/registry`, así que el `Cargo.lock` **necesita red** |
-| `chrono` en el árbol | ya está, por debajo: `cargo tree -i chrono` da **un solo** camino, `suppaftp` ← `opendal-service-ftp` ← `opendal` ← `rustic_backend` |
+| `chrono` en el árbol | ya estaba, por debajo: `cargo tree -i chrono` daba **un solo** camino, `suppaftp` ← `opendal-service-ftp` ← `opendal` ← `rustic_backend`; con el árbol nuevo da **cuatro** y sigue habiendo **una sola copia** (0.4.45). `chrono-tz` **0.10.4** entra nuevo por un solo camino |
 
 De ahí salen tres cosas que hay que hacer y no solo saber:
 
@@ -54,7 +54,13 @@ Lo que se usa es la mitad que no guarda nada: un reloj con tareas en memoria. La
 
 ## La forma del cron: cinco o seis campos, y en UTC
 
-`croner` acepta las dos formas clásicas —`0 3 * * *` sin segundos y `0 0 3 * * *` con ellos—, y eso permite validar **sin romper nada**: el §3 no impone el número de campos, el ejemplo del §5 no lo dice y todas las filas y pruebas del repositorio usan cinco. Exigir seis habría dejado inválido lo que ya está guardado; aceptar cinco y seis no pierde expresividad y no obliga a migrar nada.
+Las dos formas clásicas —`0 3 * * *` sin segundos y `0 0 3 * * *` con ellos— se siguen aceptando, y eso permite validar **sin romper nada**: el §3 no impone el número de campos, el ejemplo del §5 no lo dice y todas las filas y pruebas del repositorio usan cinco. Exigir seis habría dejado inválido lo que ya está guardado; aceptar cinco y seis no pierde expresividad y no obliga a migrar nada.
+
+Pero quién acepta qué es asimétrico, y **está medido**. El analizador **por defecto** de `croner` 3 (`Seconds::Optional`) acepta las dos formas; el que usa la **biblioteca del reloj** —construido en sus cinco sitios con **`Seconds::Required`** y **`dom_and_dow(true)`**— **rechaza** la de cinco con `ParseSchedule`, y el error literal de su analizador es `Invalid pattern: Pattern must have 6 or 7 fields when seconds are required and years are optional.` Validar con el analizador por defecto aceptaría expresiones que el reloj no sabe evaluar, que es justo el fallo que esta validación existe para evitar.
+
+De ahí la normalización, y es **del módulo**: anteponer `0 ` a la expresión **solo cuando el número de campos es exactamente 5**. No es una invención —es literalmente lo que `croner` hace con `Seconds::Optional`, `parts.insert(0, "0")` cuando `split_whitespace()` da cinco piezas—, reproducida a propósito para que la forma que se valida y la que se le entrega al reloj sean la misma. Las de seis y las de siete **no se tocan**: una de siete, con año, es válida y no hay nada que reescribir en ella. La validación y la evaluación usan **la misma configuración de analizador** —la de la biblioteca—, aplicada sobre la forma normalizada; el detalle fino que lo explica es que la comprobación posterior de `croner` cuenta los campos **antes** de insertar el `0`, y de ahí que con `Required` el `5` no pase.
+
+Y la normalización ocurre **en vuelo**, al construir el job, nunca en la fila: `backup_jobs.cron_expression` guarda lo que escribió el usuario. Así el panel devuelve la expresión que se tecleó, la edición no la reescribe sin que nadie lo haya pedido y no hay una migración implícita de datos que este change no necesita.
 
 La cadena **vacía** se nombra aparte aunque el analizador ya la rechace, porque es el valor que llega de verdad: `cron_expression` es `NOT NULL` en el §3, así que un formulario que manda el campo en blanco no produce un error de base, produce una fila con una cadena vacía —una tarea que existe, se lista, se pinta como programada y **no corre nunca**—. Nombrar el vacío por su nombre convierte ese caso en un motivo que se entiende.
 
@@ -114,7 +120,7 @@ La parada es donde está el matiz que no se deduce del resto. Hoy la forma es `s
 
 De ahí la frase que resume el requisito 6: **el planificador se para antes que el motor y arranca detrás de él**. Nada se encola después de que la parada empiece, y una ejecución ya encolada sigue siendo del motor y no del reloj.
 
-La parada del reloj está **acotada por un plazo**, y por qué hace falta medirlo antes de decidirlo es lo mismo que en el motor: si la biblioteca espera a un disparo en vuelo, un `shutdown()` sin plazo convierte un `docker stop` en una espera indefinida que el orquestador resuelve con un `SIGKILL`. La tarea 0.4 mide qué hace `shutdown()` con un job en vuelo; el plazo es lo que garantiza el requisito en cualquiera de los dos casos, y lo que no termine dentro de él se registra y el apagado continúa.
+La parada del reloj está **acotada por un plazo**, y lo que ese plazo acota hay que decirlo con la medición delante, porque no es lo que este documento suponía. `shutdown()` **no espera** a un disparo en vuelo: está medido que resuelve en **3,76 µs** con un job durmiendo cinco segundos, porque `Scheduler::shutdown()` es un `swap` de un flag y el cierre que estaba en vuelo sigue avanzando después —inobservable, porque su `JoinHandle` se descarta—; el único gancho que la biblioteca espera de verdad es `set_shutdown_handler`. Y tampoco basta con parar: está medido que un tick puede disparar **después** de que la parada empiece —**4 de 4** rondas, con desfases de 610–880 ms—, porque el bucle del `JobRunner` no mira ningún flag y el ticker lee el suyo una vez por vuelta, antes de un `sleep` de 500 ms. De ahí las dos cosas que obliga el diseño: **la garantía de que no se encola tras la parada es del módulo**, que cierra su propia puerta en la misma sección crítica que el encolado —un encolado o termina antes de que la puerta cierre o no empieza, y eso cubre también el tick que la biblioteca dispare después—; y el plazo acota **el drenaje del módulo** —su reconciliación y sus disparos—, no la llamada a `shutdown()`, que volvería en microsegundos aunque se la envolviera. Lo que no termine dentro del plazo se registra y el apagado continúa, porque un `docker stop` no puede convertirse en una espera indefinida que el orquestador resuelva con un `SIGKILL`.
 
 ## Una expresión que no parsea no impide arrancar
 
@@ -143,11 +149,17 @@ La validación no sustituye a la robustez del planificador: la validación prote
 | `add()` devuelve un `Uuid` que es el mango, y `remove(&Uuid)` es lo único que retira | Hay que llevar una tabla `job_id → Uuid` propia; un mango perdido deja una tarea planificada que nadie puede retirar y que dispara **dos veces** al reemplazarla |
 | La API de persistencia (`JobBuilder`, `JobCode`, `MetaDataStorage`/`NotificationStore`) existe y es cómoda | Usarla duplicaría la verdad: la tarea vive en `backup_jobs` y el panel la edita ahí |
 | Depende de `croner ^3`, **no** del crate `cron` | Declarar `cron` o `croner` en otro major daría dos gramáticas: la validación aceptaría lo que el reloj no entiende |
-| `croner` acepta segundos opcionales | Es lo que permite validar sin romper nada: cinco campos y seis son ambos válidos |
-| `chrono` y `chrono-tz` entran **no opcionales** | El árbol gana una segunda familia de fechas al lado del `time` elegido a conciencia. `chrono` ya estaba por debajo (`suppaftp` ← `opendal`), `chrono-tz` no |
+| `croner` acepta segundos opcionales | Cierto del analizador **por defecto**; el de la **biblioteca** exige seis (`Seconds::Required`), así que el módulo normaliza de cinco a seis en vuelo. Sigue permitiendo validar sin romper nada: cinco y seis son ambas válidas |
+| El mensaje de `croner` **no nombra** la expresión, y la biblioteca **descarta** su error (`map_err(|_| JobSchedulerError::ParseSchedule)`), cuyo `Display` es su `Debug` | El texto del rechazo lo escribe el módulo: nombra la expresión en el registro del arranque y el campo `cron_expression` en el `400`. Sin él, al operador le llega la palabra `ParseSchedule` y nada más |
+| `chrono` y `chrono-tz` entran **no opcionales** | El árbol gana una segunda familia de fechas al lado del `time` elegido a conciencia. `chrono` ya estaba por debajo (`suppaftp` ← `opendal`, una sola copia, 0.4.45), `chrono-tz` 0.10.4 entra nuevo |
 | Ni `tokio-cron-scheduler` ni `croner` están en la caché local de Cargo | El `Cargo.lock` necesita red y es entregable: el CI corre `cargo test --locked` |
-| El disparo es `async` y `encolar` también | El job tiene que ser de la variante asíncrona; la 0.2 mide cuál es, en vez de suponerla |
-| `shutdown()` con un job en vuelo | Es lo que hay que medir en la fase 0: si espera, la parada del planificador necesita el plazo, no la fe |
+| Toda la API del ciclo de vida es `async`, y el constructor con cierre es **`Job::new_async`** (`S: ToString`, cierre `FnMut(Uuid, JobsSchedulerLocked) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync`) | El disparo tiene que ser de la variante asíncrona, y `new_async` delega en `new_async_tz(..., Utc, ...)`: la zona por defecto ya es UTC, que es lo que la decisión de UTC pide |
+| Solo `shutdown`, `next_tick_for_job` y `time_till_next_job` piden `&mut self`; el resto de la API, no | El mango del planificador tiene que poder prestarse mutable para parar y para consultar la próxima ejecución, y no hace falta más |
+| `add()` y `remove()` llaman a `init()` por su cuenta, y `start()` después de apagar devuelve `Err(StartScheduler)` | No hay que inicializar a mano, y la parada es de **un solo sentido**: no se reanuda |
+| `remove` de un `Uuid` que no existe devuelve `Ok(())`, `add()` después de apagar devuelve `Ok(uuid)` sin disparar nunca, e `inited()` se queda en `true` tras la parada | La biblioteca no ofrece **ninguna** señal de estado: la tabla `job_id → Uuid` del módulo es la única autoridad de lo planificado, y la existencia de un mango no dice que la tarea siga planificada |
+| Cada disparo es un `tokio::spawn` propio, y el cuerpo del cierre corre bajo el candado de escritura del job hasta el `Box::pin` | El reloj **no** serializa nada —la serialización es del motor—, y el cierre no puede quedarse con el candado mientras espera |
+| El único gancho awaitable es `set_shutdown_handler`, y es lo único que `shutdown()` espera | La puerta del módulo no se puede delegar en la biblioteca: hay que cerrarla en la misma sección crítica que el encolado |
+| Los ejemplos de la documentación del crate son `rust,ignore` y **no compilan** | La referencia es el fuente de la 0.15.1, no los ejemplos |
 | El planificador es estado **efímero** | Al reiniciar no hay nada planificado hasta que la planificación inicial termina: la ventana entre el arranque y el primer tick planificado es real y se cierra antes de escuchar |
 
 ## Alternativas descartadas
@@ -155,6 +167,7 @@ La validación no sustituye a la robustez del planificador: la validación prote
 - **La persistencia de la biblioteca como almacén de las tareas.** Dos verdades: lo que el panel edita en `backup_jobs` y lo que el reloj tiene guardado. El fallo no da error, da una tarea que dispara con la expresión vieja.
 - **Avisar al planificador desde el alta, la edición y el borrado.** Acopla el borde HTTP al reloj y no cubre los cambios que no pasan por la API —una fila editada con `sqlite3`, una base restaurada—, que se quedarían sin corregir para siempre.
 - **Evaluar el `cron_expression` a mano, con un analizador propio o con el crate `cron`.** Sería una segunda gramática: lo que la validación acepte y lo que el reloj entienda podrían discrepar, y discreparían en los bordes —segundos, días de la semana— que es donde aparecen las expresiones raras.
+- **Validar con el analizador por defecto de `croner`, sin normalizar.** Aceptaría cinco campos que el reloj rechaza con `ParseSchedule`, que es exactamente la discrepancia que la normalización evita: validación y evaluación usan la configuración de la biblioteca sobre la misma forma normalizada.
 - **Reintentar en el acto un disparo que se salta.** Convierte una copia larga en una tormenta de intentos contra el mismo repositorio y el mismo worker.
 - **Planificar por reloj de pared en la zona del proceso.** El momento de las copias cambiaría con una variable de entorno, sin tocar una línea de código, y la base seguiría guardando UTC.
 - **Meter el planificador en el `AppState`.** Ninguna ruta lo necesita —la validación es una función, no un estado— y obligaría a que cada prueba de las rutas levantara un reloj.
@@ -167,23 +180,25 @@ La validación no sustituye a la robustez del planificador: la validación prote
 1. **Alcance: el planificador y la validación.** Una capability nueva (`scheduler`) y un delta de `api-resources`. `ui/` y `Dockerfile` siguen sin existir.
 2. **La verdad es `backup_jobs`.** La API de persistencia de la biblioteca no se usa; el planificador es estado efímero y se reconstruye al arrancar.
 3. **`croner` directo en el `^3`.** El mismo analizador que evaluará la expresión.
-4. **Cinco o seis campos**, segundos opcionales; la cadena vacía se rechaza con nombre propio.
+4. **Cinco o seis campos**, con la normalización de cinco a seis **en vuelo** —el analizador del reloj exige seis y la fila guarda lo que se escribió— y el mismo analizador para validar y para evaluar; la cadena vacía se rechaza con nombre propio.
 5. **UTC** para toda agenda; ninguna columna ni variable introduce una zona por tarea.
 6. **Reconciliación periódica** con el período declarado; se acepta la latencia acotada a cambio de no acoplar la API al reloj y de cubrir los cambios que no pasan por ella.
 7. **El disparo es `Motor::encolar`**, sin una segunda ruta de escritura; se heredan la guarda del `409` y la publicación del evento, y se declara que el §3 no tiene columna de origen.
 8. **Una tarea en curso se salta.** No se reintenta en el acto ni se encola una segunda.
 9. **`enabled = 0` no se planifica y sí se dispara a mano** —esto segundo ya lo fijó `api-endpoints`—.
 10. **Una expresión ya guardada que no parsea no impide arrancar**: se registra, se salta y las demás siguen.
-11. **El planificador arranca detrás del motor y se para antes que él**, dentro del futuro de apagado y con un plazo que acota su parada.
+11. **El planificador arranca detrás del motor y se para antes que él**, dentro del futuro de apagado y con un plazo que acota **el drenaje del módulo**; la puerta que impide encolar tras la parada es **del módulo**, cerrada en la misma sección crítica que el encolado.
 12. **El planificador no entra en el `AppState`**; su mango va por `main.rs` a la parada ordenada.
 13. **El reloj no se para por un error de base.** `Base` se registra y se sigue: un `SQLITE_BUSY` de un tick no puede dejar sin copias programadas a todo el despliegue.
 14. **El error de una expresión inválida se nombra distinto en cada camino**: la expresión en el registro del arranque, el campo en la respuesta HTTP. La regla de no repetir el valor existe por las credenciales, y una expresión cron no lo es.
 
 ## Riesgos abiertos
 
-- **El `Cargo.lock`.** Dos dependencias fuera de la caché local y un CI que corre `cargo test --locked`. Se resuelve con red en la fase 0 y se commitea; sin él no hay ni `cargo check`.
-- **El coste de `chrono` y `chrono-tz`.** `chrono` ya está en el árbol por debajo; `chrono-tz` entra entero con sus datos de zonas. La medición de la fase 0 fija el número real en vez de una estimación.
-- **La variante asíncrona del job.** El disparo tiene que ser `async` porque `encolar` lo es; si la 0.15.1 solo ofreciera cierres bloqueantes, el disparo tendría que correr fuera del runtime y la forma del módulo cambiaría. Lo mide la tarea 0.2 **antes** de escribir nada.
-- **El `shutdown()` con un job en vuelo.** Si espera a un disparo en curso, la parada del planificador depende del plazo para no colgar el apagado. Lo mide la tarea 0.4.
+- **El `Cargo.lock`.** Dos dependencias fuera de la caché local y un CI que corre `cargo test --locked`. Se resuelve con red en la fase 0 y se commitea; sin él no hay ni `cargo check`. **Medido en la fase 0**: resuelto y aditivo —`tokio-cron-scheduler` 0.15.1 y `croner` 3.0.1, una sola copia de cada uno, 12 altas y ninguna versión existente cambiada—.
+- **El coste de `chrono` y `chrono-tz`.** `chrono` ya estaba en el árbol por debajo; `chrono-tz` entra entero con sus datos de zonas. **Medido en la fase 0**: `chrono` sigue con **una sola copia** (0.4.45) y pasa de uno a cuatro caminos de entrada; `chrono-tz` **0.10.4** entra nuevo por un solo camino.
+- **La variante asíncrona del job.** El disparo tiene que ser `async` porque `encolar` lo es; si la 0.15.1 solo ofreciera cierres bloqueantes, el disparo tendría que correr fuera del runtime y la forma del módulo cambiaría. **Medido en la fase 0**: es `Job::new_async`, con cierre `FnMut(Uuid, JobsSchedulerLocked) -> Pin<Box<dyn Future<Output = ()> + Send>>`, y delega en `new_async_tz(..., Utc, ...)`.
+- **El `shutdown()` con un job en vuelo — cerrado por la medición.** No espera a un disparo en curso: vuelve en 3,76 µs y el cierre en vuelo sigue avanzando, inobservable; y un tick puede disparar después de la parada (4 de 4). De ahí que la puerta sea del módulo y que el plazo acote su drenaje, como cuentan *El arranque y la parada*, *Trampas medidas* y el requisito 6.
+- **La carrera de doble disparo por `next_tick` / `last_tick` — no medida.** La biblioteca actualiza la próxima marca en una tarea aparte y el tick mira `must_run`: si la lectura y la actualización se cruzan, un tick podría disparar dos veces. **No se consiguió provocar** —en corridas de 2,6 s con una tarea de cada segundo salieron exactamente 3 disparos y 0 duplicados—, así que queda como **no medido**, no como «no ocurre». Nota de método: el primer intento dio 0 de 4 porque los desfases caían en la vuelta equivocada, y el experimento solo da 4 de 4 con desfases de 610–880 ms; es decir, es sensible al desfase, y un 0 de 4 no significa «no pasa» sino «no he apuntado ahí».
+- **El jitter del tick — no cronometrado.** Por construcción es ≤ 500 ms —el ticker lee su flag una vez por vuelta, antes de un `sleep` de 500 ms—, pero no se ha medido disparo a disparo.
 - **La cobertura automática del tick.** Un tick de cron real obliga a esperar a la hora del calendario, así que las pruebas de la planificación y del disparo tienen que poder forzar el momento en vez de esperarlo. Lo que quede sin cubrir se declara por escrito en `docs/FEATURE-006-scheduler.md` en vez de fingirlo.
 - **La ventana entre el arranque y la primera planificación.** Nadie planificado es un estado que dura lo que tarde la planificación inicial; se cierra antes de escuchar y por eso el orden del arranque importa.

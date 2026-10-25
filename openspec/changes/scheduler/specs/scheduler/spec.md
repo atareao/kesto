@@ -1,7 +1,7 @@
 # scheduler Specification
 
 ## Purpose
-El reloj que faltaba: qué hace que una tarea se ejecute a su hora sin que nadie pulse nada. Cubre la **validación** de la expresión cron —el mismo analizador que después la evaluará, con los segundos opcionales y la agenda en UTC—, la **planificación** de las tareas activas al arrancar, la **sincronización** periódica con `backup_jobs` para que un alta, un borrado, una edición del cron o un cambio de `enabled` tengan efecto sin reiniciar el proceso, el **disparo** —una llamada a `Motor::encolar`, la misma puerta que el disparo manual, con la reacción que le toca a cada desenlace— y el **ciclo de vida** del propio planificador: arranca detrás del motor, se para antes que él y no acepta trabajo nuevo desde que la parada empieza. Fuera quedan la extracción del volcado —que es de `extraction`—, el trato con Rustic —de `repository`— y la cola y los trabajadores —de `engine`—, de los que es solo un cliente: no escribe ninguna fila de `job_executions`, no conoce la cola y no guarda tareas por su cuenta, porque la única verdad es la tabla del §3.
+El reloj que faltaba: qué hace que una tarea se ejecute a su hora sin que nadie pulse nada. Cubre la **validación** de la expresión cron —la misma configuración de analizador que después la evaluará, con la normalización de cinco a seis campos y la agenda en UTC—, la **planificación** de las tareas activas al arrancar, la **sincronización** periódica con `backup_jobs` para que un alta, un borrado, una edición del cron o un cambio de `enabled` tengan efecto sin reiniciar el proceso, el **disparo** —una llamada a `Motor::encolar`, la misma puerta que el disparo manual, con la reacción que le toca a cada desenlace— y el **ciclo de vida** del propio planificador: arranca detrás del motor, se para antes que él y no acepta trabajo nuevo desde que la parada empieza. Fuera quedan la extracción del volcado —que es de `extraction`—, el trato con Rustic —de `repository`— y la cola y los trabajadores —de `engine`—, de los que es solo un cliente: no escribe ninguna fila de `job_executions`, no conoce la cola y no guarda tareas por su cuenta, porque la única verdad es la tabla del §3.
 
 ## ADDED Requirements
 
@@ -9,9 +9,13 @@ El reloj que faltaba: qué hace que una tarea se ejecute a su hora sin que nadie
 
 La expresión cron de una tarea SHALL parsearse con el analizador del planificador antes de usarse, SHALL aceptarse tanto con **cinco** campos —sin segundos, como `0 3 * * *`— como con **seis** —con segundos, como `0 0 3 * * *`—, y NO SHALL aceptarse una expresión **vacía**. Una expresión que no parsea SHALL rechazarse con un error que **nombra la expresión** y dice el motivo. La agenda de toda expresión SHALL interpretarse en **UTC**, con independencia de la zona horaria del proceso.
 
-El analizador es el de `croner` **3**, que es el que usará la biblioteca del reloj para evaluar la misma cadena: validar con otra gramática aceptaría expresiones que el reloj no entiende, y eso es precisamente el fallo que esta validación existe para evitar. Los segundos son **opcionales** y no exigidos: el §3 no impone el número de campos y todas las filas y pruebas del repositorio escriben cinco (`0 3 * * *`), así que exigir seis habría dejado inválido lo que ya está guardado. Aceptar las dos formas valida sin romper nada y sin migrar una sola fila.
+El analizador **del reloj** es el de `croner` **3** construido con **`Seconds::Required`** y **`dom_and_dow(true)`** —la configuración con la que la biblioteca fabrica su parser en los cinco sitios donde lo hace—, y **rechaza** la forma de cinco campos con `ParseSchedule`. Por eso la validación SHALL usar **esa misma configuración** sobre la **forma normalizada**, y el módulo SHALL normalizar de cinco a seis anteponiendo `0 ` **solo cuando el número de campos sea exactamente 5**, sin tocar las de 6 ni las de 7 —una de siete, con año, es válida y no se reescribe—. El analizador **por defecto** de `croner` (`Seconds::Optional`) sí acepta las dos formas, y su normalización de cinco a seis es literalmente `parts.insert(0, "0")`: lo que hace el módulo es reproducirla a propósito, en vez de validar con un analizador que no es el del reloj. Validar con otra gramática aceptaría expresiones que el reloj no entiende, y eso es precisamente el fallo que esta validación existe para evitar.
+
+Que las dos formas sigan siendo válidas es deliberado: el §3 no impone el número de campos y todas las filas y pruebas del repositorio escriben cinco (`0 3 * * *`), así que exigir seis habría dejado inválido lo que ya está guardado. Aceptar las dos formas valida sin romper nada y sin migrar una sola fila, y la normalización ocurre **en vuelo**, al construir el job: `backup_jobs.cron_expression` **no** se reescribe, así que el panel devuelve la expresión que se tecleó.
 
 La cadena vacía se nombra aparte aunque el analizador ya la rechace, porque es el valor que llega de verdad: `cron_expression` es `TEXT NOT NULL` en el §3, así que un formulario que manda el campo en blanco no produce un error de base sino una fila con una cadena vacía —una tarea que existe, se lista, se pinta como programada y no corre nunca—.
+
+El mensaje del rechazo lo escribe **el módulo**, y no es un adorno: los textos de `croner` son del estilo `Invalid pattern: …` y **ninguno recibe la cadena original**, así que el analizador no puede nombrar la expresión; y la biblioteca **descarta** el error del analizador al construir el job —`map_err(|_| JobSchedulerError::ParseSchedule)`—, cuyo `Display` es su `Debug`, así que al operador le llega la palabra `ParseSchedule` y nada más. El mensaje SHALL nombrar la expresión y SHALL decir el motivo.
 
 UTC y no la zona del proceso porque la hora de Kesto es una sola: la base guarda UTC, las fechas del cable son RFC3339 con desplazamiento cero y el orden del listado de ejecuciones ya supone que dos marcas del mismo segundo son el mismo instante. Un reloj en la zona local haría que el momento de las copias cambiara con una variable de entorno del contenedor, sin tocar una línea de código y sin que nadie lo relacione con el cambio.
 
@@ -21,6 +25,12 @@ UTC y no la zona del proceso porque la hora de Kesto es una sola: la base guarda
 - **THEN** SHALL aceptarse
 - **AND** su próxima ejecución SHALL poder calcularse sobre el calendario en **UTC**
 - **AND** NO SHALL depender de la zona horaria del proceso
+
+#### Scenario: La forma de cinco campos que se acepta es la que el reloj sabe leer
+- **GIVEN** la expresión `0 3 * * *`, aceptada por la validación
+- **WHEN** el planificador construye con ella el job del reloj
+- **THEN** el reloj SHALL aceptarlo
+- **AND** NO SHALL devolver `ParseSchedule`
 
 #### Scenario: Una expresión de seis campos también es válida
 - **GIVEN** la expresión `0 0 3 * * *`
@@ -174,7 +184,9 @@ El arranque SHALL montar el planificador **después** de que el motor esté en m
 
 Detrás del motor porque su única operación es llamarlo: uno que arrancara antes tendría una ventana —corta, pero real— en la que el reloj dispara contra un motor que todavía no acepta trabajo, y esos disparos acabarían con el desenlace de «no hay quien atienda» por un motivo que no es cierto.
 
-Al empezar la parada, y no al final: el reloj se para **dentro** del apagado ordenado, antes de cerrar el reparto de eventos y desde luego antes de que `serve` resuelva. Si se parara al final, entre la señal y la parada cabrían ticks que encolarían trabajo contra un motor que está a punto de pararse, que es justo lo que este requisito prohíbe. Y la parada es **acotada** porque lo que puede quedar en vuelo es un disparo, y esperarlo sin límite convertiría un `docker stop` en una espera indefinida que el orquestador acaba resolviendo con un `SIGKILL` —el mismo motivo por el que el motor acota la suya—.
+Al empezar la parada, y no al final: el reloj se para **dentro** del apagado ordenado, antes de cerrar el reparto de eventos y desde luego antes de que `serve` resuelva. Si se parara al final, entre la señal y la parada cabrían ticks que encolarían trabajo contra un motor que está a punto de pararse, que es justo lo que este requisito prohíbe.
+
+Y la parada es **acotada**, pero no porque la biblioteca espere a nada: está medido que su `shutdown()` vuelve en **microsegundos** —3,76 µs con un job durmiendo cinco segundos en vuelo— porque no espera al disparo en curso, que sigue avanzando después y es inobservable, y que un tick puede disparar **después** de que la parada empiece (4 de 4 rondas medidas, con desfases de 610–880 ms). Así que la garantía de que no se encola tras la parada **no se delega en la biblioteca**: es **del módulo**, que SHALL cerrar su puerta en la misma sección crítica que el encolado, de modo que un encolado o termina antes de que la puerta cierre o no empieza —lo que cubre también el tick que la biblioteca dispare después—. El plazo acota **el drenaje del módulo** —su reconciliación y sus disparos—, no la llamada a `shutdown()`, y lo que no termine dentro de él se registra y el apagado continúa: esperarlo sin límite convertiría un `docker stop` en una espera indefinida que el orquestador acaba resolviendo con un `SIGKILL`, el mismo motivo por el que el motor acota la suya.
 
 Por último, el orden completo: el planificador se para **antes** que el motor y no después, y el motor es lo último porque es quien espera de forma acotada a la ejecución en vuelo. Las ejecuciones ya encoladas son del motor, y el reloj no las toca.
 
