@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod extract;
 pub mod health;
+pub mod jobs;
 pub mod repositories;
 pub mod response;
 pub mod targets;
@@ -46,7 +47,8 @@ pub fn api_router(state: AppState) -> Router {
                 .route("/api/v1/auth/logout", post(auth::logout))
                 .route("/api/v1/auth/session", get(auth::session))
                 .merge(repositories::router())
-                .merge(targets::router());
+                .merge(targets::router())
+                .merge(jobs::router());
 
             public.merge(protected_router(negocio, auth))
         }
@@ -58,7 +60,8 @@ pub fn api_router(state: AppState) -> Router {
         // recurso y no habría forma de dar de alta nada sin un proveedor de identidad.
         None => public
             .merge(repositories::router())
-            .merge(targets::router()),
+            .merge(targets::router())
+            .merge(jobs::router()),
     };
 
     router
