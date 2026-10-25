@@ -500,6 +500,37 @@ pub(crate) async fn post_json(router: Router, uri: &str, cuerpo: &serde_json::Va
         .expect("el router no debe fallar")
 }
 
+/// Lanza un `PUT` con un cuerpo JSON contra `router` sin abrir un socket.
+///
+/// Es lo que hace falta para ejercitar la actualización, que es reemplazo completo: el
+/// cuerpo lleva los mismos campos que el de un alta y viaja con el `Content-Type` que axum
+/// exige para extraerlo con `Json`. Se serializa del `Value` que da la prueba, sin declarar
+/// un segundo tipo de cuerpo en el arnés, y la cabecera se pone aquí por el mismo motivo
+/// que en [`post_json`]: sin ella caería el extractor por la cabecera y la prueba mediría
+/// un caso distinto del que quiere medir.
+pub(crate) async fn put_json(router: Router, uri: &str, cuerpo: &serde_json::Value) -> Response {
+    let peticion = Request::builder()
+        .method(Method::PUT)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cuerpo.to_string()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `DELETE` contra `router` sin abrir un socket.
+///
+/// Se apoya en [`request`] —igual que [`get`]— porque un borrado no lleva cuerpo: lo que
+/// hay que ejercitar es el camino del manejador y el código que contesta, no un extractor
+/// de cuerpo que esta ruta no tiene.
+pub(crate) async fn delete(router: Router, uri: &str) -> Response {
+    request(router, Method::DELETE, uri).await
+}
+
 /// Lanza un `POST` con un cuerpo crudo contra `router` sin abrir un socket.
 ///
 /// Es lo que hace falta para ejercitar un cuerpo que **no se puede construir** con

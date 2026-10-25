@@ -12,12 +12,10 @@
 //! de los campos son los del §3 en `snake_case`, el identificador viaja como texto en su
 //! forma canónica con guiones y las fechas, como cadena RFC3339.
 //!
-//! AVISO — el **alta** y la **lectura** están implementadas (GREEN del módulo 1 del change
-//! `api-endpoints`); el **listado**, la **actualización** y el **borrado** siguen sin
-//! implementarse y llegan con el **módulo 2** del mismo change, el de los recursos, que es
-//! el que escribe sus pruebas. Hasta entonces sus cuerpos se quedan como están a propósito:
-//! escribirlos ahora sería código que ninguna prueba pide y que nadie habría medido contra
-//! el §5.
+//! AVISO — las **cinco** rutas de `/repositories` están implementadas (módulo 2 del change
+//! `api-endpoints`): el listado, el alta, la lectura, la actualización y el borrado. Las de
+//! `/targets`, `/jobs` y `/executions` llegan con el resto del módulo 2 y con el módulo 3, y
+//! hasta entonces no existen.
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -162,9 +160,66 @@ fn contenido<T: Serialize>(vista: &T) -> Result<Data, AppError> {
         .map_err(|error| AppError::Other(format!("la respuesta no se pudo serializar: {error}")))
 }
 
+/// Convierte el identificador de la ruta en un `Uuid`, o contesta `400`.
+///
+/// El mensaje **nombra el campo y no repite el valor**: el segmento de la ruta llegó por el
+/// cable, y la regla de la casa es que un `400` diga qué campo está mal, nunca lo que traía.
+fn identificador(id: &str) -> Result<Uuid, AppError> {
+    Uuid::parse_str(id).map_err(|_| {
+        AppError::InvalidInput("el campo `id` de la ruta no tiene la forma de un UUID".to_owned())
+    })
+}
+
+/// El `404` de una fila que no está, con el mismo texto en las tres rutas del identificador.
+fn repositorio_ausente() -> AppError {
+    AppError::NotFound("no existe ningún repositorio con ese identificador".to_owned())
+}
+
+/// Resuelve el secreto de una actualización: el ausente conserva el almacenado y el vacío se
+/// rechaza.
+///
+/// Los dos desenlaces son distintos a propósito. Ausente es «no lo toques», y es el único
+/// camino que puede recorrer un panel que no tiene el valor, porque la API nunca lo devuelve;
+/// vacío es «déjalo en blanco», y borrar una credencial no es una operación que esta
+/// superficie ofrezca. El rechazo se contesta **antes** de escribir y nombrando el campo, y
+/// usa el mismo texto que la traducción de `DbError::SecretoVacio` para que el cliente vea un
+/// solo mensaje: la capa de acceso sigue rechazando el vacío por su cuenta, y esa es la red
+/// de seguridad; esto es la validación previa que el contrato pide al manejador.
+fn resolver_secreto(
+    nuevo: Option<SecretString>,
+    almacenado: SecretString,
+    campo: &'static str,
+) -> Result<SecretString, AppError> {
+    match nuevo {
+        None => Ok(almacenado),
+        Some(valor) if valor.expose().is_empty() => Err(AppError::InvalidInput(format!(
+            "el campo `{campo}` no puede ir vacío"
+        ))),
+        Some(valor) => Ok(valor),
+    }
+}
+
 /// `GET /api/v1/repositories` — el listado.
-pub async fn listado(State(_state): State<AppState>) -> Result<ApiResponse, AppError> {
-    todo!("el módulo 2 del change `api-endpoints` implementa el listado")
+///
+/// Una tabla sin filas es un listado de cero elementos, **no** un recurso ausente: contesta
+/// `200` con un array vacío, no `404` y no un `data` nulo. El array va vacío y no en `null`
+/// porque `Data::None` está para las respuestas que no tienen contenido —el `DELETE`— y un
+/// listado sí lo tiene: el suyo, aunque sea de longitud cero. Un `null` obligaría al panel a
+/// tratar «no hay repositorios» como un error, que es el estado normal de un Kesto recién
+/// instalado.
+pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppError> {
+    let filas = state.db.repositorios.listar().await?;
+
+    let vistas: Vec<RepositorioDelCable> = filas
+        .iter()
+        .map(RepositorioDelCable::desde)
+        .collect::<Result<_, _>>()?;
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "repositorios listados",
+        contenido(&vistas)?,
+    ))
 }
 
 /// `POST /api/v1/repositories` — el alta, que contesta `201` con el recurso creado.
@@ -221,14 +276,10 @@ pub async fn leer(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<ApiResponse, AppError> {
-    let uuid = Uuid::parse_str(&id).map_err(|_| {
-        AppError::InvalidInput("el campo `id` de la ruta no tiene la forma de un UUID".to_owned())
-    })?;
+    let uuid = identificador(&id)?;
 
     let Some(fila) = state.db.repositorios.leer(&uuid).await? else {
-        return Err(AppError::NotFound(
-            "no existe ningún repositorio con ese identificador".to_owned(),
-        ));
+        return Err(repositorio_ausente());
     };
 
     let vista = RepositorioDelCable::desde(&fila)?;
@@ -241,31 +292,99 @@ pub async fn leer(
 }
 
 /// `PUT /api/v1/repositories/{id}` — la actualización, que es reemplazo completo.
+///
+/// Los cinco campos del cuerpo sustituyen a los de la fila; el identificador y la fecha de
+/// alta **no** se reescriben —el identificador no es un campo editable y `created_at` es la
+/// fecha de nacimiento de la fila, no un dato del formulario—. Y un secreto **ausente**
+/// conserva el almacenado mientras que uno **vacío** se rechaza: la diferencia importa
+/// porque el panel **no tiene** el valor —la API no devuelve los secretos—, así que sin la
+/// primera mitad una edición de cualquier otro campo borraría la credencial, y sin la
+/// segunda un campo en blanco la borraría sin decirlo.
+///
+/// Si la fila desaparece entre la lectura y la escritura —otra petición la borró en el
+/// hueco—, contesta el mismo `404` que si no hubiera estado nunca: es la carrera que la
+/// lectura previa no puede cerrar, y el desenlace tiene que ser el del contrato.
 pub async fn actualizar(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-    Json(_cuerpo): Json<AltaDeRepositorioDelCable>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(cuerpo): Json<AltaDeRepositorioDelCable>,
 ) -> Result<ApiResponse, AppError> {
-    todo!("el módulo 2 del change `api-endpoints` implementa la actualización")
+    let uuid = identificador(&id)?;
+
+    let Some(actual) = state.db.repositorios.leer(&uuid).await? else {
+        return Err(repositorio_ausente());
+    };
+
+    let fila = Repositorio {
+        id: actual.id,
+        name: cuerpo.name,
+        endpoint: cuerpo.endpoint,
+        bucket: cuerpo.bucket,
+        region: cuerpo.region,
+        access_key_id: cuerpo.access_key_id,
+        secret_access_key: resolver_secreto(
+            cuerpo.secret_access_key,
+            actual.secret_access_key,
+            "secret_access_key",
+        )?,
+        passphrase: resolver_secreto(cuerpo.passphrase, actual.passphrase, "passphrase")?,
+        created_at: actual.created_at,
+    };
+
+    if !state.db.repositorios.actualizar(&fila).await? {
+        return Err(repositorio_ausente());
+    }
+
+    let vista = RepositorioDelCable::desde(&fila)?;
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "repositorio actualizado",
+        contenido(&vista)?,
+    ))
 }
 
 /// `DELETE /api/v1/repositories/{id}` — el borrado, que contesta `200` con `data` nulo.
+///
+/// `data` nulo y **no** `204`: la envoltura de la API lleva `{status, message, data}` en
+/// **todas** sus respuestas, y un `204` no tiene cuerpo —sería la única respuesta capaz de
+/// romperla, y el panel tendría una rama especial para un solo endpoint—.
+///
+/// Borrar un repositorio **arrastra sus tareas y con ellas sus ejecuciones**, por el
+/// `ON DELETE CASCADE` del §3: el histórico de copias desaparece con el repositorio que lo
+/// produjo. Queda escrito aquí para que nadie lo descubra vaciando una tabla por curiosidad.
+/// El `false` de la capa de acceso —«no estaba»— se traduce a `404` porque el contrato del
+/// `DELETE` lo fija así, por encima de la lectura de «quien pidió borrar algo que ya no está
+/// consiguió lo que quería»: el recurso pedido no existe, y eso es lo que el código dice.
 pub async fn borrar(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
 ) -> Result<ApiResponse, AppError> {
-    todo!("el módulo 2 del change `api-endpoints` implementa el borrado")
+    let uuid = identificador(&id)?;
+
+    if !state.db.repositorios.borrar(&uuid).await? {
+        return Err(repositorio_ausente());
+    }
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "repositorio borrado",
+        Data::None,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::http::{StatusCode, header};
+    use uuid::Uuid;
 
     use crate::api::api_router;
     use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
-        base_con_clave, body_json, body_text, capturar_log, config_con_dsn, estado_desarrollo, get,
-        post_crudo, post_json,
+        base_con_clave, body_json, body_text, capturar_log, config_con_dsn, delete,
+        estado_desarrollo, get, post_crudo, post_json, put_json,
     };
 
     /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
@@ -507,6 +626,515 @@ mod tests {
             registrado.contains("no se pudo interpretar"),
             "tiene que quedar registrado que una petición no se pudo interpretar —sin su \
              texto—, y el registro capturado fue: {registrado}"
+        );
+    }
+
+    /// 1.5 — Las cinco rutas del recurso contestan su código.
+    ///
+    /// Cubre `api-resources`, requisito 1 (escenario «Las cinco rutas del recurso contestan
+    /// su código»). Las cinco peticiones salen del **mismo** router —el de producción, con
+    /// su estado— porque lo que se afirma es la superficie del recurso y no cada manejador
+    /// por separado: un `PUT` que contestara el código del alta, o un `DELETE` que no
+    /// dejara la fila fuera, se ven aquí y no en una prueba que abriera un router nuevo por
+    /// petición. El orden importa: el alta va primero porque sin su `id` las otras tres
+    /// rutas del identificador no tienen a qué apuntar.
+    #[tokio::test]
+    async fn las_cinco_rutas_del_recurso_contestan_su_codigo() {
+        let router = api_router(estado_desarrollo().await).clone();
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-5"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 con el recurso creado"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let respuesta = get(router.clone(), "/api/v1/repositories").await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "el listado tiene que contestar 200 con el array de repositorios"
+        );
+
+        let respuesta = get(router.clone(), &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "la lectura de una fila que se acaba de dar de alta tiene que contestar 200"
+        );
+
+        let respuesta = put_json(
+            router.clone(),
+            &format!("/api/v1/repositories/{id}"),
+            &cuerpo_de_alta("repo-1-5-modificado"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "la actualización de una fila existente tiene que contestar 200"
+        );
+
+        let respuesta = delete(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "el borrado de una fila existente tiene que contestar 200"
+        );
+    }
+
+    /// 1.7 — El listado contesta `200` con un array en `data`.
+    ///
+    /// Cubre `api-resources`, requisito 1 (escenario «El listado contesta 200 con un array
+    /// en data»). Se afirman las tres cosas a la vez porque el `200` solo no dice nada: que
+    /// `data` sea un **array** —la forma del recurso en el listado— y que ese array traiga
+    /// la fila que se acaba de dar de alta. Sin la segunda mitad, un listado que contestara
+    /// `200` con `data: []` pasaría la prueba sin listar nada, que es justo el defecto que
+    /// la prueba tiene que dejar candado.
+    #[tokio::test]
+    async fn el_listado_contesta_200_con_un_array_en_data() {
+        let router = api_router(estado_desarrollo().await);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-7"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder listar nada"
+        );
+
+        let respuesta = get(router, "/api/v1/repositories").await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado tiene que contestar 200; contestó {status} con {cuerpo}"
+        );
+
+        let filas = cuerpo["data"].as_array().unwrap_or_else(|| {
+            panic!("el listado tiene que traer un array en `data`, y llegó {cuerpo}")
+        });
+
+        assert!(
+            filas.iter().any(|fila| fila["name"] == "repo-1-7"),
+            "el listado tiene que incluir la fila que se acaba de dar de alta, y llegó {cuerpo}"
+        );
+    }
+
+    /// 1.8 — Una tabla vacía contesta `200` con un array vacío.
+    ///
+    /// Cubre `api-resources`, requisito 1 (escenario «Una tabla vacía contesta 200 con un
+    /// array vacío»). El porqué es semántico y no de estilo: una tabla sin filas es un
+    /// listado de cero elementos, no un recurso ausente. Un listado que contestara `404`
+    /// —o `null` en `data`— obligaría al panel a tratar «no hay repositorios» como un
+    /// error, que es el estado normal de un Kesto recién instalado.
+    #[tokio::test]
+    async fn una_tabla_vacia_contesta_200_con_array_vacio() {
+        let router = api_router(estado_desarrollo().await);
+
+        let respuesta = get(router, "/api/v1/repositories").await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "una tabla sin filas es un listado vacío, no un recurso ausente: contestó \
+             {status} con {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]
+            .as_array()
+            .unwrap_or_else(|| panic!("el listado vacío tiene que traer un array en `data`, no un `null`, y llegó {cuerpo}"));
+
+        assert!(
+            filas.is_empty(),
+            "sin altas, el listado tiene que traer un array vacío, y llegó {cuerpo}"
+        );
+    }
+
+    /// 1.11 — El `DELETE` contesta `200` con `data` nulo y la lectura posterior da `404`.
+    ///
+    /// Cubre `api-resources`, requisito 1 (escenario «El DELETE contesta 200 con data nulo y
+    /// la lectura posterior 404»). El `assert_ne!` contra `204` es el candado del SRS: un
+    /// `204` no tiene cuerpo por definición, así que rompería la envoltura `{status,
+    /// message, data}` que devuelven todas las rutas de la API, y el panel tendría que
+    /// tratar esa ruta como un caso aparte. La lectura posterior es la otra mitad: un `200`
+    /// que no borrara nada también pasaría la primera aserción.
+    #[tokio::test]
+    async fn el_delete_contesta_200_con_data_nulo_y_la_lectura_posterior_404() {
+        let router = api_router(estado_desarrollo().await);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-11"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder borrar nada"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let respuesta = delete(router.clone(), &format!("/api/v1/repositories/{id}")).await;
+
+        let status = respuesta.status();
+
+        assert_ne!(
+            status,
+            StatusCode::NO_CONTENT,
+            "el borrado no puede contestar 204: un 204 no tiene cuerpo y rompería la \
+             envoltura de la API"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el borrado tiene que contestar 200 con la envoltura; contestó {status}"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert!(
+            cuerpo["data"].is_null(),
+            "el borrado no tiene recurso que devolver: `data` tiene que ser nulo, y llegó \
+             {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["status"], 200,
+            "la envoltura tiene que repetir el código en `status`: {cuerpo}"
+        );
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::NOT_FOUND,
+            "la fila borrada no puede seguir leyéndose: la lectura tiene que contestar 404"
+        );
+    }
+
+    /// 1.12 — El `PUT` sobre una fila inexistente contesta `404`.
+    ///
+    /// Cubre `api-resources`, requisito 3 (escenario «El PUT sobre una fila inexistente
+    /// contesta 404»). El identificador es un UUID **bien formado** que no existe —y no una
+    /// cadena cualquiera— a propósito: así el `404` lo decide la ausencia de la fila y no el
+    /// rechazo del identificador, que sería otro caso. La cuenta por SQL directo es la mitad
+    /// que impide el peor desenlace: una actualización que, al no encontrar la fila,
+    /// insertara una nueva contestando `404` de propina.
+    #[tokio::test]
+    async fn el_put_sobre_una_fila_inexistente_contesta_404() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = AppState::new(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        )
+        .expect("el estado se construye sobre la base de prueba");
+
+        let id = Uuid::new_v4().to_string();
+
+        let respuesta = put_json(
+            api_router(estado),
+            &format!("/api/v1/repositories/{id}"),
+            &cuerpo_de_alta("repo-1-12"),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "un PUT sobre una fila que no existe tiene que contestar 404; contestó {status} \
+             con {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["status"], 404,
+            "la envoltura tiene que repetir el código en `status`: {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 404 tiene que explicar que no hay fila que actualizar: {cuerpo}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories")
+            .fetch_one(&pool)
+            .await
+            .expect("la cuenta de filas tiene que poder leerse del fichero de la base");
+
+        assert_eq!(
+            filas, 0,
+            "un PUT sobre una fila inexistente no puede escribir ninguna fila: quedaron \
+             {filas}"
+        );
+    }
+
+    /// 1.32 — Un `PUT` sin el secreto conserva el almacenado.
+    ///
+    /// Cubre `api-resources`, requisito 3 (escenario «Un PUT sin el secreto conserva el
+    /// almacenado»). El porqué es que el panel **no tiene** el valor: la API nunca devuelve
+    /// los secretos —los dos viajan como `SecretString`, que no implementa `Serialize`—,
+    /// así que un `PUT` que reemplazara la credencial con lo que llega la borraría sin que
+    /// nadie pudiera evitarlo. Lo que se compara aquí es el valor **en claro**, descifrando
+    /// el sobre de la columna, y no los bytes del sobre: la capa de acceso vuelve a cifrar
+    /// en cada escritura, con nonce aleatorio por valor, así que el sobre cambia siempre
+    /// aunque el secreto no cambie y comparar sobres mediría lo que **no** es. La otra
+    /// mitad de la prueba es que la actualización sí se aplicó: sin eso, un `PUT` que no
+    /// tocara la fila también «conservaría» la passphrase.
+    #[tokio::test]
+    async fn un_put_sin_passphrase_conserva_la_almacenada() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = AppState::new(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        )
+        .expect("el estado se construye sobre la base de prueba");
+
+        let router = api_router(estado);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-32"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder actualizar nada"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let sobre_antes: String =
+            sqlx::query_scalar("SELECT passphrase FROM repositories WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que estar en el fichero con el que se abrió el estado");
+
+        let passphrase_antes = clave
+            .descifrar(&sobre_antes)
+            .expect("el alta tiene que haber guardado la passphrase cifrada y descifrable")
+            .expose()
+            .to_owned();
+
+        let respuesta = put_json(
+            router.clone(),
+            &format!("/api/v1/repositories/{id}"),
+            &serde_json::json!({
+                "name": "repo-1-32-modificado",
+                "endpoint": "https://s3.example.test/repo-1-32-modificado",
+                "bucket": "cubo-modificado",
+                "region": "eu-west-1",
+                "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la actualización de una fila existente tiene que contestar 200; contestó \
+             {status} con {cuerpo}"
+        );
+
+        let sobre_despues: String =
+            sqlx::query_scalar("SELECT passphrase FROM repositories WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila actualizada tiene que seguir en el fichero de la base");
+
+        let passphrase_despues = clave
+            .descifrar(&sobre_despues)
+            .expect("la actualización tiene que dejar la passphrase cifrada y descifrable")
+            .expose()
+            .to_owned();
+
+        assert_eq!(
+            passphrase_despues, passphrase_antes,
+            "un PUT que no informa la passphrase no puede borrarla: el panel no tiene el \
+             valor —la API no lo devuelve— y sin esta regla reescribiría la credencial con \
+             nada"
+        );
+
+        let nombre: String = sqlx::query_scalar("SELECT name FROM repositories WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .expect("la fila actualizada tiene que seguir en el fichero de la base");
+
+        assert_eq!(
+            nombre, "repo-1-32-modificado",
+            "el PUT tiene que haber aplicado los campos que sí informó"
+        );
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "la fila actualizada tiene que seguir leyéndose por la API"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["name"], "repo-1-32-modificado",
+            "la lectura tiene que devolver el nombre que escribió el PUT: {cuerpo}"
+        );
+    }
+
+    /// 1.33 — Un `PUT` con el secreto vacío se rechaza sin cambiar el almacenado.
+    ///
+    /// Cubre `api-resources`, requisito 3 (escenario «Un PUT con el secreto vacío se
+    /// rechaza»). El porqué: un campo presente y vacío significa «pon el secreto en blanco»,
+    /// no «no lo toques» —para eso está omitirlo, que es el escenario de la prueba 1.32—,
+    /// así que el manejador lo rechaza nombrando el campo en el `message`. Y la segunda
+    /// mitad es la que impide el rechazo a medias: el `400` tiene que llegar **antes** de
+    /// escribir, porque un rechazo que ya hubiera guardado el vacío dejaría la credencial
+    /// perdida con una respuesta de error.
+    #[tokio::test]
+    async fn un_put_con_la_passphrase_vacia_se_rechaza_sin_cambiar_la_almacenada() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = AppState::new(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        )
+        .expect("el estado se construye sobre la base de prueba");
+
+        let router = api_router(estado);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-33"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder actualizar nada"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let sobre_antes: String =
+            sqlx::query_scalar("SELECT passphrase FROM repositories WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que estar en el fichero con el que se abrió el estado");
+
+        let passphrase_antes = clave
+            .descifrar(&sobre_antes)
+            .expect("el alta tiene que haber guardado la passphrase cifrada y descifrable")
+            .expose()
+            .to_owned();
+
+        let mut cuerpo_de_la_actualizacion = cuerpo_de_alta("repo-1-33");
+        cuerpo_de_la_actualizacion["passphrase"] = serde_json::Value::String(String::new());
+
+        let respuesta = put_json(
+            router,
+            &format!("/api/v1/repositories/{id}"),
+            &cuerpo_de_la_actualizacion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un secreto presente y vacío es un intento de dejarlo en blanco, y eso se \
+             rechaza: contestó {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            mensaje.contains("passphrase"),
+            "el rechazo tiene que nombrar el campo que lo provoca, y el mensaje fue \
+             {mensaje:?}"
+        );
+
+        let sobre_despues: String =
+            sqlx::query_scalar("SELECT passphrase FROM repositories WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila rechazada tiene que seguir en el fichero de la base");
+
+        let passphrase_despues = clave
+            .descifrar(&sobre_despues)
+            .expect("el rechazo no puede haber dejado la passphrase indescifrable")
+            .expose()
+            .to_owned();
+
+        assert_eq!(
+            passphrase_despues, passphrase_antes,
+            "el rechazo no puede haber cambiado nada: la passphrase almacenada tiene que \
+             seguir siendo la del alta"
         );
     }
 
