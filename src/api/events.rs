@@ -271,9 +271,10 @@ mod tests {
     //! repositorio y tarea, el disparo y el propio stream—: así lo que se mide es lo que el panel
     //! ve, y no una ruta montada a mano para la prueba.
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use axum::Router;
+    use axum::body::Body;
     use axum::http::StatusCode;
     use axum::http::header;
     use uuid::Uuid;
@@ -621,11 +622,19 @@ mod tests {
     /// clientes que recibieran dos avisos distintos del mismo momento estarían viendo dos verdades
     /// distintas de la misma ejecución.
     ///
-    /// Y además se comprueba **qué** evento es el primero, sobre el del primer cliente: el
-    /// identificador de la ejecución que acaba de dispararse y su estado `pending`. Sin esto, un
-    /// evento constante con los siete campos y cualquier valor pasaría la prueba —la igualdad entre
-    /// los dos clientes la cumpliría igual—, y lo que mide el escenario es que el aviso sea **de esa
-    /// ejecución** y **del momento en que nace**, no de cualquier cosa que llegue dos veces.
+    /// Y además se comprueban dos cosas sobre el primer cliente, con el otro como testigo: que su
+    /// primer evento hable de la ejecución que se acaba de encolar —su `execution_id`, que no depende
+    /// de ningún orden— y que el **nacimiento** de esa ejecución —su `pending`— llegue a la conexión.
+    /// Sin lo primero, un evento constante con los siete campos y cualquier valor pasaría la prueba
+    /// —la igualdad entre los dos clientes la cumpliría igual—; sin lo segundo, la prueba diría que
+    /// el motor anuncia *algo*, no que anuncia el arranque.
+    ///
+    /// El `pending` **no** se exige como el **primer** evento, y esa es la diferencia con lo que la
+    /// prueba hacía antes: el motor publica el aviso del encolado **después** de entregar la ejecución
+    /// a la cola, y a partir de ahí el trabajador es otro hilo que, en cuanto la recibe, la escribe
+    /// como `running` y publica su aviso. Un cliente desprogramado en esa ventana ve `running` de
+    /// primero, así que lo único afirmable es que el nacimiento **llegue**, con plazo: el porqué
+    /// entero, en `espera_el_nacimiento`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dos_clientes_del_stream_ven_el_mismo_evento() {
         let aparato = AparatoDelStream::nuevo().await;
@@ -660,20 +669,62 @@ mod tests {
              segundo {de_otro:?}"
         );
 
-        // Y el evento es el del nacimiento **de esta** ejecución: el aviso del encolado lo publica
-        // el motor antes de contestar el `202`, así que es el primero que ven los dos.
+        // El identificador sí se afirma sobre el primer evento, y ese aserto no compite con el
+        // trabajador: el aviso de `running` es de **la misma** ejecución, así que dé igual cuál de
+        // los dos llegue antes.
         assert_eq!(
             datos_uno["execution_id"], ejecucion,
             "el primer evento de los dos clientes no habla de la ejecución que se acaba de encolar: \
              {de_uno:?}"
         );
 
-        assert_eq!(
-            datos_uno["status"], "pending",
-            "el primer evento de una ejecución recién encolada tiene que decir `pending`, y dijo \
-             {:?}: el panel pintaría un estado que la ejecución todavía no tiene",
-            datos_uno["status"]
+        assert!(
+            espera_el_nacimiento(datos_uno, &mut primero, &ejecucion, PLAZO_DEL_EVENTO).await,
+            "el stream no anunció el nacimiento de {ejecucion} en {PLAZO_DEL_EVENTO:?}: la ejecución \
+             que se acaba de encolar no se vio nunca en `pending`, así que el panel no podría pintar \
+             que ha nacido"
         );
+    }
+
+    /// Espera, de forma **acotada**, al evento de nacimiento de una ejecución, ya leído el primero.
+    ///
+    /// Nace de una reserva de la auditoría del change: el aserto del `status` exigía que `pending`
+    /// fuera el **primer** evento del stream, y eso es un orden que el motor no garantiza. El aviso
+    /// del encolado lo publica el motor **después** de entregar la ejecución a la cola —el orden que
+    /// evita anunciar un nacimiento que luego acabe en `failed` por una cola llena, así que el arreglo
+    /// no está aquí sino en el aserto—, y el trabajador es otro hilo: entre el `try_send` y su
+    /// `publicar` hay un despertar, una lectura y una escritura de base, así que un cliente que se
+    /// quede desprogramado en esa ventana ve `running` de primero. Lo que protegía el aserto viejo era
+    /// un **margen de tiempo**, y «casi siempre» no es «siempre».
+    ///
+    /// Aquí se recorre el stream de ese cliente —el primero, el que ya se leyó— hasta dar con un
+    /// evento que sea **de esa** ejecución y diga `pending`, o hasta agotar el plazo. El identificador
+    /// se comprueba en cada evento y no solo en el primero: un `pending` de otra ejecución no vale,
+    /// por el mismo motivo por el que existe la igualdad entre los dos clientes.
+    async fn espera_el_nacimiento(
+        primer_evento: serde_json::Value,
+        cuerpo: &mut Body,
+        ejecucion: &str,
+        plazo: Duration,
+    ) -> bool {
+        let limite = Instant::now() + plazo;
+        let mut datos = primer_evento;
+
+        loop {
+            let es_el_nacimiento =
+                datos["execution_id"].as_str() == Some(ejecucion) && datos["status"] == "pending";
+
+            if es_el_nacimiento {
+                return true;
+            }
+
+            let restante = limite.saturating_duration_since(Instant::now());
+
+            match siguiente_evento(cuerpo, restante).await {
+                Some(evento) => datos = datos_del_evento(&evento),
+                None => return false,
+            }
+        }
     }
 
     /// 1.26 — Un `401` **antes** de abrir el stream sí lleva la envoltura.
