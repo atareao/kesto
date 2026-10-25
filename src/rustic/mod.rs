@@ -9,11 +9,15 @@
 //!
 //! Nada de lo que entra por aquí pasa por el disco, y nada que salga de aquí lleva datos del
 //! volcado: ni un [`std::fmt::Debug`], ni un registro.
+//!
+//! El único fallo que este módulo puede rechazar por su cuenta es el que recoge [`Error`] —un
+//! nombre de volcado que no sirve para nombrar nada—: lo que ya está en manos de la biblioteca
+//! no se puede validar desde aquí, y sus pánicos son suyos.
 
 mod origen;
 mod progreso;
 
 pub use origen::{
-    LectorDeVolcado, MensajeDelVolcado, OrigenDelVolcado, TunelDelVolcado, tunel_del_volcado,
+    Error, LectorDeVolcado, MensajeDelVolcado, OrigenDelVolcado, TunelDelVolcado, tunel_del_volcado,
 };
 pub use progreso::{AvisoDeProgreso, BarrasDelMotor};

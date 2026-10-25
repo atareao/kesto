@@ -2,15 +2,24 @@
 //!
 //! La biblioteca pide un [`ProgressBars`] al archivador y le devuelve a cambio
 //! [`RusticProgress`] por cada operación que quiere informar. El motor no habla ninguno de los
-//! dos: habla [`AvisoDeProgreso`], que es un enumerado propio con tres desenlaces —el total, el
-//! avance y el final— y ni un dato del volcado dentro.
+//! dos: habla [`AvisoDeProgreso`], que es un enumerado propio con tres desenlaces —el total de
+//! bytes, los bytes y el fin de los bytes— y ni un dato del volcado dentro.
 //!
-//! La traducción está sesgada a propósito hacia lo que el panel puede pintar:
+//! La traducción está sesgada a propósito hacia lo que el panel puede pintar, y el sesgo va en
+//! una sola dirección: **por este canal solo viajan bytes**.
 //!
-//! - [`ProgressType::Bytes`] es el único que produce [`AvisoDeProgreso::Total`]. Es el progreso
-//!   de bytes, y el total del panel es un total **de bytes**; convertirlo en el total de otro
-//!   tipo de progreso —un contador de ficheros, por ejemplo— pondría un denominador que no
+//! - [`ProgressType::Bytes`] es el único tipo que se traduce, y el total del panel es un total
+//!   **de bytes**; usar el total de otro tipo de progreso pondría un denominador que no
 //!   corresponde al numerador, que es peor que no poner ninguno.
+//! - [`ProgressType::Counter`] se descarta **entero**, y eso no es comodidad: la biblioteca usa
+//!   un contador en el camino normal del archivado —lo pide para buscar el snapshot padre, entre
+//!   otros sitios— y avanza **1 por snapshot**. Si sus incrementos entraran en este canal, el
+//!   motor recibiría `Bytes(1)` mezclados con los bytes de verdad, publicaría un
+//!   `bytes_uploaded` que no corresponde a ninguna magnitud y no tendría forma de detectarlo.
+//!   El daño no sería un aviso perdido sino una cifra falsa con la que el panel miente.
+//! - [`ProgressType::Spinner`] tampoco: la biblioteca no le fija longitud ni lo avanza —está en
+//!   su documentación: «doesn't get a length and is not advanced»—, así que no hay nada que
+//!   traducir.
 //! - El título que la biblioteca pone a una barra **se ignora a propósito**, y no por descuido:
 //!   el título de una entrada es su ruta, y convertirlo en un aviso sería abrir un canal por el
 //!   que las rutas del volcado salen hacia el motor, que a su vez las pone en el panel. Un
@@ -22,18 +31,20 @@ use std::sync::Arc;
 
 use rustic_core::{Progress, ProgressBars, ProgressType, RusticProgress};
 
-/// Un aviso de progreso del archivador, ya traducido a lo que el motor entiende.
+/// Un aviso de progreso del archivador, ya traducido.
 ///
-/// Lleva cantidades y nada más: ni una ruta, ni un título, ni un byte del volcado. Es la
-/// superficie por la que el progreso puede salir hacia el motor sin arrastrar datos de la base.
+/// Solo viajan **bytes**: es lo que el motor publica como avance de la copia, y mezclar ahí una
+/// cuenta de ficheros daría una cifra que no corresponde a ninguna magnitud. Lleva cantidades y
+/// nada más: ni una ruta, ni un título, ni un byte del volcado. Es la superficie por la que el
+/// progreso puede salir hacia el motor sin arrastrar datos de la base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AvisoDeProgreso {
-    /// El archivador fija el total que va a procesar.
-    Total(u64),
+    /// El archivador fija el total de bytes que va a procesar.
+    TotalDeBytes(u64),
     /// El archivador ha procesado estos bytes más.
-    Avance(u64),
-    /// Una operación terminó.
-    Fin,
+    Bytes(u64),
+    /// La operación de bytes terminó.
+    FinDeBytes,
 }
 
 /// Las barras que el motor le pasa a la biblioteca.
@@ -105,16 +116,17 @@ impl RusticProgress for BarraDelMotor {
         false
     }
 
-    /// El total, y **solo** del progreso de bytes.
+    /// El total de bytes, y **solo** del progreso de bytes.
     ///
-    /// El total del panel es un total de bytes, así que un `set_length` de otro tipo —el de un
-    /// contador de ficheros, por ejemplo— no se traduce: daría un denominador que no
-    /// corresponde al numerador, que es peor que no tener ninguno. Y del `Spinner` no se traduce
-    /// nada: la biblioteca no le fija longitud —está medido en su documentación: «doesn't get a
-    /// length and is not advanced»— y lo usa para esperas, no para trabajo.
+    /// El total del panel es un total de bytes, así que un `set_length` de otro tipo —el del
+    /// contador de snapshots con el que la biblioteca busca el padre, por ejemplo— no se traduce:
+    /// daría un denominador que no corresponde al numerador, que es peor que no tener ninguno. Y
+    /// del `Spinner` no se traduce nada: la biblioteca no le fija longitud —está medido en su
+    /// documentación: «doesn't get a length and is not advanced»— y lo usa para esperas, no para
+    /// trabajo.
     fn set_length(&self, longitud: u64) {
         if matches!(self.tipo, ProgressType::Bytes) {
-            (self.al_avisar)(AvisoDeProgreso::Total(longitud));
+            (self.al_avisar)(AvisoDeProgreso::TotalDeBytes(longitud));
         }
     }
 
@@ -127,24 +139,28 @@ impl RusticProgress for BarraDelMotor {
     /// se registra: no hay ni un `tracing` que lleve esto.
     fn set_title(&self, _titulo: &str) {}
 
-    /// El avance, de los dos tipos que cuentan algo.
+    /// El avance en bytes, y **solo** del progreso de bytes.
     ///
-    /// El `Spinner` no: no se avanza. Sí se avanza un `Counter` —los ficheros procesados—, y
-    /// aunque no vaya a ninguna parte del panel, descartarlo aquí sería decidir por el motor.
+    /// Ni el `Counter` ni el `Spinner` producen aviso. El `Spinner` porque no se avanza. Y el
+    /// contador porque **cuenta otra cosa**: la biblioteca lo usa para recorrer snapshots o
+    /// entradas, y su `1` no es un byte. Traducirlo daría un `bytes_uploaded` sistemáticamente
+    /// falso —y hacia arriba, que es la dirección peor— sin nada que lo delatara: los dos avisos
+    /// llegarían al motor con la misma forma, y el motor no tendría forma de separarlos.
     fn inc(&self, incremento: u64) {
-        if !matches!(self.tipo, ProgressType::Spinner) {
-            (self.al_avisar)(AvisoDeProgreso::Avance(incremento));
+        if matches!(self.tipo, ProgressType::Bytes) {
+            (self.al_avisar)(AvisoDeProgreso::Bytes(incremento));
         }
     }
 
-    /// El final de una operación que **estaba contando**.
+    /// El final de la operación de bytes.
     ///
-    /// Un `Spinner` que termina no produce aviso: nunca mandó un `Total` ni un `Avance`, así que
-    /// no hay ninguna barra que cerrar y un `Fin` suelto descuadraría la cuenta del motor. Los
-    /// otros dos sí: la barra existe y hay que decir que se acabó.
+    /// Los otros dos tipos no producen aviso: un `Spinner` que termina no mandó ni un total ni un
+    /// avance, así que no hay ninguna barra que cerrar, y de un `Counter` no ha salido nada por
+    /// este canal, así que un `FinDeBytes` suyo cerraría una barra que no existe. En los dos
+    /// casos un aviso suelto descuadraría la cuenta del motor.
     fn finish(&self) {
-        if !matches!(self.tipo, ProgressType::Spinner) {
-            (self.al_avisar)(AvisoDeProgreso::Fin);
+        if matches!(self.tipo, ProgressType::Bytes) {
+            (self.al_avisar)(AvisoDeProgreso::FinDeBytes);
         }
     }
 }
@@ -157,14 +173,15 @@ mod tests {
 
     use super::{AvisoDeProgreso, BarrasDelMotor};
 
-    /// **8.** El progreso traduce los avisos con los tres desenlaces.
+    /// **8.** El progreso traduce los avisos de **bytes** con los tres desenlaces.
     ///
     /// Con [`ProgressType::Bytes`] —el único que fija un total— el motor tiene que recibir la
-    /// longitud como [`AvisoDeProgreso::Total`], el incremento como [`AvisoDeProgreso::Avance`]
-    /// y el final como [`AvisoDeProgreso::Fin`]. Y de paso queda fijado que el título **no**
-    /// produce ningún aviso: si lo produjera, la ruta de una entrada viajaría al panel.
+    /// longitud como [`AvisoDeProgreso::TotalDeBytes`], el incremento como
+    /// [`AvisoDeProgreso::Bytes`] y el final como [`AvisoDeProgreso::FinDeBytes`]. Y de paso
+    /// queda fijado que el título **no** produce ningún aviso: si lo produjera, la ruta de una
+    /// entrada viajaría al panel.
     #[test]
-    fn las_barras_traducen_los_avisos() {
+    fn las_barras_traducen_los_avisos_de_bytes() {
         let recogidos = Arc::new(Mutex::new(Vec::new()));
         let destino = Arc::clone(&recogidos);
 
@@ -195,15 +212,73 @@ mod tests {
         assert_eq!(
             avisos,
             vec![
-                AvisoDeProgreso::Total(2048),
-                AvisoDeProgreso::Avance(512),
-                AvisoDeProgreso::Fin,
+                AvisoDeProgreso::TotalDeBytes(2048),
+                AvisoDeProgreso::Bytes(512),
+                AvisoDeProgreso::FinDeBytes,
             ],
             "los avisos no son los tres que el motor espera, o el título se convirtió en uno"
         );
     }
 
-    /// **9.** El `Debug` de las barras **no publica el callback**.
+    /// **9.** Un `Counter` **no** produce ningún aviso.
+    ///
+    /// Es la prueba que impide que vuelva el error: la biblioteca usa un contador en el camino
+    /// normal del archivado —para buscar el snapshot padre, entre otros— y avanza 1 por
+    /// snapshot, así que sus avisos llegarían al motor con **la misma forma** que los bytes y
+    /// `bytes_uploaded` saldría falso de manera sistemática, sin nada que lo delatara. Al
+    /// contador se le dan las cuatro llamadas que puede recibir —longitud, título, incremento y
+    /// final— y de aquí no puede salir ninguna.
+    ///
+    /// Y después se traduce una barra de bytes contra el **mismo** destino: sin eso, un destino
+    /// roto haría pasar esta prueba sin haber medido nada.
+    #[test]
+    fn un_contador_no_produce_ningun_aviso() {
+        let recogidos = Arc::new(Mutex::new(Vec::new()));
+        let destino = Arc::clone(&recogidos);
+
+        let barras = BarrasDelMotor::nuevas(Arc::new(move |aviso: AvisoDeProgreso| {
+            destino
+                .lock()
+                .expect("el candado de la prueba no puede estar envenenado")
+                .push(aviso);
+        }));
+
+        let contador = barras.progress(ProgressType::Counter, "getting snapshots...");
+        contador.set_length(7);
+        // El título de un contador también lleva una ruta, y tampoco puede salir.
+        contador.set_title("volcado/tienda.sql");
+        contador.inc(1);
+        contador.finish();
+
+        assert!(
+            recogidos
+                .lock()
+                .expect("el candado de la prueba no puede estar envenenado")
+                .is_empty(),
+            "un `Counter` mandó avisos: sus incrementos de snapshot llegarían al motor \
+             mezclados con los bytes, y `bytes_uploaded` saldría falso sin que nada lo delatara"
+        );
+
+        let de_bytes = barras.progress(ProgressType::Bytes, "backing up...");
+        de_bytes.set_length(1024);
+        de_bytes.inc(256);
+        de_bytes.finish();
+
+        assert_eq!(
+            *recogidos
+                .lock()
+                .expect("el candado de la prueba no puede estar envenenado"),
+            vec![
+                AvisoDeProgreso::TotalDeBytes(1024),
+                AvisoDeProgreso::Bytes(256),
+                AvisoDeProgreso::FinDeBytes,
+            ],
+            "el mismo destino tampoco dejó pasar los bytes: la comprobación del contador se hizo \
+             contra un canal roto y no mide nada"
+        );
+    }
+
+    /// **10.** El `Debug` de las barras **no publica el callback**.
     ///
     /// Un `Arc<dyn Fn…>` no implementa `Debug`, y el trait lo exige, así que hay uno a mano; lo
     /// que no puede hacer ese `Debug` es imprimir el contenido del cierre, porque en producción
