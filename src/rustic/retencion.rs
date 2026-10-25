@@ -93,7 +93,14 @@ use super::Error;
 /// es donde se rechaza lo que no significa nada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retencion {
-    /// Instantáneas diarias que se conservan, una por día.
+    /// Instantáneas diarias que se conservan.
+    ///
+    /// «Una por día» es lo que se espera y **no es toda la verdad**: la biblioteca ordena de la más
+    /// nueva a la más vieja y, mientras queden puntos del contador, conserva además **la más vieja**
+    /// del grupo —la última instantánea del recorrido entra por la cláusula `!has_next`—. Medido en
+    /// un repositorio real: doce copias del mismo día con `keep_daily = 7` dejan **dos**
+    /// instantáneas —la primera y la última—, y con `keep_daily = 1` dejan una sola, porque el
+    /// contador ya llegó a cero. De ahí que todas las pruebas de este módulo usen `keep_daily = 1`.
     pub keep_daily: i64,
     /// Instantáneas semanales que se conservan, una por semana.
     pub keep_weekly: i64,

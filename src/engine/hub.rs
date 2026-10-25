@@ -207,10 +207,12 @@ impl Hub {
     /// proceso se esté apagando, que es justo lo que `publicar` existe para no hacer.
     ///
     /// El candado se mantiene **durante el `send`**, y no es un descuido: clonar el `Sender` para
-    /// soltarlo antes de enviar dejaría un extremo de envío vivo un instante más, y un
-    /// [`Hub::cerrar`] que cayera en ese hueco no cerraría nada —el clon mantendría el canal
-    /// abierto y los receptores no verían su `Closed`, que es el cuelgue que esto viene a
-    /// arreglar—. Publicar dura microsegundos y ningún `await` cabe dentro.
+    /// soltarlo antes de enviar dejaría un extremo de envío vivo hasta que este `publicar` volviera,
+    /// así que un [`Hub::cerrar`] que cayera en ese hueco soltaría el suyo y **no** cerraría el
+    /// canal: el clon lo mantendría abierto y los receptores no verían su `Closed` hasta que
+    /// `publicar` acabara. El cierre llegaría, sí, pero con retraso, y un cierre que puede
+    /// retrasarse es justo lo que este candado existe para no permitir. Publicar dura microsegundos
+    /// y ningún `await` cabe dentro.
     pub fn publicar(&self, evento: EventoDeEjecucion) {
         let emisor = self
             .emisor
