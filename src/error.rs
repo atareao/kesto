@@ -42,6 +42,17 @@ pub enum AppError {
     #[error("{0}")]
     BadGateway(String),
 
+    /// La base de datos falló: es un fallo del servidor, así que al cliente le
+    /// llega el mismo mensaje genérico que con [`AppError::Other`] y la causa se
+    /// queda en el registro.
+    ///
+    /// El mensaje de [`crate::db::DbError`] **nombra rutas** —lo hace a propósito,
+    /// para que el operador sepa qué directorio falta—, y por eso no puede salir
+    /// al cuerpo: una ruta del despliegue no es asunto de quien pregunta por una
+    /// API.
+    #[error(transparent)]
+    Database(#[from] crate::db::DbError),
+
     /// La configuración no permite arrancar.
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -71,6 +82,16 @@ impl IntoResponse for AppError {
             Self::BadGateway(causa) => {
                 tracing::error!(error = %causa, "un servicio de terceros no contestó");
                 (StatusCode::BAD_GATEWAY, INTERNAL_MESSAGE.to_owned())
+            }
+            // Y el de la base de datos igual: la causa —que nombra rutas y puede
+            // llevar el texto de una consulta— va al registro, y al cliente le
+            // llega el mensaje genérico de los fallos internos.
+            Self::Database(causa) => {
+                tracing::error!(error = %causa, "la base de datos falló");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    INTERNAL_MESSAGE.to_owned(),
+                )
             }
             Self::Config(error) => {
                 // Por construcción, esta variante solo puede dispararse al
@@ -205,6 +226,42 @@ mod tests {
             cuerpo["message"],
             super::INTERNAL_MESSAGE,
             "el 502 debe traer el mismo mensaje genérico que el 500: {cuerpo}"
+        );
+        assert!(
+            cuerpo.get("data").is_none(),
+            "el error no debe traer la clave data: {cuerpo}"
+        );
+    }
+
+    /// 1.51 — Un fallo de base de datos no publica la causa.
+    ///
+    /// El mensaje de `DbError` nombra rutas a propósito —es lo que hace útil el
+    /// log—, y es justo lo que no puede salir al cuerpo: una ruta del despliegue
+    /// no es asunto de quien pregunta a la API.
+    #[tokio::test]
+    async fn un_error_de_base_no_filtra_la_causa() {
+        let respuesta = AppError::Database(crate::db::DbError::DirectorioAusente {
+            ruta: std::path::PathBuf::from(format!("/srv/{CREDENCIAL}/data/kesto.db")),
+        })
+        .into_response();
+
+        assert_eq!(respuesta.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let texto = body_text(respuesta).await;
+
+        assert!(
+            !texto.contains(CREDENCIAL),
+            "el 500 publicó la ruta de la causa: {texto}"
+        );
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el 500 debe traer JSON en el cuerpo");
+
+        assert_eq!(cuerpo["status"], 500);
+        assert_eq!(
+            cuerpo["message"],
+            super::INTERNAL_MESSAGE,
+            "el fallo de base debe traer el mensaje genérico: {cuerpo}"
         );
         assert!(
             cuerpo.get("data").is_none(),

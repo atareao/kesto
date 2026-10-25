@@ -13,12 +13,13 @@ Kesto ("caja" en esperanto) es un contenedor único que:
 
 ## Estado
 
-Proyecto **en construcción**, pero el código ya ha empezado y los dos primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado) y `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada), con **93 tests en verde**. Lo siguiente es el esquema de base de datos. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
+Proyecto **en construcción**, pero el código ya ha empezado y los tres primeros bloques están cerrados. La base está lista —especificación, gitflow, CI y `.justfile`— y sobre ella ya están implementados `bootstrap-core` (arranque, configuración desde el entorno, redacción de credenciales, envoltura JSON única y apagado ordenado), `auth-capability` (sesión en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y puerta sobre toda la superficie de negocio salvo la salud y el propio flujo de entrada) y `db-schema` (esquema del §3 aplicado por migraciones embebidas, pool de conexiones, capa de acceso de las cuatro tablas y cifrado en reposo de los tres secretos), con **156 tests en verde**. Lo siguiente son los endpoints del §5, el motor de ejecución y el planificador. La especificación técnica ([docs/DEFINITION.md](docs/DEFINITION.md)) manda sobre todo lo demás.
 
 | Pieza | Estado |
 |---|---|
 | Arranque y API | Cerrado: configuración desde el entorno, envoltura JSON única, salud, `404`/`405` y apagado ordenado (25 tests) |
-| Autenticación | Cerrado: sesión firmada con `KESTO_SECRET` en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y todo `/api/v1/*` bajo puerta salvo la salud y el flujo de entrada (**93 tests** en total) |
+| Autenticación | Cerrado: sesión firmada con `KESTO_SECRET` en cookie `HttpOnly`, flujo OIDC contra un proveedor externo y todo `/api/v1/*` bajo puerta salvo la salud y el flujo de entrada (93 tests acumulados) |
+| Base de datos | Cerrado: esquema del §3 por migraciones embebidas, pool de conexiones, capa de acceso de las cuatro tablas y cifrado en reposo de los tres secretos (**156 tests** en total), sin endpoints nuevos todavía |
 | CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) | Verde: `cargo fmt --check`, `cargo clippy -- -D warnings` y `cargo test --locked` |
 | Imagen | Pendiente de `Dockerfile`; el job del pipeline se salta solo hasta que exista |
 | Crate | `publish = false` a propósito, para no dejar un placeholder permanente en crates.io |
@@ -84,7 +85,7 @@ just dev        # backend en local
 just ui-dev     # panel con recarga en caliente (cuando exista ui/)
 ```
 
-`just dev` **necesita `KESTO_MASTER_KEY` en el entorno** o el proceso no arranca. Sin variables `OIDC_*` arranca en modo desarrollo: **sin capa de autenticación**, con todo `/api/v1/*` abierto y `/api/v1/auth/*` contestando `404`; con las tres `OIDC_*` presentes exige además `KESTO_SECRET` y pone la puerta sobre toda la superficie de negocio. Usa `RUST_LOG=debug` para ver el detalle.
+`just dev` **necesita `KESTO_MASTER_KEY` en el entorno** o el proceso no arranca, y **necesita su propio `DATABASE_URL`**: el valor por defecto (`sqlite:///app/data/kesto.db`) es el del volumen del `compose` del §8, así que en una máquina sin `/app/data` el arranque falla nombrando la ruta —Kesto no crea el directorio a propósito—; exporta uno tuyo (`export DATABASE_URL=sqlite:///tmp/kesto/kesto.db`, con el directorio ya creado) y las migraciones embebidas se aplican solas al abrir. Sin variables `OIDC_*` arranca en modo desarrollo: **sin capa de autenticación**, con todo `/api/v1/*` abierto y `/api/v1/auth/*` contestando `404`; con las tres `OIDC_*` presentes exige además `KESTO_SECRET` y pone la puerta sobre toda la superficie de negocio. Usa `RUST_LOG=debug` para ver el detalle.
 
 Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features (`plan-*`, `feature-new`), la imagen local (`build`, `run`) y OpenSpec (`check-spec`, `spec-*`).
 
@@ -98,11 +99,13 @@ Las recetas cubren además el ciclo gitflow (`gf-*`), los planes y las features 
 src/     backend Rust (Axum)
   api/       endpoints: la salud, el flujo de entrada y la sesión
   auth/      el flujo OIDC, la sesión y el gate (módulo propio, no del §7)
+  db/        pool, migraciones embebidas, cifrado en reposo y entidades del §3
   config.rs  configuración desde el entorno
   secret.rs  redacción de credenciales
   error.rs   errores tipados + IntoResponse
   state.rs   estado compartido
-  # db, docker, engine, rustic y scheduler llegan con los changes siguientes
+  # docker, engine, rustic y scheduler llegan con los changes siguientes
+migrations/ esquema del §3 e índices (0001_init.sql, 0002_indexes.sql)
 ui/      panel React + TypeScript + Ant Design (pendiente)
 docs/    SRS y un documento por feature (FEATURE-NNN-<slug>.md)
 plans/   planes de implementación (PLAN-NNN.md)
