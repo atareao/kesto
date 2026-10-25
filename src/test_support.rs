@@ -12,11 +12,13 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderName, Method, Request, header};
 use axum::response::Response;
+use bollard::container::{CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
 use http_body_util::BodyExt;
 use sqlx::SqlitePool;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -25,6 +27,7 @@ use uuid::Uuid;
 
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
+use crate::docker::Cliente;
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState, EstadoDeBase};
 
@@ -833,6 +836,196 @@ pub(crate) fn capturar_log() -> (BufferDeLog, GuardiaDeCaptura) {
     let anterior = BUFFER_DEL_HILO.with(|celda| celda.borrow_mut().replace(buffer.clone()));
 
     (buffer, GuardiaDeCaptura(anterior))
+}
+
+// ── Motor de contenedores ────────────────────────────────────────────────────
+//
+// Las pruebas de `src/docker` que necesitan un motor de contenedores van marcadas
+// `#[ignore]`, porque el CI no levanta ninguno: el job `backend` de
+// `.github/workflows/ci.yml` no declara servicios, así que `cargo test` tiene que
+// quedar verde sin motor. Lo de abajo es el arnés de esa capa, y quien las lance con
+// `cargo test -- --ignored` necesita un motor de verdad en la máquina.
+
+/// Imagen del contenedor de prueba.
+///
+/// **Ya está en la caché local de esta máquina**: las pruebas no la descargan, y por eso
+/// el nombre lleva el registro delante, que es como la tiene Podman.
+const IMAGEN_DE_PRUEBA: &str = "docker.io/library/alpine:3.23";
+
+/// Comando del contenedor de prueba: se queda vivo sin gastar CPU.
+///
+/// Va troceado en argumentos y no como `"sleep 600"`: la API de Docker no pasa por un
+/// intérprete, así que una cadena con un espacio dentro sería el nombre de un binario que
+/// no existe.
+const COMANDO_DE_PRUEBA: &[&str] = &["sleep", "600"];
+
+/// Tiempo máximo por petición de las pruebas con motor.
+///
+/// Holgado a propósito, y **medido**: con siete pruebas creando y arrancando contenedores a
+/// la vez, las peticiones al motor se hacen cola y una de ellas superó los 60 segundos
+/// —`RequestTimeoutError` en el alta— con el motor perfectamente vivo. Un tiempo corto aquí
+/// solo produce pruebas que fallan por el entorno y no por el código, así que el valor es
+/// cinco veces el que reventó.
+pub(crate) const TIMEOUT_DEL_MOTOR: Duration = Duration::from_secs(300);
+
+/// Socket del motor de contenedores de esta máquina, si hay uno.
+///
+/// Primero `DOCKER_HOST`, que es la variable que respeta el contrato de configuración y la
+/// que define un despliegue de verdad; si no está, el socket de Podman de un usuario, que
+/// es lo que hay en esta máquina de desarrollo —aquí no hay Docker—. Devuelve `None` si la
+/// ruta no existe: devolver una que no está convertiría «aquí no hay motor» en un fallo de
+/// conexión de la prueba, que es un diagnóstico peor.
+///
+/// Que este ayudante lea el entorno **no** contradice la regla de que el socket entre por
+/// parámetro en `Cliente::conectar`: lo que el contrato prohíbe es que el **código de
+/// producción** lo lea por su cuenta, porque entonces dos pruebas no podrían apuntar a dos
+/// sockets distintos a la vez. El arnés solo necesita *encontrar* el motor que hay aquí.
+pub(crate) fn socket_del_motor() -> Option<String> {
+    let candidato = std::env::var("DOCKER_HOST")
+        .ok()
+        .filter(|valor| !valor.trim().is_empty())
+        .unwrap_or_else(ruta_de_podman);
+
+    // La biblioteca acepta también la ruta pelada, así que la comprobación se hace sobre
+    // ella; lo que se devuelve es el valor tal y como estaba, que es lo que hay que pasarle.
+    let ruta = candidato.trim_start_matches("unix://");
+
+    Path::new(ruta).exists().then_some(candidato)
+}
+
+/// Ruta del socket de Podman de esta máquina, si no hay `DOCKER_HOST`.
+fn ruta_de_podman() -> String {
+    match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(dir) if !dir.is_empty() => format!("unix://{dir}/podman/podman.sock"),
+        // Último recurso: la ruta medida en esta máquina.
+        _ => "unix:///run/user/1000/podman/podman.sock".to_owned(),
+    }
+}
+
+/// Cliente del motor de contenedores de esta máquina, si hay uno.
+///
+/// Es el punto de entrada de las pruebas marcadas `#[ignore]`. Si no hay socket devuelve
+/// `None`, y quien las lance con `--ignored` tiene que tratarlo como un fallo del entorno y
+/// no del código: el mensaje del `expect` lo dice.
+pub(crate) fn cliente_del_motor() -> Option<Cliente> {
+    let socket = socket_del_motor()?;
+
+    Cliente::conectar(&socket, TIMEOUT_DEL_MOTOR).ok()
+}
+
+/// Contenedor de prueba: se crea al construirse y se borra al soltarse.
+///
+/// El nombre es **único por prueba** —quien llama pasa el nombre de su propia prueba— porque
+/// la suite corre en paralelo: un contador compartido, además de necesitar sincronización,
+/// dejaría el nombre sin relación con la prueba que dejó el contenedor vivo.
+pub(crate) struct ContenedorDePrueba {
+    /// Cliente de la biblioteca, solo para el borrado por la API.
+    motor: bollard::Docker,
+    /// Nombre del contenedor.
+    nombre: String,
+    /// Socket con el que se creó: lo necesita el `Drop`, que no puede ser asíncrono.
+    socket: String,
+}
+
+impl ContenedorDePrueba {
+    /// Crea y arranca un contenedor de la imagen de prueba, con `sleep 600`.
+    pub(crate) async fn nuevo(prueba: &str) -> Self {
+        let socket = socket_del_motor()
+            .expect("las pruebas del motor necesitan un socket de Docker o Podman");
+        let motor = bollard::Docker::connect_with_socket(
+            &socket,
+            TIMEOUT_DEL_MOTOR.as_secs(),
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("el socket existe, así que el cliente del arnés se construye");
+
+        let nombre = format!("kesto-prueba-{prueba}");
+
+        // Una corrida anterior que muriera sin limpiar deja el nombre ocupado, y el alta
+        // fallaría con un `409` que no hablaría de nada de esto. Se retira lo que hubiera con
+        // ese nombre y se ignora el fallo: si no hay nada, el motor contesta que no existe, y
+        // eso no es un problema.
+        let _ = motor
+            .remove_container(&nombre, Some(opciones_de_borrado()))
+            .await;
+
+        motor
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: nombre.clone(),
+                    platform: None,
+                }),
+                bollard::container::Config {
+                    image: Some(IMAGEN_DE_PRUEBA.to_owned()),
+                    cmd: Some(
+                        COMANDO_DE_PRUEBA
+                            .iter()
+                            .map(|arg| (*arg).to_owned())
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("el contenedor de prueba debe poder crearse");
+
+        motor
+            .start_container(&nombre, None::<StartContainerOptions<String>>)
+            .await
+            .expect("el contenedor de prueba debe poder arrancarse");
+
+        Self {
+            motor,
+            nombre,
+            socket,
+        }
+    }
+
+    /// Nombre del contenedor.
+    pub(crate) fn nombre(&self) -> &str {
+        &self.nombre
+    }
+
+    /// Lo retira por la API, que es el camino principal de limpieza.
+    ///
+    /// El `Drop` es la red de seguridad —no puede esperar a nada—, así que cada prueba llama
+    /// a esto al terminar y el borrado explícito queda en su salida. Un fallo aquí no tumba
+    /// la prueba: se cuenta por `stderr` y el `Drop` vuelve a intentarlo con `podman`.
+    pub(crate) async fn retirar(&self) {
+        if let Err(error) = self
+            .motor
+            .remove_container(&self.nombre, Some(opciones_de_borrado()))
+            .await
+        {
+            eprintln!(
+                "el contenedor de prueba {} no se pudo retirar por la API: {error}",
+                self.nombre
+            );
+        }
+    }
+}
+
+/// Opciones de borrado: con `force`, para que un contenedor en marcha también caiga.
+fn opciones_de_borrado() -> RemoveContainerOptions {
+    RemoveContainerOptions {
+        force: true,
+        ..Default::default()
+    }
+}
+
+impl Drop for ContenedorDePrueba {
+    fn drop(&mut self) {
+        // Aquí no se puede esperar a nada: el borrado por la API es asíncrono y este `Drop`
+        // corre en un hilo que puede estar soltando su runtime. Se llama al programa `podman`
+        // —en esta máquina no hay `docker`— y el fallo se ignora: es una red de seguridad, no
+        // el camino principal, que es `retirar`. Si el contenedor ya no está, `rm -f` hizo su
+        // trabajo.
+        let _ = std::process::Command::new("podman")
+            .args(["--remote", "--url", &self.socket, "rm", "-f", &self.nombre])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 #[cfg(test)]

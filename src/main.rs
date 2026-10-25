@@ -12,6 +12,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod docker;
 pub mod error;
 pub mod secret;
 pub mod state;
