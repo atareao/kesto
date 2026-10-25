@@ -96,8 +96,8 @@ El orden importa: cada módulo se apoya en el anterior, y no se empieza uno sin 
 ## 5. Cierre
 
 - [x] 5.1 `openspec validate backup-engine --strict` → esperado: sin fallos.
-- [ ] 5.2 Archivar el change con `just spec-archive backup-engine` → esperado: las tres capabilities nuevas creadas en `openspec/specs/` y los tres deltas fusionados; **comprobar el `Purpose` de `api-resources`** tras el archivado, porque el delta trae el suyo y el fusionado tiene que ser el suyo.
+- [x] 5.2 Archivar el change con `just spec-archive backup-engine` → esperado: las tres capabilities nuevas creadas en `openspec/specs/` y los tres deltas fusionados; **comprobar el `Purpose` de `api-resources`** tras el archivado, porque el delta trae el suyo y el fusionado tiene que ser el suyo.
 - [x] 5.3 Escribir `docs/FEATURE-005-backup-engine.md` con lo que **realmente** quedó construido: contratos, los tres endpoints, los comandos de extracción, el puente, las decisiones y la deuda pendiente → esperado: cero `TBD`.
-- [ ] 5.4 Renombrar `plans/PLAN-005.md` a `plans/PLAN-005-COMPLETED.md` con `git mv` → esperado: el plan cerrado y el contador de `plans/` sin huecos.
-- [ ] 5.5 Actualizar `AGENTS.md` y `README.md` con el estado nuevo: rutas, módulos, número de tests y qué queda por construir (el planificador, la UI y el `Dockerfile`) → esperado: los dos ficheros coherentes con lo entregado.
-- [ ] 5.6 PR de `feature/backup-engine` a `development` con `just gf-pr`, y **esperar** a que el CI corra en la cabeza nueva antes de fusionar → esperado: checks en verde y `just gf-merge` sin negarse. **No** abrir PR a `main` y **no** etiquetar.
+- [x] 5.4 Renombrar `plans/PLAN-005.md` a `plans/PLAN-005-COMPLETED.md` con `git mv` → esperado: el plan cerrado y el contador de `plans/` sin huecos.
+- [x] 5.5 Actualizar `AGENTS.md` y `README.md` con el estado nuevo: rutas, módulos, número de tests y qué queda por construir (el planificador, la UI y el `Dockerfile`) → esperado: los dos ficheros coherentes con lo entregado.
+- [x] 5.6 PR de `feature/backup-engine` a `development` con `just gf-pr`, y **esperar** a que el CI corra en la cabeza nueva antes de fusionar → esperado: checks en verde y `just gf-merge` sin negarse. **No** abrir PR a `main` y **no** etiquetar.
