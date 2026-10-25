@@ -183,6 +183,36 @@ const SQL_ALTA: &str = "INSERT INTO job_executions \
      RETURNING id, job_id, status, snapshot_id, bytes_processed, bytes_uploaded, error_message, \
      started_at, finished_at";
 
+/// Alta de una ejecución **solo si la tarea no tiene ya una en curso**, devolviendo la fila
+/// tal y como quedó.
+///
+/// Es una **sola sentencia** y no un «leer y luego insertar», y ahí está todo el asunto:
+/// entre la lectura y la escritura de un `alta` caben las peticiones de otro, así que dos
+/// disparos simultáneos leerían los dos «no hay ninguna en curso» e insertarían los dos, que
+/// es exactamente lo que el contrato prohíbe. Aquí, o la fila entra y se devuelve, o no
+/// entra y no se devuelve nada: sin transacción explícita, una sola sentencia es atómica por
+/// construcción, y las conexiones que coinciden serializan en la escritura de SQLite, así
+/// que la que llega después reevalúa su `WHERE NOT EXISTS` **dentro de su propia escritura**
+/// y ve la fila de la anterior.
+///
+/// Los dos estados que bloquean van **enlazados** (`?10`, `?11`), no escritos en el texto:
+/// la única boca que escribe esos literales es [`Estado::texto`] —y el `CHECK` del §3—, y
+/// una copia aquí sería una segunda boca que se quedaría atrás el día que se añada un
+/// estado sin que nada lo delatara.
+///
+/// `job_id` se enlaza **una vez** y se nombra dos veces (`?2`), en la fila y en la guarda:
+/// es el mismo valor, y enlazarlo dos veces dejaría dos copias que podrían separarse.
+///
+/// Si el `job_id` no existe, la clave foránea rechaza la fila igual que en [`SQL_ALTA`]: una
+/// ejecución huérfana no llega a existir, y eso **no** es «la tarea ya estaba en curso».
+const SQL_ALTA_SI_LIBRE: &str = "INSERT INTO job_executions \
+     (id, job_id, status, snapshot_id, bytes_processed, bytes_uploaded, error_message, started_at, \
+     finished_at) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+     WHERE NOT EXISTS (SELECT 1 FROM job_executions WHERE job_id = ?2 AND status IN (?10, ?11)) \
+     RETURNING id, job_id, status, snapshot_id, bytes_processed, bytes_uploaded, error_message, \
+     started_at, finished_at";
+
 /// Actualización de la fila entera.
 ///
 /// `started_at` **no** entra: es la fecha de nacimiento de la fila —el equivalente del
@@ -316,6 +346,73 @@ impl Ejecuciones {
         Ok(resultado.rows_affected() == 1)
     }
 
+    /// Da de alta una ejecución **solo si la tarea no tiene ya una en curso**.
+    ///
+    /// Es la guarda del disparo manual —`POST /api/v1/jobs/:id/run` encola una ejecución y
+    /// contesta `202`, y `409` si esa tarea ya tiene una `pending` o una `running`—: el
+    /// contrato dice que **no** se cree una segunda ejecución, y la comprobación tiene que
+    /// ser atómica porque dos peticiones simultáneas no pueden leer las dos «no hay
+    /// ninguna» e insertar las dos. Por eso esto es **una sola sentencia** —la constante
+    /// `SQL_ALTA_SI_LIBRE`— y no un `leer` seguido de un `alta`: sin transacción explícita,
+    /// la sentencia es atómica por construcción.
+    ///
+    /// Devuelve `Ok(Some(fila))` cuando el alta entra, y `Ok(None)` cuando la guarda la
+    /// rechaza. `None` significa **«la tarea ya tenía una en curso»**, y nunca «no se pudo»:
+    /// un fallo de base sigue siendo `Err`, porque confundir los dos convertiría una base
+    /// caída en un `409` que manda al operador a mirar una ejecución que no existe.
+    ///
+    /// La guarda mira **las filas que ya hay** para ese `job_id`, con independencia del
+    /// estado que traiga el alta nueva: quien llama pasa [`Estado::Pending`] —que es el
+    /// estado con el que se encola—, pero la decisión no depende de eso.
+    ///
+    /// Si el `job_id` no existe, la clave foránea rechaza la fila y sale un `DbError`, igual
+    /// que en [`Ejecuciones::alta`]: una ejecución huérfana no llega a existir. Eso **no** se
+    /// convierte en `None`, que significaría «ya está corriendo» y mandaría al operador a
+    /// mirar donde no es.
+    ///
+    /// `started_at` lo informa quien llama, como en el alta normal.
+    pub async fn alta_si_no_hay_ninguna_en_curso(
+        &self,
+        alta: AltaDeEjecucion,
+    ) -> Result<Option<Ejecucion>, DbError> {
+        // El identificador se genera **aquí**, no en la base: SQLite no tiene `uuid()`
+        // y un valor por defecto en el DDL obligaría a interpolarlo en la sentencia.
+        let id = Uuid::new_v4();
+
+        let fila = sqlx::query(SQL_ALTA_SI_LIBRE)
+            // El `id` y la clave foránea van como texto con guiones: un `bind` de `Uuid`
+            // los escribiría como un BLOB de 16 bytes y el §3 dice `TEXT`.
+            .bind(id.hyphenated().to_string())
+            .bind(alta.job_id.hyphenated().to_string())
+            .bind(alta.status)
+            .bind(&alta.snapshot_id)
+            .bind(alta.bytes_processed)
+            .bind(alta.bytes_uploaded)
+            .bind(&alta.error_message)
+            // Las fechas se normalizan a UTC **al enlazarlas**, por lo mismo que en el
+            // alta normal: el `Encode` de `time` conserva el desplazamiento del valor y
+            // el §3 dice que las fechas son UTC.
+            .bind(alta.started_at.to_offset(UtcOffset::UTC))
+            .bind(
+                alta.finished_at
+                    .map(|fecha| fecha.to_offset(UtcOffset::UTC)),
+            )
+            // Los dos estados que bloquean, por la boca que los escribe: la guarda no
+            // escribe literales de estado en el SQL.
+            .bind(Estado::Pending.texto())
+            .bind(Estado::Running.texto())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(error_de_consulta(SQL_ALTA_SI_LIBRE))?;
+
+        // Sin fila devuelta no hay alta: el `WHERE` de la sentencia no encontró hueco, que
+        // es el `None` del contrato. No es un fallo y por eso no es un `Err`.
+        match fila {
+            Some(fila) => desde_fila(&fila).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Borra la fila y devuelve si existía.
     pub async fn borrar(&self, id: &Uuid) -> Result<bool, DbError> {
         let resultado = sqlx::query(SQL_BORRAR)
@@ -388,12 +485,14 @@ fn desde_fila(fila: &SqliteRow) -> Result<Ejecucion, DbError> {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::future::join_all;
     use sqlx::SqlitePool;
     use time::macros::datetime;
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
 
     use super::{AltaDeEjecucion, Ejecuciones, Estado, FiltroDeEjecuciones};
+    use crate::db::DbError;
     use crate::db::entities::job::{AltaDeTarea, Tareas};
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
@@ -450,6 +549,23 @@ mod tests {
         }
     }
 
+    /// Un alta **encolada**: en `pending`, sin `snapshot`, sin error y sin final.
+    ///
+    /// Es la forma que tiene el alta del disparo manual —la ejecución se encola y se
+    /// contesta `202`—, así que es la que ejercitan las pruebas de la guarda. Los tres
+    /// campos anulables se dejan a `None` y no a lo que traiga [`alta_ejecucion`]: una
+    /// ejecución encolada no ha visto ningún `snapshot` ni ha fallado, y una fecha de
+    /// final aquí sería una ejecución terminada disfrazada de encolada.
+    fn alta_encolada(job_id: &Uuid) -> AltaDeEjecucion {
+        AltaDeEjecucion {
+            status: Estado::Pending,
+            snapshot_id: None,
+            error_message: None,
+            finished_at: None,
+            ..alta_ejecucion(job_id)
+        }
+    }
+
     /// Un pool migrado con un repositorio, un target y una tarea ya dados de alta: lo
     /// que `job_executions` necesita para no ser huérfana.
     async fn base_con_ejecucion_posible() -> (DirectorioDePrueba, SqlitePool, Ejecuciones, Uuid) {
@@ -481,6 +597,52 @@ mod tests {
         let ejecuciones = Ejecuciones::nuevo(pool.clone());
 
         (directorio, pool, ejecuciones, tarea.id)
+    }
+
+    /// Cuántas filas de `job_executions` tiene la tarea dada, **con SQL directo**.
+    ///
+    /// Se cuenta contra la tabla y no con la capa de acceso a propósito: lo que estas
+    /// pruebas afirman es que la guarda **no dejó fila**, y una comprobación que pasara
+    /// por la misma capa que se está probando podría salir bien por la razón equivocada
+    /// —una `listar_filtrado` que se olvidara de un filtro también diría «no hay»—. El
+    /// recuento de la tabla es lo único que no comparte código con lo que se mide.
+    async fn filas_de_la_tarea(pool: &SqlitePool, job_id: &Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_executions WHERE job_id = ?1")
+            .bind(job_id.hyphenated().to_string())
+            .fetch_one(pool)
+            .await
+            .expect("el recuento de filas debe poder leerse")
+    }
+
+    /// Una **segunda** tarea sobre el mismo target y el mismo repositorio que la de la
+    /// base de prueba.
+    ///
+    /// Existe para medir que la guarda es **por tarea**: sin una segunda tarea, «no
+    /// bloquea a la de al lado» no se puede afirmar. Se construye leyendo la primera y
+    /// reutilizando sus dos claves foráneas en vez de dar de alta otro repositorio y otro
+    /// target: el §3 exige que las dos existan, y volver a montarlos aquí abriría una
+    /// segunda forma de armar el aparato que podría separarse de la primera.
+    async fn tarea_hermana(pool: &SqlitePool, job_id: &Uuid) -> Uuid {
+        let tareas = Tareas::nuevo(pool.clone());
+        let original = tareas
+            .leer(job_id)
+            .await
+            .expect("la lectura de la tarea no puede fallar")
+            .expect("la tarea de la base de prueba tiene que estar");
+
+        tareas
+            .alta(AltaDeTarea {
+                target_id: original.target_id,
+                repository_id: original.repository_id,
+                cron_expression: "0 4 * * *".to_owned(),
+                keep_daily: 7,
+                keep_weekly: 4,
+                keep_monthly: 12,
+                enabled: true,
+            })
+            .await
+            .expect("el alta de la tarea hermana no puede fallar")
+            .id
     }
 
     /// 1.30 — El ciclo completo de una ejecución, con su estado y su `status` guardado
@@ -839,5 +1001,296 @@ mod tests {
         // La guarda del directorio temporal sigue viva hasta aquí: si se soltara antes, la base
         // desaparecería bajo las consultas.
         drop(directorio);
+    }
+
+    /// Con la tarea libre, la guarda **deja pasar** el alta y devuelve la fila.
+    ///
+    /// Es el caso que el disparo manual recorre cuando nadie está copiando: `POST
+    /// /api/v1/jobs/:id/run` encola y contesta `202`, así que el alta tiene que ocurrir de
+    /// verdad —con su `id` y su `job_id`— y no quedarse en un «podría».
+    #[tokio::test]
+    async fn con_la_tarea_libre_la_guarda_inserta_y_devuelve_la_fila() {
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+
+        let creada = ejecuciones
+            .alta_si_no_hay_ninguna_en_curso(alta_encolada(&job_id))
+            .await
+            .expect("el alta no puede fallar")
+            .expect("con la tarea libre la guarda tiene que dejar pasar el alta");
+
+        assert_eq!(
+            creada.job_id, job_id,
+            "la fila devuelta no es de la tarea que se pidió"
+        );
+        assert_eq!(
+            creada.status,
+            Estado::Pending,
+            "el estado devuelto no es el del alta"
+        );
+
+        assert_eq!(
+            filas_de_la_tarea(&pool, &job_id).await,
+            1,
+            "el alta tiene que dejar exactamente una fila"
+        );
+
+        // Y la fila devuelta es la que quedó: misma `id` leída por el camino normal.
+        let leida = ejecuciones
+            .leer(&creada.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila que devolvió la guarda tiene que estar en la tabla");
+
+        assert_eq!(
+            leida.id, creada.id,
+            "la fila devuelta por la guarda no es la que quedó en la tabla"
+        );
+    }
+
+    /// Con una ejecución `pending` ya en la tabla, la guarda **rechaza** el alta: devuelve
+    /// `None` y no crea fila.
+    ///
+    /// Las dos mitades se afirman por separado y no basta con una: un `None` que además
+    /// hubiera insertado sería peor que un `Some`, porque el operador leería «ya está
+    /// corriendo» y en la tabla habría una segunda ejecución encolada que nadie mira.
+    #[tokio::test]
+    async fn una_ejecucion_pending_en_curso_rechaza_el_alta_sin_crear_fila() {
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+
+        let primera = ejecuciones
+            .alta(alta_encolada(&job_id))
+            .await
+            .expect("el alta previa no puede fallar");
+
+        let segunda = ejecuciones
+            .alta_si_no_hay_ninguna_en_curso(alta_encolada(&job_id))
+            .await
+            .expect("la guarda rechaza el alta **sin fallar**: `None` no es un error");
+
+        assert!(
+            segunda.is_none(),
+            "con una `pending` en curso la guarda tiene que devolver `None`"
+        );
+        assert_eq!(
+            filas_de_la_tarea(&pool, &job_id).await,
+            1,
+            "la guarda dijo que no, pero dejó una segunda fila en la tabla"
+        );
+
+        // La fila que queda es la de antes, no una nueva que se hubiera colado.
+        let restante = ejecuciones
+            .listar()
+            .await
+            .expect("el listado no puede fallar");
+
+        assert_eq!(
+            restante.len(),
+            1,
+            "tiene que quedar solo la ejecución previa"
+        );
+        assert_eq!(
+            restante[0].id, primera.id,
+            "la fila que queda no es la primera: la guarda insertó de todos modos"
+        );
+    }
+
+    /// Con una ejecución `running` ya en la tabla, la guarda **rechaza** igual.
+    ///
+    /// Va aparte de la `pending` aunque las dos bloqueen: son los dos estados que el
+    /// contrato nombra, y una guarda que sólo mirara `pending` —el estado con el que
+    /// siempre entra el alta nueva— dejaría pasar una segunda copia sobre la que está
+    /// corriendo, que es el caso que la guarda existe para impedir.
+    #[tokio::test]
+    async fn una_ejecucion_running_en_curso_rechaza_el_alta_sin_crear_fila() {
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+
+        let en_curso = ejecuciones
+            .alta(AltaDeEjecucion {
+                status: Estado::Running,
+                ..alta_encolada(&job_id)
+            })
+            .await
+            .expect("el alta previa no puede fallar");
+
+        let segunda = ejecuciones
+            .alta_si_no_hay_ninguna_en_curso(alta_encolada(&job_id))
+            .await
+            .expect("la guarda rechaza el alta **sin fallar**: `None` no es un error");
+
+        assert!(
+            segunda.is_none(),
+            "con una `running` en curso la guarda tiene que devolver `None`"
+        );
+        assert_eq!(
+            filas_de_la_tarea(&pool, &job_id).await,
+            1,
+            "la guarda dijo que no, pero dejó una segunda fila en la tabla"
+        );
+        assert_eq!(
+            en_curso.status,
+            Estado::Running,
+            "el aparato de la prueba no dejó la ejecución en curso"
+        );
+    }
+
+    /// El histórico **terminado** no bloquea: con un `success` o un `failed` de ayer, la
+    /// guarda deja pasar la copia de hoy.
+    ///
+    /// Es la prueba que impide que un `success` de ayer deje la tarea clavada para
+    /// siempre. Se recorren los **dos** estados terminales —y con dos tareas distintas,
+    /// porque la primera copia que pasa deja una `pending` que bloquearía la segunda
+    /// vuelta—: una guarda que sólo reconociera `success` como «terminado» dejaría un
+    /// `failed` bloqueando la tarea para siempre, que es el fallo peor de los dos porque
+    /// el operador no lo ve venir.
+    #[tokio::test]
+    async fn el_historico_terminado_no_bloquea_una_copia_nueva() {
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+        let otra_tarea = tarea_hermana(&pool, &job_id).await;
+
+        for (tarea, estado) in [(&job_id, Estado::Success), (&otra_tarea, Estado::Failed)] {
+            ejecuciones
+                .alta(AltaDeEjecucion {
+                    status: estado,
+                    ..alta_ejecucion(tarea)
+                })
+                .await
+                .expect("el alta del histórico no puede fallar");
+
+            let creada = ejecuciones
+                .alta_si_no_hay_ninguna_en_curso(alta_encolada(tarea))
+                .await
+                .expect("el alta no puede fallar");
+
+            assert!(
+                creada.is_some(),
+                "una ejecución `{estado:?}` de ayer no puede dejar la tarea clavada para siempre"
+            );
+            assert_eq!(
+                filas_de_la_tarea(&pool, tarea).await,
+                2,
+                "tienen que quedar la del histórico y la nueva"
+            );
+        }
+    }
+
+    /// ⚠️ La prueba que muerde: **seis altas simultáneas sobre la misma tarea dejan una
+    /// sola fila**.
+    ///
+    /// Es lo único que mide que la guarda sea **una sola sentencia** y no un «leer y luego
+    /// insertar». Con la versión de dos pasos, las seis lecturas se lanzan antes de que
+    /// ninguna termine —las seis quedan en el aire a la vez y todas ven «no hay ninguna en
+    /// curso»—, así que las seis insertan y la tarea acaba con seis copias encoladas: el
+    /// contrato del disparo manual dice que **no** se cree una segunda ejecución.
+    ///
+    /// Con la sentencia única, cada conexión reevalúa el `WHERE NOT EXISTS` **dentro de su
+    /// propia escritura**, y como SQLite serializa las escrituras, la que llega después ve
+    /// la fila de la anterior.
+    ///
+    /// Seis y no dos: el pool tiene [`crate::db::MAX_CONEXIONES`] conexiones, así que seis
+    /// altas garantizan que hay más peticiones que conexiones y al menos una tiene que
+    /// esperar el turno —que es justo el caso que un «leer y luego insertar» no sabe
+    /// resolver, porque su lectura ya ocurrió antes de la espera—.
+    #[tokio::test]
+    async fn seis_altas_simultaneas_dejan_una_sola_fila() {
+        /// Cuántas altas simultáneas se lanzan sobre la **misma** tarea.
+        const SIMULTANEAS: usize = 6;
+
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+
+        // Los seis futuros se construyen **antes** de esperar ninguno: así las seis
+        // sentencias están vivas a la vez y la prueba mide concurrencia de verdad, no una
+        // cola de altas en serie.
+        let altas = (0..SIMULTANEAS)
+            .map(|_| ejecuciones.alta_si_no_hay_ninguna_en_curso(alta_encolada(&job_id)));
+
+        let mut creadas = Vec::new();
+
+        for resultado in join_all(altas).await {
+            let resultado = resultado.expect(
+                "ninguna de las altas simultáneas puede fallar: un fallo de base no es «la tarea \
+                 ya estaba en curso»",
+            );
+
+            if let Some(fila) = resultado {
+                creadas.push(fila);
+            }
+        }
+
+        assert_eq!(
+            creadas.len(),
+            1,
+            "de {SIMULTANEAS} altas simultáneas sobre la misma tarea salieron {}: \
+             la guarda no es atómica",
+            creadas.len()
+        );
+        assert_eq!(
+            filas_de_la_tarea(&pool, &job_id).await,
+            1,
+            "la tabla tiene que quedar con **exactamente una** fila de la tarea"
+        );
+    }
+
+    /// La guarda es **por tarea**: la ejecución en curso de la de al lado no bloquea.
+    ///
+    /// Sin esto, una guarda que mirara la tabla entera —sin filtrar por `job_id`— pasaría
+    /// las cinco pruebas anteriores y dejaría el panel con una sola copia posible a la vez
+    /// en todo Kesto.
+    #[tokio::test]
+    async fn la_ejecucion_en_curso_de_otra_tarea_no_bloquea_el_alta() {
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+        let otra_tarea = tarea_hermana(&pool, &job_id).await;
+
+        ejecuciones
+            .alta(alta_encolada(&job_id))
+            .await
+            .expect("el alta previa no puede fallar");
+
+        let creada = ejecuciones
+            .alta_si_no_hay_ninguna_en_curso(alta_encolada(&otra_tarea))
+            .await
+            .expect("el alta no puede fallar");
+
+        assert!(
+            creada.is_some(),
+            "la ejecución en curso de otra tarea no puede bloquear el alta de ésta"
+        );
+        assert_eq!(
+            filas_de_la_tarea(&pool, &job_id).await,
+            1,
+            "la tarea que ya estaba en curso no puede llevarse una segunda fila"
+        );
+        assert_eq!(
+            filas_de_la_tarea(&pool, &otra_tarea).await,
+            1,
+            "la tarea de al lado tiene que quedarse con su fila"
+        );
+    }
+
+    /// Una tarea que no existe **falla**, no devuelve `None`.
+    ///
+    /// Es el detalle del contrato que se rompe por comodidad: convertir el fallo de la clave
+    /// foránea en `None` haría que el manejador contestara `409` —«esa tarea ya tiene una
+    /// ejecución en curso»— sobre una tarea que no existe, y mandaría al operador a buscar
+    /// una ejecución que no hay. Aquí se fija que la huérfana sale como error de consulta,
+    /// igual que en [`Ejecuciones::alta`], y que **no llega a existir**.
+    #[tokio::test]
+    async fn una_tarea_que_no_existe_falla_en_vez_de_devolver_none() {
+        let (_directorio, pool, ejecuciones, _job_id) = base_con_ejecucion_posible().await;
+        let inexistente = Uuid::new_v4();
+
+        let error = ejecuciones
+            .alta_si_no_hay_ninguna_en_curso(alta_encolada(&inexistente))
+            .await
+            .expect_err("una tarea inexistente tiene que fallar, no decir que ya estaba en curso");
+
+        assert!(
+            matches!(error, DbError::Consulta { .. }),
+            "el fallo tiene que llegar como error de consulta, no como otro: {error}"
+        );
+        assert_eq!(
+            filas_de_la_tarea(&pool, &inexistente).await,
+            0,
+            "una ejecución huérfana no puede llegar a existir"
+        );
     }
 }
