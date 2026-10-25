@@ -13,6 +13,9 @@ use axum::Router;
 use axum::http::StatusCode;
 
 use crate::api::api_router;
+use crate::api::jobs::AltaDeTareaDelCable;
+use crate::api::repositories::AltaDeRepositorioDelCable;
+use crate::api::targets::AltaDeTargetDelCable;
 use crate::state::{AppState, EstadoDeBase};
 use crate::test_support::{
     DirectorioDePrueba, base_con_clave, body_json, body_text, capturar_log, config_con_dsn, delete,
@@ -431,5 +434,98 @@ async fn un_rechazo_de_validacion_deja_la_traza_del_campo_y_no_el_cuerpo() {
     assert!(
         !log.contains(NOMBRE_DEL_RECHAZO),
         "el registro del rechazo publicó el cuerpo de la petición: {log}"
+    );
+}
+
+/// Credencial de acceso distinguible del repositorio del cable.
+const CREDENCIAL_DE_ACCESO_DEL_CABLE: &str = "AKIAIOSFODNN7EXAMPLE-1-17-no-debe-salir";
+/// Passphrase distinguible del repositorio del cable.
+const PASSPHRASE_DEL_CABLE: &str = "passphrase-1-17-no-debe-salir-0000000000001";
+/// Contraseña de base distinguible del target del cable.
+const CONTRASENA_DEL_CABLE: &str = "contrasena-1-17-no-debe-salir-00000000000001";
+
+/// 1.17 — El `Debug` del tipo del cuerpo del cable no publica la credencial.
+///
+/// Cubre el delta `secrets`, escenario «El Debug del tipo del cuerpo no publica la
+/// credencial». La prueba de `SecretString` ya fija que la pieza redacta; ésta fija
+/// que el **DTO** no la puentea: el `Debug` de un tipo del cuerpo es lo primero que
+/// se formatea al depurar un manejador que no se comporta, y un `Debug` manual sobre
+/// el DTO —o dejar de derivarlo— publicaría el valor aunque `SecretString` siguiera
+/// redactando. Como el DTO solo guarda el secreto envuelto, la redacción la hereda;
+/// lo que la prueba afirma es que **sigue heredándola**.
+///
+/// Las dos mitades importan y por eso se afirman las dos: la primera —que el valor no
+/// salga— es la que protege; la segunda —que la salida **diga** que está redactada— es
+/// la que impide que la protección se confunda con un campo vacío, que es lo que haría
+/// pensar a quien depura que el campo llegó sin rellenar.
+#[test]
+fn el_debug_del_cuerpo_del_cable_no_publica_la_credencial() {
+    /// Comprueba que la salida no publica ninguna de las credenciales y que además
+    /// dice que redacta. La etiqueta nombra el DTO para saber cuál falló sin volcar
+    /// la credencial en el mensaje.
+    fn comprobar_redaccion(etiqueta: &str, salida: &str, credenciales: &[&str]) {
+        for (indice, credencial) in credenciales.iter().enumerate() {
+            assert!(
+                !salida.contains(*credencial),
+                "el `Debug` de `{etiqueta}` publicó la credencial en la posición {indice}: {salida}"
+            );
+        }
+
+        assert!(
+            salida.to_lowercase().contains("redact"),
+            "el `Debug` de `{etiqueta}` no dice que la credencial está redactada —y una salida que no lo dice se confunde con un campo vacío—: {salida}"
+        );
+    }
+
+    /// Igual que la anterior, pero sin exigir la palabra: este DTO no declara ningún
+    /// secreto, así que no tiene nada que redactar y pedirla ahí afirmaría algo que no
+    /// es cierto. Lo que afirma es que una credencial no se coló en un tipo que no la
+    /// declara.
+    fn comprobar_sin_credenciales(etiqueta: &str, salida: &str, credenciales: &[&str]) {
+        for (indice, credencial) in credenciales.iter().enumerate() {
+            assert!(
+                !salida.contains(*credencial),
+                "el `Debug` de `{etiqueta}` publicó la credencial en la posición {indice}: {salida}"
+            );
+        }
+    }
+
+    let json_del_repositorio = format!(
+        r#"{{"name":"repo-1-17","endpoint":"https://s3.example.test/1-17","bucket":"cubo","region":"eu-west-1","access_key_id":"AKIAIOSFODNN7EXAMPLE","secret_access_key":"{CREDENCIAL_DE_ACCESO_DEL_CABLE}","passphrase":"{PASSPHRASE_DEL_CABLE}"}}"#
+    );
+    let cuerpo_del_repositorio: AltaDeRepositorioDelCable =
+        serde_json::from_str(&json_del_repositorio)
+            .expect("el cuerpo del alta de un repositorio tiene que deserializar");
+
+    comprobar_redaccion(
+        "AltaDeRepositorioDelCable",
+        &format!("{cuerpo_del_repositorio:?}"),
+        &[CREDENCIAL_DE_ACCESO_DEL_CABLE, PASSPHRASE_DEL_CABLE],
+    );
+
+    let json_del_target = format!(
+        r#"{{"name":"target-1-17","target_type":"mariadb","container_name":"contenedor","db_user":"usuario","db_password":"{CONTRASENA_DEL_CABLE}","db_name":"base"}}"#
+    );
+    let cuerpo_del_target: AltaDeTargetDelCable = serde_json::from_str(&json_del_target)
+        .expect("el cuerpo del alta de un target tiene que deserializar");
+
+    comprobar_redaccion(
+        "AltaDeTargetDelCable",
+        &format!("{cuerpo_del_target:?}"),
+        &[CONTRASENA_DEL_CABLE],
+    );
+
+    let json_de_la_tarea = r#"{"target_id":"00000000-0000-4000-8000-000000000000","repository_id":"11111111-1111-4111-8111-111111111111","cron_expression":"0 3 * * *","keep_daily":7,"keep_weekly":4,"keep_monthly":12,"enabled":true}"#;
+    let cuerpo_de_la_tarea: AltaDeTareaDelCable = serde_json::from_str(json_de_la_tarea)
+        .expect("el cuerpo del alta de una tarea tiene que deserializar");
+
+    comprobar_sin_credenciales(
+        "AltaDeTareaDelCable",
+        &format!("{cuerpo_de_la_tarea:?}"),
+        &[
+            CREDENCIAL_DE_ACCESO_DEL_CABLE,
+            PASSPHRASE_DEL_CABLE,
+            CONTRASENA_DEL_CABLE,
+        ],
     );
 }
