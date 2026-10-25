@@ -1646,10 +1646,22 @@ mod tests {
             .encolar(tarea)
             .await
             .expect("el encolado tiene que entrar");
+        // El alta devuelve la fila tal y como se insertó, en memoria y sin que nadie la haya
+        // tocado: aquí sí se puede afirmar `pending` sin carrera. Sobre la tabla no: el trabajador
+        // es otro hilo y la marca `running` en cuanto la ejecución entra en su buzón, mucho antes
+        // de abrir el repositorio, así que leer la tabla y exigir `pending` es competir con él.
+        // Lo que esta prueba tiene que garantizar es que la ejecución *nace* en curso —`pending`
+        // o ya `running`, nunca en un estado terminal— y que *acaba* en el estado que se afirma
+        // más abajo con `esperar_el_final`.
         assert_eq!(
-            aparato.estado_en_la_base(&ejecucion.id).await,
-            "pending",
+            ejecucion.status,
+            Estado::Pending,
             "la ejecución no nace en `pending`"
+        );
+        let en_la_tabla = aparato.estado_en_la_base(&ejecucion.id).await;
+        assert!(
+            en_la_tabla == Estado::Pending.texto() || en_la_tabla == Estado::Running.texto(),
+            "la ejecución no está en curso en la tabla, sino en `{en_la_tabla}`"
         );
 
         let final_de_la_fila = aparato.esperar_el_final(&ejecucion.id).await;
