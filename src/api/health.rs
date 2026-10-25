@@ -32,7 +32,8 @@ mod tests {
     // una segunda fuente de verdad del mismo literal, y cambiar una y no la otra
     // dejaría los dos tests mintiendo en silencio.
     use crate::test_support::{
-        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_con_base, get, lookup_from,
+        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_con_base, estado_de_prueba,
+        get, lookup_from,
     };
 
     /// Versión que tiene que declarar la salud: la del binario.
@@ -68,8 +69,7 @@ mod tests {
 
         let (_directorio, pool, clave) = base_con_clave().await;
 
-        AppState::new(config, EstadoDeBase::nuevo(pool, clave))
-            .expect("el estado de prueba se construye")
+        estado_de_prueba(config, EstadoDeBase::nuevo(pool, clave))
     }
 
     /// Configuración de desarrollo: sin OIDC.

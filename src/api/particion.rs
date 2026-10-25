@@ -233,17 +233,61 @@ async fn un_identificador_mal_formado_contesta_400_en_los_tres_recursos() {
     }
 }
 
-/// El listado de ejecuciones sigue la partición del resto de la superficie.
+/// Las rutas del §5 que **no** entran en la tabla de las quince, con su método.
 ///
-/// Es la ruta **nueva** del §5 que no está en la tabla de las quince —`/executions` solo tiene
-/// el listado—, y la regla es la misma: cuelga de la mitad de negocio por la lista blanca y
-/// sin excepciones. Se prueba aparte porque el recorrido de las quince rutas se construye por
-/// recurso con sus cinco verbos, y aquí hay una sola.
+/// El listado del histórico y las tres rutas nuevas del change —el disparo manual, el stream de
+/// eventos y el explorador de instantáneas— cuelgan de la misma mitad de negocio por la misma lista
+/// blanca. Se recorren aparte porque no encajan en el molde del resto —un recurso con sus cinco
+/// verbos—: dos son rutas de un solo verbo y la del disparo es una subruta con el verbo que **no**
+/// comparte con el recurso del que cuelga, que declara `GET`, `PUT` y `DELETE` con identificador y
+/// no `POST`.
+///
+/// Se construyen en vez de escribirse en cada prueba por el mismo motivo que [`las_cinco_rutas`]:
+/// las que las recorren no pueden discrepar entre sí.
+fn las_cuatro_rutas_sueltas() -> [(&'static str, String); 4] {
+    [
+        ("GET", "/api/v1/executions".to_owned()),
+        ("POST", format!("/api/v1/jobs/{UN_UUID}/run")),
+        ("GET", "/api/v1/events".to_owned()),
+        ("GET", "/api/v1/snapshots".to_owned()),
+    ]
+}
+
+/// 1.30 — Las rutas del §5 que no están en la tabla de las quince siguen la partición del resto.
+///
+/// Es la prueba que comprueba que **la lista blanca no ha crecido**, que es el requisito propio de
+/// las tres rutas nuevas: las tres son superficie de negocio —el disparo escribe, y el stream y el
+/// explorador publican qué se está copiando y qué hay en el repositorio—, así que dejarlas públicas
+/// por comodidad del panel sería publicar el estado del sistema a quien pregunte.
+///
+/// Las tres se **añadieron aquí**, a la prueba que ya recorría la ruta suelta del listado de
+/// ejecuciones, y no en una prueba nueva: la regla se mira en un solo sitio.
+///
+/// # Por qué la mitad de «está montada» se queda con una sola ruta
+///
+/// La mitad de abajo —que en el modo sin autenticación la ruta exista— se deja como estaba, sobre
+/// el listado, porque es lo que esta prueba medía y no es su objeto: el objeto es la lista blanca, y
+/// eso lo mide el `401` de arriba.
+///
+/// Y no se extiende a las tres por un motivo distinto en cada una: el stream y el explorador ya
+/// tienen su comprobación de montaje donde les corresponde —en `api::events` y en
+/// `api::snapshots`—, y en el **disparo no se puede medir por el código**: `POST /api/v1/jobs/<id>/run`
+/// sobre una tarea que no existe contesta `404` tanto si la ruta no está montada como si lo está y
+/// la tarea no está, así que un `assert_ne!(404)` ahí pasaría hoy sin medir nada y seguiría
+/// pasando mañana por el mismo azar. Lo único que se mide en las tres, y en el disparo lo único que
+/// se puede medir, es el `401` sin sesión: la capa de sesión precede al manejador, así que un `401`
+/// solo lo da una ruta que está detrás de ella.
 #[tokio::test]
-async fn el_listado_de_ejecuciones_sigue_la_particion_del_resto() {
-    // Sin cookie, en modo `Oidc`: la puerta corta antes que el manejador.
-    let respuesta = get(router_oidc().await, "/api/v1/executions").await;
-    es_un_401_con_envoltura(respuesta, "GET /api/v1/executions sin sesión").await;
+async fn las_rutas_del_srs_que_no_estan_en_la_tabla_de_las_quince_siguen_la_particion_del_resto() {
+    // Sin cookie, en modo `Oidc`: la puerta corta antes que el manejador. El router se levanta una
+    // sola vez y se clona: `router_oidc()` arranca un proveedor de identidad falso y no hace falta
+    // uno por petición.
+    let router = router_oidc().await;
+
+    for (metodo, uri) in las_cuatro_rutas_sueltas() {
+        let respuesta = sin_cuerpo(router.clone(), metodo, &uri).await;
+        es_un_401_con_envoltura(respuesta, &format!("{metodo} {uri} sin sesión")).await;
+    }
 
     // Con la autenticación apagada, la ruta está **montada**: `200`, no `404`.
     let respuesta = get(router_desarrollo().await, "/api/v1/executions").await;

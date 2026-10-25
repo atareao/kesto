@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
 use crate::docker::Cliente;
+use crate::engine::{Ajustes, Dependencias, Motor};
 use crate::rustic::BarrasDelMotor;
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState, EstadoDeBase};
@@ -313,6 +314,28 @@ pub(crate) fn destino_de_s3_que_rechaza() -> String {
     });
 
     format!("http://127.0.0.1:{puerto}")
+}
+
+/// La ruta de destino de un repositorio de prueba, dentro de un directorio temporal **retenido**.
+///
+/// El alta de un repositorio dejó de ser un apunte: desde el change `backup-engine` **habla con el
+/// destino** —lo inicializa o conecta con él—, así que el `endpoint` de una fila de prueba tiene que
+/// ser una ruta de verdad donde [`abridor_local`] pueda abrir un repositorio. Un `endpoint` de
+/// mentira (`https://s3.example.test/…`) haría fallar el alta por destino inalcanzable, que es
+/// justamente lo que ese camino tiene que hacer.
+///
+/// La guarda del directorio se **retiene** hasta que el proceso de pruebas termina, y ése es el
+/// motivo de que este ayudante exista en vez de que cada prueba se monte el suyo: el alta ocurre
+/// **después** de construir el cuerpo de la petición, así que soltar la guarda al volver de aquí
+/// borraría la ruta antes de que nadie la abriera. Es el mismo trato que [`GUARDAS_DEL_ARNES`], y la
+/// misma deuda declarada: el directorio no se borra durante la corrida.
+pub(crate) fn destino_local_de_prueba(nombre: &str) -> String {
+    let directorio = directorio_de_prueba();
+    let ruta = directorio.ruta().join(nombre);
+
+    retener(directorio);
+
+    ruta.to_string_lossy().into_owned()
 }
 
 /// Abre el repositorio local del directorio dado, con la biblioteca y sin pasar por el
@@ -680,11 +703,69 @@ async fn base_del_arnes() -> (String, SqlitePool, Arc<Clave>) {
 /// configuración distinguible, con su propio `DATABASE_URL`—, así que su cadena de base
 /// puede no ser la de la base que se entrega: lo que el estado usa es el pool, no la
 /// cadena.
+///
+/// El motor entra ya arrancado, igual que en el arranque de verdad: el estado no lo
+/// monta —el motor captura el `Handle` del runtime al construirse, y eso lo hace
+/// [`motor_de_pruebas`] desde dentro del runtime de la prueba—.
 pub(crate) async fn estado_con_base(config: Config) -> AppState {
     let (_dsn, pool, clave) = base_del_arnes().await;
 
-    AppState::new(config, EstadoDeBase::nuevo(pool, clave))
-        .expect("el estado de prueba se construye")
+    estado_de_prueba(config, EstadoDeBase::nuevo(pool, clave))
+}
+
+/// El socket de un motor de contenedores que no existe: el del arnés.
+///
+/// Ninguna prueba de la suite normal habla con contenedores, así que el motor se monta
+/// apuntando a una ruta muerta: si apuntara al Podman de esta máquina, la suite mediría
+/// el entorno —el CI no tiene ese socket— y una prueba que no habla con contenedores
+/// fallaría por lo que hay montado fuera. El valor es el mismo que usa el módulo del
+/// motor en sus propias pruebas, repetido aquí porque aquél es privado de su módulo y
+/// desde este arnés no se alcanza.
+const SOCKET_MUERTO_DEL_MOTOR: &str = "unix:///no/existe/kesto-prueba.sock";
+
+/// El motor con el que se construye cada estado de prueba.
+///
+/// Vive en **un solo sitio** a propósito: el `AppState` lleva el motor desde este change,
+/// y son decenas los puntos de uso que construyen un estado —casi todos a través de los
+/// ayudantes de este arnés—. Montarlo aquí deja que los ayudantes cambien **una vez** y
+/// que ningún punto de uso se entere de que el motor existe siquiera.
+///
+/// Va con el socket muerto de arriba y con el abridor **local**: es lo que permite que
+/// las pruebas del alta y del explorador abran un repositorio del sistema de ficheros en
+/// la ruta que lleve el `endpoint` del acceso, sin S3 y sin motor de contenedores —que es
+/// lo que hace que todo esto corra en el CI—. La firma del abridor ya es la que el motor
+/// acepta, así que no hay ninguna adaptación en medio.
+///
+/// Es síncrona porque [`Motor::arrancar`] lo es: lo que necesita no es un `await`, sino
+/// estar dentro de un runtime —captura su `Handle`—, y los siete ayudantes ya son `async`,
+/// así que la llamada ocurre dentro. Es el mismo camino que usa el módulo del motor en
+/// `Aparato::motor_con`.
+fn motor_de_pruebas(db: &EstadoDeBase) -> Motor {
+    let ajustes = Ajustes::nuevos(SOCKET_MUERTO_DEL_MOTOR).con_abridor(abridor_local);
+    let dependencias = Dependencias {
+        repositorios: db.repositorios.clone(),
+        targets: db.targets.clone(),
+        tareas: db.tareas.clone(),
+        ejecuciones: db.ejecuciones.clone(),
+    };
+
+    Motor::arrancar(ajustes, dependencias)
+        .expect("el motor de prueba se monta desde dentro del runtime de la prueba")
+}
+
+/// El estado de prueba con la base **dada** y el motor del arnés.
+///
+/// Es el punto por el que pasan **todas** las pruebas que construyen un estado: el motor
+/// se monta una vez, aquí, con el socket muerto y el abridor local de
+/// [`motor_de_pruebas`], y quien construye un estado desde una prueba no tiene que saber
+/// que el motor existe. Los ayudantes de este arnés lo usan, y los módulos de prueba que
+/// construyen su estado a mano —los de `src/api`, que necesitan una configuración
+/// distinguible— también: una prueba que construyera el estado con otro motor dejaría de
+/// estar midiendo lo que mide la suite.
+pub(crate) fn estado_de_prueba(config: Config, db: EstadoDeBase) -> AppState {
+    let motor = motor_de_pruebas(&db);
+
+    AppState::new(config, db, motor).expect("el estado de prueba se construye")
 }
 
 /// Migrador que falla: su única migración no es SQL.
@@ -724,8 +805,9 @@ pub(crate) async fn estado_desarrollo() -> AppState {
     ]))
     .expect("la configuración de desarrollo es válida");
 
-    AppState::new(config, EstadoDeBase::nuevo(pool, clave))
-        .expect("el estado de desarrollo se construye")
+    let db = EstadoDeBase::nuevo(pool, clave);
+
+    estado_de_prueba(config, db)
 }
 
 /// Estado con la autenticación encendida.
@@ -769,7 +851,9 @@ pub(crate) async fn estado_oidc_con_emisor(emisor: &str) -> AppState {
     let config = Config::from_lookup(&lookup_oidc_con_emisor(emisor, &dsn))
         .expect("la configuración OIDC es válida");
 
-    AppState::new(config, EstadoDeBase::nuevo(pool, clave)).expect("el estado OIDC se construye")
+    let db = EstadoDeBase::nuevo(pool, clave);
+
+    estado_de_prueba(config, db)
 }
 
 /// Router de producción en modo `Oidc`, apuntando al emisor indicado.
@@ -1069,6 +1153,58 @@ pub(crate) async fn body_json(response: Response) -> serde_json::Value {
     let texto = body_text(response).await;
 
     serde_json::from_str(&texto).expect("el cuerpo debe ser JSON")
+}
+
+/// El siguiente **evento** del cuerpo de un stream, ya como texto, o `None` si no llega ninguno.
+///
+/// Existe porque el cuerpo de `text/event-stream` **no termina**: [`body_text`] se quedaría
+/// esperando para siempre a que llegue el final de un cuerpo que no lo tiene. Lo que hace falta es
+/// leer por tramos, y `data:` de un evento puede venir partido entre dos tramos del cuerpo —quien
+/// escribe el stream no promete nada sobre dónde corta—, así que aquí se **acumula** hasta que el
+/// texto contiene el final de un evento (una línea en blanco) y solo entonces se devuelve.
+///
+/// El plazo es obligatorio y del llamante: sin él, una prueba que espera un evento que el motor no
+/// publica se cuelga, y un cuelgue no dice qué faltaba.
+pub(crate) async fn siguiente_evento(cuerpo: &mut Body, plazo: Duration) -> Option<String> {
+    let limite = Instant::now() + plazo;
+    let mut acumulado = String::new();
+
+    loop {
+        let restante = limite.saturating_duration_since(Instant::now());
+
+        let Ok(Some(Ok(tramo))) = tokio::time::timeout(restante, cuerpo.frame()).await else {
+            // Se agotó el plazo, o el cuerpo terminó, o falló la lectura: en los tres casos no
+            // llegó un evento, y quien llama tiene que poder distinguirlo de «llegó vacío».
+            return None;
+        };
+
+        let Ok(datos) = tramo.into_data() else {
+            // Un tramo que no son datos (los *trailers* de un cuerpo por trozos) no forma parte
+            // del stream y no se acumula.
+            continue;
+        };
+
+        acumulado.push_str(&String::from_utf8_lossy(&datos));
+
+        if acumulado.contains("\n\n") {
+            return Some(acumulado);
+        }
+    }
+}
+
+/// El campo `data` del evento, ya interpretado como JSON.
+///
+/// El cuerpo de un stream son líneas `event:` y `data:`, y el `data` es el JSON del §5. Se saca
+/// aquí —y no en cada prueba— porque todas las pruebas del stream hacen lo mismo con él: leerlo y
+/// mirar sus campos.
+pub(crate) fn datos_del_evento(evento: &str) -> serde_json::Value {
+    let crudo = evento
+        .lines()
+        .find_map(|linea| linea.strip_prefix("data:"))
+        .unwrap_or_else(|| panic!("el evento no trae ninguna línea `data:`: {evento:?}"));
+
+    serde_json::from_str(crudo.trim())
+        .unwrap_or_else(|error| panic!("el `data` del evento no es JSON ({error}): {crudo:?}"))
 }
 
 /// Valor textual de una cabecera de la respuesta, si está.

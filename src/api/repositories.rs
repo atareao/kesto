@@ -16,6 +16,12 @@
 //! `api-endpoints`): el listado, el alta, la lectura, la actualización y el borrado. Las de
 //! `/targets`, `/jobs` y `/executions` llegan con el resto del módulo 2 y con el módulo 3, y
 //! hasta entonces no existen.
+//!
+//! El **alta** dejó de ser un apunte en la base con el change `backup-engine`: desde él habla con
+//! el destino —conecta si el repositorio existe, lo inicializa si no— y **escribe la fila después**,
+//! así que un destino que no responde o una passphrase que no abre rechazan el alta sin dejar fila
+//! que limpiar. El contrato entero, con el porqué de cada mitad, está en el rustdoc de [`alta`]; y
+//! el `PUT`, que sigue sin hablar con el destino, lo dice en el suyo.
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -25,11 +31,12 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use crate::api::contenido;
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
+use crate::api::{contenido, del_motor_en_el_alta};
 use crate::db::entities::{AltaDeRepositorio, Repositorio};
 use crate::error::AppError;
+use crate::rustic::{Acceso, PuestaEnMarcha};
 use crate::secret::SecretString;
 use crate::state::AppState;
 
@@ -143,6 +150,84 @@ impl RepositorioDelCable {
     }
 }
 
+/// La vista del **alta**: el repositorio creado, más cuál de los dos desenlaces ocurrió.
+///
+/// `201` con la fila no basta, y el requisito lo dice: el alta **habla con el destino**, así que su
+/// respuesta tiene que contar qué pasó con él. «No había repositorio y lo he creado» y «ya había uno
+/// y me he conectado» no se leen igual —el primero deja un historial vacío y el segundo uno que la
+/// próxima copia viene a continuar—, y sin el campo el operador tendría que abrir el panel del
+/// cubo para averiguarlo. El desenlace viaja en `data.outcome`, y su nombre y sus dos valores en
+/// inglés los fija el RED de este change, como fija los del explorador: son vocabulario del cable,
+/// que va en el inglés del resto del §5 —`status`, `execution_id`— mientras que lo que se pinta se
+/// queda en español.
+///
+/// # Por qué envuelve la vista del repositorio en vez de copiarla
+///
+/// Porque el alta devuelve **el mismo recurso** que la lectura y el listado y con los mismos nueve
+/// campos: lo único que añade es el desenlace. Un segundo tipo con los nueve campos escritos otra
+/// vez sería un segundo sitio donde se decide qué se publica de un repositorio —el día que un campo
+/// se añada, o que otro cambie de nombre, el que se olvide rompe el contrato en silencio—, y este
+/// fichero ya rechaza esa clase de copia en `contenido` y en la tabla de errores. Con el
+/// `flatten`, el `data` del alta es la vista del repositorio **y** el campo nuevo, en un objeto
+/// plano, que es la forma que las pruebas del cable fijan.
+#[derive(Debug, Serialize)]
+struct RepositorioCreadoDelCable {
+    /// La fila recién escrita, tal y como la publican la lectura y el listado.
+    #[serde(flatten)]
+    repositorio: RepositorioDelCable,
+    /// Cuál de los dos desenlaces ocurrió: `initialized` o `connected`.
+    outcome: &'static str,
+}
+
+impl RepositorioCreadoDelCable {
+    /// Vuelca la fila y el desenlace en la vista del alta.
+    fn desde(fila: &Repositorio, puesta: PuestaEnMarcha) -> Result<Self, AppError> {
+        Ok(Self {
+            repositorio: RepositorioDelCable::desde(fila)?,
+            outcome: desenlace(puesta),
+        })
+    }
+}
+
+/// El nombre del desenlace de la puesta en marcha en el vocabulario del cable.
+///
+/// Es el único sitio donde los dos desenlaces de [`PuestaEnMarcha`] se traducen a lo que viaja, y
+/// está aquí y no en `src/rustic` por lo mismo que el nombre de los campos: la biblioteca describe
+/// **qué** pasó con el repositorio —`Inicializado` y `Conectado`— y cómo se llama eso en una
+/// respuesta de la API es asunto de la capa HTTP, que es la que tiene un contrato que cumplir. El
+/// `match` es exhaustivo y sin rama comodín a propósito: un desenlace nuevo lo rompe la compilación
+/// en vez de viajar con un texto inventado.
+fn desenlace(puesta: PuestaEnMarcha) -> &'static str {
+    match puesta {
+        PuestaEnMarcha::Inicializado => "initialized",
+        PuestaEnMarcha::Conectado => "connected",
+    }
+}
+
+/// El acceso al destino que describe un **alta**: se construye desde el cuerpo, no desde una fila.
+///
+/// Es la diferencia de fondo con el resto de sitios que arman un [`Acceso`] —la copia de una tarea
+/// lo hace desde la fila, con los secretos que la capa de acceso acaba de descifrar—: en un alta no
+/// hay fila todavía, y no la hay **a propósito**, porque la fila se escribe después de que el
+/// destino conteste. Así que los secretos que se le entregan a la biblioteca son los que llegaron
+/// en la petición, en claro, y por ese camino no pasa la clave maestra: este módulo no descifra
+/// nada, y no puede.
+///
+/// Se copian los cuatro campos y los dos secretos porque el alta necesita las dos cosas —el acceso
+/// para hablar con el destino y los valores para la fila—, y se hace aquí, en un sitio con nombre,
+/// para que la copia se vea: es el único punto de este fichero donde los dos secretos existen dos
+/// veces a la vez.
+fn acceso_del_alta(alta: &AltaDeRepositorio) -> Acceso {
+    Acceso {
+        endpoint: alta.endpoint.clone(),
+        bucket: alta.bucket.clone(),
+        region: alta.region.clone(),
+        access_key_id: alta.access_key_id.clone(),
+        secret_access_key: alta.secret_access_key.clone(),
+        passphrase: alta.passphrase.clone(),
+    }
+}
+
 /// Convierte el identificador de la ruta en un `Uuid`, o contesta `400`.
 ///
 /// El mensaje **nombra el campo y no repite el valor**: el segmento de la ruta llegó por el
@@ -205,12 +290,100 @@ pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppEr
     ))
 }
 
-/// `POST /api/v1/repositories` — el alta, que contesta `201` con el recurso creado.
+/// `POST /api/v1/repositories` — el alta, que habla con el destino y contesta `201`.
 ///
 /// Los dos secretos del cuerpo son `Option`, y aquí se exigen: las columnas del §3 son
 /// `NOT NULL`, así que un alta sin ellos no tiene fila que escribir. El «ausente =
 /// consérvalo» es una regla del `PUT`, no del alta. El rechazo se contesta nombrando el
-/// campo y **sin haber tocado la base**.
+/// campo y **sin haber tocado la base** —y desde este change, sin haber hablado tampoco
+/// con el destino: se decide sobre el cuerpo, que es lo único que hace falta—.
+///
+/// # El alta habla con el destino, y la fila se escribe **después**
+///
+/// Un alta no es un apunte en la base: **pone el repositorio en marcha**. Conecta con el destino
+/// que describe el cuerpo y, si ese repositorio no existe todavía, lo **inicializa**; y solo
+/// cuando el destino ha contestado bien se escribe la fila. Las dos mitades del contrato están
+/// juntas a propósito, y el orden no es un detalle de implementación:
+///
+/// - sin la primera, el alta contesta `201` sobre un cubo que no existe, una `passphrase` con una
+///   errata o un endpoint mal escrito, y el error aparece mucho después, al ejecutar la primera
+///   copia, cuando ya nadie lo relaciona con el alta;
+/// - sin la segunda, un destino que no responde deja una fila que describe un repositorio
+///   inalcanzable: el panel lo lista como disponible, una tarea puede apuntarle y el fallo sale
+///   como una ejecución fallida en vez de como un alta rechazada. **Es más barato no escribir que
+///   limpiar**, y aquí sale gratis por construcción: hay un solo `INSERT` y va detrás de la única
+///   llamada que puede fallar por el destino.
+///
+/// Lo que **sí** puede quedar a medias es lo de fuera: si el destino se inicializa y la escritura de
+/// la fila falla después, queda un repositorio vacío en el almacenamiento y ninguna fila que lo
+/// describa. Es el menos malo de los dos desenlaces —un repositorio vacío no le dice a nadie que hay
+/// una copia hecha, una fila sin repositorio sí— y se deja escrito en vez de fingir que esto es
+/// atómico. Y no se intenta deshacer: borrar lo que se acaba de crear en el destino es más
+/// peligroso que dejarlo, porque el destino puede tener contenido que este proceso no puso.
+///
+/// El `PUT` de este mismo recurso hace lo contrario, y a propósito: **no** conecta ni inicializa.
+/// Editar una fila no puede depender de que el destino esté en pie, y el motivo entero está en su
+/// manejador.
+///
+/// # Los dos desenlaces, y el `400` frente al `502`
+///
+/// La respuesta dice cuál de los dos ocurrió en `data.outcome` —`initialized` o `connected`—, porque
+/// `201` con la fila no distingue «lo he creado» de «me he conectado con lo que había» y eso no se
+/// lee igual: uno deja un historial vacío y el otro uno que la próxima copia viene a continuar. La
+/// forma de la vista está en [`RepositorioCreadoDelCable`].
+///
+/// Y el fallo lo traduce [`del_motor_en_el_alta`], el **único** sitio donde el código de un
+/// [`crate::engine::ErrorDelMotor::Repositorio`] lo elige quien llama: `400` si lo que falla es un
+/// dato del formulario —la passphrase que no abre el repositorio que ya está, o un campo que no
+/// puede funcionar—, y `502` si el que no contesta es el destino. La frontera es de quién es la
+/// culpa, y el porqué está escrito allí, con el de la tabla que **no** elige.
+///
+/// # Lo que cuesta, y por qué no se acota aquí
+///
+/// Hablar con el destino no es gratis cuando el destino no está: un alta contra un S3 inalcanzable
+/// se lleva **41–54 s** medidos —cinco reintentos de `rustic_backend` con retroceso y temblor,
+/// `DEFAULT_RETRY`— antes de contestar el `502`. Se ha decidido **no acotarlo** con un plazo en este
+/// manejador, y los motivos van en orden de peso:
+///
+/// 1. **Un plazo devolvería una respuesta equivocada.** No distingue un destino muerto de uno lento:
+///    contestaría «el destino no se alcanza» sobre un cubo que sí está y que iba despacio, y un
+///    diagnóstico falso es peor que una espera, porque manda a buscar el fallo donde no está.
+/// 2. **El trabajo no se puede cancelar.** El alta espera a un hilo de bloqueo
+///    (`Motor::abrir_repositorio` entra por `spawn_blocking`), y un plazo sobre esa espera **no**
+///    para el hilo: los reintentos siguen corriendo, con los dos secretos vivos dentro, y cada alta
+///    abandonada dejaría un hilo ocupado. La respuesta se adelantaría a los hechos.
+/// 3. **Aquí no hay un número con el que acertar.** Los tres plazos que este proyecto sí pone —el de
+///    la petición al motor de contenedores, el de la inactividad del volcado y el de la parada—
+///    acotan cosas cuya lentitud está medida y cuyo coste de equivocarse es una copia que falla, no
+///    un alta que se rechaza. Éste sería el único plazo elegido contra un desconocido.
+///
+/// Lo que se acepta a cambio, dicho claro: la petición se queda colgada ese tiempo y el operador
+/// espera sin ver nada. Es asumible donde esto se usa —un alta es una acción humana, delante del
+/// formulario, no una llamada en un bucle—, y la espera está **acotada por la biblioteca**, no
+/// abierta. Lo que **no** está medido es un destino que traga la conexión y no contesta nunca —un
+/// cortafuegos que descarta en silencio—: ahí el techo lo pone el tiempo de transporte de `opendal`,
+/// que no se ha podido medir sin red de verdad. Queda declarado como lo que es.
+///
+/// Y la palanca buena, si algún día duele, no está en este fichero: `rustic_backend` construye su
+/// cliente con las opciones de `opendal`, y bajar ahí la política de reintentos —`("retry","0")` deja
+/// el mismo caso en **13 ms** medidos— es un cambio de `src/rustic/repositorio.rs`, que es donde vive
+/// la construcción del destino. Eso sería una política del alta decidida en un solo sitio, y no un
+/// plazo puesto encima. Se deja escrito en vez de callado porque el precio existe y alguien lo va a
+/// preguntar.
+///
+/// # Errors
+///
+/// `400` — un secreto que falta en el cuerpo, un campo que no puede funcionar, o una passphrase que
+/// no abre el repositorio que ya está en el destino. `502` — el destino no se alcanza, o se alcanza y
+/// no se deja inicializar. Y `500` — la base no atendió la escritura de la fila, o el hilo que
+/// hablaba con el repositorio se cayó: las dos las traduce [`crate::api::del_motor`].
+///
+/// # El identificador y la fecha los pone la capa de acceso
+///
+/// Este manejador no inventa ni el `id` ni el `created_at`: los genera el `INSERT` de la capa de
+/// acceso, y la respuesta los publica tal y como quedaron en la fila. Un `id` compuesto aquí sería
+/// un segundo generador de identificadores que el día que discrepara del de la base dejaría al panel
+/// pidiendo una fila que no existe.
 pub async fn alta(
     State(state): State<AppState>,
     Json(cuerpo): Json<AltaDeRepositorioDelCable>,
@@ -227,21 +400,32 @@ pub async fn alta(
         ));
     };
 
-    let fila = state
-        .db
-        .repositorios
-        .alta(AltaDeRepositorio {
-            name: cuerpo.name,
-            endpoint: cuerpo.endpoint,
-            bucket: cuerpo.bucket,
-            region: cuerpo.region,
-            access_key_id: cuerpo.access_key_id,
-            secret_access_key,
-            passphrase,
-        })
-        .await?;
+    // La fila, montada y **sin escribir**: es el valor con el que se arma el acceso y el que se
+    // guardará si el destino contesta bien. Montarla aquí no adelanta nada de lo que el orden evita,
+    // porque no toca la base.
+    let alta = AltaDeRepositorio {
+        name: cuerpo.name,
+        endpoint: cuerpo.endpoint,
+        bucket: cuerpo.bucket,
+        region: cuerpo.region,
+        access_key_id: cuerpo.access_key_id,
+        secret_access_key,
+        passphrase,
+    };
 
-    let vista = RepositorioDelCable::desde(&fila)?;
+    // 1. El destino, que es lo único que puede fallar por fuera. El motor saca esta llamada del
+    //    runtime por dentro —la biblioteca entra en pánico si se la llama desde dentro de uno, y con
+    //    el backend de S3 ninguna prueba del CI lo vería—, así que aquí solo hay que esperarla.
+    let puesta = state
+        .motor
+        .abrir_repositorio(acceso_del_alta(&alta))
+        .await
+        .map_err(del_motor_en_el_alta)?;
+
+    // 2. La fila, ya con el destino en marcha: es la mitad que no deja rastro de un alta rechazada.
+    let fila = state.db.repositorios.alta(alta).await?;
+
+    let vista = RepositorioCreadoDelCable::desde(&fila, puesta)?;
 
     Ok(ApiResponse::new(
         StatusCode::CREATED,
@@ -287,6 +471,22 @@ pub async fn leer(
 /// Si la fila desaparece entre la lectura y la escritura —otra petición la borró en el
 /// hueco—, contesta el mismo `404` que si no hubiera estado nunca: es la carrera que la
 /// lectura previa no puede cerrar, y el desenlace tiene que ser el del contrato.
+///
+/// # Y no conecta con el destino, a diferencia del alta
+///
+/// Es la asimetría que este change deja escrita a propósito, y **no** es un olvido: editar una fila
+/// no puede depender de que el destino esté en pie. El alta habla con el destino porque está
+/// **creando** la fila y su trabajo es averiguar si ese repositorio existe o hay que inicializarlo
+/// —una pregunta que solo tiene sentido una vez, y cuya respuesta se lleva la respuesta del `201`—;
+/// el `PUT` no crea nada: cambia el nombre, el cubo o la credencial de una fila que ya está, y hasta
+/// el caso en el que el destino ya no responde tiene que poder arreglarse desde aquí, porque puede
+/// ser justo lo que se viene a corregir. Un `PUT` que exigiera al destino convertiría la edición de
+/// una errata en una operación que falla precisamente cuando la errata es la que rompe el destino, y
+/// dejaría la fila sin forma de arreglarse desde el panel.
+///
+/// Lo que se paga, y se dice: si el `PUT` cambia el endpoint o la credencial a algo que no funciona,
+/// la fila queda guardada y el fallo aparecerá en la primera copia. Es el mismo trato que tenía el
+/// alta antes de este change, y se acepta porque la alternativa —no poder editar— es peor.
 pub async fn actualizar(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -358,6 +558,7 @@ pub async fn borrar(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use axum::http::{StatusCode, header};
@@ -366,10 +567,12 @@ mod tests {
     use uuid::Uuid;
 
     use crate::api::api_router;
-    use crate::state::{AppState, EstadoDeBase};
+    use crate::state::EstadoDeBase;
     use crate::test_support::{
-        base_con_clave, body_json, body_text, capturar_log, config_con_dsn, delete,
-        estado_desarrollo, get, post_crudo, post_json, put_json,
+        OTRA_PASSPHRASE_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, abrir_local, base_con_clave, body_json,
+        body_text, capturar_log, config_con_dsn, delete, destino_local_de_prueba,
+        directorio_de_prueba, estado_de_prueba, estado_desarrollo, get, post_crudo, post_json,
+        put_json, sembrar_snapshots,
     };
 
     /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
@@ -438,16 +641,21 @@ mod tests {
     async fn la_escritura_por_el_router_esta_en_el_fichero_de_la_base() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), clave),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
+
+        let cuerpo_de_la_peticion = cuerpo_de_alta("repo-1-3");
+        let endpoint_informado = cuerpo_de_la_peticion["endpoint"]
+            .as_str()
+            .expect("el cuerpo de la prueba informa el endpoint")
+            .to_owned();
 
         let respuesta = post_json(
             api_router(estado),
             "/api/v1/repositories",
-            &cuerpo_de_alta("repo-1-3"),
+            &cuerpo_de_la_peticion,
         )
         .await;
 
@@ -482,7 +690,7 @@ mod tests {
                 .expect("la fila tiene que estar en el fichero con el que se abrió el estado");
 
         assert_eq!(
-            endpoint, "https://s3.example.test/repo-1-3",
+            endpoint, endpoint_informado,
             "la fila del fichero no tiene los valores que informó la petición"
         );
     }
@@ -845,11 +1053,10 @@ mod tests {
     async fn el_put_sobre_una_fila_inexistente_contesta_404() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let id = Uuid::new_v4().to_string();
 
@@ -910,11 +1117,10 @@ mod tests {
     async fn un_put_sin_passphrase_conserva_la_almacenada() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let router = api_router(estado);
 
@@ -1033,11 +1239,10 @@ mod tests {
     async fn un_put_con_la_passphrase_vacia_se_rechaza_sin_cambiar_la_almacenada() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let router = api_router(estado);
 
@@ -1124,10 +1329,17 @@ mod tests {
     }
 
     /// El cuerpo de un alta válida, con valores distinguibles por su nombre.
+    ///
+    /// El `endpoint` es la ruta de un directorio temporal y no una URL de mentira, y eso no es un
+    /// detalle del arnés: desde el change `backup-engine` el alta **habla con el destino** —lo
+    /// inicializa si está vacío—, así que una URL que no existe convierte un alta válida en un
+    /// fallo por destino inalcanzable. [`destino_local_de_prueba`] deja además la ruta viva mientras
+    /// el proceso de pruebas corra, que es lo que hace falta porque el alta ocurre después de
+    /// construir el cuerpo.
     fn cuerpo_de_alta(nombre: &str) -> serde_json::Value {
         serde_json::json!({
             "name": nombre,
-            "endpoint": format!("https://s3.example.test/{nombre}"),
+            "endpoint": destino_local_de_prueba(nombre),
             "bucket": format!("cubo-{nombre}"),
             "region": "eu-west-1",
             "access_key_id": "AKIAIOSFODNN7EXAMPLE",
@@ -1265,11 +1477,10 @@ mod tests {
     async fn la_fecha_del_cable_se_relee_con_rfc3339_y_es_el_mismo_instante() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let respuesta = post_json(
             api_router(estado.clone()),
@@ -1449,6 +1660,312 @@ mod tests {
             &cuerpo_de_la_lectura,
             &texto_de_la_lectura,
             [&secreto, &passphrase],
+        );
+    }
+
+    // ── El alta habla con el destino ─────────────────────────────────────────
+    //
+    // Cubre `api-resources`, requisito «El alta de un repositorio conecta con él, y lo inicializa
+    // si todavía no existe», con sus cuatro escenarios. El instrumento es el abridor **local** del
+    // arnés: el `endpoint` de la fila es la ruta de un directorio temporal y el motor abre ahí un
+    // repositorio del sistema de ficheros, así que los cuatro desenlaces se recorren sin red, sin
+    // S3 y sin credenciales —que es lo que permite que esto corra en el CI—.
+
+    /// El secreto de estas pruebas, distinguible para que un `contains` no dé un falso positivo.
+    const SECRETO_DEL_ALTA_1_31: &str = "AKIAIOSFODNN7EXAMPLE-secreto-del-alta-1-31";
+
+    /// El cuerpo de un alta contra un destino y con una passphrase **elegidos**.
+    ///
+    /// El ayudante general del módulo informa un destino nuevo en cada llamada; estas pruebas
+    /// necesitan decidir el destino —para poder abrirlo antes, o para que no sea un directorio— y
+    /// la passphrase —para que no abra—, así que construyen el cuerpo aquí.
+    fn cuerpo_contra(nombre: &str, endpoint: &str, passphrase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": nombre,
+            "endpoint": endpoint,
+            "bucket": format!("cubo-{nombre}"),
+            "region": "eu-west-1",
+            "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "secret_access_key": SECRETO_DEL_ALTA_1_31,
+            "passphrase": passphrase,
+        })
+    }
+
+    /// Cuántas filas hay en `repositories`, contadas con SQL directo sobre el fichero.
+    ///
+    /// Se cuenta por SQL y no por el listado de la API porque lo que hay que afirmar es que **no
+    /// quedó fila**: un listado que contestara `200` con un array vacío por otro motivo —o una
+    /// lectura que fallara— diría lo mismo sin haber mirado la tabla.
+    async fn filas_de_repositorios(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM repositories")
+            .fetch_one(pool)
+            .await
+            .expect("la tabla de repositorios tiene que poder contarse")
+    }
+
+    /// Todo lo que hay dentro de un directorio, con el contenido de cada fichero.
+    ///
+    /// Es lo que permite afirmar que un destino **no** se tocó: el nombre y el tamaño no bastan
+    /// —un fichero reescrito con el mismo tamaño pasaría—, así que se compara el contenido.
+    fn inventario(ruta: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut encontrado = Vec::new();
+        let mut pendientes = vec![ruta.to_path_buf()];
+
+        while let Some(actual) = pendientes.pop() {
+            let Ok(entradas) = std::fs::read_dir(&actual) else {
+                continue;
+            };
+
+            for entrada in entradas.flatten() {
+                let camino = entrada.path();
+
+                if camino.is_dir() {
+                    pendientes.push(camino);
+                } else if let Ok(contenido) = std::fs::read(&camino) {
+                    encontrado.push((camino.to_string_lossy().into_owned(), contenido));
+                }
+            }
+        }
+
+        encontrado.sort_by(|uno, otro| uno.0.cmp(&otro.0));
+
+        encontrado
+    }
+
+    /// 1.31a — Un alta contra un destino **vacío** lo inicializa, y la respuesta lo dice.
+    ///
+    /// Cubre `api-resources`, escenario «Un alta contra un destino vacío lo inicializa». Se
+    /// afirman las tres cosas a la vez porque ninguna basta: que el alta contesta `201` (el
+    /// contrato del alta), que la respuesta **dice** cuál de los dos desenlaces ocurrió —un `201`
+    /// mudo dejaría al operador sin saber si su repositorio se creó o ya estaba— y que el destino
+    /// quedó con un repositorio de verdad, que se comprueba **abriéndolo con la biblioteca**: es el
+    /// camino que recorre quien restaura, y un repositorio que solo abriera el motor no está
+    /// probado.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_alta_contra_un_destino_vacio_lo_inicializa() {
+        let router = api_router(estado_desarrollo().await);
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-1-31a", &ruta, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "el alta contra un destino vacío tiene que contestar 201; contestó {status} con \
+             {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["outcome"], "initialized",
+            "la respuesta del alta tiene que decir que el repositorio se ha inicializado, y \
+             llegó {cuerpo}"
+        );
+
+        // Y el destino quedó inicializado de verdad: la biblioteca lo abre con esa passphrase.
+        let _ = abrir_local(destino.ruta(), PASSPHRASE_DE_PRUEBA);
+    }
+
+    /// 1.31b — Un alta contra un destino que **ya tiene** repositorio conecta, y lo dice.
+    ///
+    /// Cubre `api-resources`, escenario «Un alta contra un destino que ya tiene repositorio
+    /// conecta». El destino se siembra con la **biblioteca** y no con el motor, para que el alta
+    /// tenga que darse cuenta de que el repositorio ya está: si la discriminación fuera «abro y si
+    /// falla, inicializo», este escenario seguiría contestando `201` —y diría lo contrario de lo
+    /// que pasó—, así que la prueba afirma el **desenlace** y no solo el código.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_alta_contra_un_destino_con_repositorio_conecta() {
+        let router = api_router(estado_desarrollo().await);
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let antes = inventario(destino.ruta());
+
+        sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-1-31b", &ruta, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "el alta contra un destino que ya tiene repositorio tiene que contestar 201 y no \
+             fallar por «ya existe»; contestó {status} con {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["outcome"], "connected",
+            "la respuesta del alta tiene que decir que se ha conectado con un repositorio que ya \
+             estaba, y llegó {cuerpo}"
+        );
+
+        // Y un alta que conecta no vuelve a inicializar nada: lo que había sigue ahí.
+        let despues = inventario(destino.ruta());
+
+        assert!(
+            despues.starts_with(&antes),
+            "el alta borró o reescribió ficheros del repositorio que ya estaba: de {} a {} \
+             entradas",
+            antes.len(),
+            despues.len()
+        );
+    }
+
+    /// 1.31c — Un alta contra un destino inalcanzable contesta un error y **no deja fila**.
+    ///
+    /// Cubre `api-resources`, escenario «Un alta contra un destino inalcanzable no deja fila». El
+    /// destino es un **fichero** donde el motor espera un directorio: la biblioteca no puede
+    /// listarlo ni escribir en él, así que el desenlace es el de un destino que no responde, y se
+    /// recorre sin red. Se afirman tres cosas: que el error sale por la envoltura, que **no queda
+    /// fila** —una fila que describe un repositorio inalcanzable hace que el panel lo liste como
+    /// disponible y que el fallo aparezca en la primera copia— y que el error no publica la clave
+    /// secreta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_alta_contra_un_destino_inalcanzable_contesta_error_y_no_deja_fila() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        // El destino es un fichero de verdad en la ruta donde el motor espera un directorio.
+        let ruta = destino_local_de_prueba("repo-1-31c");
+        std::fs::write(&ruta, b"esto no es un repositorio").expect("el fichero del destino");
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-1-31c", &ruta, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "un destino que no responde es un fallo del servicio de fuera, no de la petición: \
+             contestó {status} con {texto}"
+        );
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el error tiene que salir por la envoltura");
+
+        assert_eq!(
+            cuerpo["status"], 502,
+            "la envoltura tiene que repetir el código: {texto}"
+        );
+
+        assert_eq!(
+            filas_de_repositorios(&pool).await,
+            0,
+            "un alta que no pudo hablar con el destino dejó una fila: el panel lo listaría como \
+             disponible y el fallo saldría en la primera copia"
+        );
+
+        assert!(
+            !texto.contains(SECRETO_DEL_ALTA_1_31),
+            "el error publicó la clave secreta que iba en la petición: {texto}"
+        );
+        assert!(
+            !texto.contains(PASSPHRASE_DE_PRUEBA),
+            "el error publicó la passphrase que iba en la petición: {texto}"
+        );
+    }
+
+    /// 1.31d — Un alta cuya passphrase no abre el repositorio existente no deja fila **ni toca el
+    /// destino**.
+    ///
+    /// Cubre `api-resources`, escenario «Un alta cuya passphrase no abre el repositorio existente
+    /// no deja fila», que es el desenlace que más importa de los cuatro: es el error de una errata
+    /// en el formulario, y sin esta mitad el panel daría por buena una fila que apunta a un
+    /// repositorio al que no puede acceder. Se afirman las tres cosas —el `400`, la ausencia de
+    /// fila y que el destino queda **byte a byte** como estaba—: un alta que «probara» escribiendo
+    /// algo antes de comprobar la passphrase pasaría las dos primeras y no la tercera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_alta_cuya_passphrase_no_abre_no_deja_fila_ni_toca_el_destino() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+
+        sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let antes = inventario(destino.ruta());
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-1-31d", &ruta, OTRA_PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "una passphrase que no abre el repositorio que ya está es un fallo del formulario, no \
+             del servicio de fuera: contestó {status} con {texto}"
+        );
+
+        let cuerpo: serde_json::Value =
+            serde_json::from_str(&texto).expect("el error tiene que salir por la envoltura");
+
+        assert_eq!(cuerpo["status"], 400, "la envoltura del 400: {texto}");
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 400 tiene que explicar que la passphrase no abre: {texto}"
+        );
+
+        assert_eq!(
+            filas_de_repositorios(&pool).await,
+            0,
+            "el alta con la passphrase equivocada dejó fila"
+        );
+
+        assert_eq!(
+            inventario(destino.ruta()),
+            antes,
+            "el alta con la passphrase equivocada modificó el destino"
+        );
+
+        assert!(
+            !texto.contains(SECRETO_DEL_ALTA_1_31),
+            "el error publicó la clave secreta que iba en la petición: {texto}"
         );
     }
 }

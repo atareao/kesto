@@ -239,7 +239,7 @@ mod tests {
     use crate::secret::SecretString;
     use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
-        DirectorioDePrueba, base_con_clave, body_json, body_text, config_con_dsn,
+        DirectorioDePrueba, base_con_clave, body_json, body_text, config_con_dsn, estado_de_prueba,
         estado_desarrollo, get,
     };
 
@@ -339,11 +339,10 @@ mod tests {
     async fn estado_con_base() -> (AppState, DirectorioDePrueba) {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool, Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         (estado, directorio)
     }

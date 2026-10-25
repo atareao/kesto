@@ -24,6 +24,25 @@ const ENV_OIDC_CLIENT_ID: &str = "OIDC_CLIENT_ID";
 const ENV_OIDC_CLIENT_SECRET: &str = "OIDC_CLIENT_SECRET";
 /// URL de retorno del proveedor OIDC.
 const ENV_OIDC_REDIRECT_URL: &str = "OIDC_REDIRECT_URL";
+/// Nombre de la variable que fija el socket del motor de contenedores.
+///
+/// No es una elección de este proyecto: es el nombre que la biblioteca de Docker
+/// lee por convención, y respetarlo deja que un `compose` que ya la define para
+/// Kesto funcione sin traducir nada. Y hace falta por una razón de este entorno:
+/// la máquina de desarrollo no tiene Docker, tiene Podman con una API compatible
+/// en otro socket, así que una ruta fija en el binario haría imposible ejercitar
+/// el motor sin un Docker de verdad.
+const ENV_DOCKER_HOST: &str = "DOCKER_HOST";
+/// Socket del motor de contenedores por defecto: la ruta del §8 del SRS.
+///
+/// Es la ruta que la biblioteca de Docker usa cuando `DOCKER_HOST` no está
+/// informada, y por eso es también la de aquí: el defecto del proyecto y el de la
+/// biblioteca tienen que ser el mismo, o el motor de producción hablaría con un
+/// socket que nadie le ha dicho. Una variable con valor por defecto no es
+/// obligatoria: su ausencia y su vacío caen aquí, y ninguno de los dos impide
+/// arrancar —una ruta vacía es una interpolación de `compose` sin variable, no una
+/// intención—.
+const DEFAULT_DOCKER_HOST: &str = "unix:///var/run/docker.sock";
 
 /// Filtro de registro por defecto.
 ///
@@ -86,6 +105,16 @@ pub struct Config {
     pub master_key: SecretString,
     /// Filtro de registro con el que arranca el proceso.
     pub log_filter: String,
+    /// Socket con el que el motor habla con Docker (`DOCKER_HOST`).
+    ///
+    /// Es una ruta y no una dirección de escucha: el socket es del motor de
+    /// contenedores, no de este proceso. Y viaja **ya resuelta** —nunca `None`—
+    /// porque el defecto lo aplica la carga de la configuración: quien lea este
+    /// campo se conecta o falla, pero no tiene que volver a decidir cuál es la
+    /// ruta por defecto. La lectura sale del `Lookup` inyectado, como el resto:
+    /// el motor no lee el entorno del proceso por su cuenta, y eso es lo que deja
+    /// que dos pruebas quieran dos sockets distintos a la vez.
+    pub docker_host: String,
 }
 
 /// Fallo de configuración: la aplicación no puede arrancar.
@@ -213,6 +242,18 @@ impl Config {
             AuthMode::Disabled => lookup.get(ENV_KESTO_SECRET).map(SecretString::new),
         };
 
+        // El socket del motor de contenedores. A diferencia de `RUST_LOG`, el
+        // vacío **no** falla: cae al defecto. La diferencia no es capricho —aquí
+        // el valor vacío no degrada nada en silencio, porque el defecto es una
+        // ruta usable y el motor avisa si no contesta al arrancar—. Y es el
+        // desenlace que de verdad ocurre: un `compose` que interpola una variable
+        // que no definiste deja la cadena vacía, y negarse a arrancar por eso
+        // convertiría un error de configuración en ausencia de copias.
+        let docker_host = lookup
+            .get(ENV_DOCKER_HOST)
+            .filter(|valor| !valor.is_empty())
+            .unwrap_or_else(|| DEFAULT_DOCKER_HOST.to_owned());
+
         Ok(Self {
             bind_address,
             database_url,
@@ -220,6 +261,7 @@ impl Config {
             secret,
             master_key: SecretString::new(master_key),
             log_filter,
+            docker_host,
         })
     }
 
@@ -275,6 +317,7 @@ impl Config {
             "database_url": self.database_url,
             "log_filter": self.log_filter,
             "auth_mode": self.auth.as_str(),
+            "docker_host": self.docker_host,
             "master_key": self.master_key.to_string(),
             "secret": self.secret.as_ref().map(ToString::to_string),
         });
@@ -601,6 +644,98 @@ mod tests {
 
         assert_eq!(config.bind_address.to_string(), "127.0.0.1:1");
         assert_eq!(config.master_key.expose(), "clave-maestra-inyectada");
+    }
+
+    /// 1.32 — `DOCKER_HOST` se respeta, su ausencia cae al defecto y su vacío también.
+    ///
+    /// Cubre `config`, requisito 1, los tres escenarios: la variable informada
+    /// manda, sin ella el socket es la ruta por defecto de la plataforma, y una
+    /// variable informada pero vacía —una interpolación de `compose` sin
+    /// variable— también cae al defecto.
+    ///
+    /// La prueba mira el **volcado** (`describe`) y no un campo del `Config`: el
+    /// volcado es lo que el arranque registra y lo que un operador lee, así que
+    /// es el camino que de verdad importa; y mirar el campo obligaría a que
+    /// existiera para compilar, lo que enmascararía el rojo de las demás pruebas.
+    #[test]
+    fn docker_host_se_respeta_y_su_ausencia_y_su_vacio_caen_al_defecto() {
+        // El escenario de la variable informada: manda tal cual, sin traducirla.
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("DOCKER_HOST", "unix:///run/user/1000/podman/podman.sock"),
+        ]);
+
+        let config = Config::from_lookup(&lookup).expect("la configuración es válida");
+
+        assert_eq!(
+            config.describe()["docker_host"],
+            "unix:///run/user/1000/podman/podman.sock",
+            "el volcado no muestra el socket de Docker informado"
+        );
+
+        // El escenario de la ausencia: la ruta por defecto, y sin fallar.
+        let lookup = lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY)]);
+
+        let config = Config::from_lookup(&lookup).expect("sin DOCKER_HOST el arranque no falla");
+
+        assert_eq!(
+            config.describe()["docker_host"],
+            "unix:///var/run/docker.sock",
+            "sin DOCKER_HOST el volcado no muestra la ruta por defecto"
+        );
+
+        // El escenario del vacío: también la ruta por defecto, y sin fallar.
+        let lookup = lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY), ("DOCKER_HOST", "")]);
+
+        let config =
+            Config::from_lookup(&lookup).expect("una DOCKER_HOST vacía no impide arrancar");
+
+        assert_eq!(
+            config.describe()["docker_host"],
+            "unix:///var/run/docker.sock",
+            "una DOCKER_HOST vacía no cae a la ruta por defecto"
+        );
+    }
+
+    /// 1.33 — Dos configuraciones con sockets distintos conviven.
+    ///
+    /// Cubre `config`, requisito 2: la lectura se inyecta como la del resto de la
+    /// configuración, así que dos pruebas pueden querer dos sockets distintos a
+    /// la vez. Cada volcado ve **el suyo**, y ninguno ve el del otro.
+    ///
+    /// Y la variable del proceso no se toca: eso no se comprueba con una lectura
+    /// —este módulo no puede consultarla sin volver a la lectura del entorno, que
+    /// es justo lo que la regla prohíbe— sino por la forma del código, que
+    /// recibe el `Lookup` y nunca consulta el proceso.
+    #[test]
+    fn dos_configuraciones_con_sockets_distintos_conviven() {
+        let una = Config::from_lookup(&lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("DOCKER_HOST", "unix:///run/user/1000/podman/podman.sock"),
+        ]))
+        .expect("la primera configuración es válida");
+
+        let otra = Config::from_lookup(&lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("DOCKER_HOST", "unix:///no/existe/kesto-prueba.sock"),
+        ]))
+        .expect("la segunda configuración es válida");
+
+        assert_eq!(
+            una.describe()["docker_host"],
+            "unix:///run/user/1000/podman/podman.sock",
+            "la primera configuración no ve su socket"
+        );
+        assert_eq!(
+            otra.describe()["docker_host"],
+            "unix:///no/existe/kesto-prueba.sock",
+            "la segunda configuración no ve su socket"
+        );
+        assert_ne!(
+            una.describe()["docker_host"],
+            otra.describe()["docker_host"],
+            "las dos configuraciones no pueden ver el mismo socket"
+        );
     }
 
     #[test]

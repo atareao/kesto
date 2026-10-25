@@ -26,6 +26,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::db::crypto::Clave;
+use crate::engine::{Ajustes, Dependencias, Motor};
 use crate::state::{AppState, EstadoDeBase};
 
 /// Arranca el servidor sobre `state.config.bind_address` y devuelve cuando
@@ -285,12 +286,42 @@ async fn main() -> std::process::ExitCode {
     // `repositories` y `backup_targets` la reciben al construirse.
     let clave = Arc::new(Clave::desde_maestra(&config.master_key));
 
-    // 5. Router, escucha y apagado. El estado se construye desde la configuración ya
-    //    resuelta y la base **ya abierta**: en modo `Oidc` lleva el estado de
-    //    autenticación, y en desarrollo no lleva ninguno.
+    // El estado de base: el pool **ya abierto y migrado**, la clave y las cuatro capas de
+    // acceso. El pool no se queda suelto como variable local en ningún momento.
+    let db = EstadoDeBase::nuevo(pool, clave);
+
+    // 5. El motor de copias: **detrás** de abrir y migrar la base y **delante** de empezar
+    //    a escuchar. El orden tiene dos razones y ninguna es decorativa: los trabajadores
+    //    del motor escriben en `job_executions` desde sus propios hilos, así que necesitan
+    //    las cuatro capas construidas sobre la base con el esquema ya aplicado —es el
+    //    mismo «abrir, migrar y solo entonces» que rige la base—; y nada de lo que sirve el
+    //    §5 —ni una copia, ni el explorador de instantáneas— existe antes del motor.
+    //
+    //    El socket sale de la configuración —`DOCKER_HOST`, con la ruta del §8 de defecto—,
+    //    y no del entorno del proceso: es la misma lectura inyectada que el resto, y es lo
+    //    que deja que una prueba quiera otro socket sin tocar el entorno.
+    let ajustes = Ajustes::nuevos(config.docker_host.clone());
+    // La espera de la parada se lee **antes** de mover los ajustes al motor, porque es el
+    // número con el que el apagado de más abajo acota su espera, y de ahí no se puede leer.
+    let espera_de_parada = ajustes.espera_de_parada;
+
+    let motor = match Motor::arrancar(ajustes, dependencias_del_motor(&db)) {
+        Ok(motor) => motor,
+        Err(error) => {
+            eprintln!("kesto no puede arrancar: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // 6. Router, escucha y apagado. El estado se construye desde la configuración ya
+    //    resuelta, la base **ya abierta** y el motor **ya arrancado**: en modo `Oidc` lleva
+    //    el estado de autenticación, y en desarrollo no lleva ninguno. El motor se clona
+    //    hacia el estado —un clon es un `Arc` por dentro, así que no copia ni la cola ni un
+    //    evento— porque el apagado de aquí abajo necesita el suyo, y el estado se lo lleva
+    //    el servidor.
     let address = config.bind_address;
 
-    let state = match AppState::new(config, EstadoDeBase::nuevo(pool, clave)) {
+    let state = match AppState::new(config, db, motor.clone()) {
         Ok(state) => state,
         Err(error) => {
             eprintln!("kesto no puede arrancar: {error}");
@@ -298,7 +329,22 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // 6. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
+    // 7. El socket del motor de contenedores, comprobado **para avisar** y nunca para
+    //    decidir si el proceso arranca. Un socket que no responde no puede dejar al
+    //    operador sin la herramienta con la que diagnosticarlo: el panel tiene que poder
+    //    levantarse precisamente para enseñar que no responde, y el fallo reaparece donde
+    //    importa —al ejecutar una copia—. Aquí queda dicho antes, que es todo lo que se
+    //    puede hacer sin inventarse un modo degradado.
+    if let Err(error) = motor.comprobar().await {
+        tracing::warn!(
+            %error,
+            "el motor de copias no puede hablar con el motor de contenedores: las tareas que \
+             volquen un contenedor fallarán hasta que su socket responda; el resto de Kesto \
+             funciona"
+        );
+    }
+
+    // 8. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
     //    si no contesta, se avisa y se sigue. Kesto es el orquestador de las
     //    **copias**, y negarse a arrancar porque el proveedor está caído
     //    convertiría un problema de autenticación en ausencia de copias. El
@@ -311,7 +357,34 @@ async fn main() -> std::process::ExitCode {
 
     tracing::info!(%address, "escuchando");
 
-    if let Err(error) = serve(state, shutdown_signal()).await {
+    let resultado = serve(state, shutdown_signal()).await;
+
+    // 9. La parada del motor va **después** del servidor, y el orden es la mitad del
+    //    contrato: `serve` resuelve cuando la señal llega y las peticiones en curso han
+    //    terminado de salir —deja de aceptar, y solo entonces vuelve—, así que para cuando
+    //    se llega aquí nadie puede pedir una copia. Al revés, una petición que ya estaba
+    //    dentro habría encontrado el motor parado y habría contestado `503` en vez de
+    //    servirse: el apagado convertiría en error una petición anterior a él.
+    //
+    //    Y va en `spawn_blocking` porque `Motor::parar` es **bloqueante**: espera, hasta
+    //    `espera_de_parada`, a que los trabajadores suelten. Llamarlo aquí mismo dejaría
+    //    parado el hilo del runtime que está corriendo este `main` —y con él las tareas que
+    //    ese hilo tuviera por delante, entre ellas los futuros con los que los hilos del
+    //    motor entran en la base—. El conjunto de bloqueo existe exactamente para esto. Y
+    //    no vale `block_in_place`, que es la otra salida: sobre un runtime `current_thread`
+    //    —el que monta `#[tokio::test]` por defecto, y el que puede pedir quien despliegue—
+    //    entra en **pánico**, así que la elección no es de estilo.
+    let parada = tokio::task::spawn_blocking(move || motor.parar(espera_de_parada));
+
+    if let Err(error) = parada.await {
+        // Un fallo aquí es la espera que no llegó a término —un pánico dentro de ella—. Su
+        // detalle es arbitrario y se queda en el registro: lo que importa es que no impide
+        // acabar, porque el proceso tiene que terminar. Lo que no acabe queda registrado
+        // como tal en `job_executions`, que es para lo que existe la espera.
+        tracing::error!(%error, "la parada del motor no ha llegado a término");
+    }
+
+    if let Err(error) = resultado {
         // El registro puede estar apagado (`RUST_LOG=off`), así que el fallo
         // fatal también sale por `stderr`. Devolver el código —en vez de matar
         // el proceso— deja caer `state`, y con él los `SecretString`, que
@@ -321,6 +394,25 @@ async fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+/// Las cuatro capas de acceso que el motor necesita, tomadas del estado de base.
+///
+/// Existe porque el motor **no** nombra [`EstadoDeBase`] a propósito: `src/engine` no importa
+/// `src/state`, y ese es el motivo de que el día que el `AppState` lleva el motor no haya un
+/// ciclo de módulos. Las cuatro líneas que unen las dos piezas viven aquí, donde las dos se
+/// tienen a la vista.
+///
+/// Clonar las capas no vuelve a construirlas: van tras un `Arc`, y el motor se queda con
+/// **las mismas** que el estado —que es lo que hace que las filas que escribe un trabajador
+/// estén en el pool que sirve el panel—.
+fn dependencias_del_motor(db: &EstadoDeBase) -> Dependencias {
+    Dependencias {
+        repositorios: db.repositorios.clone(),
+        targets: db.targets.clone(),
+        tareas: db.tareas.clone(),
+        ejecuciones: db.ejecuciones.clone(),
+    }
 }
 
 #[cfg(test)]

@@ -15,6 +15,15 @@ use crate::db::DbError;
 /// bibliotecas.
 const INTERNAL_MESSAGE: &str = "error interno del servidor";
 
+/// Mensaje con el que el cliente recibe un `503`.
+///
+/// Es propio y no el genérico del `500` porque el desenlace no es el mismo: aquí la petición está
+/// bien y el servicio no la puede atender **ahora** —el motor ha dejado de aceptar trabajo o su cola
+/// está llena—, así que lo que el cliente puede hacer es reintentar más tarde. El motivo no viaja: es
+/// un `5xx` y le rige la misma regla que al resto, se queda en el registro.
+const UNAVAILABLE_MESSAGE: &str =
+    "el servicio no está disponible para atender la petición ahora mismo";
+
 /// Error de la aplicación, con el código HTTP que le corresponde.
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -33,6 +42,26 @@ pub enum AppError {
     /// Sin sesión válida no se atiende: el motivo sí se explica.
     #[error("{0}")]
     Unauthorized(String),
+
+    /// La petición contradice el estado actual del recurso: es un `409`.
+    ///
+    /// Existe desde que hay motor de copias, y nace de un caso que ningún recurso tenía: encolar
+    /// dos veces la misma tarea no acelera nada —su repositorio las atiende de una en una—, la pone
+    /// a esperar y deja al panel con dos barras para un solo trabajo. No es una petición mal
+    /// formada —eso es el `400`— sino una que **está bien** y choca con lo que ya está pasando, que
+    /// es exactamente lo que un `409` significa. Como el `400`, explica el motivo: no lleva ninguna
+    /// credencial.
+    #[error("{0}")]
+    Conflict(String),
+
+    /// El servicio no puede atender la petición ahora mismo: es un `503`.
+    ///
+    /// El motivo **no** se publica —es un `5xx`— y el mensaje es [`UNAVAILABLE_MESSAGE`]: el motor
+    /// parado o su cola llena contesta con un texto que nombra el estado del servicio —el operador
+    /// ya lo tiene en el registro— y no lo que el cliente mandó. Es lo que permite contestar `503`
+    /// sin que el `Display` de un error de base, que nombra rutas del despliegue, asome al cuerpo.
+    #[error("{0}")]
+    ServiceUnavailable(String),
 
     /// Fallo interno: el detalle va al registro y al cliente le llega un mensaje genérico.
     #[error("{0}")]
@@ -77,6 +106,22 @@ impl IntoResponse for AppError {
             Self::MethodNotAllowed(motivo) => (StatusCode::METHOD_NOT_ALLOWED, motivo),
             // Al cliente que no ha entrado se le explica el motivo, como en el 400.
             Self::Unauthorized(motivo) => (StatusCode::UNAUTHORIZED, motivo),
+            // Y al que choca con el estado actual del recurso, también: el `409` es un rechazo de
+            // la petición y su motivo —«ya hay una ejecución en curso»— es lo único que le permite
+            // saber qué hacer. Se traza a `debug` igual que el `400`.
+            Self::Conflict(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición rechazada");
+                (StatusCode::CONFLICT, motivo)
+            }
+            // El `503` sí es del servidor: la causa va al registro y al cuerpo llega el mensaje
+            // fijo de la indisponibilidad, que no repite ni el motivo ni nada de la petición.
+            Self::ServiceUnavailable(causa) => {
+                tracing::error!(error = %causa, "el servicio no puede atender la petición");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    UNAVAILABLE_MESSAGE.to_owned(),
+                )
+            }
             // Estos dos son fallos del servidor: la causa va al log, no al cuerpo.
             Self::Other(causa) => {
                 tracing::error!(error = %causa, "fallo interno al atender la petición");

@@ -445,10 +445,10 @@ mod tests {
     use axum::http::StatusCode;
 
     use crate::api::api_router;
-    use crate::state::{AppState, EstadoDeBase};
+    use crate::state::EstadoDeBase;
     use crate::test_support::{
-        base_con_clave, body_json, body_text, config_con_dsn, delete, estado_desarrollo, get,
-        post_json, put_json,
+        base_con_clave, body_json, body_text, config_con_dsn, delete, estado_de_prueba,
+        estado_desarrollo, get, post_json, put_json,
     };
 
     /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
@@ -658,11 +658,10 @@ mod tests {
     async fn un_directory_con_container_name_se_rechaza_nombrando_el_campo() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let cuerpo_de_la_peticion = serde_json::json!({
             "name": "target-1-26",
@@ -720,11 +719,10 @@ mod tests {
     async fn un_directory_sin_host_path_se_rechaza_nombrando_el_campo() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let cuerpo_de_la_peticion = serde_json::json!({
             "name": "target-1-26b",
@@ -780,11 +778,10 @@ mod tests {
     async fn un_mariadb_sin_db_password_se_rechaza_nombrando_el_campo() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let cuerpo_de_la_peticion = serde_json::json!({
             "name": "target-1-27",
@@ -844,11 +841,10 @@ mod tests {
     async fn un_db_name_ausente_queda_nulo_en_la_columna() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let cuerpo_de_la_peticion = serde_json::json!({
             "name": "target-1-28",
@@ -905,11 +901,10 @@ mod tests {
     async fn un_campo_de_texto_vacio_se_rechaza_nombrando_el_campo() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let router = api_router(estado);
 
@@ -1071,11 +1066,10 @@ mod tests {
     async fn un_put_sin_db_password_conserva_la_almacenada() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let router = api_router(estado);
 
@@ -1204,11 +1198,10 @@ mod tests {
     async fn un_put_que_cambia_el_tipo_a_directory_descarta_la_credencial() {
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let router = api_router(estado);
 
