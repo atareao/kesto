@@ -361,6 +361,8 @@ mod tests {
     use std::sync::Arc;
 
     use axum::http::{StatusCode, header};
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
     use uuid::Uuid;
 
     use crate::api::api_router;
@@ -1132,5 +1134,321 @@ mod tests {
             "secret_access_key": "AKIAIOSFODNN7EXAMPLE-secreto-de-prueba",
             "passphrase": "passphrase-distinguible-00000000000000000000000001",
         })
+    }
+
+    /// 1.10 — Un `GET` sobre una fila inexistente contesta `404` con la envoltura.
+    ///
+    /// Cubre `api-resources`, requisito 2 (escenario «Un GET sobre una fila inexistente
+    /// contesta 404»). El identificador es un UUID **bien formado** que no existe —y no una
+    /// cadena cualquiera— a propósito: así el `404` lo decide la ausencia de la fila y no el
+    /// rechazo del identificador, que sería otro caso y ya tiene su prueba. El `404` es para
+    /// el recurso que no está, y ésa es la forma en que el panel distingue «no existe» de
+    /// «no puedes»: la prueba hermana del `PUT` (1.12) ya lo fija para la escritura, y ésta
+    /// lo fija para la lectura, que es la que el panel pide primero al abrir una ficha.
+    ///
+    /// El cuerpo se mira y no solo el código porque la envoltura única es el contrato del
+    /// §5: un `404` pelado, sin `status` ni `message`, dejaría al panel sin nada que pintar.
+    #[tokio::test]
+    async fn un_get_de_una_fila_inexistente_contesta_404_con_la_envoltura() {
+        let router = api_router(estado_desarrollo().await);
+
+        let id = Uuid::new_v4().to_string();
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "un GET sobre una fila que no existe tiene que contestar 404; contestó {status} \
+             con {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["status"], 404,
+            "la envoltura tiene que repetir el código en `status`: {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 404 tiene que explicar que no hay fila que leer: {cuerpo}"
+        );
+    }
+
+    /// 1.14 — El identificador del cable es la forma canónica con guiones.
+    ///
+    /// Cubre `api-resources`, requisito 1 (escenario «El identificador del cable es la forma
+    /// canónica con guiones»). El §3 guarda el identificador como `TEXT` y la trampa medida
+    /// por este proyecto es que un `Uuid` de `sqlx` enlazado contra una columna `TEXT` se
+    /// escribe como un **BLOB de 16 bytes** ilegible con `sqlite3`; la forma canónica con
+    /// guiones es la que hace la tabla legible a mano y la única que el panel puede meter en
+    /// una URL. Por eso la prueba no se queda en el aspecto del texto: además lo **relee**
+    /// con el mismo camino que usará el panel al construir la ruta del `GET`.
+    #[tokio::test]
+    async fn el_identificador_del_cable_es_la_forma_canonica_con_guiones() {
+        let router = api_router(estado_desarrollo().await);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-14"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder mirar el identificador"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let uuid = Uuid::parse_str(&id).expect(
+            "el identificador tiene que poder releerse como UUID —el panel lo usa para \
+             construir las rutas de GET, PUT y DELETE—",
+        );
+
+        assert_eq!(
+            uuid.hyphenated().to_string(),
+            id,
+            "el identificador releído tiene que volver a escribirse igual: {id}"
+        );
+
+        let posiciones: Vec<usize> = id
+            .char_indices()
+            .filter(|(_, caracter)| *caracter == '-')
+            .map(|(indice, _)| indice)
+            .collect();
+
+        assert_eq!(
+            posiciones,
+            vec![8, 13, 18, 23],
+            "los guiones tienen que estar en las posiciones de la forma canónica: {id}"
+        );
+
+        assert_eq!(
+            id.len(),
+            36,
+            "la forma canónica con guiones mide 36 bytes, y éste mide {}: {id}",
+            id.len()
+        );
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "el identificador que salió del alta tiene que servir para pedir la fila: {id}"
+        );
+    }
+
+    /// 1.15 — La fecha del cable se relee con RFC3339 y es el mismo instante.
+    ///
+    /// Cubre `api-resources`, requisito 1 (escenario «La fecha del cable se relee con RFC3339
+    /// y es el mismo instante»). El contrato fija el literal medido
+    /// (`2026-10-25T12:34:56Z`: emite `Z` y **omite la fracción** cuando los nanosegundos son
+    /// cero), y esta prueba es la que impide que una actualización de `time` cambie la forma
+    /// del cable sin que nadie se entere: la serialización por defecto de `time` en este
+    /// crate **no** produce una cadena —`serde-human-readable` es una feature aparte y no
+    /// está activada—, así que una fecha que no fuera cadena delataría que alguien cambió el
+    /// formateo. La última mitad es la que de verdad importa: la fecha publicada tiene que
+    /// ser **la que la base guardó** y no la del reloj de la respuesta.
+    #[tokio::test]
+    async fn la_fecha_del_cable_se_relee_con_rfc3339_y_es_el_mismo_instante() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = AppState::new(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        )
+        .expect("el estado se construye sobre la base de prueba");
+
+        let respuesta = post_json(
+            api_router(estado.clone()),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-1-15"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder mirar la fecha"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let texto = cuerpo["data"]["created_at"]
+            .as_str()
+            .expect(
+                "la fecha del cable tiene que ser una **cadena** RFC3339 y no un número: \
+                     `time` sin `serde-human-readable` serializa por defecto en su forma \
+                     binaria, y una fecha numérica delataría ese cambio",
+            )
+            .to_owned();
+
+        let instante_publicado = OffsetDateTime::parse(&texto, &Rfc3339).expect(
+            "la fecha del cable tiene que releerse con RFC3339, que es el formato que el \
+             contrato fija",
+        );
+
+        assert!(
+            texto.ends_with('Z'),
+            "la fecha del cable termina en `Z` cuando el instante va en UTC: {texto}"
+        );
+
+        assert!(
+            !texto.contains('.'),
+            "la fecha del cable omite la fracción de segundo cuando los nanosegundos son \
+             cero, y ésta la lleva: {texto}"
+        );
+
+        let uuid = Uuid::parse_str(&id).expect("el identificador del alta tiene que ser un UUID");
+
+        let fila = estado
+            .db
+            .repositorios
+            .leer(&uuid)
+            .await
+            .expect("la fila recién dada de alta tiene que poder releerse")
+            .expect("la fila recién dada de alta tiene que seguir en la base");
+
+        assert_eq!(
+            fila.created_at, instante_publicado,
+            "la fecha que publica la API tiene que ser la que guardó la base, y la base \
+             guardó {} mientras el cable publicó {texto}",
+            fila.created_at
+        );
+    }
+
+    /// 1.16 — El alta y la lectura no traen los secretos y sí los booleanos.
+    ///
+    /// Cubre `api-resources`, requisito 4 (escenario «El alta y la lectura no traen los
+    /// secretos y sí los booleanos»). El §3 guarda las dos credenciales y el panel necesita
+    /// saber **si están configuradas** para pintar el campo como ya relleno; devolver el
+    /// valor convertiría cada `GET` en una fuga que viaja al navegador y a cualquier registro
+    /// intermedio, así que de cada credencial sale un booleano derivado y nunca el valor. Los
+    /// valores que se buscan en el texto crudo se leen del **propio cuerpo de la petición** y
+    /// no se escriben aquí: si el ayudante cambia, la prueba sigue midiendo lo correcto. Y se
+    /// mira el texto crudo además del JSON porque un campo que se colara **dentro de otro**
+    /// —o un `data` que serializara la entidad entera— no aparecería como clave propia y sí
+    /// en el texto.
+    #[tokio::test]
+    async fn el_alta_y_la_lectura_no_traen_los_secretos_y_si_los_booleanos() {
+        /// Comprueba las cuatro propiedades de la vista de un repositorio, en el JSON y en
+        /// el texto que viajó por el cable.
+        fn comprobar_vista(
+            etiqueta: &str,
+            cuerpo: &serde_json::Value,
+            texto: &str,
+            secretos: [&str; 2],
+        ) {
+            let data = &cuerpo["data"];
+
+            for (campo, presente) in [
+                (
+                    "has_secret_access_key",
+                    data["has_secret_access_key"].as_bool(),
+                ),
+                ("has_passphrase", data["has_passphrase"].as_bool()),
+            ] {
+                assert_eq!(
+                    presente,
+                    Some(true),
+                    "el {etiqueta} tiene que decir que `{campo}` está guardada: {cuerpo}"
+                );
+            }
+
+            for campo in ["secret_access_key", "passphrase"] {
+                assert!(
+                    data[campo].is_null(),
+                    "el {etiqueta} no puede traer `{campo}`: de un secreto guardado sale un \
+                     booleano y nunca el valor: {cuerpo}"
+                );
+            }
+
+            for secreto in secretos {
+                assert!(
+                    !texto.contains(secreto),
+                    "el {etiqueta} no puede contener el secreto ni dentro de otro campo, y \
+                     el texto crudo lo lleva: {texto}"
+                );
+            }
+        }
+
+        let router = api_router(estado_desarrollo().await);
+
+        let cuerpo_de_peticion = cuerpo_de_alta("repo-1-16");
+
+        let secreto = cuerpo_de_peticion["secret_access_key"]
+            .as_str()
+            .expect("el cuerpo de alta del ayudante tiene que traer `secret_access_key`")
+            .to_owned();
+        let passphrase = cuerpo_de_peticion["passphrase"]
+            .as_str()
+            .expect("el cuerpo de alta del ayudante tiene que traer `passphrase`")
+            .to_owned();
+
+        let respuesta =
+            post_json(router.clone(), "/api/v1/repositories", &cuerpo_de_peticion).await;
+
+        let status = respuesta.status();
+        let texto_del_alta = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201; contestó {status} con {texto_del_alta}"
+        );
+
+        let cuerpo_del_alta: serde_json::Value = serde_json::from_str(&texto_del_alta)
+            .expect("el cuerpo del alta tiene que ser JSON válido");
+
+        comprobar_vista(
+            "alta",
+            &cuerpo_del_alta,
+            &texto_del_alta,
+            [&secreto, &passphrase],
+        );
+
+        let id = cuerpo_del_alta["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        let status = respuesta.status();
+        let texto_de_la_lectura = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la lectura de la fila que se acaba de dar de alta tiene que contestar 200; \
+             contestó {status} con {texto_de_la_lectura}"
+        );
+
+        let cuerpo_de_la_lectura: serde_json::Value = serde_json::from_str(&texto_de_la_lectura)
+            .expect("el cuerpo de la lectura tiene que ser JSON válido");
+
+        comprobar_vista(
+            "lectura",
+            &cuerpo_de_la_lectura,
+            &texto_de_la_lectura,
+            [&secreto, &passphrase],
+        );
     }
 }

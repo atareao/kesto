@@ -1053,4 +1053,248 @@ mod tests {
             "la envoltura de error tiene que traer un `message` de texto: {cuerpo}"
         );
     }
+
+    /// 1.32t — Un `PUT` sin la contraseña conserva la almacenada.
+    ///
+    /// Cubre `api-resources`, escenario «Un `PUT` sin el secreto conserva el almacenado», la mitad
+    /// que faltaba para este recurso —el hermano de `repositories`
+    /// (`un_put_sin_passphrase_conserva_la_almacenada`) ya la tenía—. El panel no **tiene** la
+    /// contraseña: la API no la devuelve por ninguna ruta, solo el booleano `has_db_password`. Sin
+    /// esta regla, reescribir un target para cambiarle el nombre mandaría el secreto vacío y
+    /// borraría la credencial de una copia que hasta ese momento funcionaba.
+    ///
+    /// La conservación se afirma **descifrando** los dos sobres, nunca comparándolos: el nonce es
+    /// aleatorio por valor y `Targets::actualizar` vuelve a cifrar, así que la fila estrena sobre
+    /// —con otro nonce— aunque el valor en claro no haya cambiado. Comparar los bytes mediría el
+    /// nonce, no el secreto que hay que conservar.
+    #[tokio::test]
+    async fn un_put_sin_db_password_conserva_la_almacenada() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = AppState::new(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        )
+        .expect("el estado se construye sobre la base de prueba");
+
+        let router = api_router(estado);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/targets",
+            &cuerpo_de_target("target-1-32t"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder actualizar nada"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let sobre_antes: Option<String> =
+            sqlx::query_scalar("SELECT db_password FROM backup_targets WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que estar en el fichero con el que se abrió el estado");
+
+        let sobre_antes = sobre_antes.expect(
+            "el alta de un target de base de datos tiene que dejar la contraseña guardada en la \
+             columna, cifrada",
+        );
+
+        let contrasena_antes = clave
+            .descifrar(&sobre_antes)
+            .expect("el alta tiene que haber guardado la contraseña cifrada y descifrable")
+            .expose()
+            .to_owned();
+
+        let respuesta = put_json(
+            router.clone(),
+            &format!("/api/v1/targets/{id}"),
+            &serde_json::json!({
+                "name": "target-1-32t-editado",
+                "target_type": "mariadb",
+                "container_name": "contenedor-editado",
+                "db_user": "usuario-editado",
+                "db_name": "base-editada",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la actualización de una fila existente tiene que contestar 200; contestó {status} con \
+             {cuerpo}"
+        );
+
+        let sobre_despues: Option<String> =
+            sqlx::query_scalar("SELECT db_password FROM backup_targets WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila actualizada tiene que seguir en el fichero de la base");
+
+        let sobre_despues = sobre_despues.expect(
+            "un PUT que no informa la contraseña no puede vaciar la columna: la fila actualizada \
+             tiene que seguir teniendo su sobre",
+        );
+
+        let contrasena_despues = clave
+            .descifrar(&sobre_despues)
+            .expect("la actualización tiene que dejar la contraseña cifrada y descifrable")
+            .expose()
+            .to_owned();
+
+        assert_eq!(
+            contrasena_despues, contrasena_antes,
+            "un PUT que no informa `db_password` no puede borrarlo: el panel no tiene el valor —la \
+             API no lo devuelve— y sin esta regla reescribiría la credencial con nada"
+        );
+
+        let respuesta = get(router, &format!("/api/v1/targets/{id}")).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la fila actualizada tiene que seguir leyéndose por la API; contestó {status} con \
+             {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["name"], "target-1-32t-editado",
+            "el PUT tiene que haber aplicado el nombre que sí informó: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["container_name"], "contenedor-editado",
+            "el PUT tiene que haber aplicado el contenedor que sí informó: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["db_user"], "usuario-editado",
+            "el PUT tiene que haber aplicado el usuario que sí informó: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["has_db_password"], true,
+            "la credencial conservada tiene que seguir anunciándose como presente: {cuerpo}"
+        );
+    }
+
+    /// 1.32t-bis — Un `PUT` que cambia el tipo a `directory` descarta la credencial.
+    ///
+    /// Cubre el otro desenlace del validador de `api-resources`: si el tipo nuevo es `directory`,
+    /// la contraseña se descarta **aunque la fila la tuviera**. Un directorio no admite
+    /// credenciales, y arrastrarlas sería guardar una contraseña que ninguna copia va a usar nunca
+    /// —y que seguiría ahí, cifrada y viva, después de que el recurso haya dejado de ser una base
+    /// de datos—. Por eso la prueba no se fía solo de la vista del cable: va a la columna y afirma
+    /// que es `NULL`, no un sobre huérfano.
+    #[tokio::test]
+    async fn un_put_que_cambia_el_tipo_a_directory_descarta_la_credencial() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = AppState::new(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        )
+        .expect("el estado se construye sobre la base de prueba");
+
+        let router = api_router(estado);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/targets",
+            &cuerpo_de_target("target-1-32t-bis"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 con la credencial guardada antes de poder cambiarla \
+             de tipo"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["has_db_password"], true,
+            "el alta de un target de base de datos tiene que dejar credencial antes del cambio de \
+             tipo: {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let respuesta = put_json(
+            router,
+            &format!("/api/v1/targets/{id}"),
+            &serde_json::json!({
+                "name": "target-1-32t-bis",
+                "target_type": "directory",
+                "host_path": "/srv/datos",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el cambio de tipo a `directory` es una actualización válida y tiene que contestar 200; \
+             contestó {status} con {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["target_type"], "directory",
+            "la respuesta tiene que devolver el tipo que acaba de escribir el PUT: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["has_db_password"], false,
+            "un directorio no tiene credencial, así que la vista no puede anunciarla como \
+             presente: {cuerpo}"
+        );
+        assert!(
+            cuerpo["data"]["container_name"].is_null(),
+            "un `directory` no tiene contenedor, así que la columna tiene que quedar nula en la \
+             respuesta: {cuerpo}"
+        );
+        assert!(
+            cuerpo["data"]["db_user"].is_null(),
+            "un `directory` no tiene usuario de base, así que la columna tiene que quedar nula en \
+             la respuesta: {cuerpo}"
+        );
+        assert!(
+            cuerpo["data"]["db_name"].is_null(),
+            "un `directory` no tiene nombre de base, así que la columna tiene que quedar nula en \
+             la respuesta: {cuerpo}"
+        );
+
+        let guardada: Option<String> =
+            sqlx::query_scalar("SELECT db_password FROM backup_targets WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila actualizada tiene que seguir en el fichero de la base");
+
+        assert!(
+            guardada.is_none(),
+            "la credencial tiene que descartarse de verdad, no quedarse huérfana en la columna que \
+             el tipo nuevo ya no va a mirar: quedó {guardada:?}"
+        );
+    }
 }
