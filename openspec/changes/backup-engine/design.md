@@ -46,6 +46,16 @@ El canal es `sync_channel` y **acotado**: sin tope, un productor rápido contra 
 
 `size()` devuelve `Ok(None)` para un volcado por `stdout` —medido: el `StdinSource` de rustic hace lo mismo— y `Ok(Some(total))` para un directorio. Es la causa directa de que `percentage` sea nullable.
 
+### El final del volcado y la espera del lector: tres cosas que la medición refutó
+
+La primera versión de este puente declaraba el final con un mensaje por el canal y esperaba con `recv()` sin plazo. Una medición contra un repositorio local —sin S3 y sin contenedores— demostró que las dos cosas estaban mal, y también que el resultado de `archive()` no sirve para decidir si la copia está completa:
+
+- **El final no puede viajar como mensaje.** Medido: un solo `try_send` del mensaje de final se encontró el canal **lleno** justo al terminar el volcado —con un mebibyte entero ya leído—, el final se perdió y el volcado se descartó. Ahora el final es una señal atómica que el productor pone **después** del último byte y que el lector solo da por buena cuando el canal se ha cerrado; un productor que muere —o que se olvida de declararlo— deja el cierre clasificado como «truncado», que es la dirección segura.
+- **La espera del lector necesita plazo.** Medido: con el extremo de envío retenido en un campo del túnel mientras el productor moría, el lector se quedó esperando y `archive()` **no volvió nunca** —hubo que matar la ejecución a los 400 s—. El canal se cierra cuando muere el **último** emisor, así que el extremo de envío es un tipo que **no se puede clonar** y que la declaración del final consume; y la espera es `recv_timeout` con un plazo que entra por parámetro, con un error propio que nombra el volcado y el plazo.
+- **El `Ok` de `archive()` no dice nada del volcado.** Medido en el peor caso: productor muerto y un padre que ya tenía el nodo del volcado → `archive()` devuelve `Ok` **sin una sola línea de aviso** y el árbol del snapshot es el del padre, de modo que un volcado que no se generó se convierte en una copia válida de los datos anteriores. La única verdad consultable es la señal de la entrega completa, que el motor pregunta por su cuenta cuando el archivado ya volvió.
+
+Y el plazo existe **dos veces** porque son dos esperas distintas: el de la extracción acota el `stream` del `exec` —cuánto puede callarse el proceso— y el del puente acota el **canal** —cuánto puede estar el lector sin recibir nada—. Ninguno cubre al otro: el `timeout` del cliente de la API de Docker se resuelve al llegar las cabeceras y el canal se cierra cuando muere el último emisor.
+
 ## La acotación de la extracción: la inactividad, no la duración
 
 Hay una sola cosa que acota el trabajo, y no es la que parece. El `timeout` del cliente de la API de Docker se resuelve **cuando llegan las cabeceras** de la respuesta, así que el cuerpo del `exec` se drena **fuera** de él: el tiempo máximo cubre la conexión y el apretón de manos, no el volcado.
@@ -101,6 +111,18 @@ Y no se pueden distinguir por el error: `open()` señala «no hay fichero de con
 La vía que sí funciona es preguntarle **al destino**. `RepositoryBackends::repository()` devuelve el `Arc<dyn WriteBackend>`, así que se conserva una copia antes de pasársela a `RepositoryBackends::new`, y sobre esa copia se llama a `list(FileType::Config)`: vacío ⇒ inicializar, con ficheros ⇒ abrir, error ⇒ el destino no se alcanza. Sin leer un solo mensaje de error.
 
 Encadenado de tipos, que tiene su propia trampa: `init`/`open` viven en `impl Repository<()>` y devuelven `Repository<OpenStatus>`; `list`, `get_snapshots` y `prune` viven en `impl<S: Open>`; y `archive` en `impl<S: IndexedIds>`. Un `to_indexed()` en medio da `Repository<IndexedFullStatus>`, que sirve para las tres cosas.
+
+## Lo que la copia no puede dar por bueno: el emparejamiento y el error silenciado
+
+Dos mediciones contra un repositorio local —sin S3 y sin motor de contenedores— destaparon los dos fallos más graves de este change, y los dos son de la clase que no se ve hasta que se intenta restaurar.
+
+**El primero: la copia de hoy con los datos de ayer.** El nodo que el puente fabrica para el volcado lleva tamaño cero y no lleva fechas ni inodo, porque no puede llevarlos —la longitud de un volcado por `stdout` no se conoce hasta que termina—. El emparejamiento de la biblioteca compara exactamente esos campos, así que dos copias del mismo destino comparan igual, la segunda **empareja**, la biblioteca **descarta el lector sin leerlo** y el snapshot nuevo apunta al contenido del anterior. Medido restaurando: la segunda copia devolvió los bytes de la primera, y su resumen declaraba «un fichero sin modificar» con cero bytes. La mitigación está medida y es desactivar el emparejamiento con el padre; y la propia biblioteca ya lo hace en su ruta de entrada estándar, así que quien llama al archivado directamente tiene que hacerlo por su cuenta. Perder la deduplicación no es una pérdida real: un origen de flujo no puede probar que no ha cambiado sin leerlo.
+
+**El segundo: un resultado correcto que no dice nada.** El archivado **silencia** el error del lector con un aviso, se lo traga y devuelve un resultado correcto **guardando el snapshot igualmente**, sin el volcado dentro: la entrada que falló no llega al árbol, así que el fichero desaparece. Y en el peor caso medido —el productor murió y el snapshot anterior sí tenía el nodo del volcado— no hay **ni una línea de aviso**: el archivado devuelve un resultado correcto y el árbol del snapshot nuevo es idéntico al del anterior. Un volcado que no se generó acaba siendo una copia válida de los datos de ayer, en silencio.
+
+De ahí la regla que gobierna el motor: **la condición de éxito no se hereda del archivado**. Se compone de tres cosas que el motor sí puede observar —el volcado se entregó entero, el proceso de extracción terminó con éxito y el snapshot tiene el volcado dentro— y ninguna de las tres es «el archivado no dio error».
+
+Y una tercera medición, de operación: **reutilizar el repositorio ya abierto entre dos copias desactiva la deduplicación por completo**, porque el índice en memoria no contiene el árbol que la copia anterior acaba de escribir —la biblioteca avisa de que no encuentra el árbol del padre—. Es decir: un repositorio de larga vida no ahorra trabajo, lo esconde. El motor abre el repositorio por ejecución.
 
 ## La retención, en tres operaciones
 
@@ -158,6 +180,9 @@ En el router eso se consigue declarando la ruta fuera de las capas que envuelven
 12. **El CI no tiene Docker.** Las pruebas van por capas para que el subconjunto que corre en CI no necesite un motor de contenedores, y lo que quede sin cubrir automáticamente se declara por escrito en `docs/FEATURE-005-backup-engine.md` en vez de fingirlo.
 13. **La extracción se acota por inactividad, no por duración.** El `timeout` de la biblioteca no cubre el drenaje y sin acotar nada un volcado colgado deja ocupado el worker de su repositorio para siempre. El plazo lo decide el motor; el transporte solo lo aplica. Un volcado lento que avanza no falla nunca.
 14. **La credencial de la base se protege por filtro de registro, además de por tipos.** La biblioteca registra el cuerpo de la petición a `DEBUG` con el `env` dentro, así que el arranque declara la directiva que lo corta. El `Debug` propio de la orden que lleva el entorno es necesario y no suficiente, y así queda escrito en el código.
+15. **El puente declara el final con una señal y su lectura tiene plazo.** Medido: el mensaje de final se pierde con el canal lleno, y un extremo de envío retenido deja `archive()` sin volver nunca. El extremo del productor es un tipo que no se puede clonar, declarar el final lo consume, y tanto la capacidad del canal como el plazo de inactividad los elige el motor y entran por parámetro.
+16. **Un volcado de flujo no empareja con el snapshot anterior.** Medido: con el emparejamiento activo, la segunda copia del mismo destino reutiliza el contenido de la primera y el snapshot de hoy contiene los datos de ayer. Se desactiva el emparejamiento con el padre, que es lo que la propia biblioteca hace para su origen de entrada estándar. La deduplicación con la copia anterior no se pierde de verdad: un origen de flujo no puede probar que no ha cambiado sin leerlo.
+17. **El `Ok` del archivado no es la condición de éxito.** Medido: el archivado silencia el error del lector, devuelve un resultado correcto y guarda el snapshot sin el volcado dentro —y en el peor caso sin avisar siquiera—. El éxito lo compone el motor: volcado entregado entero, proceso de extracción con éxito y snapshot con el volcado dentro. Y el repositorio se abre **por ejecución**, porque reutilizarlo desactiva la deduplicación en silencio.
 
 ## Trampas medidas de la biblioteca
 
@@ -179,6 +204,12 @@ Se dejan aquí porque cada una costaría una tarde a quien no las sepa:
 | El `timeout` de `bollard` se resuelve al llegar las cabeceras | No acota el drenaje: hay que acotar la **inactividad** entre trozos, o un volcado colgado bloquea el worker de su repositorio para siempre |
 | El prefijo de versión de API no llega al cable | `Uri::parse` compone la ruta y el `join` posterior se lleva el prefijo por delante: hoy fijar la versión es inerte, y el día que un parche lo restaure la salida es negociar la versión |
 | El motor de contenedores agrupa los trozos por canal | El entrelazado fino entre `stdout` y `stderr` **no** es observable. El orden dentro de cada canal sí es contrato; el de entre canales, no |
+| El nodo de un volcado de flujo empareja con el snapshot anterior | El segundo archivado del mismo destino **no lee el volcado**: el snapshot nuevo apunta al contenido del viejo. Hay que desactivar el emparejamiento con el padre |
+| El archivado silencia el error del lector y devuelve un resultado correcto | Guarda el snapshot **sin el volcado dentro**, y en el peor caso sin una sola línea de aviso: la condición de éxito la tiene que componer el motor |
+| Reutilizar el repositorio abierto entre copias | El índice en memoria no ve el árbol que la copia anterior escribió: se pierde la deduplicación por completo. El motor abre el repositorio por ejecución |
+| `archive()` descarta con un `warn!` el error del lector y guarda el snapshot igualmente | Un `Ok` de `archive()` **no** significa que el volcado esté completo, y en el peor caso ni siquiera hay aviso: lo dice la señal de la entrega del puente, no el resultado |
+| Un `sync_channel` se cierra cuando muere el **último** emisor | Un extremo de envío retenido sin usarse deja al lector esperando para siempre: es la razón del plazo en el puente y de que el extremo no se pueda clonar |
+| Un `try_send` del mensaje de final se pierde con el canal lleno | El final no puede viajar como mensaje: va en una señal atómica que el productor pone después de empujar el último byte |
 
 ## Alternativas descartadas
 

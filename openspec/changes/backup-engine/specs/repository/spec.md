@@ -83,6 +83,58 @@ La biblioteca tiene un defecto peligroso aquí y está medido: si el campo del c
 - **THEN** SHALL listar las rutas copiadas
 - **AND** SHALL llevar la etiqueta con la que se identificó la tarea
 
+### Requirement: Un volcado de flujo no empareja con el snapshot anterior
+
+El archivado de un volcado SHALL desactivar el emparejamiento con el snapshot anterior, y NO SHALL dejar que la biblioteca empareje el volcado con el mismo destino de la copia previa.
+
+Está medido, y es el hallazgo más grave de este change. El nodo que el puente fabrica para el volcado lleva tamaño cero y no lleva fechas ni inodo, porque no puede llevarlos: la longitud de un volcado por `stdout` no se conoce hasta que termina. Y el emparejamiento de la biblioteca compara exactamente esos campos. El resultado medido es que dos copias del mismo destino comparan igual —tipo, tamaño y fechas—, la segunda empareja, la biblioteca **descarta el lector sin leerlo**, y el snapshot nuevo apunta al contenido del anterior: restaurando la copia de hoy salieron los bytes de ayer, y su resumen declara «un fichero sin modificar» y cero bytes.
+
+Que se pierda la deduplicación con la copia anterior **no** es una pérdida que haya que lamentar aquí: para un origen de flujo no hay nada que deduplicar sin leerlo, porque su nodo no puede probar que no ha cambiado. La propia biblioteca toma esa decisión en su ruta de entrada estándar, donde desactiva el emparejamiento por el mismo motivo; quien llama al archivado directamente —como hace este motor— se la salta, y por eso tiene que desactivarlo él.
+
+#### Scenario: Dos copias del mismo destino llevan cada una su contenido
+- **GIVEN** dos copias consecutivas declaradas sobre el mismo destino y la misma etiqueta, con contenido distinto
+- **WHEN** se restauran las dos
+- **THEN** cada una SHALL devolver su propio contenido
+- **AND** la segunda NO SHALL devolver el de la primera
+
+#### Scenario: Un volcado nuevo no reutiliza el contenido anterior
+- **GIVEN** una copia anterior del mismo destino ya en el repositorio
+- **WHEN** se archiva un volcado nuevo
+- **THEN** el contenido del volcado en el snapshot nuevo SHALL ser distinto del de la copia anterior
+- **AND** el resumen NO SHALL declarar el volcado como fichero sin modificar
+
+#### Scenario: El tamaño que el nodo declara no es el del volcado
+- **GIVEN** una copia terminada de un volcado de flujo
+- **WHEN** se lee el nodo del volcado en el snapshot
+- **THEN** el tamaño que declara SHALL ser cero, porque el origen no lo conoce de antemano
+- **AND** el tamaño real SHALL estar en el resumen de la copia, que es donde se cuenta lo que se procesó
+
+### Requirement: La copia no se da por buena porque el archivado devuelva un resultado correcto
+
+El motor NO SHALL dar una ejecución por buena porque el archivado termine sin error. SHALL comprobar que el volcado se entregó **entero** y que el proceso del que salió terminó bien, y SHALL marcar la ejecución como fallida cuando alguna de las dos cosas no se cumple, aunque el archivado haya devuelto un resultado correcto.
+
+Está medido: el archivado **silencia** el error del lector con un aviso, se lo traga y devuelve un resultado correcto **guardando el snapshot igualmente**, sin el volcado dentro —la entrada que falló no llega al árbol, así que el fichero desaparece—. Y en el peor caso medido —el productor murió y el snapshot anterior sí tenía el nodo del volcado— no hay **ni una línea de aviso**: el archivado devuelve un resultado correcto y el árbol del snapshot nuevo es idéntico al del anterior. Un volcado que no se generó acaba siendo una copia válida de los datos de ayer, y nada lo delata.
+
+Es la peor salida posible de este change —una copia que existe, ocupa sitio y no se puede restaurar— y no se puede arreglar desde dentro del archivado. Por eso el motor comprueba por su cuenta: la señal de que el volcado se entregó entero la escribe el puente y la consulta el motor, y la condición de éxito incluye además el código de salida del proceso de extracción, que es lo que dice si el volcado se generó.
+
+#### Scenario: Un archivado que termina bien con el volcado truncado no se da por bueno
+- **GIVEN** un productor del volcado que muere a mitad, de modo que el volcado no se entrega entero
+- **WHEN** la ejecución acaba
+- **THEN** su estado NO SHALL ser `success`, aunque el archivado haya terminado sin error
+- **AND** `error_message` SHALL llevar el motivo
+
+#### Scenario: El aviso del archivado no es la señal
+- **GIVEN** el mismo caso, en el que el archivado deja constancia en el registro
+- **WHEN** la ejecución acaba
+- **THEN** el estado SHALL decidirse por la señal de entrega y por el código de salida
+- **AND** NO SHALL decidirse por lo que el archivado haya registrado
+
+#### Scenario: Una copia entera se da por buena
+- **GIVEN** un volcado que se entrega entero y un proceso que termina con éxito
+- **WHEN** la ejecución acaba
+- **THEN** su estado SHALL ser `success`
+- **AND** el snapshot SHALL contener el volcado
+
 ### Requirement: La retención se aplica en tres operaciones —decidir, retirar y purgar— y solo con los tres `keep_*` que el esquema guarda
 
 Tras un snapshot correcto, la retención SHALL aplicarse con los tres parámetros que el esquema guarda —`keep_daily`, `keep_weekly` y `keep_monthly`— y en **tres** operaciones distinguibles: primero decidir **qué snapshots** se retiran según esas reglas, después retirarlos, y por último reclamar los datos que quedaron huérfanos, calculando el plan de purga **antes** de ejecutarlo. Los parámetros de retención que el §3 no guarda SHALL quedarse con el valor por defecto de la biblioteca, y eso NO SHALL dejarse implícito. Una retención que falle NO SHALL cambiar el resultado de la copia, que ya está hecha y es correcta.

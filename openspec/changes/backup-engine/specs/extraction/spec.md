@@ -166,6 +166,8 @@ El `stdout` del `exec` SHALL entregarse a la biblioteca de copia como un origen 
 
 La API de `rustic_core` no acepta un `AsyncRead` —el diagrama del §4.A lo dibuja así, pero la biblioteca pide un trait bloqueante—, así que hay un puente que construir, y su forma importa: sin un tope, un productor rápido contra un consumidor lento acumula el volcado entero en memoria. Con el tope, el productor espera, que es lo que hace que la memoria consumida sea un valor acotado y no una función del tamaño de la base.
 
+Estar acotada no basta, porque hay dos desenlaces que la biblioteca **no** propaga. El **final** del volcado es lo único que no puede perderse, así que NO SHALL viajar como un mensaje por el canal: un mensaje se pierde cuando el canal está lleno justo al terminar —medido: un solo `try_send` del final se encontró el canal **lleno** con un mebibyte ya leído, y el volcado se descartó—, y en su lugar el productor SHALL declarar el final con una señal que el lector solo da por buena cuando el canal se ha cerrado. Y la espera del lector SHALL estar acotada por un plazo que decida el motor, porque el canal se cierra cuando muere el **último** emisor y un extremo de envío retenido deja el archivado esperando para siempre —medido: `archive()` **no volvió**—. `archive()` es una llamada bloqueante y sin ese plazo puede no volver nunca.
+
 #### Scenario: El origen es un lector y no un fichero
 - **GIVEN** una copia en curso
 - **WHEN** se inspecciona el espacio de ficheros
@@ -181,3 +183,21 @@ La API de `rustic_core` no acepta un `AsyncRead` —el diagrama del §4.A lo dib
 - **WHEN** se le pregunta su tamaño
 - **THEN** SHALL poder contestar que no lo conoce
 - **AND** la copia SHALL completarse igualmente
+
+#### Scenario: Un volcado cuyo final no se declaró no se da por entregado
+- **GIVEN** un productor que suelta su extremo del canal sin declarar que el volcado terminó
+- **WHEN** el lector llega al cierre del canal
+- **THEN** la lectura SHALL fallar y NO SHALL devolver un fin de fichero
+- **AND** la señal de entrega completa del volcado NO SHALL quedar puesta
+
+#### Scenario: Un canal sin datos no se espera para siempre
+- **GIVEN** un productor que deja de entregar bytes y conserva vivo su extremo de envío
+- **WHEN** pasa el plazo de inactividad del canal
+- **THEN** la lectura SHALL fallar con un motivo que nombre el volcado y el plazo
+- **AND** `archive()` NO SHALL quedarse sin volver
+
+#### Scenario: Un canal lleno no pierde ni el final ni la cuenta de bytes
+- **GIVEN** un productor que entrega más trozos que la capacidad del canal
+- **WHEN** el consumidor lee despacio
+- **THEN** el productor SHALL esperar hueco y NO SHALL perderse ningún byte
+- **AND** la señal de entrega completa SHALL quedar puesta al final

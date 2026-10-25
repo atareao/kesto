@@ -18,6 +18,7 @@ mod origen;
 mod progreso;
 
 pub use origen::{
-    Error, LectorDeVolcado, MensajeDelVolcado, OrigenDelVolcado, TunelDelVolcado, tunel_del_volcado,
+    EntregaDelVolcado, Error, LectorDeVolcado, OrigenDelVolcado, ProductorDelVolcado,
+    TunelDelVolcado, tunel_del_volcado,
 };
 pub use progreso::{AvisoDeProgreso, BarrasDelMotor};
