@@ -1,7 +1,13 @@
 //! Extracción del cuerpo JSON con el rechazo traducido a la envoltura de la API.
+//!
+//! El mismo tratamiento se aplica a los parámetros de consulta, por la misma razón medida: el
+//! rechazo por defecto del extractor de consulta describe el fallo con el texto del intérprete
+//! y ese texto **lleva el valor del parámetro dentro**, así que también sale por la envoltura y
+//! con un mensaje nuestro.
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Request};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{FromRequest, FromRequestParts, Request};
+use axum::http::request::Parts;
 
 use crate::error::AppError;
 
@@ -69,5 +75,56 @@ fn traducir(rechazo: JsonRejection) -> AppError {
 
     AppError::InvalidInput(format!(
         "no se pudo interpretar el cuerpo de la petición: {motivo}"
+    ))
+}
+
+/// Parámetros de consulta cuyo rechazo sale por la envoltura de la API.
+///
+/// Es el hermano de [`Json`] para la otra mitad de la misma familia —lo que no se puede
+/// interpretar— y existe por la misma razón medida: el rechazo por defecto describe el fallo
+/// con el texto del intérprete, y ese texto **lleva el valor del parámetro dentro**. Aquí sale
+/// `400` con la envoltura y con un mensaje nuestro, y el texto del intérprete no se registra
+/// tampoco: lo que se registra es **que** los parámetros no se pudieron interpretar.
+pub struct Query<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for Query<T>
+where
+    axum::extract::Query<T>: FromRequestParts<S, Rejection = QueryRejection>,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(valor)) => Ok(Self(valor)),
+            Err(rechazo) => Err(traducir_consulta(rechazo)),
+        }
+    }
+}
+
+/// Traduce el rechazo del extractor de consulta a la frontera del `4xx`.
+///
+/// El mensaje es **nuestro** y nunca el `Display` del rechazo, por la razón medida en el
+/// cuerpo: el texto del intérprete lleva el valor de dentro. `QueryRejection` está declarado
+/// `#[non_exhaustive]` y hoy tiene **una sola** variante, así que el brazo comodín no cubre
+/// nada: está porque una variante nueva de axum tiene que caer por el mismo camino en vez de
+/// romper la compilación.
+fn traducir_consulta(rechazo: QueryRejection) -> AppError {
+    let motivo = match rechazo {
+        QueryRejection::FailedToDeserializeQueryString(_) => {
+            "los parámetros de la consulta no tienen el tipo que la ruta espera"
+        }
+        _ => "los parámetros de la consulta no se pudieron interpretar",
+    };
+
+    // Se registra **que** falló y de qué clase, nunca el rechazo: su `Display` lleva el valor
+    // del parámetro dentro.
+    tracing::warn!(
+        motivo,
+        "no se pudieron interpretar los parámetros de la consulta"
+    );
+
+    AppError::InvalidInput(format!(
+        "no se pudieron interpretar los parámetros de la consulta: {motivo}"
     ))
 }

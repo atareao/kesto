@@ -232,3 +232,28 @@ async fn un_identificador_mal_formado_contesta_400_en_los_tres_recursos() {
         );
     }
 }
+
+/// El listado de ejecuciones sigue la partición del resto de la superficie.
+///
+/// Es la ruta **nueva** del §5 que no está en la tabla de las quince —`/executions` solo tiene
+/// el listado—, y la regla es la misma: cuelga de la mitad de negocio por la lista blanca y
+/// sin excepciones. Se prueba aparte porque el recorrido de las quince rutas se construye por
+/// recurso con sus cinco verbos, y aquí hay una sola.
+#[tokio::test]
+async fn el_listado_de_ejecuciones_sigue_la_particion_del_resto() {
+    // Sin cookie, en modo `Oidc`: la puerta corta antes que el manejador.
+    let respuesta = get(router_oidc().await, "/api/v1/executions").await;
+    es_un_401_con_envoltura(respuesta, "GET /api/v1/executions sin sesión").await;
+
+    // Con la autenticación apagada, la ruta está **montada**: `200`, no `404`.
+    let respuesta = get(router_desarrollo().await, "/api/v1/executions").await;
+    let status = respuesta.status();
+    let texto = body_text(respuesta).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "en el modo sin autenticación las rutas de recursos están montadas y contestan, \
+         no dan 404; contestó {status} con {texto}"
+    );
+}

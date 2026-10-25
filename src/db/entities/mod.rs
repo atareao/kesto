@@ -29,7 +29,7 @@ pub mod job;
 pub mod repository;
 pub mod target;
 
-pub use execution::{AltaDeEjecucion, Ejecucion, Ejecuciones, Estado};
+pub use execution::{AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, FiltroDeEjecuciones};
 pub use job::{AltaDeTarea, Tarea, Tareas};
 pub use repository::{AltaDeRepositorio, Repositorio, Repositorios};
 pub use target::{AltaDeTarget, Target, Targets, TipoDeTarget};

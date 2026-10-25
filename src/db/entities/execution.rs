@@ -35,6 +35,39 @@ pub enum Estado {
     Failed,
 }
 
+impl Estado {
+    /// El texto que el `CHECK` del §3 admite y que la columna guarda.
+    ///
+    /// Es la **única** otra boca que escribe estos cuatro literales, además del `CHECK`: la
+    /// capa de acceso los guarda con `sqlx::Type`, el cable los publica por aquí y el filtro
+    /// de la consulta los lee por [`Estado::desde_texto`]. Con la pareja en un solo sitio,
+    /// añadir un estado es tocar el `CHECK` y este `match`, y el compilador avisa de la rama
+    /// que falta.
+    pub fn texto(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// El estado que corresponde a un texto, o `None` si no es ninguno de los cuatro.
+    ///
+    /// `None` y no un estado por defecto: quien pregunta por un `status` que no existe ha
+    /// escrito mal la petición, y devolverle el listado entero sin decirlo sería el silencio
+    /// que esta casa no admite.
+    pub fn desde_texto(texto: &str) -> Option<Self> {
+        match texto {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "success" => Some(Self::Success),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// Fila de `job_executions`.
 #[derive(Debug, Clone)]
 pub struct Ejecucion {
@@ -84,6 +117,24 @@ pub struct Ejecuciones {
     pool: SqlitePool,
 }
 
+/// Los filtros y la ventana del listado de `job_executions`.
+///
+/// Los dos filtros son **opcionales y ausentes por defecto**, y la ventana llega siempre
+/// informada: el valor por defecto y el tope son del contrato HTTP, así que quien los decide es
+/// el manejador —que es quien conoce `limit`— y la capa de acceso no tiene que saber que
+/// existen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FiltroDeEjecuciones {
+    /// Tarea por la que filtrar; `None` no filtra.
+    pub job_id: Option<Uuid>,
+    /// Estado por el que filtrar; `None` no filtra.
+    pub status: Option<Estado>,
+    /// Cuántas filas devolver como mucho.
+    pub limite: i64,
+    /// Cuántas filas saltar desde el principio del orden.
+    pub desplazamiento: i64,
+}
+
 // Las sentencias, como constantes: `DbError::Consulta` lleva el texto de la consulta,
 // así que la que se ejecuta y la que viaja en el error tienen que ser **la misma
 // cadena**. Con el literal repetido en los dos sitios, lo que se ejecuta y lo que se
@@ -104,6 +155,23 @@ const SQL_LEER: &str = "SELECT id, job_id, status, snapshot_id, bytes_processed,
 /// entre dos llamadas seguidas sea estable.
 const SQL_LISTAR: &str = "SELECT id, job_id, status, snapshot_id, bytes_processed, bytes_uploaded, \
      error_message, started_at, finished_at FROM job_executions ORDER BY started_at, id";
+
+/// Listado filtrado y paginado, con el orden del contrato.
+///
+/// El `WHERE` se escribe **una sola vez** y con los dos filtros dentro de la misma sentencia:
+/// `?1 IS NULL OR job_id = ?1` no filtra cuando el filtro no llega, así que la consulta es una
+/// cadena **estática** y los cuatro valores van enlazados. Componerla en piezas según los
+/// filtros presentes sería construir una consulta concatenando, que es lo que la auditoría de
+/// este change prohíbe.
+///
+/// `ORDER BY started_at DESC, id` y no `started_at` a secas: las ejecuciones que arrancan en el
+/// mismo segundo empatan —`CURRENT_TIMESTAMP` no tiene más resolución— y sin desempate dos
+/// peticiones seguidas con el mismo `offset` pueden repetir una fila y saltarse otra. El
+/// descendente es el del contrato: lo último primero, que es lo que el panel pinta.
+const SQL_LISTAR_FILTRADO: &str = "SELECT id, job_id, status, snapshot_id, bytes_processed, \
+     bytes_uploaded, error_message, started_at, finished_at FROM job_executions \
+     WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR status = ?2) \
+     ORDER BY started_at DESC, id LIMIT ?3 OFFSET ?4";
 
 /// Alta de una ejecución, devolviendo la fila tal y como quedó.
 ///
@@ -201,6 +269,27 @@ impl Ejecuciones {
             .fetch_all(&self.pool)
             .await
             .map_err(error_de_consulta(SQL_LISTAR))?;
+
+        filas.iter().map(desde_fila).collect()
+    }
+
+    /// Lista las ejecuciones que cumplen el filtro, en el orden del contrato.
+    ///
+    /// La ventana es obligatoria —llega ya resuelta— porque el histórico es la tabla que más
+    /// crece: sin tope, un listado materializaría la tabla entera en memoria y ocuparía una de
+    /// las conexiones del pool mientras el motor quiere escribir.
+    pub async fn listar_filtrado(
+        &self,
+        filtro: &FiltroDeEjecuciones,
+    ) -> Result<Vec<Ejecucion>, DbError> {
+        let filas = sqlx::query(SQL_LISTAR_FILTRADO)
+            .bind(filtro.job_id.map(|id| id.hyphenated().to_string()))
+            .bind(filtro.status.map(Estado::texto))
+            .bind(filtro.limite)
+            .bind(filtro.desplazamiento)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(error_de_consulta(SQL_LISTAR_FILTRADO))?;
 
         filas.iter().map(desde_fila).collect()
     }
@@ -304,7 +393,7 @@ mod tests {
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
 
-    use super::{AltaDeEjecucion, Ejecuciones, Estado};
+    use super::{AltaDeEjecucion, Ejecuciones, Estado, FiltroDeEjecuciones};
     use crate::db::entities::job::{AltaDeTarea, Tareas};
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
@@ -596,5 +685,159 @@ mod tests {
             "el finished_at volvió con desplazamiento, no en UTC: {fin_leido}"
         );
         assert_eq!(fin_leido, fin, "el instante final no es el de entrada");
+    }
+
+    /// El listado filtrado acota por los dos filtros, ordena descendente por la fecha y
+    /// desempata por el identificador.
+    ///
+    /// Fija la **sentencia** y no el manejador: lo que se afirma es que un filtro ausente no
+    /// filtra, que el orden es `started_at DESC, id` y que la ventana se aplica. Una prueba que
+    /// pasara por la API no distinguiría una sentencia mal escrita de un manejador que
+    /// reordena.
+    #[tokio::test]
+    async fn el_listado_filtrado_acota_y_ordena_por_la_fecha_descendente() {
+        let (directorio, _pool, ejecuciones, tarea) = base_con_ejecucion_posible().await;
+
+        // Tres filas: dos con la **misma** fecha —para el desempate— y una anterior.
+        let empate = datetime!(2026-10-25 03:00:00 UTC);
+        let anterior = empate - Duration::hours(1);
+
+        let mut identificadores = Vec::new();
+
+        for (estado, fecha, procesados) in [
+            (Estado::Success, anterior, 100_i64),
+            (Estado::Failed, empate, 200),
+            (Estado::Running, empate, 300),
+        ] {
+            let fila = ejecuciones
+                .alta(AltaDeEjecucion {
+                    job_id: tarea,
+                    status: estado,
+                    snapshot_id: None,
+                    bytes_processed: procesados,
+                    bytes_uploaded: procesados / 2,
+                    error_message: None,
+                    started_at: fecha,
+                    finished_at: None,
+                })
+                .await
+                .expect("el alta de la ejecución no puede fallar");
+
+            identificadores.push(fila.id);
+        }
+
+        let sin_filtros = FiltroDeEjecuciones {
+            job_id: None,
+            status: None,
+            limite: 50,
+            desplazamiento: 0,
+        };
+
+        // Sin filtros: las tres, la más reciente primero.
+        let todas = ejecuciones
+            .listar_filtrado(&sin_filtros)
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(
+            todas.len(),
+            3,
+            "sin filtros tienen que salir las tres filas"
+        );
+        assert_eq!(
+            todas[2].bytes_processed, 100,
+            "la más antigua tiene que quedar la última, y ahí no hay empate que valga"
+        );
+
+        // Las dos que empatan en la fecha son las **dos primeras**, y entre ellas el orden lo
+        // decide el identificador, que es aleatorio en cada ejecución. Afirmar que la de 300 va
+        // primero mediría el azar del UUID y no el contrato —y así se midió: la prueba fallaba
+        // siete de cada diez veces—. Lo que se afirma es el **conjunto**, que es lo que el orden
+        // por fecha decide de verdad: las dos empatadas van delante de la antigua, y el orden
+        // entre ellas es el que fijan las dos aserciones por identificador que vienen después.
+        let mut de_las_empatadas = [todas[0].bytes_processed, todas[1].bytes_processed];
+        de_las_empatadas.sort();
+
+        assert_eq!(
+            de_las_empatadas,
+            [200, 300],
+            "las dos filas que empatan tienen que ir delante de la más antigua"
+        );
+
+        // Las dos que empatan salen en orden de identificador, que es el desempate.
+        let mut esperadas = [
+            identificadores[1].hyphenated().to_string(),
+            identificadores[2].hyphenated().to_string(),
+        ];
+        esperadas.sort();
+
+        assert_eq!(
+            todas[0].id.hyphenated().to_string(),
+            esperadas[0],
+            "con la misma fecha, el desempate es el identificador"
+        );
+        assert_eq!(
+            todas[1].id.hyphenated().to_string(),
+            esperadas[1],
+            "y el de la segunda también"
+        );
+
+        // El filtro por estado acota.
+        let solo_fallidas = ejecuciones
+            .listar_filtrado(&FiltroDeEjecuciones {
+                job_id: None,
+                status: Some(Estado::Failed),
+                limite: 50,
+                desplazamiento: 0,
+            })
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(
+            solo_fallidas.len(),
+            1,
+            "el filtro por estado tiene que acotar"
+        );
+
+        // Un `job_id` que no es el de las filas no devuelve ninguna: el filtro no se ignora.
+        let de_otra_tarea = ejecuciones
+            .listar_filtrado(&FiltroDeEjecuciones {
+                job_id: Some(Uuid::new_v4()),
+                status: None,
+                limite: 50,
+                desplazamiento: 0,
+            })
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert!(
+            de_otra_tarea.is_empty(),
+            "un filtro por una tarea sin ejecuciones no puede devolver filas"
+        );
+
+        // La ventana se aplica: saltar una devuelve la segunda del orden.
+        let segunda = ejecuciones
+            .listar_filtrado(&FiltroDeEjecuciones {
+                job_id: None,
+                status: None,
+                limite: 1,
+                desplazamiento: 1,
+            })
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(
+            segunda.len(),
+            1,
+            "la ventana tiene que devolver una sola fila"
+        );
+        assert_eq!(
+            segunda[0].id, todas[1].id,
+            "saltar una tiene que dar la segunda del orden"
+        );
+
+        // La guarda del directorio temporal sigue viva hasta aquí: si se soltara antes, la base
+        // desaparecería bajo las consultas.
+        drop(directorio);
     }
 }

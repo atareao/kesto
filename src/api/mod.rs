@@ -1,6 +1,7 @@
 //! API HTTP de Kesto: el router de `/api/v1` y la partición de su superficie.
 
 pub mod auth;
+pub mod executions;
 pub mod extract;
 pub mod health;
 pub mod jobs;
@@ -92,7 +93,8 @@ pub fn api_router(state: AppState) -> Router {
                 .route("/api/v1/auth/session", get(auth::session))
                 .merge(repositories::router())
                 .merge(targets::router())
-                .merge(jobs::router());
+                .merge(jobs::router())
+                .merge(executions::router());
 
             public.merge(protected_router(negocio, auth))
         }
@@ -105,7 +107,8 @@ pub fn api_router(state: AppState) -> Router {
         None => public
             .merge(repositories::router())
             .merge(targets::router())
-            .merge(jobs::router()),
+            .merge(jobs::router())
+            .merge(executions::router()),
     };
 
     router
