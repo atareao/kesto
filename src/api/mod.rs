@@ -1,12 +1,14 @@
 //! API HTTP de Kesto: el router de `/api/v1` y la partición de su superficie.
 
 pub mod auth;
+pub mod events;
 pub mod executions;
 pub mod extract;
 pub mod health;
 pub mod jobs;
 pub mod repositories;
 pub mod response;
+pub mod snapshots;
 pub mod targets;
 
 #[cfg(test)]
@@ -21,6 +23,7 @@ use serde::Serialize;
 
 use crate::api::response::Data;
 use crate::auth::middleware;
+use crate::engine::ErrorDelMotor;
 use crate::error::AppError;
 use crate::state::{AppState, AuthState};
 
@@ -71,7 +74,9 @@ async fn trazar(
 ///
 /// La lista blanca y no una lista negra: así una ruta nueva queda del lado
 /// protegido por construcción, sin que nadie tenga que acordarse. El SSE de
-/// `/api/v1/events` quedará detrás del *gate* el día que su change lo declare.
+/// `/api/v1/events` está detrás del *gate* como cualquier otra ruta de negocio:
+/// lo que su change declara en excepción es su **cuerpo** —no lleva la
+/// envoltura—, no su sitio en el router.
 pub fn api_router(state: AppState) -> Router {
     // La salud es lo único público en cualquier modo.
     let mut public: Router<AppState> = Router::new().route("/api/v1/health", get(health::health));
@@ -94,7 +99,18 @@ pub fn api_router(state: AppState) -> Router {
                 .merge(repositories::router())
                 .merge(targets::router())
                 .merge(jobs::router())
-                .merge(executions::router());
+                .merge(executions::router())
+                // El explorador de instantáneas, como los tres recursos y no como el stream: su
+                // respuesta lleva la envoltura, así que lo único que tiene que llegarle es el
+                // *gate* de sesión, que es de esta mitad. No entra en la lista blanca.
+                .merge(snapshots::router())
+                // El stream de eventos cuelga de **esta** mitad y no de una tercera: en este
+                // repositorio la envoltura no es una capa del router sino lo que produce un
+                // manejador, así que el stream se salta la envoltura por lo que devuelve su
+                // manejador —un `Sse`— y no por dónde está montado. Y lo que sí tiene que
+                // llegarle es el *gate* de sesión, que es lo que lo protege, y la capa de
+                // traza, que es la que deja constancia de que alguien se conectó.
+                .merge(events::router());
 
             public.merge(protected_router(negocio, auth))
         }
@@ -108,7 +124,15 @@ pub fn api_router(state: AppState) -> Router {
             .merge(repositories::router())
             .merge(targets::router())
             .merge(jobs::router())
-            .merge(executions::router()),
+            .merge(executions::router())
+            // Y el explorador, igual: en este modo no hay ninguna capa que montar, así que queda
+            // abierto como el resto —es lo que el modo de desarrollo significa— y el panel puede
+            // explorar un repositorio sin un proveedor de identidad.
+            .merge(snapshots::router())
+            // Y el stream, como en la mitad protegida: en este modo no hay ninguna capa que montar,
+            // así que queda abierto igual que el resto —es lo que el modo de desarrollo significa—
+            // y el panel puede seguirlo sin un proveedor de identidad.
+            .merge(events::router()),
     };
 
     router
@@ -194,6 +218,166 @@ async fn not_found() -> AppError {
 /// Fallback de los métodos no declarados: `405` con la envoltura de error.
 async fn metodo_no_permitido() -> AppError {
     AppError::MethodNotAllowed("el método no está permitido en esta ruta".to_owned())
+}
+
+/// El `404` de una tarea que no está, con un solo texto para las cuatro rutas que la buscan.
+///
+/// Lo usan la lectura, la edición, el borrado y el disparo —las cuatro que resuelven una tarea por
+/// el identificador de la ruta—: el mensaje que el panel pinta no puede depender de por qué ruta se
+/// buscó, así que la frase vive en un solo sitio y lo comparten la constancia de
+/// [`crate::api::jobs`] y la traducción de [`ErrorDelMotor::TareaQueNoEsta`] de aquí abajo.
+///
+/// El texto **no** repite el valor de la ruta: la regla de la casa es que un rechazo nombre el
+/// campo, nunca lo que traía.
+pub(crate) const TAREA_QUE_NO_ESTA: &str = "no existe ninguna tarea con ese identificador";
+
+/// Traduce el desenlace del motor al error de la API.
+///
+/// Es la **única** tabla de correspondencias entre [`ErrorDelMotor`] y el código HTTP, y vive aquí
+/// por dos motivos. El primero es de sitio: es una función de la capa HTTP y la usan **todos** los
+/// módulos de recurso que hablan con el motor —el disparo de una tarea hoy; el alta de un
+/// repositorio y el explorador de instantáneas en los lotes siguientes—, así que su casa es el
+/// módulo que ya presta lo que los cuatro recursos necesitan, como [`contenido`]. Ponerla en el
+/// módulo de un recurso obligaría a los otros a importarla de un hermano, y una tabla de códigos
+/// duplicada en cada manejador es una tabla que se desincroniza.
+///
+/// El segundo es que la correspondencia es **contrato**, y está escrita variante a variante en la
+/// documentación de [`ErrorDelMotor`]: aquí solo se copia, y una variante nueva rompe este `match`
+/// —no hay rama comodín— de modo que no puede quedarse sin código sin que la compilación lo diga.
+///
+/// # La única variante que este `match` no puede cerrar
+///
+/// [`ErrorDelMotor::Repositorio`] es el desenlace en el que el código **lo elige quien llama**, y
+/// su documentación lo explica: el alta de un repositorio tiene que contestar `502` si el destino no
+/// se alcanza y `400` si la passphrase no abre uno que ya existe, y distinguirlos exige mirar la
+/// [`causa`](ErrorDelMotor::Repositorio::causa) de la biblioteca, que viaja entera y con su tipo
+/// precisamente para eso. Aquí se le da el desenlace por defecto —`502`, «el repositorio no ha
+/// respondido»—, que es el correcto para los caminos en los que el motor no puede decir cuál de los
+/// dos fue; quien tenga que elegir mira la causa **antes** de llamar a esta función, porque el error
+/// entra por valor: eso es exactamente lo que hace [`del_motor_en_el_alta`].
+///
+/// # Por qué el fallo de base no pasa por [`AppError::Database`]
+///
+/// [`ErrorDelMotor::Base`] documenta que corresponde a un `500`, y aquí se le da el genérico. La
+/// tentación es reenviarlo a [`AppError::Database`] —que sabe traducir la clave foránea violada a
+/// `409` y el secreto vacío a `400`—, pero esos dos desenlaces los provoca **el cuerpo de una
+/// petición**, y el encolado no escribe nada con cuerpo: la fila la compone el motor con valores que
+/// acaba de leer. Lo que sí llegaría por ahí es una violación de clave foránea de una tarea borrada
+/// entre la lectura y el `INSERT`, que para quien disparó es un fallo del servidor y no algo que
+/// pueda corregir. El contrato dice `500`, y la causa —que nombra rutas del despliegue— se queda en
+/// el registro.
+pub(crate) fn del_motor(error: ErrorDelMotor) -> AppError {
+    // El texto del motor se guarda **antes** de mirar la variante: es el que va al registro en todas
+    // las ramas, y las que publican un mensaje propio lo hacen a propósito —el `404` y el `409` no
+    // repiten el valor de la ruta, y el `503` no publica su motivo—. El texto nunca lleva un
+    // secreto: el motor ya pasa por su red lo que viene de fuera.
+    let motivo = error.to_string();
+
+    match error {
+        // 404 — la tarea no existe. Es la misma frase que la de las otras tres rutas que buscan una
+        // tarea por su identificador, y sale de la misma constante.
+        ErrorDelMotor::TareaQueNoEsta { .. } => AppError::NotFound(TAREA_QUE_NO_ESTA.to_owned()),
+
+        // 409 — la guarda atómica de la capa de acceso. El mensaje no repite el identificador: la
+        // traza de la petición ya registra la ruta, y la regla de la casa es que un rechazo nombre
+        // el campo y no lo que traía.
+        ErrorDelMotor::YaTieneUnaEnCurso { .. } => AppError::Conflict(
+            "la tarea ya tiene una ejecución en curso: no se encola una segunda".to_owned(),
+        ),
+
+        // 503 — el motor no acepta trabajo ahora mismo: o ha empezado a apagarse, o la cola de ese
+        // repositorio está llena, o su trabajador no está. El motivo —que incluye los
+        // identificadores y, en el último caso, la causa de base— se queda en el registro.
+        ErrorDelMotor::MotorParado
+        | ErrorDelMotor::ColaDelRepositorioLlena { .. }
+        | ErrorDelMotor::SinQuienAtiendaLaCola { .. } => AppError::ServiceUnavailable(motivo),
+
+        // 500 — un fallo del servidor: la base no atendió el encolado, el hilo de trabajo se cayó, o
+        // el motor se montó fuera de un runtime (que no es un desenlace de una petición, pero el
+        // `match` es exhaustivo a propósito).
+        ErrorDelMotor::Base { .. }
+        | ErrorDelMotor::TrabajoInterrumpido { .. }
+        | ErrorDelMotor::SinRuntime => AppError::Other(motivo),
+
+        // 502 — un servicio de fuera no contesta: el motor de contenedores —desenlace de
+        // `Motor::comprobar`, que el arranque usa para avisar—, o el repositorio. Ver arriba por qué
+        // el del repositorio lleva aquí el desenlace por defecto.
+        ErrorDelMotor::MotorDeContenedores { .. } | ErrorDelMotor::Repositorio { .. } => {
+            AppError::BadGateway(motivo)
+        }
+    }
+}
+
+/// El `400` de una passphrase que no abre el repositorio que ya está en el destino.
+///
+/// Es texto **propio** y no el `motivo` que trae el error del motor, y no por escrúpulo de estilo:
+/// el motivo de la biblioteca es el suyo, está escrito para el registro —nombra la comprobación que
+/// falló, «no suitable key found»— y copiarlo al cuerpo ataría el contrato del cable a un texto de
+/// una dependencia que puede cambiar en cualquier versión menor. Lo que el `400` tiene que decir es
+/// lo que el operador necesita leer para arreglarlo, y eso cabe en una frase: el campo, y que no
+/// abre. El destino sí se nombra —lo mandó la petición—, pero el mensaje no lo lleva: el panel tiene
+/// el formulario delante, y el registro es quien guarda el motivo entero.
+const PASSPHRASE_QUE_NO_ABRE: &str = "el campo `passphrase` no abre el repositorio que ya está en el destino: \
+     revisa la passphrase, y que el repositorio del destino siga entero";
+
+/// Traduce el desenlace del motor al error de la API **en el alta de un repositorio**.
+///
+/// Es el único sitio que elige el código de [`ErrorDelMotor::Repositorio`], y existe porque
+/// [`del_motor`] no puede elegirlo: su documentación lo dice —el `502` que da por defecto vale para
+/// los caminos en los que el motor no sabe cuál de los dos desenlaces fue—, y aquí sí se sabe,
+/// porque la [`causa`](ErrorDelMotor::Repositorio::causa) viaja entera y con su tipo. Vive junto a
+/// la tabla que NO elige, y no en el manejador, por el mismo motivo por el que vive la tabla: una
+/// segunda correspondencia de código escrita en un manejador es una correspondencia que se
+/// desincroniza del contrato, y el día que haya otro sitio que abra un repositorio con las
+/// credenciales de un formulario tendrá que elegir igual que éste.
+///
+/// La frontera es **de quién es la culpa**, que es lo que decide si el operador puede arreglarlo
+/// mandando otra petición:
+///
+/// * **La credencial no abre un repositorio que ya existe** ⇒ `400`. El destino contestó —se acaba
+///   de listar—, así que lo que falla es un dato del formulario, y quien lo mandó lo tiene delante y
+///   puede corregirlo. Un `502` aquí mandaría a mirar el servicio de fuera cuando lo que hay que
+///   mirar es lo que se escribió.
+/// * **Un campo del cuerpo que no puede funcionar** —vacío— ⇒ `400` **nombrando el campo**, que es
+///   la forma que el rechazo de un formulario tiene en toda la API. Dos de los tres casos son un
+///   rechazo que ya existía antes de este change: un `secret_access_key` o una `passphrase` vacíos
+///   los rechazaba la capa de acceso con [`crate::db::DbError::SecretoVacio`], y ese camino deja de
+///   recorrerse porque ahora el alta habla con el destino **antes** de escribir nada; el mensaje se
+///   mantiene palabra por palabra para que el cliente vea el mismo. El tercero es nuevo y es una
+///   mejora medida: un `endpoint`, un `bucket` o una credencial vacíos se escribían hasta hoy en la
+///   fila y el alta contestaba `201`, y ahora esa fila no se puede ni abrir, así que lo que
+///   corresponde es decir qué campo está mal y no culpar al destino con un `502`.
+/// * **Todo lo demás** ⇒ el desenlace por defecto de [`del_motor`], que es el `502`: el destino no
+///   se alcanza, o se alcanza y no se deja inicializar. Eso no se arregla cambiando la petición.
+///
+/// # Por qué la causa se mira por variante y no por su texto
+///
+/// Porque el texto no es contrato de nadie: `Error::PassphraseNoAbre` y `Error::DestinoNoAlcanzable`
+/// son las dos variantes de la biblioteca, están construidas por el módulo que las midió —que
+/// distingue los desenlaces **preguntando al destino** y por el código que publica `rustic_core`,
+/// nunca por el mensaje— y una variante nueva rompe este `match` en la compilación si algún día
+/// aparece. Y ninguno de los dos mensajes que salen de aquí publica un secreto: el de la passphrase
+/// es una constante, y el `502` no publica motivo.
+///
+/// # Cuándo se llama, y cuándo **no**
+///
+/// Solo el alta de un repositorio. El `PUT` de un repositorio **no** conecta ni inicializa —editar
+/// una fila no puede depender de que el destino esté en pie, y el porqué está escrito en su
+/// manejador—, así que no debe pasar por aquí.
+pub(crate) fn del_motor_en_el_alta(error: ErrorDelMotor) -> AppError {
+    if let ErrorDelMotor::Repositorio { causa, .. } = &error {
+        match causa {
+            crate::rustic::Error::PassphraseNoAbre { .. } => {
+                return AppError::InvalidInput(PASSPHRASE_QUE_NO_ABRE.to_owned());
+            }
+            crate::rustic::Error::AccesoInvalido { campo } => {
+                return AppError::InvalidInput(format!("el campo `{campo}` no puede ir vacío"));
+            }
+            _ => {}
+        }
+    }
+
+    del_motor(error)
 }
 
 /// Serializa una vista del cable al `data` de la envoltura.

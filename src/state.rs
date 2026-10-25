@@ -11,6 +11,7 @@ use crate::auth::oidc::Discovery;
 use crate::config::{AuthMode, Config, ConfigError, OidcSettings};
 use crate::db::crypto::Clave;
 use crate::db::entities::{Ejecuciones, Repositorios, Tareas, Targets};
+use crate::engine::Motor;
 use crate::secret::SecretString;
 
 /// Caducidad de un `state` emitido en el login: 5 minutos.
@@ -249,11 +250,24 @@ pub struct AppState {
     /// que no hay ninguna forma de construir un estado servible sin haber abierto la
     /// base antes.
     pub db: EstadoDeBase,
+    /// El motor de copias: la cola, los trabajadores y el hub de eventos.
+    ///
+    /// **Tampoco** es un `Option`, y por el mismo razonamiento que la base: un estado
+    /// sin motor declararía válido un Kesto que no puede copiar. Y ahí el daño sería
+    /// peor que un `404`, porque el panel estaría en pie y contestaría `200` a las
+    /// rutas del §5 mientras la primera copia descubriera que no hay quien la
+    /// ejecute. El tipo lo dice: no hay estado servible sin motor, y montarlo es cosa
+    /// del arranque, no del constructor —el motor captura el `Handle` del runtime, y
+    /// eso solo se puede hacer desde dentro de uno—.
+    ///
+    /// Se clona como el resto del estado, y clonarlo no cuesta nada: el motor es un
+    /// `Arc` por dentro, así que un clon no copia ni la cola ni un solo evento.
+    pub motor: Motor,
 }
 
 impl AppState {
-    /// Construye el estado a partir de la configuración efectiva y la base **ya
-    /// abierta**.
+    /// Construye el estado a partir de la configuración efectiva, la base **ya
+    /// abierta** y el motor **ya arrancado**.
     ///
     /// Falla —en vez de degradar a superficie pública en silencio— si el modo
     /// es `Oidc` y no hay clave de firma. `Config` ya garantiza que en `Oidc` la
@@ -262,12 +276,13 @@ impl AppState {
     /// «panel sin *gate*»: un fallo de invariante no puede abrir la superficie
     /// sin que nadie se entere.
     ///
-    /// La base entra por parámetro **ya construida** en vez de abrirse aquí: abrirla
-    /// exige un `await`, y el orden «abrir, migrar y solo entonces escuchar» es una
-    /// decisión del arranque —un fallo de migración es un arranque fallido, no un modo
-    /// degradado—, no del constructor del estado. Con la base fuera, esta función sigue
-    /// siendo síncrona y no puede quedarse a medias.
-    pub fn new(config: Config, db: EstadoDeBase) -> Result<Self, ConfigError> {
+    /// La base y el motor entran por parámetro **ya construidos** en vez de abrirse
+    /// aquí: abrir la base y arrancar el motor exigen, respectivamente, un `await` y
+    /// estar dentro de un runtime, y el orden —abrir, migrar, montar el motor y solo
+    /// entonces escuchar— es una decisión del arranque: un fallo de migración es un
+    /// arranque fallido, no un modo degradado. Con las dos piezas fuera, esta función
+    /// sigue siendo síncrona y no puede quedarse a medias.
+    pub fn new(config: Config, db: EstadoDeBase, motor: Motor) -> Result<Self, ConfigError> {
         let auth = match &config.auth {
             AuthMode::Oidc(settings) => match &config.secret {
                 Some(secret) => Some(AuthState::new(settings.clone(), secret.clone())),
@@ -284,6 +299,7 @@ impl AppState {
             config: Arc::new(config),
             auth,
             db,
+            motor,
         })
     }
 }
@@ -294,7 +310,7 @@ mod tests {
 
     use time::OffsetDateTime;
 
-    use super::{AppState, EstadoDeBase, PendingLogin, STATE_TTL};
+    use super::{EstadoDeBase, PendingLogin, STATE_TTL};
     use crate::config::Config;
     use crate::db::entities::{
         AltaDeEjecucion, AltaDeRepositorio, AltaDeTarea, AltaDeTarget, Estado, TipoDeTarget,
@@ -302,7 +318,7 @@ mod tests {
     use crate::secret::SecretString;
     use crate::test_support::{
         MASTER_KEY, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER_URL, SESSION_SECRET, auth_oidc,
-        base_con_clave, config_con_dsn, lookup_from,
+        base_con_clave, config_con_dsn, estado_de_prueba, lookup_from,
     };
 
     #[tokio::test]
@@ -369,8 +385,7 @@ mod tests {
         // lleva dentro tiene que existir mientras el pool esté abierto.
         let (_directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(config, EstadoDeBase::nuevo(pool, clave))
-            .expect("el estado se construye");
+        let estado = estado_de_prueba(config, EstadoDeBase::nuevo(pool, clave));
 
         assert!(
             estado.auth.is_none(),
@@ -391,8 +406,7 @@ mod tests {
 
         let (_directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(config, EstadoDeBase::nuevo(pool, clave))
-            .expect("el estado se construye");
+        let estado = estado_de_prueba(config, EstadoDeBase::nuevo(pool, clave));
         let auth = estado
             .auth
             .as_ref()
@@ -431,11 +445,10 @@ mod tests {
 
         let (directorio, pool, clave) = base_con_clave().await;
 
-        let estado = AppState::new(
+        let estado = estado_de_prueba(
             config_con_dsn(&directorio.dsn()),
             EstadoDeBase::nuevo(pool.clone(), clave),
-        )
-        .expect("el estado se construye sobre la base de prueba");
+        );
 
         let repositorio = estado
             .db

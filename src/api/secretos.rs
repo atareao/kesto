@@ -16,10 +16,10 @@ use crate::api::api_router;
 use crate::api::jobs::AltaDeTareaDelCable;
 use crate::api::repositories::AltaDeRepositorioDelCable;
 use crate::api::targets::AltaDeTargetDelCable;
-use crate::state::{AppState, EstadoDeBase};
+use crate::state::EstadoDeBase;
 use crate::test_support::{
     DirectorioDePrueba, base_con_clave, body_json, body_text, capturar_log, config_con_dsn, delete,
-    estado_desarrollo, get, post_json, put_json,
+    destino_local_de_prueba, estado_de_prueba, estado_desarrollo, get, post_json, put_json,
 };
 
 /// Credencial de acceso distinguible: larga y con coletilla propia, para que un
@@ -184,10 +184,14 @@ async fn barrido(
 }
 
 /// El cuerpo de un alta de repositorio, con las dos credenciales que se le pasen.
+///
+/// El `endpoint` es la ruta de un directorio temporal —retenida mientras dure la corrida— y no una
+/// URL de mentira: el alta **habla con el destino** desde el change `backup-engine`, así que una
+/// URL que no existe convertiría estas altas en fallos por destino inalcanzable.
 fn cuerpo_de_repositorio(nombre: &str, credencial: &str, passphrase: &str) -> serde_json::Value {
     serde_json::json!({
         "name": nombre,
-        "endpoint": "https://s3.example.test",
+        "endpoint": destino_local_de_prueba(nombre),
         "bucket": nombre,
         "region": "eu-west-1",
         "access_key_id": "AKIAIOSFODNN7EXAMPLE",
@@ -298,11 +302,10 @@ async fn ninguna_respuesta_de_los_tres_recursos_trae_un_secreto() {
 async fn la_credencial_que_entro_por_la_api_no_aparece_en_los_bytes_del_fichero() {
     let (directorio, pool, clave) = base_con_clave().await;
 
-    let estado = AppState::new(
+    let estado = estado_de_prueba(
         config_con_dsn(&directorio.dsn()),
         EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
-    )
-    .expect("el estado con pool y clave se construye");
+    );
 
     let router = api_router(estado);
 
