@@ -36,7 +36,7 @@ El change se reparte en tres módulos entregables, cada uno con su ciclo RED →
 |---|---|---|---|
 | 1 | Estado, tipos del cable y errores | El `Deserialize` manual de `SecretString`, el estado de base en el `AppState`, el arnés ajustado y la traducción de los errores de base y del rechazo del cuerpo | `src/secret.rs`, `src/state.rs`, `src/main.rs`, `src/test_support.rs`, `src/error.rs` |
 | 2 | Los tres recursos | Los DTO de petición y respuesta, las quince rutas, la validación y la conservación del secreto en la edición | `src/api/mod.rs`, `src/api/{targets,repositories,jobs}.rs` |
-| 3 | El listado de ejecuciones | Los filtros, la paginación acotada y el orden estable | `src/api/executions.rs` |
+| 3 | El listado de ejecuciones | Los filtros, la paginación acotada, el orden estable y el `Query` propio | `src/api/executions.rs`, `src/api/extract.rs`, `src/api/mod.rs`, `src/api/particion.rs`, `src/db/entities/execution.rs` |
 
 El **orden de entrega** es 1 → 2 → 3. El 1 va primero porque **nada se puede probar sin él**: los manejadores reciben las capas por el estado, así que sin el estado no hay una sola ruta que ejecutar, y la traducción de los errores es lo que permite contestar `400` y `409` desde cualquiera de los tres recursos. El 3 va último aunque sea independiente del 2: los dos declaran rutas en `src/api/mod.rs`, y escribirlos a la vez sería dos escritores sobre el mismo fichero.
 
@@ -86,6 +86,63 @@ Medido: `axum` 0.8.9 trae `json` y `query` en sus features por defecto y este `C
 - **`PUT` es reemplazo completo**: lo que no venga en el cuerpo vuelve a su valor por defecto, con la salvedad de los secretos. No hay `PATCH`.
 - **El `DELETE` de un repositorio arrastra sus tareas y con ellas sus ejecuciones** por el `ON DELETE CASCADE` del §3: el histórico desaparece con el repositorio. Queda escrito para que nadie lo descubra vaciando la tabla.
 
+## Módulo 3 — el plan de `/executions`
+
+### Qué entra
+
+`GET /api/v1/executions` — la séptima entrega del §5 y la última del change. Es un recurso **de solo lectura**: el §5 no le da `POST` ni `/:id`, y no se le añaden. El histórico lo escribe el **motor** por la capa de acceso —`alta`, `actualizar` y `borrar` ya existen desde `db-schema` y siguen sin ruta—, no un cliente HTTP: una ejecución no se «crea» desde el panel, la crea una copia que corre.
+
+| Fichero | Qué se le hace |
+|---|---|
+| `src/api/executions.rs` | **nuevo**: el DTO de la consulta, el DTO del cable, el manejador, la validación y las ocho pruebas |
+| `src/api/extract.rs` | el `Query` propio, con el rechazo traducido a la envoltura |
+| `src/db/entities/execution.rs` | `Estado::texto`/`Estado::desde_texto`, `FiltroDeEjecuciones`, `SQL_LISTAR_FILTRADO`, `listar_filtrado` y su prueba |
+| `src/api/mod.rs` | `pub mod executions;` y el `merge` en las **dos** ramas |
+| `src/api/particion.rs` | una prueba: ejecuciones sigue la partición del resto |
+
+### Decisiones
+
+**1) El filtro vive en la capa de acceso, y su SQL es una sola cadena estática.** El `WHERE` de dos filtros opcionales se escribe `WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR status = ?2)` con los valores **enlazados**, y no componiendo la consulta en piezas: la tarea 3.2 prohíbe que una consulta se construya concatenando, y una capa que decidiera el `WHERE` según los filtros presentes sería exactamente eso. Los cuatro parámetros van siempre al mismo sitio de la **misma** sentencia.
+
+**2) El orden es `started_at DESC, id`.** El descendente es el del contrato —lo último primero, que es lo que el panel pinta—, y el `id` desempata hacia arriba. **No se toca `SQL_LISTAR`**, que sigue en ascendente: su orden es el del change anterior y hay pruebas que afirman lo suyo. La sentencia nueva es otra constante.
+
+**3) El vocabulario del estado viaja en la entidad, no en el DTO.** `Estado` gana `texto()` y `desde_texto(...)`, la pareja que `TipoDeTarget` ya tiene con `texto_del_tipo`/`tipo_del_cable`. Sin ellas, el DTO tendría que conocer los cuatro literales —`pending`, `running`, `success`, `failed`— y sería el segundo sitio que los escribe: el `CHECK` del §3 es el primero y `Estado::texto` el único otro.
+
+**4) `deny_unknown_fields` en la consulta, igual que en el cuerpo.** Un `?limits=5` que se ignorara en silencio devolvería el listado por defecto —cincuenta filas— y quien llamó creería haber acotado. Medido antes de decidirlo: `serde_urlencoded` 0.7.1 **sí** lo respeta, porque el `deserialize_identifier` de la clave va a `visit_borrowed_str`, y es la clave desconocida la que revienta.
+
+**5) Los parámetros de consulta también tienen mensaje propio.** El `Query` propio de `src/api/extract.rs` cierra la mitad que le faltaba a la tarea 2.11: `QueryRejection` es `#[non_exhaustive]` con una sola variante —`FailedToDeserializeQueryString`—, así que la traducción lleva su brazo comodín, y el aviso al registro dice **que** no se pudieron interpretar los parámetros y nunca su texto, por la misma razón medida que en el cuerpo: el `Display` del rechazo lleva el valor de dentro.
+
+**6) El rango de `limit` es `1..=200`, y el de `offset` es `>= 0`.** Fuera de rango es un `400` que **nombra el campo y dice el rango**, y no un recorte silencioso. Un `limit=0` se rechaza: un listado vacío pedido a propósito y un recorte son indistinguibles para quien lo lee.
+
+**7) `?limit=` —presente y vacía— es `400`, y no el valor por defecto.** Es la misma regla que la del `BIND_ADDRESS` y el `RUST_LOG` del arranque: presente-y-vacía no es lo mismo que ausente, y caer al defecto escondería un formulario mal construido. Lo hace cumplir el intérprete, porque `serde_urlencoded` deserializa el valor vacío como `visit_some` y `""` no parsea a `i64`.
+
+**8) `error_message` sale por el cable tal cual, y es deuda del motor.** El DTO publica las nueve columnas del §3; `error_message` es una de ellas y el panel la necesita para decir por qué falló una copia. Quien la escribe es el motor, y **el motor no debe volcar credenciales ahí**: queda declarado.
+
+### Las ocho pruebas del listado
+
+| Tarea | Prueba | Qué fija |
+|---|---|---|
+| 1.38 | `el_listado_sin_filtros_devuelve_las_ejecuciones_con_sus_metricas` | `200`, las tres filas y las cuatro claves de métricas |
+| 1.39 | `los_filtros_por_job_id_y_por_status_acotan_el_listado` | cada filtro por su lado y los dos a la vez |
+| 1.40 | `el_limite_acota_y_el_desplazamiento_avanza` | `limit=1` y `limit=1&offset=1` dan filas **distintas** |
+| 1.41 | `un_limite_fuera_de_rango_o_no_numerico_contesta_400_sin_recortar` | `limit=201` y `limit=abc` → `400`, y no hay recorte en silencio |
+| 1.42 | `dos_llamadas_seguidas_dan_el_mismo_orden_con_filas_empatadas` | dos `started_at` iguales, mismo orden, desempate por `id` |
+| 1.47 | `las_fechas_de_una_fila_de_ejecucion_son_cadenas_rfc3339` | las dos son cadena, se releen y ninguna es número |
+| 1.25 | `un_parametro_de_consulta_mal_formado_contesta_400_con_la_envoltura` | `?limit=abc` → envoltura y **sin** el texto del intérprete |
+| — | `un_parametro_de_consulta_desconocido_se_rechaza` | `?limits=5` → `400`: es la decisión 4 |
+
+Más una prueba en `particion.rs` —`el_listado_de_ejecuciones_sigue_la_particion_del_resto`— y una en la capa de acceso —`el_listado_filtrado_acota_y_ordena_por_la_fecha_descendente`— que fija el SQL directamente.
+
+### El ciclo, medido
+
+**RED**: `src/api/executions.rs` con los DTO, el router declarado y los manejadores en `todo!()`, con el `Query` **de axum** y no el propio. Las ocho pruebas del listado y la de partición en rojo, y las dos del parámetro por un motivo que vale la pena medir: con el extractor de axum, `?limit=abc` contesta `400` en **texto plano** y con el texto del intérprete dentro —que es el defecto que la 1.25 mide—.
+
+**GREEN**: el `Query` propio, el `listar_filtrado` de la capa de acceso y el manejador. Las **dos** pruebas de la capa de acceso no pueden ser rojas de compilar —el método todavía no existe y no hay binario que medir—, así que acompañan al verde: se dice aquí para que no parezca que se escribieron después para que pasaran.
+
+### Esperado
+
+203 pruebas hoy. Con las diez nuevas: **213 passed; 0 failed** en el binario y **1 passed** en la de integración, con las cuatro puertas limpias. Casillas: **1.25, 1.38–1.42, 1.47, 2.8 y 2.11** —**nueve**—, que dejan **62 de 99**. Las `0.1–0.7` y la `2.15` quedan para la fase de cierre, donde se verifican con `git diff` y con las cuatro puertas.
+
 ## Auditado y corregido
 
 ### Módulo 1 — el estado, los tipos del cable y la traducción de los errores
@@ -115,6 +172,23 @@ Los demás hallazgos del módulo, en corto:
 - **La búsqueda en los bytes ya existía** para el camino de la capa de acceso (`src/db/mod.rs`); la del módulo 2 la extiende al camino **completo**, con la credencial entrando por el `POST` —el camino real del panel—, y reutiliza la misma idea de control: se comprueba que el control **sí** se encuentra antes de afirmar que la credencial no.
 - **La conservación del secreto se prueba descifrando**, nunca comparando sobres: `Targets::actualizar` vuelve a cifrar y el nonce es aleatorio por valor, así que el sobre **cambia en cada escritura** aunque el valor no cambie. Comparar bytes habría dado un rojo falso.
 
+### Módulo 3 — el listado de ejecuciones, la ventana y el `Query` propio
+
+RED y GREEN medidos: **203 passed; 9 failed** → **213 passed; 0 failed** en el binario, más **1 passed** en la de integración, y las cuatro puertas limpias en los dos extremos. Los nueve rojos, en dos grupos que conviene no confundir: **seis** —`1.38` a `1.42` y `1.47`— por el `todo!()` del manejador, que en el binario de pruebas revienta como el `panic!` de la propia prueba; y **tres** —`1.25`, la del parámetro desconocido y la de la partición— por **el defecto que la `1.25` existe para medir**: con el `Query` **de axum** el rechazo no sale por la envoltura, sino en `text/plain` y con el texto del intérprete dentro, así que leerlo como JSON revienta. El RED de esta fase, por tanto, no fue un `todo!()` disfrazado: fue el rechazo real, medido contra el extractor equivocado.
+
+**El `Query` propio cierra la mitad que le faltaba a la `2.11`.** La tarea habla del cuerpo **y de los parámetros**, y los parámetros llegaban con este módulo: `src/api/extract.rs` gana un `Query<T>` que envuelve al de axum y traduce su rechazo a la envoltura, con un mensaje nuestro y sin el texto del intérprete —ni en el cuerpo ni en el registro—. Dos hechos medidos antes de escribirlo, y los dos importan: `QueryRejection` es `#[non_exhaustive]` con **una sola** variante, así que la traducción lleva un brazo comodín que hoy no cubre nada y está para que una variante nueva de axum caiga por el mismo camino en vez de romper la compilación; y `serde_urlencoded` 0.7.1 **sí** respeta `deny_unknown_fields` —el `deserialize_identifier` de la clave va a `visit_borrowed_str`—, que es lo que permite rechazar un `?limits=5` en vez de ignorarlo en silencio y devolver el listado por defecto mientras quien llamó cree haber acotado.
+
+**Un fallo de este módulo fue mío, y lo destapó la verificación, no la implementación.** La prueba de la capa de acceso que yo dicté —`el_listado_filtrado_acota_y_ordena_por_la_fecha_descendente`— salió **flaky**: medida diez veces seguidas, falló **siete**. La causa no estaba en el código —el SQL y el orden de la sentencia eran correctos— sino en la aserción: la prueba siembra dos filas **con la misma** `started_at` para ejercitar el desempate, el orden entre ellas lo decide el `id` —que es **aleatorio** en cada ejecución—, y yo afirmé `todas[0].bytes_processed == 300`, que es medir el azar del UUID y no el contrato. Corregido afirmando el **conjunto** de las empatadas y dejando el desempate a las aserciones por identificador, que ya comparaban contra el orden ordenado y eran correctas. Y la corrección se verificó como se verifica un fallo intermitente —con **doce** pasadas seguidas de la prueba sola, todas verdes, y la suite entera verde **dos** veces—, porque una pasada verde suelta no prueba nada cuando el fallo es de uno de cada tres. Queda escrito porque el error es de **diseño de la prueba** y no del código: una prueba que siembra un empate no puede afirmar cuál de las dos empatadas va primero cuando el desempate es aleatorio.
+
+Los demás hallazgos del módulo, en corto:
+
+- **El `?limit=` presente y vacío contesta `400` y no cae al valor por defecto**, y lo hace cumplir el intérprete: `serde_urlencoded` deserializa el valor vacío como `visit_some` y `""` no parsea a `i64`. Es la misma regla que el `BIND_ADDRESS` y el `RUST_LOG` del arranque —presente y vacía no es lo mismo que ausente—, y aquí sale gratis.
+- **La ventana no se recorta.** Un `limit` fuera de `1..=200` y un `offset` negativo contestan `400` nombrando el campo, y el mensaje dice el rango con el tope y **nunca** repite el valor que llegó. Recortar habría dejado a quien pidió creyendo que recibió lo que pidió.
+- **El contrato no pide escritura para `/executions`, y no se le añade.** El requisito de la superficie nombra los **tres** recursos con cinco rutas —`/targets`, `/repositories` y `/jobs`—; las ejecuciones tienen su propio requisito, que habla del listado. El histórico lo escribe el **motor** por la capa de acceso, cuyas tres escrituras siguen sin ruta, así que la única ruta del recurso es la del §5 y no hay añadido que declarar aquí.
+- **`error_message` se publica tal cual, y es deuda del motor**: queda declarada abajo, con su motivo.
+
+Contabilidad: **nueve** casillas —`1.25`, `1.38`–`1.42`, `1.47`, `2.8` y `2.11`—, que dejan **62 de 99**. Las `0.1`–`0.7` y la `2.15` siguen abiertas para el cierre, donde se comprueban con `git diff` y con las cuatro puertas.
+
 ## Verificación
 
 *(Se rellena al cerrar. Son las puertas del repositorio —`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked` y `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`— más las diez comprobaciones de operador de la fase 4 del `tasks.md`, que esta vez van con `curl` **de verdad** contra el binario —ya hay endpoints— y con `sqlite3` sobre el fichero: los altas y las lecturas de los tres recursos, la columna del secreto guardando el sobre, el `NULL` del `db_name` de un directorio, la `passphrase` que **no** cambia cuando no se envía, las credenciales buscadas literalmente en los bytes del fichero, el `limit` fuera de rango, la cascada del borrado y el `401` sin cookie en modo `Oidc`.)*
@@ -130,6 +204,7 @@ Los demás hallazgos del módulo, en corto:
 - **Las más de treinta construcciones de `AppState`** que hereda el arnés se ajustan a la firma nueva, y los siete ayudantes pasan a ser asíncronos: es un cambio ancho, mecánico y verificado por las 156 pruebas que ya existen, que tienen que seguir verdes afirmando lo mismo.
 - **Los tres manejadores que siguen sin implementar —`listado`, `actualizar` y `borrar` de `/repositories`— revientan si se alcanzan por la red**: son `todo!()` y llegan con el módulo 2. Medido: sin `CatchPanicLayer`, el `panic!` deja caer la tarea de la conexión, el cliente ve la conexión cerrada sin respuesta (`curl` contesta `000`) y el pánico sale en el registro del servidor. Queda declarado mientras dure la fase, para que nadie lo confunda con un fallo del servidor: ningún binario entregado debe tener un camino declarado y sin implementar.
 - **Los `debug!` de la instrumentación solo se ven con `RUST_LOG=debug` o `trace`** y el valor por defecto es `info`, así que en un despliegue sin tocar la variable no queda rastro de las peticiones atendidas. Es deliberado —una línea por clic del panel es ruido de operación a `info`— pero conviene que sea una decisión y no una sorpresa: quien depure un problema en producción tendrá que subir el nivel, y eso está escrito aquí.
+- **`error_message` sale por el cable tal cual, y el motor no debe volcar credenciales ahí.** Es una de las nueve columnas del §3 y el panel la necesita para decir por qué falló una copia, así que el listado la publica. Quien la escribe es el **motor**, y el §4.A manda la contraseña del volcado por la línea de comandos del `exec` —el cuarto cabo suelto del SRS, todavía abierto—, así que la salida de un volcado fallido puede traerla dentro: cuando llegue el motor, `error_message` es un sitio donde una credencial **no** puede acabar. Se declara aquí para que no se descubra con una fuga.
 
 ## Cierre
 
