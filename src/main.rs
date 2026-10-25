@@ -13,6 +13,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod docker;
+pub mod engine;
 pub mod error;
 pub mod rustic;
 pub mod secret;

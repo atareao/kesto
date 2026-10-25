@@ -1235,6 +1235,36 @@ pub(crate) fn capturar_log() -> (BufferDeLog, GuardiaDeCaptura) {
     (buffer, GuardiaDeCaptura(anterior))
 }
 
+// ── Volcados de prueba ───────────────────────────────────────────────────────
+//
+// El puente de `src/rustic` entrega el volcado por un `ReadSource` —el trait de la
+// biblioteca de copia—, así que leerlo desde una prueba exige pasar por el mismo camino que
+// pasa `archive()`: `entries()` → la entrada → su `open` → `.open()`. Ese camino vive aquí y
+// no en cada módulo porque quien lo recorre es un **consumidor** del puente —el motor—, y las
+// pruebas del motor no tienen por qué conocer el trait de la biblioteca.
+
+/// Abre el lector del volcado de un origen, por el mismo camino que la biblioteca de copia.
+///
+/// Si la entrada del origen no trajera cómo abrirse, la biblioteca no podría leer nada: por
+/// eso la prueba pasa por aquí y no por un atajo propio, que probaría otra cosa.
+pub(crate) fn lector_del_volcado(
+    origen: &crate::rustic::OrigenDelVolcado,
+) -> crate::rustic::LectorDeVolcado {
+    use rustic_core::{ReadSource as _, ReadSourceOpen as _};
+
+    let mut entradas = origen.entries();
+    let entrada = entradas
+        .next()
+        .expect("el origen de un volcado entrega una entrada")
+        .expect("la entrada de un volcado no puede ser un error");
+
+    entrada
+        .open
+        .expect("la entrada del volcado tiene que traer cómo abrirse")
+        .open()
+        .expect("el lector del volcado tiene que abrirse")
+}
+
 // ── Motor de contenedores ────────────────────────────────────────────────────
 //
 // Las pruebas de `src/docker` que necesitan un motor de contenedores van marcadas
