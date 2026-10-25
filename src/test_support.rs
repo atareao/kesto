@@ -500,6 +500,28 @@ pub(crate) async fn post_json(router: Router, uri: &str, cuerpo: &serde_json::Va
         .expect("el router no debe fallar")
 }
 
+/// Lanza un `POST` con un cuerpo crudo contra `router` sin abrir un socket.
+///
+/// Es lo que hace falta para ejercitar un cuerpo que **no se puede construir** con
+/// [`post_json`]: una cadena suelta que no es un objeto, o texto que ni siquiera es JSON.
+/// El cuerpo viaja tal cual, sin serializar ni validar antes, y la cabecera
+/// `Content-Type` se pone a propósito: lo que se quiere provocar es el rechazo del
+/// **cuerpo** —su sintaxis o sus tipos—, no el de la cabecera, que si faltara haría caer
+/// al extractor por otra razón y la prueba mediría un caso distinto.
+pub(crate) async fn post_crudo(router: Router, uri: &str, cuerpo: &str) -> Response {
+    let peticion = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(cuerpo.to_owned()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
 /// Lanza una petición con una cabecera `Cookie` ya formada.
 async fn request_with_cookie(router: Router, metodo: Method, uri: &str, cookie: &str) -> Response {
     let peticion = Request::builder()

@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
 use crate::db::entities::{AltaDeRepositorio, Repositorio};
 use crate::error::AppError;
@@ -51,9 +52,11 @@ pub fn router() -> Router<AppState> {
 ///
 /// Los dos son `Option` y no obligatorios **en el tipo** a propósito: quien decide si un
 /// alta sin `passphrase` es válida es el manejador, que es el único sitio donde se puede
-/// contestar un `400` nombrando el campo. Si los exigiera el tipo, el rechazo llegaría
-/// con el texto del intérprete de `serde` —que puede ecoar el valor— en vez de con la
-/// envoltura de la API.
+/// contestar un `400` nombrando el campo. El rechazo del extractor sí sale por la
+/// envoltura de la API, pero con un mensaje propio de la clase del fallo —«el cuerpo no
+/// tiene los campos que la ruta espera»—, que no nombra el campo que falta; por eso el
+/// `400` que sí lo nombra lo tiene que contestar el manejador, y por eso los dos secretos
+/// llegan como `Option`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AltaDeRepositorioDelCable {
@@ -80,9 +83,13 @@ pub struct AltaDeRepositorioDelCable {
 /// reescribirla en cada edición, pero devolver el valor convertiría cada `GET` —y cada
 /// listado— en una fuga que viaja al navegador y queda en su historial.
 ///
-/// **El booleano lleva el nombre de la columna del §3** —`has_secret_access_key`— porque el
-/// formulario, el cuerpo de la petición y la columna se llaman igual: así se lee como «esto
-/// es el `secret_access_key` de la tabla, dicho como sí/no».
+/// **El booleano es un campo derivado, y es un añadido al SRS.** El §3 no tiene ninguna
+/// columna `has_secret_access_key` y el cuerpo del alta informa `secret_access_key`, así
+/// que este campo no lleva el nombre de nada que exista: lo exige el requisito «un secreto
+/// no vuelve al cliente», y es el único campo de esta vista que no refleja una columna.
+/// Su nombre antepone `has_` al de la columna para que se lea como un sí/no **sobre**
+/// ella —«el `secret_access_key` de la tabla, dicho como sí/no»— y no como una segunda
+/// credencial.
 ///
 /// **Y se calcula sobre la fila, no se pone a `true` fijo.** La capa de acceso rechaza el
 /// secreto vacío al escribir, así que en la práctica vale `true` en todas las filas que
@@ -141,8 +148,14 @@ impl RepositorioDelCable {
 ///
 /// Existe porque `serde_json::to_value` devuelve `Result` y un manejador no puede abortar
 /// con `panic!`: un fallo aquí es un `500` con la causa al registro, que es lo que el resto
-/// de la API hace con lo que no debería ocurrir. El mensaje no lleva el valor serializado
-/// —la causa de `serde_json` describe la posición y el tipo, no el contenido—.
+/// de la API hace con lo que no debería ocurrir.
+///
+/// El mensaje no lleva el valor serializado, y eso **no** es una garantía de `serde_json`
+/// sino de estos tipos: `serde_json` sí mete en su error el texto que le dé un serializador
+/// propio —`ser::Error::custom`—, así que la propiedad se sostiene mientras ninguna vista
+/// del cable declare un `serialize_with` que formatee un valor. La red de verdad es de
+/// antes: una respuesta que llevara un secreto no compila, porque
+/// [`crate::secret::SecretString`] no implementa `Serialize`.
 fn contenido<T: Serialize>(vista: &T) -> Result<Data, AppError> {
     serde_json::to_value(vista)
         .map(Data::Some)
@@ -162,7 +175,7 @@ pub async fn listado(State(_state): State<AppState>) -> Result<ApiResponse, AppE
 /// campo y **sin haber tocado la base**.
 pub async fn alta(
     State(state): State<AppState>,
-    axum::Json(cuerpo): axum::Json<AltaDeRepositorioDelCable>,
+    Json(cuerpo): Json<AltaDeRepositorioDelCable>,
 ) -> Result<ApiResponse, AppError> {
     let Some(secret_access_key) = cuerpo.secret_access_key else {
         return Err(AppError::InvalidInput(
@@ -231,7 +244,7 @@ pub async fn leer(
 pub async fn actualizar(
     State(_state): State<AppState>,
     Path(_id): Path<String>,
-    axum::Json(_cuerpo): axum::Json<AltaDeRepositorioDelCable>,
+    Json(_cuerpo): Json<AltaDeRepositorioDelCable>,
 ) -> Result<ApiResponse, AppError> {
     todo!("el módulo 2 del change `api-endpoints` implementa la actualización")
 }
@@ -246,13 +259,22 @@ pub async fn borrar(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use axum::http::{StatusCode, header};
 
     use crate::api::api_router;
     use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
-        base_con_clave, body_json, config_con_dsn, estado_desarrollo, get, post_json,
+        base_con_clave, body_json, body_text, capturar_log, config_con_dsn, estado_desarrollo, get,
+        post_crudo, post_json,
     };
+
+    /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
+    ///
+    /// Es larga y con una coletilla propia a propósito: una cadena corta —una que pudiera
+    /// aparecer en un mensaje de `serde` por casualidad— daría un `contains` con falso
+    /// positivo, y lo que estas pruebas afirman es exactamente que este valor concreto,
+    /// que llega en el cuerpo de la petición, no sale del proceso.
+    const CREDENCIAL_DE_RECHAZO: &str = "AKIAIOSFODNN7EXAMPLE-credencial-distinguible-0001";
 
     /// 1.2 — Dos peticiones seguidas al **mismo** router ven lo mismo.
     ///
@@ -358,6 +380,133 @@ mod tests {
         assert_eq!(
             endpoint, "https://s3.example.test/repo-1-3",
             "la fila del fichero no tiene los valores que informó la petición"
+        );
+    }
+
+    /// 1.23 — Un cuerpo que no es JSON contesta `400` con la envoltura.
+    ///
+    /// Cubre `api-shell`, requisito «Un cuerpo o una consulta que no se pueden interpretar
+    /// contestan 400 con la envoltura, y su texto no sale del proceso» (escenario «Un
+    /// cuerpo que no es JSON contesta `400` con la envoltura»). El porqué de lo que se
+    /// afirma aquí es de **seguridad**, no de estilo, y éste es el defecto que la prueba
+    /// deja candado: el extractor por defecto de axum rechaza **antes** de entrar al
+    /// manejador y contesta en texto plano con el código del intérprete dentro, que puede
+    /// ecoar el valor del campo. Lo intercepta [`Json`] —el extractor propio de este
+    /// crate—, que traduce el rechazo a la envoltura; y por eso la prueba mira el tipo de
+    /// contenido **además** del código: un `400` en texto plano seguiría publicando el
+    /// texto del intérprete.
+    #[tokio::test]
+    async fn un_cuerpo_que_no_es_json_contesta_400_con_la_envoltura() {
+        let router = api_router(estado_desarrollo().await);
+
+        let respuesta = post_crudo(router, "/api/v1/repositories", "esto no es json").await;
+
+        let status = respuesta.status();
+        let tipo_de_contenido = respuesta
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|valor| valor.to_str().ok())
+            .map(ToOwned::to_owned);
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un cuerpo que no se puede interpretar tiene que contestar 400 por la envoltura, \
+             no el código con el que lo rechaza el intérprete"
+        );
+
+        let tipo_de_contenido = tipo_de_contenido
+            .expect("la respuesta tiene que declarar un tipo de contenido, no salir sin cabecera");
+
+        assert!(
+            tipo_de_contenido.starts_with("application/json"),
+            "el rechazo no puede salir en texto plano: publicaría el texto del intérprete, \
+             que ecoa el valor del campo; el tipo de contenido fue {tipo_de_contenido}"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["status"], 400,
+            "la envoltura tiene que repetir el código en `status`: {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            !mensaje.is_empty(),
+            "la envoltura tiene que explicar el rechazo, no traer un mensaje vacío: {cuerpo}"
+        );
+    }
+
+    /// 1.24 — El rechazo de un cuerpo no publica la credencial en ninguna parte.
+    ///
+    /// Cubre `api-shell`, requisito «Un cuerpo o una consulta que no se pueden interpretar
+    /// contestan 400 con la envoltura, y su texto no sale del proceso» (escenario «El
+    /// rechazo de un cuerpo no publica la credencial en ninguna parte»). Los dos vectores
+    /// de abajo están medidos **en vivo** contra el binario: el cuerpo entero es la
+    /// credencial, y lo contesta con `invalid type: string "AKIA…", expected struct …`; y
+    /// la credencial como nombre de un campo que no existe, que lo contesta con
+    /// `unknown field 'AKIA…'`. Los dos textos llevan la credencial dentro, así que la
+    /// prueba afirma dos cosas a la vez: que el rechazo contesta por la envoltura y que su
+    /// texto **no** lleva el valor. Y sobre el registro, las dos mitades del requisito: la
+    /// credencial no está, pero sí queda constancia de **que** una petición no se pudo
+    /// interpretar —sin el texto—, que es lo que permite diagnosticar un panel roto sin
+    /// escribir credenciales en los registros.
+    #[tokio::test]
+    async fn el_rechazo_de_un_cuerpo_no_publica_la_credencial_en_ninguna_parte() {
+        let (buffer, _guard) = capturar_log();
+
+        let router = api_router(estado_desarrollo().await);
+
+        let vectores = [
+            (
+                "el cuerpo entero es la credencial",
+                format!("\"{CREDENCIAL_DE_RECHAZO}\""),
+            ),
+            (
+                "la credencial es el nombre de un campo que no existe",
+                format!("{{\"{CREDENCIAL_DE_RECHAZO}\":1}}"),
+            ),
+        ];
+
+        for (motivo, cuerpo_de_la_peticion) in vectores {
+            let respuesta = post_crudo(
+                router.clone(),
+                "/api/v1/repositories",
+                &cuerpo_de_la_peticion,
+            )
+            .await;
+
+            let status = respuesta.status();
+            let texto = body_text(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "el rechazo tiene que salir por la envoltura ({motivo}); contestó {status} \
+                 con {texto}"
+            );
+
+            assert!(
+                !texto.contains(CREDENCIAL_DE_RECHAZO),
+                "el rechazo publicó la credencial al cliente ({motivo}): {texto}"
+            );
+        }
+
+        let registrado = buffer.texto();
+
+        assert!(
+            !registrado.contains(CREDENCIAL_DE_RECHAZO),
+            "el rechazo escribió la credencial en el registro ({registrado})"
+        );
+
+        assert!(
+            registrado.contains("no se pudo interpretar"),
+            "tiene que quedar registrado que una petición no se pudo interpretar —sin su \
+             texto—, y el registro capturado fue: {registrado}"
         );
     }
 

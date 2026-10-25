@@ -1,6 +1,7 @@
 //! API HTTP de Kesto: el router de `/api/v1` y la partición de su superficie.
 
 pub mod auth;
+pub mod extract;
 pub mod health;
 pub mod repositories;
 pub mod response;
