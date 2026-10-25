@@ -755,19 +755,18 @@ const ESQUEMA_DE_S3: &str = "s3";
 ///
 /// # Visibilidad
 ///
-/// **Privada**, y no `pub(crate)` como decía antes su documentación: sus únicos
-/// consumidores son las pruebas de este mismo fichero, que son un módulo hijo y ven lo
-/// privado. Lo que sí necesitan las pruebas de [`crate::rustic::retencion`] son los
-/// ayudantes del arnés —`abrir_local` y compañía, que solo existen con `cfg(test)`—, y ésos
-/// no pasan por aquí: aquella prueba mide las reglas sobre un repositorio que abre por su
-/// cuenta. Tampoco es `pub`: el destino local que recibe es un gancho de prueba, no un modo
-/// de funcionamiento.
+/// **`pub(crate)`**, y no privada como decía antes su documentación: la prueba del motor
+/// necesita abrir un repositorio **local** —un directorio del sistema de ficheros en vez de un
+/// cubo de S3— para poder recorrer el ciclo de vida completo sin red, sin credenciales y sin
+/// motor de contenedores, y este es el único punto por el que se le puede dar un backend que no
+/// sea el de S3. Lo que no es, es `pub`: el destino local que recibe es un gancho de prueba, no
+/// un modo de funcionamiento, y la API pública construye siempre el de S3.
 ///
 /// # Errors
 ///
 /// Las tres del desenlace y las de la construcción del propio repositorio. Ver
 /// [`Repositorio::poner_en_marcha`].
-fn poner_en_marcha_con(
+pub(crate) fn poner_en_marcha_con(
     acceso: &Acceso,
     backends: RepositoryBackends,
     barras: BarrasDelMotor,

@@ -65,7 +65,7 @@
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -87,7 +87,7 @@ use super::Error;
 /// nadie y envejecería mintiendo.
 ///
 /// ```text
-/// let TunelDelVolcado { origen, productor, entrega } =
+/// let TunelDelVolcado { origen, productor, entrega, avance } =
 ///     tunel_del_volcado(nombre, capacidad, inactividad_maxima)?;
 ///
 /// let hilo = std::thread::spawn(move || {          // 1. el productor, en su hilo
@@ -98,6 +98,7 @@ use super::Error;
 /// let resultado = repositorio.archive(origen, …);  // 2. el archivado, en **este** hilo
 /// hilo.join()?;                                    // 3. la unión, y después
 /// if !entrega.completa() { /* la copia NO está completa, diga lo que diga ese `Ok` */ }
+/// let leidos = avance.bytes();                     // …y el avance, mientras corre o al final
 /// ```
 ///
 /// # El productor va en **otro hilo**, y esto no es un consejo
@@ -160,6 +161,12 @@ pub struct TunelDelVolcado {
     /// Ver [`EntregaDelVolcado`], que es también donde está escrito por qué es un tipo propio y
     /// no un [`Arc<AtomicBool>`] suelto.
     pub entrega: EntregaDelVolcado,
+    /// La cuenta de los bytes que el productor ha entregado al canal.
+    ///
+    /// Ver [`AvanceDelVolcado`], que es también donde está escrito por qué es un tipo propio y
+    /// no un [`Arc<AtomicU64>`] suelto: es el otro acceso que tiene que sobrevivir al
+    /// movimiento del productor a su hilo.
+    pub avance: AvanceDelVolcado,
 }
 
 /// La señal de que el volcado se entregó **entero**.
@@ -215,6 +222,73 @@ impl std::fmt::Debug for EntregaDelVolcado {
     }
 }
 
+/// La cuenta de los bytes que el productor ha empujado al canal.
+///
+/// Es lo que el motor publica como `bytes_processed` de un volcado, y su razón de vivir aquí
+/// es que este es el **único** punto por el que pasa cada byte del volcado: el motor, desde
+/// fuera, solo vería el total cuando el archivado acabara… y no lo vería siquiera, porque el
+/// tamaño de un volcado por `stdout` no se conoce hasta que termina. La cuenta nace donde los
+/// bytes pasan.
+///
+/// Y es **en vivo**: crece mientras el volcado corre y se puede consultar desde otro hilo, que
+/// es lo que el motor necesita para publicar el avance sin esperar al final de nadie.
+///
+/// # Qué cuenta exactamente
+///
+/// Lo **entregado al canal**, y nada más: un trozo que el productor no llegó a empujar porque
+/// el archivado se rindió no suma —el `enviar` devolvió error— y un trozo vacío tampoco —no se
+/// envía—. Por eso la suma va **después** de que el canal acepte el trozo: lo que se cuenta es
+/// lo entregado, no lo intentado.
+///
+/// Lo que **no** cuenta, y conviene no leerlo al revés nunca: no son los bytes que han llegado
+/// al repositorio. Eso no lo observa ningún sitio desde aquí, y publicarlo como si fuera eso
+/// sería describir un hecho que este puente no mide.
+///
+/// # Por qué es un tipo y no un `Arc<AtomicU64>` suelto
+///
+/// Por la misma razón que [`EntregaDelVolcado`], y está contada allí con detalle: el acceso
+/// tiene que sobrevivir al **movimiento** de [`TunelDelVolcado::productor`] al hilo que produce,
+/// y después de ese movimiento ya no se puede pedir `&self` del túnel
+/// —`error[E0382]: borrow of partially moved value`—. Envolver el [`Arc<AtomicU64>`] deja el
+/// acceso donde sí se puede llamar: en el valor, que se saca del túnel al desestructurarlo.
+#[derive(Clone)]
+pub struct AvanceDelVolcado(Arc<AtomicU64>);
+
+impl AvanceDelVolcado {
+    /// Los bytes que el productor ha entregado al canal hasta ahora.
+    ///
+    /// Crece mientras el volcado corre y se puede consultar desde otro hilo: es lo que el motor
+    /// publica **en vivo** como `bytes_processed`. Lo que devuelve nunca retrocede, y lo que
+    /// devuelva **antes** de que el productor acabe es un avance, no un total.
+    pub fn bytes(&self) -> u64 {
+        // `Relaxed` y no `Acquire`: esto no es una señal que sincronice nada —no publica datos
+        // que otro hilo vaya a usar—, es un contador que se lee para pintar. Lo único que se
+        // afirma de él es que no retrocede, y eso lo da la operación atómica por sí sola. La
+        // señal de la entrega, en cambio, usa `Acquire`/`Release` a propósito: ver
+        // [`EntregaDelVolcado`].
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Suma un trozo **ya entregado** al canal. Solo lo llama
+    /// [`ProductorDelVolcado::enviar`], y solo después de que el canal lo acepte.
+    fn sumar(&self, bytes: u64) {
+        self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for AvanceDelVolcado {
+    /// Publica la cuenta y nada más: no hay nada más que publicar, y desde luego no el volcado.
+    ///
+    /// Se escribe a mano y no se deriva por la misma razón que el de
+    /// [`EntregaDelVolcado`]: lo que hay aquí dentro es un contador compartido, y lo que un
+    /// diagnóstico necesita saber de él es cuánto lleva contado.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvanceDelVolcado")
+            .field("bytes", &self.bytes())
+            .finish()
+    }
+}
+
 /// El extremo por el que el productor empuja los bytes: el **único** que existe.
 ///
 /// No se puede clonar a propósito. El canal se cierra cuando muere el **último** emisor, y
@@ -230,6 +304,12 @@ pub struct ProductorDelVolcado {
     emisor: SyncSender<Vec<u8>>,
     /// La señal que [`terminar`](Self::terminar) pone y que el lector consulta al ver el cierre.
     terminado_bien: Arc<AtomicBool>,
+    /// La cuenta de lo entregado, que el motor consulta **en vivo**.
+    ///
+    /// Es la otra punta de [`AvanceDelVolcado`]: se guarda aquí porque este es el único sitio
+    /// que escribe en el canal, y se entrega también en el túnel porque quien la consulta
+    /// —el motor— no tiene el productor: lo movió a su hilo.
+    avance: AvanceDelVolcado,
 }
 
 impl std::fmt::Debug for ProductorDelVolcado {
@@ -252,17 +332,31 @@ impl ProductorDelVolcado {
     /// Un trozo **vacío** no se envía: el canal solo transporta datos, y un mensaje sin datos no
     /// puede significar nada —el final ya no viaja por aquí—. Descartarlo en el único sitio que
     /// escribe en el canal es lo que permite que el lector trate cualquier mensaje recibido como
-    /// progreso, sin tener que decidir qué hacer con un vacío.
+    /// progreso, sin tener que decidir qué hacer con un vacío. Y tampoco cuenta: lo que se cuenta
+    /// es lo **entregado**, y por aquí no se entregó nada.
+    ///
+    /// La cuenta va **después** del `send`, no antes: el `send` puede fallar —el archivado se
+    /// rindió—, y un trozo que no llegó al canal no es un byte entregado. Contarlo antes haría
+    /// que el motor publicara un avance que el repositorio no vio, y hacia arriba, que es la
+    /// dirección peor.
     pub fn enviar(&self, trozo: Vec<u8>) -> Result<(), Error> {
         if trozo.is_empty() {
             return Ok(());
         }
 
+        // La longitud se lee antes de mover el trozo al canal, que es lo único que el `send`
+        // consume. No es una copia: es un `usize`.
+        let bytes = trozo.len() as u64;
+
         self.emisor
             .send(trozo)
             .map_err(|_| Error::ElArchivadoSeRindio {
                 nombre: self.nombre.clone(),
-            })
+            })?;
+
+        self.avance.sumar(bytes);
+
+        Ok(())
     }
 
     /// Declara el volcado **terminado bien** y cierra el canal. Consume: después de esto no
@@ -353,10 +447,12 @@ pub fn tunel_del_volcado(
     // Las dos señales: la del productor, que el lector consulta al ver el canal cerrado, y la de
     // la entrega completa, que el lector marca y el motor consulta. Nacen aquí y a partir de este
     // momento van por caminos distintos —el origen se le entrega a la biblioteca, el productor a
-    // su hilo y la señal al motor—, que es lo que hace que estas cuatro líneas sean la única
-    // costura entre las tres partes.
+    // su hilo y las señales al motor—, que es lo que hace que estas cuatro líneas sean la única
+    // costura entre las tres partes. Y con ellas la **cuenta de lo entregado**, que es la tercera
+    // pieza que va por caminos distintos: la escribe el productor y la lee el motor en vivo.
     let terminado_bien = Arc::new(AtomicBool::new(false));
     let entrega = EntregaDelVolcado(Arc::new(AtomicBool::new(false)));
+    let avance = AvanceDelVolcado(Arc::new(AtomicU64::new(0)));
 
     Ok(TunelDelVolcado {
         origen: OrigenDelVolcado {
@@ -370,8 +466,10 @@ pub fn tunel_del_volcado(
             nombre,
             emisor,
             terminado_bien,
+            avance: avance.clone(),
         },
         entrega,
+        avance,
     })
 }
 
@@ -969,6 +1067,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-acotado.sql", capacidad);
 
         let trozos: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 4096]).collect();
@@ -1071,6 +1170,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-entero.sql", 4);
 
         assert!(
@@ -1122,6 +1222,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-truncado.sql", 4);
 
         productor
@@ -1191,6 +1292,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_con_plazo("volcado-sin-final.sql", 4, Duration::from_secs(3600));
 
         // Nadie más tiene un emisor —el tipo no se puede clonar—, así que el canal queda cerrado.
@@ -1247,6 +1349,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_con_plazo("volcado-atascado.sql", 4, plazo);
 
         let mut lector = lector_de(&origen).expect("el lector tiene que abrirse");
@@ -1495,6 +1598,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_con_plazo("volcado-sin-bufer.sql", 4, Duration::from_secs(60));
 
         let lector = lector_de(&origen).expect("el lector tiene que abrirse");
@@ -1657,5 +1761,218 @@ mod tests {
             tunel.origen.nombre, "volcado-de-tienda-2026-10-25.sql",
             "el nombre aceptado no es el que el origen va a usar como camino de la entrada"
         );
+    }
+
+    // ── El avance del volcado ────────────────────────────────────────────────
+    //
+    // Es la cuenta que el motor publica como `bytes_processed` **en vivo**, así que lo que
+    // estas cuatro pruebas fijan es lo que el motor va a leer: dónde empieza, cuándo crece,
+    // qué no cuenta y qué publica de sí misma.
+
+    /// **20.** La cuenta empieza en cero y crece **exactamente** con lo entregado.
+    ///
+    /// La cuenta es lo que el panel pinta como bytes procesados, así que un contador que
+    /// arrancara en otra cosa o que sumara de más sería una cifra falsa con la misma
+    /// autoridad que una de verdad. Se mide contra el total enviado, y con trozos de tamaño
+    /// distinto para que una implementación que sumara «un trozo» en vez de sus bytes no
+    /// cuadre por casualidad.
+    #[test]
+    fn el_avance_empieza_en_cero_y_crece_con_lo_entregado() {
+        let TunelDelVolcado {
+            origen: _origen,
+            productor,
+            entrega: _entrega,
+            avance,
+        } = tunel_de_prueba("volcado-contado.sql", 8);
+
+        assert_eq!(
+            avance.bytes(),
+            0,
+            "un túnel recién construido no puede traer bytes contados"
+        );
+
+        let trozos = [vec![b'a'; 97], vec![b'b'; 1024], vec![b'c'; 3]];
+        let total: u64 = trozos.iter().map(|trozo| trozo.len() as u64).sum();
+
+        for trozo in trozos {
+            productor
+                .enviar(trozo)
+                .expect("el canal tiene sitio de sobra, así que el envío no puede fallar");
+        }
+
+        assert_eq!(
+            avance.bytes(),
+            total,
+            "la cuenta no es la suma de lo entregado: {} de {total}",
+            avance.bytes()
+        );
+
+        drop(productor);
+    }
+
+    /// **21.** Un trozo **vacío** no cuenta y tampoco viaja.
+    ///
+    /// Las dos mitades importan: si contara, la cuenta subiría sin que se hubiera entregado
+    /// nada, y si viajara, el lector tendría un mensaje que no significa nada que desambiguar
+    /// —el final del volcado no viaja por el canal—. Se comprueba por el camino del lector:
+    /// lo primero que recibe tiene que ser el trozo de verdad, no un hueco.
+    #[test]
+    fn un_trozo_vacio_no_cuenta_ni_viaja_por_el_canal() {
+        let TunelDelVolcado {
+            origen,
+            productor,
+            entrega: _entrega,
+            avance,
+        } = tunel_de_prueba("volcado-sin-trozo-vacio.sql", 4);
+
+        productor
+            .enviar(Vec::new())
+            .expect("un trozo vacío no puede fallar: ni siquiera se envía");
+
+        assert_eq!(
+            avance.bytes(),
+            0,
+            "un trozo vacío sumó a la cuenta, que es contar lo que no se entregó"
+        );
+
+        let esperado = b"CREATE TABLE tienda (id INT);\n".to_vec();
+        let a_enviar = esperado.clone();
+
+        let emisor = std::thread::spawn(move || {
+            productor
+                .enviar(a_enviar)
+                .expect("el canal no puede estar cerrado antes del final");
+            productor.terminar();
+        });
+
+        let mut lector = lector_de(&origen).expect("el lector tiene que abrirse");
+        let mut leido = Vec::new();
+        lector
+            .read_to_end(&mut leido)
+            .expect("con el final declarado, leer no puede fallar");
+
+        emisor.join().expect("el hilo productor no puede caerse");
+
+        assert_eq!(
+            leido, esperado,
+            "lo que llegó al lector no es el trozo de verdad: el vacío viajó por el canal"
+        );
+        assert_eq!(
+            avance.bytes(),
+            esperado.len() as u64,
+            "la cuenta no cuadra con lo que sí se entregó"
+        );
+    }
+
+    /// **22.** La cuenta se puede leer **mientras** el productor empuja, desde otro hilo, y
+    /// **no retrocede**.
+    ///
+    /// Es la propiedad que hace útil el contador para el panel: si solo se pudiera consultar al
+    /// final, el motor no tendría nada que publicar en vivo y `bytes_processed` llegaría siempre
+    /// tarde. Aquí el productor va en su hilo —donde va de verdad— y esta prueba lee el contador
+    /// en un bucle, mirando todas las muestras en orden: un contador que bajara sería un panel
+    /// que va hacia atrás.
+    #[test]
+    fn el_avance_se_puede_leer_mientras_el_productor_empuja_y_no_retrocede() {
+        /// Trozos que empuja el productor.
+        const TROZOS: usize = 8;
+        /// Bytes de cada trozo.
+        const BYTES: usize = 100;
+
+        let TunelDelVolcado {
+            origen: _origen,
+            productor,
+            entrega: _entrega,
+            avance,
+        } = tunel_de_prueba("volcado-leido-en-vivo.sql", TROZOS + 1);
+
+        let total = (TROZOS * BYTES) as u64;
+
+        let emisor = std::thread::spawn(move || {
+            for _ in 0..TROZOS {
+                productor
+                    .enviar(vec![b'x'; BYTES])
+                    .expect("el canal tiene sitio de sobra, así que el envío no puede fallar");
+            }
+            productor.terminar();
+        });
+
+        let limite = Instant::now() + Duration::from_secs(10);
+        let mut anterior = 0;
+        let mut muestras = 0;
+
+        while avance.bytes() < total {
+            let ahora = avance.bytes();
+
+            assert!(
+                ahora >= anterior,
+                "la cuenta retrocedió, y un avance que baja es un panel que va hacia atrás: \
+                 {anterior} -> {ahora}"
+            );
+            anterior = ahora;
+            muestras += 1;
+
+            assert!(
+                Instant::now() < limite,
+                "la cuenta no llegó al total en 10 segundos: {ahora} de {total}"
+            );
+
+            std::thread::yield_now();
+        }
+
+        emisor.join().expect("el hilo productor no puede caerse");
+
+        assert_eq!(
+            avance.bytes(),
+            total,
+            "la cuenta final no es la de lo entregado"
+        );
+        assert!(
+            muestras > 0,
+            "el bucle no llegó a leer la cuenta: la prueba no midió nada"
+        );
+        assert!(
+            anterior <= total,
+            "alguna muestra pasó del total: {anterior} de {total}"
+        );
+    }
+
+    /// **23.** El `Debug` de la cuenta publica la cuenta y **nada** del volcado.
+    ///
+    /// Lo que hay dentro es un contador compartido, y lo único que alguien necesita saber de él
+    /// en un diagnóstico es cuánto lleva contado. Se escribe a mano y no se deriva por eso
+    /// mismo: un `Debug` derivado imprimiría el `Arc` y el interior del `AtomicU64`, y en un
+    /// tipo que existe para acompañar a un volcado eso es un sitio más por el que el contenido
+    /// puede salir.
+    #[test]
+    fn el_debug_del_avance_publica_la_cuenta_y_nada_del_volcado() {
+        let distinguible = "contenido-distinguible-del-volcado-0002";
+        let tunel = tunel_de_prueba("volcado-sin-publicar.sql", 4);
+
+        tunel
+            .productor
+            .enviar(distinguible.as_bytes().to_vec())
+            .expect("el canal tiene sitio de sobra");
+
+        let en_debug = format!("{:?}", tunel.avance);
+
+        assert!(
+            en_debug.contains("AvanceDelVolcado"),
+            "el Debug no dice ni de qué tipo es: {en_debug}"
+        );
+        assert!(
+            en_debug.contains(&tunel.avance.bytes().to_string()),
+            "el Debug no publica la cuenta, que es lo único que tiene que publicar: {en_debug}"
+        );
+        assert!(
+            !en_debug.contains(distinguible),
+            "el Debug de la cuenta publicó el contenido del volcado: {en_debug}"
+        );
+        assert!(
+            !en_debug.contains("volcado-sin-publicar.sql"),
+            "el Debug de la cuenta publicó el nombre del volcado: {en_debug}"
+        );
+
+        drop(tunel.productor);
     }
 }

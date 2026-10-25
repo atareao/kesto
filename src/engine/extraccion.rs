@@ -882,7 +882,14 @@ fn acumular_el_motivo(crudo: &mut Vec<u8>, bytes: &[u8]) {
 /// [`TOPE_DEL_CRUDO`]. Lo que se tiró allí es lo que no cabría en el motivo, así que esta
 /// función nunca ve el `stderr` entero sino su principio —que es justo lo que el recorte
 /// conservaría— y el llamante no tiene que acordarse de nada.
-fn motivo_para_guardar(crudo: Vec<u8>, orden: &Orden) -> String {
+///
+/// # Visibilidad
+///
+/// **`pub(crate)`** porque el motor la reutiliza: es la red que quita los valores del entorno y
+/// recorta, y el motor tiene motivos que vienen de fuera —el de un error de la biblioteca de
+/// copia— que se guardan en la misma columna que éste. Reimplementarla allí sería tener dos
+/// redes, y el día que una se ampliara la otra seguiría con el agujero.
+pub(crate) fn motivo_para_guardar(crudo: Vec<u8>, orden: &Orden) -> String {
     // El `stderr` de un contenedor no tiene por qué ser UTF-8 válido —una base puede
     // escribirlo en la codificación de su idioma—, así que lo que no lo sea se sustituye en
     // vez de rechazarse: perder el motivo entero por un byte raro dejaría al operador sin el
@@ -967,7 +974,15 @@ fn valores_del_entorno(env: &[String]) -> impl Iterator<Item = &str> {
 /// límite no se toca —cabe—, y uno que mida uno más se corta a [`LIMITE_DEL_MOTIVO`] caracteres
 /// contando el `…`, así que pierde un carácter respecto a lo que traía. El resultado mide el
 /// límite en los dos casos, que es lo que el campo de la base puede guardar.
-fn recortar(motivo: &str) -> String {
+///
+/// # Visibilidad
+///
+/// **`pub(crate)`** por lo mismo que [`motivo_para_guardar`]: el motor tiene motivos que **ya
+/// vienen depurados** —el del contenedor, que sale de [`volcar`]— y lo único que les falta es
+/// el recorte. Volver a pasarlos por la red de los valores del entorno no haría daño, pero
+/// exigiría inventar una orden que no existe; el recorte sí es el mismo, y por eso se
+/// comparte.
+pub(crate) fn recortar(motivo: &str) -> String {
     if motivo.chars().count() <= LIMITE_DEL_MOTIVO {
         return motivo.to_owned();
     }
@@ -1970,6 +1985,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-de-tienda.sql");
 
         let orden = orden_de_shell("printf volcado; printf motivo >&2; exit 0");
@@ -2028,6 +2044,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-que-falla.sql");
 
         let orden = orden_de_shell("printf algo; printf fallo-del-volcado >&2; exit 3");
@@ -2085,6 +2102,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-grande.sql");
 
         let orden = orden_de_shell(&format!("yes a | head -c {BYTES_ESCRITOS}"));
@@ -2135,6 +2153,7 @@ mod tests {
             origen,
             productor,
             entrega: _,
+            avance: _,
         } = tunel_de_prueba("volcado-sin-credencial.sql");
 
         let orden = Orden {
@@ -2181,6 +2200,7 @@ mod tests {
             origen: _origen,
             productor,
             entrega: _,
+            avance: _,
         } = tunel_de_prueba("volcado-sin-contenedor.sql");
 
         let error = volcar_en_su_hilo(AUSENTE, orden_de_shell("echo nunca-llega"), productor)
@@ -2226,6 +2246,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-sin-cliente.sql");
 
         // El comando de un volcado global de MariaDB, con la forma que le da `ruta`: en `alpine`
@@ -2303,6 +2324,7 @@ mod tests {
             origen,
             productor,
             entrega,
+            avance: _,
         } = tunel_de_prueba("volcado-estancado.sql");
 
         let orden = Orden {

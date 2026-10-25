@@ -35,9 +35,17 @@ mod retencion;
 
 pub use error::Error;
 pub use origen::{
-    EntregaDelVolcado, LectorDeVolcado, OrigenDelVolcado, ProductorDelVolcado, TunelDelVolcado,
-    tunel_del_volcado,
+    AvanceDelVolcado, EntregaDelVolcado, LectorDeVolcado, OrigenDelVolcado, ProductorDelVolcado,
+    TunelDelVolcado, tunel_del_volcado,
 };
 pub use progreso::{AvisoDeProgreso, BarrasDelMotor};
 pub use repositorio::{Acceso, Copia, CopiaHecha, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
 pub use retencion::{InformeDeRetencion, Retencion};
+
+// El gancho por el que las pruebas del motor abren un repositorio **local** en vez de uno de S3.
+// Se reexporta y no se usa desde aquí para nada: el módulo `repositorio` es privado, y el arnés de
+// pruebas —y con él el motor— viven fuera. Va detrás de `cfg(test)` a propósito: en un binario de
+// producción nadie abre un repositorio local, y un reexport que nadie usa sería un aviso de import
+// sin uso.
+#[cfg(test)]
+pub(crate) use repositorio::poner_en_marcha_con;

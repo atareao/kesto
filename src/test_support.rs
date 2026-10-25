@@ -241,6 +241,29 @@ pub(crate) fn barras_mudas() -> BarrasDelMotor {
     BarrasDelMotor::nuevas(Arc::new(|_aviso: AvisoDeProgreso| {}))
 }
 
+/// El abridor de repositorios del motor, para las pruebas: abre un repositorio **local**.
+///
+/// El motor abre su repositorio con un puntero a función que entra por los ajustes, y sin este
+/// gancho sus pruebas necesitarían un S3 de verdad, que no hay: con él, el ciclo de vida completo
+/// —cola, hilo, archivado, fila— se recorre contra un directorio del sistema de ficheros, sin red,
+/// sin credenciales y sin motor de contenedores, que es lo que permite que corra en el CI.
+///
+/// La ruta del repositorio sale del `endpoint` del [`Acceso`](crate::rustic::Acceso): es lo que
+/// [`acceso_local`] deja ahí, y por eso un aparato de prueba solo tiene que escribir esa ruta en la
+/// fila del §3 para que el motor abra **ese** repositorio. Y es un `fn` y no un cierre porque el
+/// tipo que el motor acepta es un puntero a función: lo que se inyecta no puede llevar dentro ni
+/// una credencial ni una ruta escondida.
+pub(crate) fn abridor_local(
+    acceso: &crate::rustic::Acceso,
+    barras: BarrasDelMotor,
+) -> Result<(crate::rustic::Repositorio, crate::rustic::PuestaEnMarcha), crate::rustic::Error> {
+    crate::rustic::poner_en_marcha_con(
+        acceso,
+        backends_locales(Path::new(&acceso.endpoint)),
+        barras,
+    )
+}
+
 /// Abre el repositorio local del directorio dado, con la biblioteca y sin pasar por el
 /// módulo.
 ///
