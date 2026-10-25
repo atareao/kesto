@@ -112,8 +112,11 @@ impl IntoResponse for AppError {
 /// hasta ahora no estaba dicha porque ningún manejador tocaba la base.
 ///
 /// * Un **secreto vacío** contesta `400`: la petición se puede atender y lo que trae mal
-///   es un campo. La causa ya existe y es tipada —[`DbError::SecretoVacio`]—, y su mensaje
-///   nombra el **campo** y nunca el valor, así que se puede publicar tal cual.
+///   es un campo. La causa ya existe y es tipada —[`DbError::SecretoVacio`]—, y se responde
+///   con un mensaje **propio** que nombra el campo: el `Display` de [`DbError`] está escrito
+///   para el registro y puede cambiar para dar más contexto —una ruta, un detalle del
+///   motor—, así que publicarlo ataría el contrato del cable a un texto interno sin que
+///   nadie pensara que está rompiendo la API.
 /// * Una **clave foránea violada** contesta `409`: la petición está **bien formada** y lo
 ///   que ocurre es que contradice una relación que existe —la tarea apunta a un target o a
 ///   un repositorio que ya no está—, así que un `400` diría que está mal escrita, y no lo
@@ -130,11 +133,11 @@ impl IntoResponse for AppError {
 /// la comprobación y el `INSERT`** —otra petición borró la fila referenciada—. Si aparece
 /// en un caso de uso normal, la comprobación previa no está haciendo su trabajo.
 fn traducir_base(causa: DbError) -> (StatusCode, String) {
-    if matches!(&causa, DbError::SecretoVacio { .. }) {
-        todo!(
-            "el módulo 1 del change `api-endpoints` contesta aquí `400` nombrando el campo del \
-             secreto vacío, nunca su valor"
-        )
+    if let DbError::SecretoVacio { campo } = &causa {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("el campo `{campo}` no puede ir vacío"),
+        );
     }
 
     if let DbError::Consulta {
@@ -142,10 +145,16 @@ fn traducir_base(causa: DbError) -> (StatusCode, String) {
     } = &causa
         && es_violacion_de_clave_foranea(sqlx_causa)
     {
-        todo!(
-            "el módulo 1 del change `api-endpoints` contesta aquí `409` con un mensaje propio y \
-             deja la causa entera en el registro"
-        )
+        tracing::error!(
+            error = %causa,
+            "la petición contradice una relación existente: se violó una clave foránea"
+        );
+
+        return (
+            StatusCode::CONFLICT,
+            "la petición contradice el estado actual: algún recurso que referencia ya no existe"
+                .to_owned(),
+        );
     }
 
     // Todo lo demás sigue siendo un fallo del servidor: la causa —que nombra rutas del

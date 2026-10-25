@@ -12,17 +12,23 @@
 //! de los campos son los del §3 en `snake_case`, el identificador viaja como texto en su
 //! forma canónica con guiones y las fechas, como cadena RFC3339.
 //!
-//! AVISO — los cinco manejadores están **sin implementar** en esta fase (RED del módulo
-//! 1): el andamiaje declara la superficie y el tipo del cuerpo para que las pruebas
-//! puedan recorrer el camino real —el router de producción, en el modo que corresponda—
-//! y el rojo sea «no implementado». Los cuerpos llegan con el módulo de los recursos.
+//! AVISO — el **alta** y la **lectura** están implementadas (GREEN del módulo 1 del change
+//! `api-endpoints`); el **listado**, la **actualización** y el **borrado** siguen sin
+//! implementarse y llegan con el **módulo 2** del mismo change, el de los recursos, que es
+//! el que escribe sus pruebas. Hasta entonces sus cuerpos se quedan como están a propósito:
+//! escribirlos ahora sería código que ninguna prueba pide y que nadie habría medido contra
+//! el §5.
 
 use axum::Router;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::routing::get;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
-use crate::api::response::ApiResponse;
+use crate::api::response::{ApiResponse, Data};
+use crate::db::entities::{AltaDeRepositorio, Repositorio};
 use crate::error::AppError;
 use crate::secret::SecretString;
 use crate::state::AppState;
@@ -67,25 +73,158 @@ pub struct AltaDeRepositorioDelCable {
     pub passphrase: Option<SecretString>,
 }
 
+/// Un repositorio tal y como viaja por el cable: lo que devuelve la API.
+///
+/// **De los secretos sale un booleano, no el valor.** El panel necesita saber si hay
+/// credencial guardada para pintar el campo del formulario como configurado y no obligar a
+/// reescribirla en cada edición, pero devolver el valor convertiría cada `GET` —y cada
+/// listado— en una fuga que viaja al navegador y queda en su historial.
+///
+/// **El booleano lleva el nombre de la columna del §3** —`has_secret_access_key`— porque el
+/// formulario, el cuerpo de la petición y la columna se llaman igual: así se lee como «esto
+/// es el `secret_access_key` de la tabla, dicho como sí/no».
+///
+/// **Y se calcula sobre la fila, no se pone a `true` fijo.** La capa de acceso rechaza el
+/// secreto vacío al escribir, así que en la práctica vale `true` en todas las filas que
+/// pasan por la API; se calcula igualmente para que el campo signifique lo que dice y no
+/// una constante que un día mentiría.
+///
+/// **Las fechas van como cadena** porque `time` viaja con `formatting`: el formato lo fija
+/// el servidor, en RFC3339 —lo que `OffsetDateTime::parse(…, &Rfc3339)` relee—, en vez de
+/// dejarlo en manos del serializador.
+#[derive(Debug, Serialize)]
+pub struct RepositorioDelCable {
+    /// Identificador en su forma canónica con guiones, la que escribe la capa de acceso.
+    pub id: String,
+    /// Nombre del repositorio.
+    pub name: String,
+    /// Endpoint del servicio S3.
+    pub endpoint: String,
+    /// Cubo de destino.
+    pub bucket: String,
+    /// Región del cubo.
+    pub region: String,
+    /// Identificador público de la credencial.
+    pub access_key_id: String,
+    /// Si hay `secret_access_key` guardada. El valor no sale del servidor.
+    pub has_secret_access_key: bool,
+    /// Si hay `passphrase` guardada. El valor no sale del servidor.
+    pub has_passphrase: bool,
+    /// Fecha de alta, en RFC3339.
+    pub created_at: String,
+}
+
+impl RepositorioDelCable {
+    /// Vuelca una fila de la capa de acceso en su forma del cable.
+    ///
+    /// Es el único sitio donde los secretos de una fila se miran, y se miran solo para
+    /// decidir un booleano: el contenido se consulta por `expose()` —el único camino por el
+    /// que sale del tipo— y nunca se copia a la vista.
+    fn desde(fila: &Repositorio) -> Result<Self, AppError> {
+        Ok(Self {
+            id: fila.id.hyphenated().to_string(),
+            name: fila.name.clone(),
+            endpoint: fila.endpoint.clone(),
+            bucket: fila.bucket.clone(),
+            region: fila.region.clone(),
+            access_key_id: fila.access_key_id.clone(),
+            has_secret_access_key: !fila.secret_access_key.expose().is_empty(),
+            has_passphrase: !fila.passphrase.expose().is_empty(),
+            created_at: fila.created_at.format(&Rfc3339).map_err(|error| {
+                AppError::Other(format!("la fecha de la fila no se pudo formatear: {error}"))
+            })?,
+        })
+    }
+}
+
+/// Serializa una vista del cable al `data` de la envoltura.
+///
+/// Existe porque `serde_json::to_value` devuelve `Result` y un manejador no puede abortar
+/// con `panic!`: un fallo aquí es un `500` con la causa al registro, que es lo que el resto
+/// de la API hace con lo que no debería ocurrir. El mensaje no lleva el valor serializado
+/// —la causa de `serde_json` describe la posición y el tipo, no el contenido—.
+fn contenido<T: Serialize>(vista: &T) -> Result<Data, AppError> {
+    serde_json::to_value(vista)
+        .map(Data::Some)
+        .map_err(|error| AppError::Other(format!("la respuesta no se pudo serializar: {error}")))
+}
+
 /// `GET /api/v1/repositories` — el listado.
 pub async fn listado(State(_state): State<AppState>) -> Result<ApiResponse, AppError> {
     todo!("el módulo 2 del change `api-endpoints` implementa el listado")
 }
 
-/// `POST /api/v1/repositories` — el alta.
+/// `POST /api/v1/repositories` — el alta, que contesta `201` con el recurso creado.
+///
+/// Los dos secretos del cuerpo son `Option`, y aquí se exigen: las columnas del §3 son
+/// `NOT NULL`, así que un alta sin ellos no tiene fila que escribir. El «ausente =
+/// consérvalo» es una regla del `PUT`, no del alta. El rechazo se contesta nombrando el
+/// campo y **sin haber tocado la base**.
 pub async fn alta(
-    State(_state): State<AppState>,
-    axum::Json(_cuerpo): axum::Json<AltaDeRepositorioDelCable>,
+    State(state): State<AppState>,
+    axum::Json(cuerpo): axum::Json<AltaDeRepositorioDelCable>,
 ) -> Result<ApiResponse, AppError> {
-    todo!("el módulo 2 del change `api-endpoints` implementa el alta")
+    let Some(secret_access_key) = cuerpo.secret_access_key else {
+        return Err(AppError::InvalidInput(
+            "el campo `secret_access_key` es obligatorio en un alta".to_owned(),
+        ));
+    };
+
+    let Some(passphrase) = cuerpo.passphrase else {
+        return Err(AppError::InvalidInput(
+            "el campo `passphrase` es obligatorio en un alta".to_owned(),
+        ));
+    };
+
+    let fila = state
+        .db
+        .repositorios
+        .alta(AltaDeRepositorio {
+            name: cuerpo.name,
+            endpoint: cuerpo.endpoint,
+            bucket: cuerpo.bucket,
+            region: cuerpo.region,
+            access_key_id: cuerpo.access_key_id,
+            secret_access_key,
+            passphrase,
+        })
+        .await?;
+
+    let vista = RepositorioDelCable::desde(&fila)?;
+
+    Ok(ApiResponse::new(
+        StatusCode::CREATED,
+        "repositorio creado",
+        contenido(&vista)?,
+    ))
 }
 
-/// `GET /api/v1/repositories/{id}` — la lectura de una fila.
+/// `GET /api/v1/repositories/{id}` — la lectura de una fila, o `404` si no está.
+///
+/// Un identificador que no sea un UUID es un `400` que nombra el campo de la ruta y **no**
+/// repite el valor: el segmento llegó por el cable, y la casa tiene la regla de que un
+/// `400` no filtra el valor. Por lo mismo, el `404` no ecoa el identificador.
 pub async fn leer(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
 ) -> Result<ApiResponse, AppError> {
-    todo!("el módulo 2 del change `api-endpoints` implementa la lectura por identificador")
+    let uuid = Uuid::parse_str(&id).map_err(|_| {
+        AppError::InvalidInput("el campo `id` de la ruta no tiene la forma de un UUID".to_owned())
+    })?;
+
+    let Some(fila) = state.db.repositorios.leer(&uuid).await? else {
+        return Err(AppError::NotFound(
+            "no existe ningún repositorio con ese identificador".to_owned(),
+        ));
+    };
+
+    let vista = RepositorioDelCable::desde(&fila)?;
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "repositorio encontrado",
+        contenido(&vista)?,
+    ))
 }
 
 /// `PUT /api/v1/repositories/{id}` — la actualización, que es reemplazo completo.

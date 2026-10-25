@@ -74,12 +74,9 @@ impl<'de> Deserialize<'de> for SecretString {
     where
         D: Deserializer<'de>,
     {
-        // El parámetro se consume de forma inerte en esta fase: el cuerpo es un
-        // `todo!()` y la firma no se toca —renombrarlo con guion bajo obligaría a
-        // deshacerlo al implementarlo—, así que se marca como usado sin usarlo.
-        let _ = deserializer;
+        let valor = String::deserialize(deserializer)?;
 
-        todo!("el módulo 1 del change `api-endpoints` lo implementa vía `SecretString::new`")
+        Ok(Self::new(valor))
     }
 }
 
