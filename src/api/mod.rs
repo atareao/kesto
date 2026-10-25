@@ -11,6 +11,9 @@ pub mod targets;
 #[cfg(test)]
 mod secretos;
 
+#[cfg(test)]
+mod particion;
+
 use axum::Router;
 use axum::routing::{get, post};
 use serde::Serialize;
