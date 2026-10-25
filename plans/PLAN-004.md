@@ -191,7 +191,63 @@ Contabilidad: **nueve** casillas —`1.25`, `1.38`–`1.42`, `1.47`, `2.8` y `2.
 
 ## Verificación
 
-*(Se rellena al cerrar. Son las puertas del repositorio —`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked` y `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`— más las diez comprobaciones de operador de la fase 4 del `tasks.md`, que esta vez van con `curl` **de verdad** contra el binario —ya hay endpoints— y con `sqlite3` sobre el fichero: los altas y las lecturas de los tres recursos, la columna del secreto guardando el sobre, el `NULL` del `db_name` de un directorio, la `passphrase` que **no** cambia cuando no se envía, las credenciales buscadas literalmente en los bytes del fichero, el `limit` fuera de rango, la cascada del borrado y el `401` sin cookie en modo `Oidc`.)*
+*(Rellenada al cerrar la fase 4. Las puertas del repositorio salen por `just check` —`cargo fmt --all -- --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --locked`, el orden exacto del CI— más `just doc`; y las diez comprobaciones de operador fueron con `curl` **de verdad** contra el binario y con `sqlite3` sobre el fichero.)*
+
+### Las cuatro puertas
+
+`just check` en verde con **213 passed; 0 failed** en el binario y **1 passed** en la de integración; `cargo fmt --all -- --check` limpio; `cargo clippy --all-targets -- -D warnings` sin un aviso; `just doc` (`RUSTDOCFLAGS="-D warnings"`) limpio. `just check-all` **no** se puede ejecutar y no es un fallo: el job del panel se salta solo mientras no exista `ui/`.
+
+### Fase 3 — la auditoría
+
+El código del change lo auditó un revisor **independiente**, de solo lectura y con el alcance de los siete puntos de la fase. Veredicto: **aprobado en los siete**, sin ningún defecto. El revisor agotó su presupuesto de pasos antes de ejecutar las cuatro puertas —lo declara en su informe—, así que las corrí yo después: es el único punto de su auditoría que quedaba sin firmar.
+
+Lo que el barrido dejó medido, punto por punto:
+
+- **SQL (3.2).** Todas las sentencias de las cuatro capas son `const SQL_*: &str` con marcadores `?1…?N`, y `SQL_LISTAR_FILTRADO` es **una sola cadena estática** —el `WHERE`, el `ORDER BY` y el `LIMIT`/`OFFSET` dentro— con los cuatro valores por `.bind(...)`. Ni un `format!`, `concat!` o `push_str` sobre una sentencia en todo `src/db/`. Hay además una garantía **estructural**: `DbError::Consulta` lleva `consulta: &'static str`, así que interpolar un valor en el texto que viaja al registro **no compila**. Los dos únicos valores no numéricos que llegan del cliente —`job_id` y `status`— se canonicalizan **antes** de enlazarse: el primero a UUID con guiones y el segundo a uno de los cuatro literales del `CHECK` vía `Estado::desde_texto`. El `status` que llega a la sentencia **no** es la cadena del cliente.
+- **Registro (3.2 y 3.3).** Revisadas **todas** las llamadas a `tracing::` del alcance y, por el otro extremo, **todos** los sitios que construyen `AppError::InvalidInput`: ninguno interpola un valor del cable —nombres de campo, el motivo estático del intérprete y constantes—. La captura real con `RUST_LOG=trace` sobre la sesión de operador: **130 líneas**, 36 del middleware (`peticion atendida metodo=… ruta=… estado=…`), y **cero** apariciones de las tres credenciales. El registro dice qué ocurrió y nunca el cuerpo ni el valor.
+- **`Debug` de los tipos del cable (3.4).** Tipo por tipo: los cuatro DTO de alta y de lectura que llevan secreto lo llevan como `SecretString` —con el `Debug` redactado a mano, medido en `src/secret.rs:38`— o como un booleano `has_*`; los de tarea y ejecución no tienen columna de secreto. El único `String` del cable no protegido por la estructura es `error_message` de `EjecucionDelCable`, y se comprobó que **no alcanza ningún sumidero**: en todo `src/` no hay un solo `?vista` ni un `format!("{vista:?}")` de esas vistas.
+- **Pánicos (3.5).** Cero `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, `unreachable!` ni indexación arriesgada en código de producción de los 18 ficheros del alcance. Los `expect`/`panic!` que aparecen están todos en `mod tests` —incluido `plan_de` de `src/db/migrate.rs`, que vive bajo el `#[cfg(test)]` de la línea 42— o en el arnés (`src/test_support.rs` y `src/test_support/proveedor_falso.rs`), que está detrás de `#[cfg(test)]`. El único `unwrap` de producción es un `unwrap_or(...)` sobre `StatusCode::from_u16`, que no puede salir de rango.
+- **Pruebas (3.6).** El barrido de `unsafe`, `env::set_var`, `remove_var`, `set_default` y `with_default` sobre todo `src/` devuelve **solo comentarios** que prohíben esas construcciones y explican por qué. El único instalador de suscriptor de prueba es `capturar_log` —global y con el buffer por hilo—, que es el arnés deliberado.
+- **Partición (3.7).** El diff de `src/api/mod.rs` contra `development`: la mitad pública sigue siendo la salud y, solo en modo `Oidc`, las dos rutas del flujo de entrada; **ninguna excepción nueva** a la lista blanca. Los dos fallbacks conservan su orden (`not_found` antes de `method_not_allowed_fallback`) y la capa `trazar` se añadió **después** de los dos. El *gate* sigue por `route_layer` sobre la mitad de negocio, no ruta a ruta.
+- **Dependencias y layout (3.8 y 3.10).** `git diff development --stat -- Cargo.toml Cargo.lock` sale **vacío**: el change no estrena ni una dependencia. Y `git status --short` no tiene ningún directorio nuevo **del change**: el único sin trackear es `assets/` —material del usuario, de fecha anterior al change, que **no** entra en ningún commit—, y `src/` sigue el §7.
+
+#### Una observación del auditor, refutada por medición
+
+El auditor apuntó que `(?1 IS NULL OR job_id = ?1)` «puede inhabilitar el índice» y que merecía un `EXPLAIN QUERY PLAN`. Se midió, sobre la base real de la sesión de operador:
+
+| Petición | Plan de SQLite |
+|---|---|
+| sin filtros | `SCAN job_executions` + `USE TEMP B-TREE FOR ORDER BY` |
+| los dos filtros | `SEARCH job_executions USING INDEX idx_job_executions_status_started_at (status=?)` |
+| solo `status` | `SEARCH job_executions USING INDEX idx_job_executions_status_started_at (status=?)` |
+| solo `job_id` | `SEARCH job_executions USING INDEX idx_job_executions_job_id (job_id=?)` |
+
+El patrón **no** inhabilita el índice: SQLite elige el que le corresponde a cada filtro. Lo único que paga la sentencia es la ordenación —`USE TEMP B-TREE FOR LAST TERM OF ORDER BY`—, porque `ORDER BY started_at DESC, id` tiene un término (`id`) que el índice no cubre: queda como deuda declarada abajo, con su arreglo, para el change del motor, que es quien va a llenar la tabla.
+
+### Fase 4 — la verificación de operador
+
+Dos instancias del binario de verdad —una en modo de desarrollo con `RUST_LOG=trace` y otra en modo `Oidc`— sobre una base en `/tmp/opencode`, con `curl` para hablar y `sqlite3` para mirar. Las diez, una por una:
+
+| # | Qué se comprobó | Medido |
+|---|---|---|
+| 4.1 | Las cuatro altas | **`201`** en repositorio, target de base, target de directorio y tarea, con la envoltura y sin credencial en el cuerpo |
+| 4.2 | Las lecturas | **`200`** en las ocho; **cero** apariciones de las tres credenciales en 2 639 bytes de respuestas, y el control `cubo-de-verificacion` **sí** encontrado: la búsqueda funciona |
+| 4.3 | El sobre | `v1:` con sus **tres** partes en las tres columnas de secreto y **nonce distinto** por valor |
+| 4.4 | `db_name` | `NULL` en el target de directorio y `'base_de_verificacion'` en el de base |
+| 4.5 | El `PUT` sin secreto | la expectativa escrita era **falsa**; ver abajo |
+| 4.6 | La búsqueda en los bytes | **cero** apariciones de las tres credenciales en `kesto.db` y su `-wal`, con los dos controles encontrados (`cubo-de-verificacion` y `target-de-base`, dos veces cada uno) |
+| 4.7 | El `limit` hostil | `?limit=201`, `?limit=0`, `?limit=-1`, `?limit=abc`, `?offset=-1`, `?limits=5` y `?limit=` → **`400`** los siete, con la envoltura, en `application/json` y sin una traza del intérprete |
+| 4.8 | La cascada | filas antes **1/2/1/1** y después **0/2/0/0**: el borrado se llevó tareas y ejecuciones y dejó los **dos targets**; el borrado repetido y el `GET` del borrado contestan `404` |
+| 4.9 | La partición en `Oidc` | **`401`** con envoltura en `/executions`, `/repositories` y `/jobs` sin cookie; **`200`** en la salud con `auth_mode: "oidc"`; `/auth/login` existe en `Oidc` (`502`, el proveedor de prueba no existe) y **`404`** en desarrollo |
+| 4.10 | La base | una sola familia `kesto.db`/`-shm`/`-wal`, el mismo fichero, y `git status --short` intacto: la sesión no tocó el repositorio |
+
+#### La 4.5: una expectativa escrita que la medición contradijo
+
+La tarea decía «comprobar que la almacenada **no** cambió → esperado: **el sobre idéntico al anterior**», y eso es **falso**: `Repositorios::actualizar` vuelve a cifrar y el nonce es aleatorio por valor, así que **el sobre cambia de bytes en cada escritura aunque el valor no cambie**. Medido: el `secret_access_key` pasó de `v1:9d6zm/KzbF7Z7HaG:…` a `v1:7S6bZ+Hme0EbOwNx:…`. Lo que sí se conserva —y es lo que importa— es la **estructura y el tamaño**: `v1:` con tres partes y el cifrado de 80 y 76 caracteres **antes y después**, que son las longitudes de los dos secretos originales; y la conservación del **valor** la fija la prueba de la suite que descifra, `un_put_sin_passphrase_conserva_la_almacenada` (y su hermana `un_put_sin_db_password_conserva_la_almacenada` en `/targets`). La expectativa se corrigió en el `tasks.md` en vez de marcarla como cumplida: dejar un «esperado» falso marcado en verde es exactamente lo que este repositorio no hace.
+
+#### Y una nota sobre la 3.10
+
+El «sin directorios nuevos en la raíz» de la tarea se cumple **para el change**, y hay que decirlo con precisión: el único directorio sin trackear del árbol es `assets/` —12 ficheros, 740 K, con logotipos y un `generate-assets.fish`—, que **no** es de este change, tiene fecha anterior al primer commit del mismo, no lo referencia ningún fichero ni `Cargo.toml`, y **nunca** se ha añadido a un commit ni se añadirá: es material del usuario. Queda escrito aquí porque el auditor lo marcó como hallazgo y su informe merece respuesta: no es deuda del código, y el riesgo real —que un `git add -A` lo barra dentro de un commit del change— se evita commiteando rutas explícitas, que es lo que se ha hecho en los dos commits del módulo 3.
 
 ## Deuda declarada
 
@@ -205,6 +261,10 @@ Contabilidad: **nueve** casillas —`1.25`, `1.38`–`1.42`, `1.47`, `2.8` y `2.
 - **Los tres manejadores que siguen sin implementar —`listado`, `actualizar` y `borrar` de `/repositories`— revientan si se alcanzan por la red**: son `todo!()` y llegan con el módulo 2. Medido: sin `CatchPanicLayer`, el `panic!` deja caer la tarea de la conexión, el cliente ve la conexión cerrada sin respuesta (`curl` contesta `000`) y el pánico sale en el registro del servidor. Queda declarado mientras dure la fase, para que nadie lo confunda con un fallo del servidor: ningún binario entregado debe tener un camino declarado y sin implementar.
 - **Los `debug!` de la instrumentación solo se ven con `RUST_LOG=debug` o `trace`** y el valor por defecto es `info`, así que en un despliegue sin tocar la variable no queda rastro de las peticiones atendidas. Es deliberado —una línea por clic del panel es ruido de operación a `info`— pero conviene que sea una decisión y no una sorpresa: quien depure un problema en producción tendrá que subir el nivel, y eso está escrito aquí.
 - **`error_message` sale por el cable tal cual, y el motor no debe volcar credenciales ahí.** Es una de las nueve columnas del §3 y el panel la necesita para decir por qué falló una copia, así que el listado la publica. Quien la escribe es el **motor**, y el §4.A manda la contraseña del volcado por la línea de comandos del `exec` —el cuarto cabo suelto del SRS, todavía abierto—, así que la salida de un volcado fallido puede traerla dentro: cuando llegue el motor, `error_message` es un sitio donde una credencial **no** puede acabar. Se declara aquí para que no se descubra con una fuga.
+- **`ORDER BY started_at DESC, id` cuesta una ordenación parcial**: medido con `EXPLAIN QUERY PLAN`, el plan dice `USE TEMP B-TREE FOR LAST TERM OF ORDER BY` incluso cuando el índice `(status, started_at)` cubre el primer término, porque el `id` del desempate no está en el índice. Con la tabla vacía o casi no se nota; cuando el motor la llene, un índice que incluya `id` —`(status, started_at DESC, id)` y `(job_id, started_at DESC, id)`— quita la ordenación. Va con el change del motor, que es quien llena el histórico.
+- **`offset` no tiene tope**: solo se exige `>= 0`. Un `offset` enorme es un no-op en SQLite, así que no es un defecto hoy; si algún día la base cambia de motor —o el histórico pasa a millones de filas con el plan pidiendo saltos largos— conviene acotarlo, como ya se acota `limit`.
+- **El listado no devuelve el total de filas**: el panel no puede pintar «N de M» sin una llamada extra, y esa llamada no existe. El §5 no pide agregados, así que queda como consecuencia de diseño; si el panel lo necesita, el change que lo pida añade el `COUNT` —y entonces habrá que decidir si va en la misma respuesta o en un endpoint aparte—.
+- **`Ejecuciones::listar` —el listado ascendente— y sus tres escrituras siguen sin ruta**: los usa el motor, que es quien crea, actualiza y cierra filas; el listado de la API va por `listar_filtrado`. Si el motor no acaba necesitando el ascendente, se retira entonces, no ahora.
 
 ## Cierre
 

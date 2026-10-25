@@ -81,31 +81,31 @@ Todas las pruebas de esta fase van contra el **router de verdad**, con una base 
 
 ## 3. REFACTOR
 
-- [ ] 3.1 Dejar `cargo fmt --all -- --check` y `cargo clippy --all-targets -- -D warnings` limpios tras el refactor → evidencia: la salida pegada en el change.
-- [ ] 3.2 Comprobar con `grep` sobre `src/` que **ninguna** consulta se construye concatenando y que **ningún** cuerpo de petición se registra → evidencia: el `grep` pegado y los `bind`/`query` parametrizados.
-- [ ] 3.3 Comprobar que **ninguna** credencial llega al registro —ni el cuerpo en crudo, ni un `serde_json::Value`, ni el texto del rechazo del intérprete— → evidencia: la captura de registro con `RUST_LOG=trace` pegada.
-- [ ] 3.4 Revisar el `Debug` de los tipos del cable, **tipo por tipo**, comprobando que no publica credenciales → evidencia: la lista de tipos revisados.
-- [ ] 3.5 Comprobar que no hay `unwrap`/`expect`/`panic!` en rutas de producción → evidencia: el `grep` sobre `src/` sin hallazgos fuera de pruebas.
-- [ ] 3.6 Comprobar que ninguna prueba declara `unsafe` ni muta el entorno del proceso, y que las capturas de registro usan el buffer **por hilo** (`src/test_support.rs`, nunca `set_default`/`with_default`) → evidencia: el `grep` y las pruebas que capturan registro.
-- [ ] 3.7 Comprobar que la lista blanca del router **no** creció con excepciones y que el orden de los dos fallbacks **no** se invirtió → evidencia: el `git diff` de `src/api/`.
-- [ ] 3.8 Comprobar que no hay dependencias nuevas y que `Cargo.toml` y `Cargo.lock` siguen **sin tocar** → evidencia: `git diff --stat` con ambos ficheros fuera del diff.
-- [ ] 3.9 Comprobar que `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` pasa sin enlaces rotos → evidencia: la salida pegada.
-- [ ] 3.10 Comprobar que el layout sigue el §7 (`src/api/` con sus módulos, sin directorios nuevos en la raíz) → evidencia: `git status --short` sin directorios nuevos.
+- [x] 3.1 Dejar `cargo fmt --all -- --check` y `cargo clippy --all-targets -- -D warnings` limpios tras el refactor → evidencia: la salida pegada en el change.
+- [x] 3.2 Comprobar con `grep` sobre `src/` que **ninguna** consulta se construye concatenando y que **ningún** cuerpo de petición se registra → evidencia: el `grep` pegado y los `bind`/`query` parametrizados.
+- [x] 3.3 Comprobar que **ninguna** credencial llega al registro —ni el cuerpo en crudo, ni un `serde_json::Value`, ni el texto del rechazo del intérprete— → evidencia: la captura de registro con `RUST_LOG=trace` pegada.
+- [x] 3.4 Revisar el `Debug` de los tipos del cable, **tipo por tipo**, comprobando que no publica credenciales → evidencia: la lista de tipos revisados.
+- [x] 3.5 Comprobar que no hay `unwrap`/`expect`/`panic!` en rutas de producción → evidencia: el `grep` sobre `src/` sin hallazgos fuera de pruebas.
+- [x] 3.6 Comprobar que ninguna prueba declara `unsafe` ni muta el entorno del proceso, y que las capturas de registro usan el buffer **por hilo** (`src/test_support.rs`, nunca `set_default`/`with_default`) → evidencia: el `grep` y las pruebas que capturan registro.
+- [x] 3.7 Comprobar que la lista blanca del router **no** creció con excepciones y que el orden de los dos fallbacks **no** se invirtió → evidencia: el `git diff` de `src/api/`.
+- [x] 3.8 Comprobar que no hay dependencias nuevas y que `Cargo.toml` y `Cargo.lock` siguen **sin tocar** → evidencia: `git diff --stat` con ambos ficheros fuera del diff.
+- [x] 3.9 Comprobar que `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` pasa sin enlaces rotos → evidencia: la salida pegada.
+- [x] 3.10 Comprobar que el layout sigue el §7 (`src/api/` con sus módulos, sin directorios nuevos en la raíz) → evidencia: `git status --short` con **un solo** directorio sin trackear, y **no** es del change —ver la nota de la 3.10 en el plan—; medido: `src/` con `api`, `auth`, `db` y los cuatro módulos de nivel superior, `ui/` y `Dockerfile` todavía inexistentes, y `assets/` como material del usuario, de fecha anterior al change, que **no** entra en ningún commit.
 
 ## 4. Verificación manual (operador)
 
 Todas contra el binario de verdad, con `KESTO_MASTER_KEY`, un `DATABASE_URL` temporal, `BIND_ADDRESS` en un puerto libre y `RUST_LOG=info`.
 
-- [ ] 4.1 Arrancar el binario y dar de alta con `curl` un repositorio, un target de base de datos, uno de directorio y una tarea → esperado: `201` en los cuatro, con la envoltura.
-- [ ] 4.2 Leer los cuatro con `curl` y comprobar los códigos y que **ningún** cuerpo trae una credencial → esperado: `200` y ningún valor secreto en la salida.
-- [ ] 4.3 Comprobar con `sqlite3` que la columna del secreto guarda el sobre `v1:…` con sus **tres** partes → esperado: `v1:<nonce>:<cifrado>` con el nonce distinto por valor.
-- [ ] 4.4 Comprobar con `sqlite3` que el `db_name` del target de directorio es `NULL` y el del target de base es el informado → esperado: `IS NULL` para el primero.
-- [ ] 4.5 Actualizar un repositorio **sin** mandar la `passphrase` y comprobar con `sqlite3` que la almacenada **no** cambió → esperado: el sobre idéntico al anterior.
-- [ ] 4.6 Comprobar que las credenciales buscadas **literalmente** en los bytes del fichero no aparecen, **validando la búsqueda** antes con un valor que no es secreto → esperado: el control se encuentra y la credencial no.
-- [ ] 4.7 Pedir un `limit` fuera de rango y ver el `400` con la envoltura → esperado: `{status,message}` y ni una traza del intérprete.
-- [ ] 4.8 Borrar el repositorio y comprobar que sus tareas y sus ejecuciones **desaparecen** con él (`ON DELETE CASCADE`) y que el target **sigue** → esperado: `sqlite3` confirma el borrado en cascada y la supervivencia del target.
-- [ ] 4.9 En modo `Oidc`, comprobar el `401` sin cookie en una ruta nueva y el `200` con la salud → esperado: la partición intacta y la salud pública.
-- [ ] 4.10 Comprobar que arrancar **no** abre una segunda base y que el fichero sigue siendo el mismo → esperado: un único `kesto.db` con su `-wal`, sin ficheros nuevos.
+- [x] 4.1 Arrancar el binario y dar de alta con `curl` un repositorio, un target de base de datos, uno de directorio y una tarea → esperado: `201` en los cuatro, con la envoltura.
+- [x] 4.2 Leer los cuatro con `curl` y comprobar los códigos y que **ningún** cuerpo trae una credencial → esperado: `200` y ningún valor secreto en la salida.
+- [x] 4.3 Comprobar con `sqlite3` que la columna del secreto guarda el sobre `v1:…` con sus **tres** partes → esperado: `v1:<nonce>:<cifrado>` con el nonce distinto por valor.
+- [x] 4.4 Comprobar con `sqlite3` que el `db_name` del target de directorio es `NULL` y el del target de base es el informado → esperado: `IS NULL` para el primero.
+- [x] 4.5 Actualizar un repositorio **sin** mandar la `passphrase` ni el `secret_access_key` y comprobar con `sqlite3` que el **valor** almacenado no cambió → **corregido tras medir**: el «esperado: el sobre idéntico al anterior» era **falso**, porque la capa vuelve a cifrar y el nonce es aleatorio por valor, así que el sobre **cambia de bytes** en cada escritura (medido: `v1:9d6zm/KzbF7Z7HaG:…` → `v1:7S6bZ+Hme0EbOwNx:…`). Lo que se conserva es la estructura y el tamaño —`v1:` con tres partes, y el cifrado de 80 y 76 caracteres **antes y después**, que son las longitudes de los dos secretos— y el **valor**, que lo fija por descifrado la prueba `un_put_sin_passphrase_conserva_la_almacenada`.
+- [x] 4.6 Comprobar que las credenciales buscadas **literalmente** en los bytes del fichero no aparecen, **validando la búsqueda** antes con un valor que no es secreto → esperado: el control se encuentra y la credencial no.
+- [x] 4.7 Pedir un `limit` fuera de rango y ver el `400` con la envoltura → esperado: `{status,message}` y ni una traza del intérprete.
+- [x] 4.8 Borrar el repositorio y comprobar que sus tareas y sus ejecuciones **desaparecen** con él (`ON DELETE CASCADE`) y que el target **sigue** → esperado: `sqlite3` confirma el borrado en cascada y la supervivencia del target.
+- [x] 4.9 En modo `Oidc`, comprobar el `401` sin cookie en una ruta nueva y el `200` con la salud → esperado: la partición intacta y la salud pública.
+- [x] 4.10 Comprobar que arrancar **no** abre una segunda base y que el fichero sigue siendo el mismo → esperado: un único `kesto.db` con su `-wal`, sin ficheros nuevos.
 
 ## 5. Cierre
 
