@@ -101,17 +101,17 @@ mod tests {
     }
 
     /// La mitad protegida de producción con una ruta de negocio ficticia.
-    fn router() -> Router {
+    async fn router() -> Router {
         protected_router(
             Router::new().route(RUTA, axum::routing::get(quien_soy)),
-            &auth_oidc(),
+            &auth_oidc().await,
         )
     }
 
     #[tokio::test]
     async fn una_peticion_protegida_sin_cookie_contesta_401_con_la_envoltura() {
         // Escenario 1.27.
-        let respuesta = get(router(), RUTA).await;
+        let respuesta = get(router().await, RUTA).await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
 
@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn una_cookie_valida_deja_pasar_y_el_manejador_ve_la_identidad() {
         // Escenario 1.31.
-        let respuesta = get_with_cookie(router(), RUTA, &cookie_de_sesion()).await;
+        let respuesta = get_with_cookie(router().await, RUTA, &cookie_de_sesion()).await;
 
         assert_eq!(respuesta.status(), StatusCode::OK);
 
@@ -173,7 +173,7 @@ mod tests {
         )
         .expect("la emisión de la sesión de prueba no puede fallar");
 
-        let respuesta = get_with_cookie(router(), RUTA, &session_cookie_header(&token)).await;
+        let respuesta = get_with_cookie(router().await, RUTA, &session_cookie_header(&token)).await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
 

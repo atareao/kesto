@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod health;
+pub mod repositories;
 pub mod response;
 
 use axum::Router;
@@ -32,16 +33,25 @@ pub fn api_router(state: AppState) -> Router {
                 .route("/api/v1/auth/login", get(auth::login))
                 .route("/api/v1/auth/callback", get(auth::callback));
 
+            // La superficie de negocio: las rutas del flujo de entrada y las de los
+            // recursos, **declaradas aquí** y no en la mitad pública. No hay ninguna
+            // excepción a la lista blanca: una ruta de negocio cuelga de esta mitad por
+            // construcción, así que el *gate* de sesión la alcanza sin que nadie tenga
+            // que acordarse de colgarlo.
             let negocio = Router::new()
                 .route("/api/v1/auth/logout", post(auth::logout))
-                .route("/api/v1/auth/session", get(auth::session));
+                .route("/api/v1/auth/session", get(auth::session))
+                .merge(repositories::router());
 
             public.merge(protected_router(negocio, auth))
         }
-        // En desarrollo no se monta la mitad protegida: sin proveedor no hay
-        // flujo que ofrecer, así que `/api/v1/auth/*` **no** se declara y
-        // contesta el `404` de la envoltura en vez de un `401`.
-        None => public,
+        // En desarrollo no se monta la mitad protegida —no hay proveedor, así que
+        // `/api/v1/auth/*` **no** se declara y contesta el `404` de la envoltura en vez
+        // de un `401`—, pero **sí** la superficie de recursos: en este modo no se monta
+        // ninguna capa, así que las rutas de negocio quedan públicas, que es lo que el
+        // modo de desarrollo significa. Sin esto, `just dev` contestaría `404` en cada
+        // recurso y no habría forma de dar de alta nada sin un proveedor de identidad.
+        None => public.merge(repositories::router()),
     };
 
     router
@@ -149,8 +159,8 @@ mod tests {
         ApiResponse::new(StatusCode::OK, "atendida", Data::None)
     }
 
-    #[test]
-    fn los_estados_de_prueba_no_heredan_el_puerto_por_defecto() {
+    #[tokio::test]
+    async fn los_estados_de_prueba_no_heredan_el_puerto_por_defecto() {
         // Es un candado del arnés, no del router, y nace de una regresión real:
         // `crate::serve` abre un socket de verdad, así que un estado de prueba
         // que herede el puerto por defecto pone la suite roja por `AddrInUse` en
@@ -158,7 +168,10 @@ mod tests {
         // eso es un fallo del entorno disfrazado de fallo del código. El puerto
         // `0` es el efímero: lo elige el sistema y no hay que acordarse test a
         // test.
-        for (modo, estado) in [("desarrollo", estado_desarrollo()), ("Oidc", estado_oidc())] {
+        for (modo, estado) in [
+            ("desarrollo", estado_desarrollo().await),
+            ("Oidc", estado_oidc().await),
+        ] {
             assert_eq!(
                 estado.config.bind_address.port(),
                 0,
@@ -171,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn en_modo_oidc_el_flujo_protegido_no_se_atiende_sin_sesion() {
         // Escenario 1.2.
-        let respuesta = get(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
 
@@ -194,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn en_desarrollo_el_flujo_no_esta_montado_y_contesta_404() {
         // Escenario 1.1.
-        let respuesta = get(router_desarrollo(), "/api/v1/auth/session").await;
+        let respuesta = get(router_desarrollo().await, "/api/v1/auth/session").await;
 
         assert_ne!(
             respuesta.status(),
@@ -216,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn la_salud_sigue_siendo_publica_con_la_autenticacion_encendida() {
         // Escenario 1.3.
-        let respuesta = get(router_oidc(), "/api/v1/health").await;
+        let respuesta = get(router_oidc().await, "/api/v1/health").await;
 
         assert_eq!(respuesta.status(), StatusCode::OK);
 
@@ -243,7 +256,7 @@ mod tests {
             "/api/v1/auth/login",
             "/api/v1/auth/callback",
         ] {
-            let respuesta = get(router_oidc(), ruta).await;
+            let respuesta = get(router_oidc().await, ruta).await;
 
             assert_ne!(
                 respuesta.status(),
@@ -254,7 +267,7 @@ mod tests {
 
         let eventos = protected_router(
             Router::new().route("/api/v1/events", axum::routing::get(negocio)),
-            &auth_oidc(),
+            &auth_oidc().await,
         );
 
         let sin_cookie = get(eventos.clone(), "/api/v1/events").await;
@@ -277,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn las_rutas_publicas_no_pasan_por_el_gate_y_la_superficie_de_negocio_si() {
         // Escenario 1.41.
-        let salud = get(router_oidc(), "/api/v1/health").await;
+        let salud = get(router_oidc().await, "/api/v1/health").await;
 
         assert_eq!(salud.status(), StatusCode::OK);
         assert_ne!(salud.status(), StatusCode::UNAUTHORIZED);
@@ -286,7 +299,7 @@ mod tests {
         // estará la de verdad.
         let negocio_router = protected_router(
             Router::new().route("/api/v1/targets", axum::routing::get(negocio)),
-            &auth_oidc(),
+            &auth_oidc().await,
         );
 
         let sin_cookie = get(negocio_router.clone(), "/api/v1/targets").await;
@@ -311,7 +324,7 @@ mod tests {
         // contestar `401`, no `405`: el *gate* precede al enrutado por método.
         // Este es el único test que cae si las dos líneas de `protected_router`
         // se invierten; el de con sesión pasa en los dos órdenes.
-        let respuesta = post(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = post(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_ne!(
             respuesta.status(),
@@ -339,8 +352,12 @@ mod tests {
     #[tokio::test]
     async fn un_metodo_no_declarado_con_sesion_contesta_405() {
         // Escenario 1.43.
-        let respuesta =
-            post_with_cookie(router_oidc(), "/api/v1/auth/session", &cookie_de_sesion()).await;
+        let respuesta = post_with_cookie(
+            router_oidc().await,
+            "/api/v1/auth/session",
+            &cookie_de_sesion(),
+        )
+        .await;
 
         assert_eq!(respuesta.status(), StatusCode::METHOD_NOT_ALLOWED);
 
@@ -363,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn una_ruta_no_declarada_no_pasa_por_el_gate() {
         // Escenario 1.44.
-        let respuesta = get(router_oidc(), "/api/v1/no-existe").await;
+        let respuesta = get(router_oidc().await, "/api/v1/no-existe").await;
 
         assert_ne!(
             respuesta.status(),
@@ -385,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn el_401_no_es_una_redireccion_ni_un_cuerpo_vacio() {
         // Escenario 1.32.
-        let respuesta = get(router_oidc(), "/api/v1/auth/session").await;
+        let respuesta = get(router_oidc().await, "/api/v1/auth/session").await;
 
         assert_eq!(respuesta.status(), StatusCode::UNAUTHORIZED);
         assert!(
@@ -409,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn una_ruta_desconocida_contesta_404_con_envoltura() {
-        let respuesta = get(api_router(estado_desarrollo()), "/api/v1/no-existe").await;
+        let respuesta = get(api_router(estado_desarrollo().await), "/api/v1/no-existe").await;
 
         assert_eq!(respuesta.status(), StatusCode::NOT_FOUND);
 
@@ -431,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn un_metodo_no_declarado_contesta_405_con_envoltura() {
-        let respuesta = post(api_router(estado_desarrollo()), "/api/v1/health").await;
+        let respuesta = post(api_router(estado_desarrollo().await), "/api/v1/health").await;
 
         assert_eq!(respuesta.status(), StatusCode::METHOD_NOT_ALLOWED);
 
@@ -456,7 +473,7 @@ mod tests {
         let (senal, espera) = tokio::sync::oneshot::channel::<()>();
 
         let servidor = tokio::spawn(async move {
-            crate::serve(estado_desarrollo(), async move {
+            crate::serve(estado_desarrollo().await, async move {
                 let _ = espera.await;
             })
             .await

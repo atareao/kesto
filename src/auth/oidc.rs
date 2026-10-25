@@ -498,7 +498,7 @@ mod tests {
     async fn la_redireccion_lleva_los_seis_parametros() {
         // Escenario 1.7.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let location = location_del_login(router).await;
 
@@ -583,7 +583,7 @@ mod tests {
     async fn cada_login_usa_un_state_y_un_nonce_nuevos() {
         // Escenario 1.8.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let primera = parametros_de_consulta(&location_del_login(router.clone()).await);
         let segunda = parametros_de_consulta(&location_del_login(router).await);
@@ -622,7 +622,7 @@ mod tests {
     async fn el_login_no_establece_sesion() {
         // Escenario 1.9.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let respuesta = get(router, "/api/v1/auth/login").await;
 
@@ -712,7 +712,7 @@ mod tests {
         // Escenario 1.11. Un `state` que no se emitió no está en el mapa ni entre
         // los ya gastados: el callback lo rechaza.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let respuesta = get(
             router,
@@ -734,7 +734,7 @@ mod tests {
         // comprobación al consumir es lo que la rechaza: si el callback solo
         // mirara el mapa, esta entrada pasaría y el test caería.
         let proveedor = ProveedorFalso::servir().await;
-        let estado = estado_oidc_con_emisor(&proveedor.issuer);
+        let estado = estado_oidc_con_emisor(&proveedor.issuer).await;
         let auth = estado
             .auth
             .clone()
@@ -765,7 +765,7 @@ mod tests {
         // Escenario 1.13. El primer callback consume el `state`; el segundo, con
         // el mismo `state`, se rechaza porque ya se gastó.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = proveedor.firmar(&IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce));
@@ -791,7 +791,7 @@ mod tests {
         // viejas, el rastro que permite distinguir «reutilizado» de «desconocido»—,
         // que era la mitad sin candado. Borrar cualquiera de los dos `retain` de
         // `consumir_login` deja este test en rojo.
-        let auth = auth_oidc();
+        let auth = auth_oidc().await;
         let hace = Instant::now()
             .checked_sub(STATE_TTL + Duration::from_secs(1))
             .expect("la purga necesita un uptime mayor que STATE_TTL");
@@ -833,7 +833,7 @@ mod tests {
         // dónde contar: si el callback intentara canjear, subiría. El requisito es
         // que no lo intente.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         proveedor
             .montar_token_endpoint("id-token-que-no-debe-usarse")
@@ -861,7 +861,7 @@ mod tests {
     async fn un_aud_ajeno_no_se_acepta() {
         // Escenario 1.15.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
@@ -882,7 +882,7 @@ mod tests {
         // cortesía que trae `Validation::new` por defecto —sesenta segundos—, de
         // modo que revertir esa decisión pone este test en rojo.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let ahora = jsonwebtoken::get_current_timestamp();
@@ -912,7 +912,7 @@ mod tests {
         // el rojo de esta prueba: quitando `"exp"` de esa lista, el token se
         // acepta y este test cae.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = proveedor.firmar_claims(&serde_json::json!({
@@ -956,7 +956,7 @@ mod tests {
         // Un `iat` dentro de ese margen es un desfase de reloj y se acepta; este
         // es un token emitido en el futuro de verdad.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let ahora = jsonwebtoken::get_current_timestamp();
@@ -1006,7 +1006,7 @@ mod tests {
         // del reloj. Un suelo de un segundo no bastaba: la ventana del arnés cruza
         // la frontera del segundo y de 60 repeticiones una salía verde.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let desfase = (MARGEN_DE_RELOJ / 2).max(5);
@@ -1042,7 +1042,7 @@ mod tests {
         // aserción de que el rechazo se registró es lo que demuestra que la
         // captura estaba en pie y que la de abajo no pasa por vacía.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = proveedor.firmar_claims(&serde_json::json!({
@@ -1085,7 +1085,7 @@ mod tests {
         // Escenario 1.17. El token lleva un `nonce` distinto del que el login
         // guardó para ese `state`: el ataque de repetición que el `nonce` cierra.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, _nonce) = login_state_y_nonce(router.clone()).await;
         let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, "nonce-ajeno");
@@ -1106,7 +1106,7 @@ mod tests {
         // una, úsala» —el atajo clásico— aceptaría este token, que va firmado con
         // esa misma clave y con todos los claims en regla.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = proveedor.firmar_sin_kid(&claims_completos(&proveedor, &nonce));
@@ -1133,7 +1133,7 @@ mod tests {
         // la firma cuadraría: lo que falla es la búsqueda de la clave por su `kid`
         // —la comprobación anterior a la firma—, y sin ella el token se aceptaría.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = proveedor.firmar_con_kid_ajeno(&claims_completos(&proveedor, &nonce));
@@ -1157,7 +1157,7 @@ mod tests {
         // encuentra la clave y es la **firma** la que no cuadra. Sin verificar la
         // firma, este token pasaría.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
@@ -1179,7 +1179,7 @@ mod tests {
         // eso se fija aquí: el día que alguien sustituya ese parseo por uno hecho
         // a mano, el token entra y emite sesión sin haber comprobado nada.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = token_con_alg_none(&claims_completos(&proveedor, &nonce));
@@ -1216,7 +1216,7 @@ mod tests {
         // `InvalidKeyFormat` en vez de `InvalidAlgorithm` —que es justo lo que la
         // aserción de abajo delata—.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let token = proveedor.firmar_confundiendo_algoritmo(&claims_completos(&proveedor, &nonce));
@@ -1241,7 +1241,7 @@ mod tests {
     async fn un_iss_distinto_no_se_acepta() {
         // Escenario 1.19.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let mut claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
@@ -1259,7 +1259,7 @@ mod tests {
     async fn un_token_verificado_se_convierte_en_sesion() {
         // Escenario 1.20. El `sub` y el `email` de la sesión son los del ID token.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
@@ -1296,7 +1296,7 @@ mod tests {
         // `userinfo_endpoint`; el flujo se completa igual porque el ID token
         // verificado basta. Y no se pide ningún `userinfo`.
         let proveedor = ProveedorFalso::servir().await;
-        let router = router_oidc_con_emisor(&proveedor.issuer);
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
         let (state, nonce) = login_state_y_nonce(router.clone()).await;
         let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);

@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
 /// Cadena que guarda una credencial.
@@ -43,6 +44,42 @@ impl fmt::Debug for SecretString {
 impl fmt::Display for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(REDACTED)
+    }
+}
+
+/// El `Deserialize` es **manual**, y el `Serialize` **no** existe. Las dos mitades
+/// tienen motivo, y ninguna se deduce leyendo el código.
+///
+/// El `Deserialize` no se deriva porque [`SecretString`] guarda su valor en un
+/// [`Zeroizing<String>`], y el `Deserialize` de `Zeroizing` vive tras la feature
+/// **`serde`** de `zeroize` —una dependencia **opcional**, hoy apagada—, así que un
+/// `#[derive(Deserialize)]` sobre el tipo del cuerpo no compila tal cual. Encender esa
+/// feature resolvería el `derive`, pero activaría la feature para **todo** el grafo que
+/// usa `zeroize` —las features de Cargo son aditivas y se unifican por crate—:
+/// `crypto-bigint`, `curve25519-dalek`, `der`, `ed25519-dalek`, `elliptic-curve`,
+/// `generic-array`, `jsonwebtoken`, `num-bigint-dig`, `rsa`, `rustls`,
+/// `rustls-pki-types`, `sec1` y, por encima, `p256`, `p384`, `ecdsa` y `primeorder`.
+/// Dejaría una invariante de seguridad de este crate colgando de una feature de
+/// terceros por una necesidad local; la implementación son unas pocas líneas y pasa por
+/// [`SecretString::new`], de modo que el envoltorio `Zeroizing` no se puede saltar.
+///
+/// Y **`Serialize` no se implementa**, ni derivado ni a mano: es lo que hace que un
+/// tipo de respuesta que llevara una credencial **no compile**. La regla «un secreto no
+/// vuelve al cliente» deja así de depender de que alguien se acuerde al escribir el DTO
+/// y pasa a ser imposible de escribir. Implementar `Serialize` aquí —aunque fuera para
+/// redactar— abriría esa puerta: bastaría con que un campo llegara a un DTO de
+/// respuesta para que el valor saliera por el cable.
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // El parámetro se consume de forma inerte en esta fase: el cuerpo es un
+        // `todo!()` y la firma no se toca —renombrarlo con guion bajo obligaría a
+        // deshacerlo al implementarlo—, así que se marca como usado sin usarlo.
+        let _ = deserializer;
+
+        todo!("el módulo 1 del change `api-endpoints` lo implementa vía `SecretString::new`")
     }
 }
 

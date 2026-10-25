@@ -20,8 +20,10 @@ pub mod state;
 mod test_support;
 
 use std::future::Future;
+use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::db::crypto::Clave;
+use crate::state::{AppState, EstadoDeBase};
 
 /// Arranca el servidor sobre `state.config.bind_address` y devuelve cuando
 /// `shutdown` se resuelve, dando salida antes a las peticiones en curso.
@@ -131,11 +133,11 @@ async fn main() -> std::process::ExitCode {
     //    el motor escribiría contra columnas que no existen y el síntoma sería
     //    una copia perdida en vez de un arranque roto.
     //
-    //    El pool se queda vivo como variable local hasta que exista quien lo
-    //    consuma: el motor y el planificador lo recibirán por el estado de la
-    //    aplicación en su propio change. Soltarlo aquí cerraría la base en cuanto
-    //    el servidor empezara a escuchar.
-    let _database = match db::preparar(&config).await {
+    //    El pool **no** se queda suelto como variable local: con él se construye el
+    //    estado de base —la clave de cifrado en reposo y las cuatro capas de acceso—,
+    //    que viaja dentro del `AppState` y llega así a los manejadores. Sigue habiendo
+    //    **una sola** base por proceso: la abre esta línea y ninguna otra.
+    let pool = match db::preparar(&config).await {
         Ok(pool) => pool,
         Err(error) => {
             eprintln!("kesto no puede arrancar: {error}");
@@ -143,12 +145,17 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // 5. Router, escucha y apagado. El estado se construye desde la
-    //    configuración ya resuelta: en modo `Oidc` lleva el estado de
+    // La clave del cifrado en reposo se deriva de `KESTO_MASTER_KEY`, que la
+    // configuración exige siempre. Se construye **una vez** y se comparte: las capas de
+    // `repositories` y `backup_targets` la reciben al construirse.
+    let clave = Arc::new(Clave::desde_maestra(&config.master_key));
+
+    // 5. Router, escucha y apagado. El estado se construye desde la configuración ya
+    //    resuelta y la base **ya abierta**: en modo `Oidc` lleva el estado de
     //    autenticación, y en desarrollo no lleva ninguno.
     let address = config.bind_address;
 
-    let state = match AppState::new(config) {
+    let state = match AppState::new(config, EstadoDeBase::nuevo(pool, clave)) {
         Ok(state) => state,
         Err(error) => {
             eprintln!("kesto no puede arrancar: {error}");
