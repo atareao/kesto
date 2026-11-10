@@ -190,6 +190,72 @@ rustic_core = "0.13.0"
 rustic_backend = { version = "0.7.0", default-features = false, features = ["opendal"] }
 futures-util = "0.3.34"
 
+# Scheduler (scheduler): the clock that turns `backup_jobs.cron_expression` into
+# a job that actually fires. Like the block above, this one is NOT resolved
+# against an offline cache -- and here it is measured, not assumed: neither
+# `tokio-cron-scheduler` nor `croner` is present in this machine's Cargo cache
+# (~/.cargo/registry), so `Cargo.lock` was resolved WITH the network ONCE and is
+# part of the deliverable, because CI runs `cargo test --locked`.
+#
+# `tokio-cron-scheduler` 0.15.1 is the crate SRS section 2 names ("Task
+# Scheduler (tokio-cron)") and the reason the `src/scheduler` module of section 7
+# exists. Only its in-memory API is used -- `JobScheduler::new()` -> `add(Job)`
+# -> `start()` -> `remove(&Uuid)` -> `shutdown()`, plus the `JobToRunAsync`
+# variant, because firing calls the engine's queue and that is async. Its
+# persistence API (`JobBuilder`, the `JobCode` trait, `MetaDataStorage` and
+# `NotificationStore`) is NOT used, and the reason is not effort: `backup_jobs`
+# is already the store, and mirroring it into the library's own would create two
+# truths that can drift. The line carries its defaults and nothing else --
+# `default` is `[]` in 0.15.1 -- so the `nats_storage` / `postgres_storage`
+# backends, the `signal` and `log` features and the optional `english-to-cron`
+# all stay off.
+#
+# `croner` 3 is declared as a DIRECT dependency on purpose, and the major is the
+# whole point. `tokio-cron-scheduler` 0.15.1 depends on `croner ^3.0.0` -- it
+# does NOT use the `cron` crate -- so declaring the SAME major is what makes the
+# resolver unify both requirements into ONE single copy; declaring any other
+# major would ship two cron grammars, and validating with a different parser than
+# the one that evaluates the string would accept expressions the clock cannot
+# read, which is the exact failure the validation exists to prevent. Hiding
+# behind a re-export of the library would tie the grammar to a third party's
+# packaging detail. Same promotion play as `base64` and `futures-util` above,
+# and the same consequence: a crate in `[dependencies]` is already available to
+# tests, so it is not repeated under `[dev-dependencies]`.
+#
+# DECLARED COST, measured and not minimised: `tokio-cron-scheduler` 0.15.1
+# carries `chrono` 0.4 and `chrono-tz` as NON-optional dependencies, so the tree
+# gains a second date family next to the `time` this project chose on purpose
+# (see the db-schema block above). The scheduler module never converts a date
+# across the two families: if it needs one from the library it keeps it inside
+# the module and never crosses it with the `time` values of section 3. The
+# `chrono` already in the tree before this change was a passenger -- a single
+# path, `suppaftp` -> `opendal-service-ftp` -> `opendal` -> `rustic_backend`, a
+# transport Kesto never uses -- and not a decision; `chrono-tz` is new with this
+# change, and it arrives only through `tokio-cron-scheduler` (in `croner` 3 it is
+# a dev-dependency, so it does not reach a downstream tree).
+#
+# MSRV: neither crate declares a `rust-version` -- checked in the registry index
+# and on crates.io, both come back empty -- so neither raises the floor. This
+# project is on `edition = "2024"` (>= 1.85) with a toolchain of 1.97.
+tokio-cron-scheduler = "0.15.1"
+croner = "3"
+# `chrono` is declared DIRECTLY for one reason and one only: the single crossing point in
+# `src/scheduler/validacion.rs` (`Agenda::proxima_tras`). Both `croner` and
+# `tokio-cron-scheduler` measure the calendar in `chrono` -- it is already their non-optional
+# dependency, and already in the tree (see the note above) -- while the rest of Kesto and SRS
+# section 3 measure dates in `time`. The public surface of the scheduler keeps `time`
+# (`Agenda::proxima_tras` receives and returns `time::OffsetDateTime`), so the `time` -> `chrono`
+# -> `croner` -> `time` conversion happens INSIDE the module, at that one documented point, and
+# not at every call site. Declaring `chrono` a direct dependency -- instead of reaching for it
+# through a re-export that does not exist: `croner` re-exports only `CronIterator` and hides its
+# `chrono` -- is what lets that crossing name `chrono::DateTime` without depending on a third
+# party's bundling. This AMENDS the earlier "`time`, NOT `chrono`" note in the db-schema block:
+# that note was written before the scheduler existed and is still true of the persistence layer;
+# `chrono` is here for the clock's grammar, not to measure any stored date. The version resolves
+# against the `chrono` 0.4 already in the tree and in this machine's cache, so no new crate is
+# fetched.
+chrono = "0.4"
+
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1"
