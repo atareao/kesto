@@ -239,6 +239,22 @@ futures-util = "0.3.34"
 # project is on `edition = "2024"` (>= 1.85) with a toolchain of 1.97.
 tokio-cron-scheduler = "0.15.1"
 croner = "3"
+# `chrono` is declared DIRECTLY for one reason and one only: the single crossing point in
+# `src/scheduler/validacion.rs` (`Agenda::proxima_tras`). Both `croner` and
+# `tokio-cron-scheduler` measure the calendar in `chrono` -- it is already their non-optional
+# dependency, and already in the tree (see the note above) -- while the rest of Kesto and SRS
+# section 3 measure dates in `time`. The public surface of the scheduler keeps `time`
+# (`Agenda::proxima_tras` receives and returns `time::OffsetDateTime`), so the `time` -> `chrono`
+# -> `croner` -> `time` conversion happens INSIDE the module, at that one documented point, and
+# not at every call site. Declaring `chrono` a direct dependency -- instead of reaching for it
+# through a re-export that does not exist: `croner` re-exports only `CronIterator` and hides its
+# `chrono` -- is what lets that crossing name `chrono::DateTime` without depending on a third
+# party's bundling. This AMENDS the earlier "`time`, NOT `chrono`" note in the db-schema block:
+# that note was written before the scheduler existed and is still true of the persistence layer;
+# `chrono` is here for the clock's grammar, not to measure any stored date. The version resolves
+# against the `chrono` 0.4 already in the tree and in this machine's cache, so no new crate is
+# fetched.
+chrono = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

@@ -16,6 +16,7 @@ pub mod docker;
 pub mod engine;
 pub mod error;
 pub mod rustic;
+pub mod scheduler;
 pub mod secret;
 pub mod state;
 
@@ -27,6 +28,7 @@ use std::sync::Arc;
 
 use crate::db::crypto::Clave;
 use crate::engine::{Ajustes, Dependencias, Motor};
+use crate::scheduler::{Ajustes as AjustesDelReloj, PLAZO_DE_PARADA, Planificador};
 use crate::state::{AppState, EstadoDeBase};
 
 /// Arranca el servidor sobre `state.config.bind_address` y devuelve cuando
@@ -51,25 +53,38 @@ pub async fn serve(
         .await
 }
 
-/// El apagado del servidor: espera la señal, **cierra el hub** y resuelve.
+/// El apagado del servidor: espera la señal, **para el planificador**, **cierra el hub** y resuelve.
 ///
-/// Es lo que se le pasa a [`serve`], y la composición importa tanto como las piezas: el cierre del
-/// hub tiene que ocurrir **dentro** de este futuro y antes de que resuelva, para que cuando el
-/// servidor empiece su apagado ordenado los clientes del stream ya sepan que se acabó. El porqué
-/// entero, en el rustdoc de [`serve`] y en el de [`Motor::cerrar_el_hub`].
+/// Es lo que se le pasa a [`serve`], y la composición importa tanto como las piezas: el reloj tiene
+/// que quedar parado —y el cierre del hub tiene que ocurrir— **dentro** de este futuro y antes de
+/// que resuelva. El orden entre las dos tampoco es decorativo: el planificador se para lo primero,
+/// desde el instante en que la señal llega, para que entre la señal y su parada no quepa ningún tick
+/// que encole trabajo contra un motor que ya está a punto de pararse; el cierre del hub va después,
+/// para que cuando el servidor empiece su apagado ordenado los clientes del stream ya sepan que se
+/// acabó. El porqué entero, en el rustdoc de [`serve`], en el de [`Motor::cerrar_el_hub`] y en el de
+/// [`Planificador::parar`].
 ///
 /// La señal entra por parámetro —en vez de llamar aquí a [`shutdown_signal`]— para que la
 /// composición se pueda medir sin mandar una señal de verdad, que es lo único de este camino que una
 /// prueba unitaria no puede recorrer; el binario de verdad, con su `SIGTERM`, lo mide
 /// `tests/arranque.rs`.
-async fn apagado_ordenado(motor: Motor, senal: impl Future<Output = ()>) {
+async fn apagado_ordenado(
+    motor: Motor,
+    planificador: Planificador,
+    senal: impl Future<Output = ()>,
+) {
     senal.await;
 
-    // Y con la señal dentro, se cierra el reparto: a partir de aquí los clientes conectados al
-    // stream reciben su `Closed`, su cuerpo termina y sus conexiones se cierran, que es lo que deja
-    // a `serve` resolver. El motor sigue vivo y aceptando lo que ya está dentro —lo para el paso 9,
-    // **después** de `serve`—, así que una petición anterior al apagado se sirve y no encuentra un
-    // `503`.
+    // 1. El reloj, lo **primero**: desde aquí no se planifica ni se encola nada nuevo. Su plazo lo
+    //    declara el módulo, en un solo sitio —[`PLAZO_DE_PARADA`]—, y lo que no drene dentro de él
+    //    se registra y el apagado continúa.
+    planificador.parar(PLAZO_DE_PARADA).await;
+
+    // 2. Y con la señal dentro, se cierra el reparto: a partir de aquí los clientes conectados al
+    //    stream reciben su `Closed`, su cuerpo termina y sus conexiones se cierran, que es lo que deja
+    //    a `serve` resolver. El motor sigue vivo y aceptando lo que ya está dentro —lo para el paso
+    //    10, **después** de `serve`—, así que una petición anterior al apagado se sirve y no encuentra
+    //    un `503`.
     motor.cerrar_el_hub();
 }
 
@@ -344,12 +359,64 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // 6. Router, escucha y apagado. El estado se construye desde la configuración ya
-    //    resuelta, la base **ya abierta** y el motor **ya arrancado**: en modo `Oidc` lleva
-    //    el estado de autenticación, y en desarrollo no lleva ninguno. El motor se clona
-    //    hacia el estado —un clon es un `Arc` por dentro, así que no copia ni la cola ni un
-    //    evento— porque el apagado de aquí abajo necesita el suyo, y el estado se lo lleva
-    //    el servidor.
+    // 6. El socket del motor de contenedores, comprobado **para avisar** y nunca para
+    //    decidir si el proceso arranca. Un socket que no responde no puede dejar al
+    //    operador sin la herramienta con la que diagnosticarlo: el panel tiene que poder
+    //    levantarse precisamente para enseñar que no responde, y el fallo reaparece donde
+    //    importa —al ejecutar una copia—. Aquí queda dicho antes, que es todo lo que se
+    //    puede hacer sin inventarse un modo degradado. Va **pegado al arranque del motor** y no
+    //    más abajo porque es su constancia: así el orden de las marcas del registro —el aviso
+    //    del motor, el planificador, la escucha— es el orden real del arranque del §6, que es
+    //    lo que la prueba de integración afirma.
+    if let Err(error) = motor.comprobar().await {
+        tracing::warn!(
+            %error,
+            "el motor de copias no puede hablar con el motor de contenedores: las tareas que \
+             volquen un contenedor fallarán hasta que su socket responda; el resto de Kesto \
+             funciona"
+        );
+    }
+
+    // 7. El planificador: **detrás** del motor y **delante** del estado y de la escucha. Detrás
+    //    del motor porque su única operación es llamarlo, y uno que arrancara antes tendría una
+    //    ventana —corta, pero real— en la que el reloj dispara contra un motor que todavía no
+    //    acepta trabajo, y esos disparos acabarían con el desenlace de «no hay quien atienda» por
+    //    un motivo que no es cierto. Delante de la escucha porque el requisito 6 exige que esté en
+    //    marcha cuando el proceso empieza a atender, así que un fallo al montarlo es un fallo de
+    //    arranque, con la misma forma que el del motor.
+    //
+    //    ⚠️ Y no es una contradicción con la robustez del planificador: una `cron_expression` que
+    //    no parsea **no** llega aquí como error —el módulo la registra nombrando la tarea y la
+    //    expresión, se salta esa tarea y sigue con las demás—; lo único que puede fallar aquí es
+    //    el reloj, y un proceso que escuchara sin reloj no estaría programando ninguna copia, que
+    //    es medio Kesto.
+    //
+    //    Al planificador se le da un **clon** del pool —`SqlitePool` clona barato, un `Arc` por
+    //    dentro— porque el `db` entero se lo lleva el `AppState` dos pasos más abajo. Y **no**
+    //    entra en el estado: ninguna ruta lo necesita, y meterlo obligaría a levantar un reloj en
+    //    cada prueba de las rutas. Su mango viaja por aquí hasta la parada ordenada, al lado del
+    //    motor.
+    let planificador =
+        match Planificador::arrancar(motor.clone(), db.pool.clone(), AjustesDelReloj::nuevos())
+            .await
+        {
+            Ok(planificador) => planificador,
+            Err(error) => {
+                eprintln!("kesto no puede arrancar: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+
+    // Y su reconciliación periódica, lanzada una sola vez: a partir de aquí relee `backup_jobs`
+    // cada período y ajusta lo planificado sin que nadie se lo pida.
+    planificador.vigilar();
+
+    // 8. Router, escucha y apagado. El estado se construye desde la configuración ya
+    //    resuelta, la base **ya abierta**, el motor **ya arrancado** y el planificador **ya en
+    //    marcha**: en modo `Oidc` lleva el estado de autenticación, y en desarrollo no lleva
+    //    ninguno. El motor se clona hacia el estado —un clon es un `Arc` por dentro, así que no
+    //    copia ni la cola ni un evento— porque el apagado de aquí abajo necesita el suyo, y el
+    //    estado se lo lleva el servidor.
     let address = config.bind_address;
 
     let state = match AppState::new(config, db, motor.clone()) {
@@ -360,22 +427,7 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // 7. El socket del motor de contenedores, comprobado **para avisar** y nunca para
-    //    decidir si el proceso arranca. Un socket que no responde no puede dejar al
-    //    operador sin la herramienta con la que diagnosticarlo: el panel tiene que poder
-    //    levantarse precisamente para enseñar que no responde, y el fallo reaparece donde
-    //    importa —al ejecutar una copia—. Aquí queda dicho antes, que es todo lo que se
-    //    puede hacer sin inventarse un modo degradado.
-    if let Err(error) = motor.comprobar().await {
-        tracing::warn!(
-            %error,
-            "el motor de copias no puede hablar con el motor de contenedores: las tareas que \
-             volquen un contenedor fallarán hasta que su socket responda; el resto de Kesto \
-             funciona"
-        );
-    }
-
-    // 8. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
+    // 9. Descubrimiento del proveedor de identidad: se intenta al arrancar y,
     //    si no contesta, se avisa y se sigue. Kesto es el orquestador de las
     //    **copias**, y negarse a arrancar porque el proveedor está caído
     //    convertiría un problema de autenticación en ausencia de copias. El
@@ -388,14 +440,23 @@ async fn main() -> std::process::ExitCode {
 
     tracing::info!(%address, "escuchando");
 
-    let resultado = serve(state, apagado_ordenado(motor.clone(), shutdown_signal())).await;
+    let resultado = serve(
+        state,
+        apagado_ordenado(motor.clone(), planificador, shutdown_signal()),
+    )
+    .await;
 
-    // 9. La parada del motor va **después** del servidor, y el orden es la mitad del
+    // 10. La parada del motor va **después** del servidor, y el orden es la mitad del
     //    contrato: `serve` resuelve cuando la señal llega y las peticiones en curso han
     //    terminado de salir —deja de aceptar, y solo entonces vuelve—, así que para cuando
     //    se llega aquí nadie puede pedir una copia. Al revés, una petición que ya estaba
     //    dentro habría encontrado el motor parado y habría contestado `503` en vez de
     //    servirse: el apagado convertiría en error una petición anterior a él.
+    //
+    //    El planificador ya está parado —lo para `apagado_ordenado`, lo primero— y el motor
+    //    es lo último porque es quien espera de forma acotada a la ejecución en vuelo: las
+    //    ejecuciones ya encoladas son suyas y el reloj no las toca. Ese es el «se para antes
+    //    que él» del requisito 6.
     //
     //    «Terminado de salir» incluye el stream: el hub se cierra dentro del futuro de
     //    apagado —ver `apagado_ordenado`—, así que el cuerpo del `text/event-stream` de cada
@@ -459,6 +520,7 @@ mod tests {
 
     use super::{DIRECTIVA_DEL_MOTOR, apagado_ordenado, aviso_del_filtro, componer_el_filtro};
     use crate::db;
+    use crate::scheduler::{Ajustes as AjustesDelReloj, Planificador};
     use crate::test_support::{
         config_con_dsn, directorio_de_prueba, estado_desarrollo, migrador_roto,
     };
@@ -585,21 +647,34 @@ mod tests {
         }
     }
 
-    /// 1.34 — El futuro del apagado cierra el hub **antes** de resolver.
+    /// 1.34 — El futuro del apagado para el planificador y cierra el hub **antes** de resolver.
     ///
-    /// Es la composición del paso 6, que ningún test puede observar dentro de `main`: lo que se
-    /// afirma es que el cierre del hub está **dentro** del futuro que `serve` recibe y antes de que
-    /// resuelva, y no después. La mitad de verdad —un cliente conectado, un `SIGTERM` y el proceso
-    /// acabando dentro del plazo— la mide `tests/arranque.rs` con el binario; aquí se fija sin
-    /// señales, que es lo que permite que la prueba corra en cualquier sitio.
+    /// Es la composición del paso 8, que ningún test puede observar dentro de `main`: lo que se
+    /// afirma es que la parada del planificador y el cierre del hub están **dentro** del futuro que
+    /// `serve` recibe y antes de que resuelva, y no después. La mitad de verdad —un cliente
+    /// conectado, un `SIGTERM` y el proceso acabando dentro del plazo— la mide `tests/arranque.rs`
+    /// con el binario; aquí se fija sin señales, que es lo que permite que la prueba corra en
+    /// cualquier sitio.
     ///
-    /// Las dos aserciones van juntas por eso: la primera dice que el canal **no** se cierra solo
+    /// Las tres aserciones van juntas por eso: la primera dice que el canal **no** se cierra solo
     /// —sin ella, un `Closed` llegado de cualquier otra parte pasaría por un acierto de esta
-    /// composición—, y la segunda que lo cierra este futuro.
+    /// composición—, la segunda que lo cierra este futuro, y la tercera que además dejó el
+    /// planificador parado.
     #[tokio::test]
     async fn el_apagado_cierra_el_hub_antes_de_resolver() {
         let estado = estado_desarrollo().await;
         let motor = estado.motor.clone();
+
+        // El planificador de verdad, montado como lo monta `main`, para que este futuro recorra el
+        // camino entero y no una versión sin reloj. La base del arnés no tiene tareas, así que no
+        // planifica nada y no hace falta vigilarlo.
+        let planificador = Planificador::arrancar(
+            motor.clone(),
+            estado.db.pool.clone(),
+            AjustesDelReloj::nuevos(),
+        )
+        .await
+        .expect("el planificador tiene que poder montarse en la prueba");
 
         let mut cliente = motor
             .hub()
@@ -613,13 +688,19 @@ mod tests {
              nada sobre este futuro"
         );
 
-        apagado_ordenado(motor, std::future::ready(())).await;
+        apagado_ordenado(motor, planificador.clone(), std::future::ready(())).await;
 
         assert!(
             matches!(cliente.try_recv(), Err(TryRecvError::Closed)),
             "el apagado no cerró el hub, así que el cuerpo del stream de un cliente conectado no \
              terminaría y el cierre ordenado se quedaría esperándolo hasta el `SIGKILL` del período \
              de gracia"
+        );
+
+        assert!(
+            planificador.esta_parado(),
+            "el apagado no paró el planificador: se esperaba que el reloj quedara parado dentro del \
+             futuro que `serve` recibe, desde el instante en que la señal llega"
         );
     }
 
