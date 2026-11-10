@@ -281,6 +281,12 @@ const AVISO_DEL_MOTOR_MUDO: &str = "no puede hablar con el motor de contenedores
 const SENAL_DE_CIERRE: &str = "señal de cierre recibida";
 /// Marca de la parada del motor, que solo se emite al pararlo.
 const MOTOR_PARADO: &str = "motor parado";
+/// Marca del arranque del planificador: la emite el **módulo** cuando el reloj queda arrancado, así
+/// que verla es la constancia de que el planificador está montado, y su posición respecto a las demás
+/// marcas dice dónde se montó respecto al motor y al listener.
+const PLANIFICADOR_EN_MARCHA: &str = "planificador en marcha";
+/// Marca de la parada del planificador, que solo se emite al pararlo (dentro del apagado ordenado).
+const PLANIFICADOR_PARADO: &str = "planificador parado";
 
 /// Plazo para que el proceso **acabe** tras el `SIGTERM`.
 ///
@@ -729,13 +735,65 @@ fn un_socket_de_docker_inalcanzable_no_impide_arrancar_y_el_motor_va_antes_del_l
     );
 }
 
-/// 1.34 (escenario 2) — **`SIGTERM` acaba con el proceso dentro de un plazo acotado.**
+/// 1.34 (escenario 2) — **El planificador arranca detrás del motor y antes de escuchar.**
+///
+/// El requisito 6 fija el orden del arranque —base abierta y migrada, motor, planificador, estado y
+/// listener—, y esta prueba mira el escalón que ese orden añade: el planificador. Su marca la emite
+/// el **propio módulo** al arrancar el reloj, así que su posición en el registro del proceso es la
+/// constancia de que quedó montado, y de dónde.
+///
+/// Se afirman las **dos** mitades y no una: que el planificador va detrás del motor —delante tendría
+/// una ventana en la que el reloj dispara contra un motor que todavía no acepta trabajo, y esos
+/// disparos acabarían con el desenlace de «no hay quien atienda» por un motivo que no es cierto— y
+/// que va delante de la línea de escucha —detrás atendería antes de estar programando—. Comprobar
+/// solo una dejaría pasar el montaje que se hubiera movido por el otro lado.
+///
+/// El aviso del socket muerto es la marca del paso del motor: es como esta suite monta un Kesto
+/// **entero** sin motor de contenedores, y va justo por delante de la del planificador. Como la
+/// prueba de arriba, **no es roja y se dice**: pasa hoy y seguirá pasando mientras nadie mueva el
+/// montaje; la rompe quien suba el planificador por delante del motor o lo baje por detrás del
+/// listener.
+#[test]
+fn el_planificador_arranca_detras_del_motor_y_antes_de_escuchar() {
+    let en_marcha = arrancar(
+        &socket_muerto(),
+        &[AVISO_DEL_MOTOR_MUDO, PLANIFICADOR_EN_MARCHA, ARRANCADO],
+    );
+
+    let (del_motor, del_planificador, de_escuchar) = (
+        en_marcha.posicion(AVISO_DEL_MOTOR_MUDO),
+        en_marcha.posicion(PLANIFICADOR_EN_MARCHA),
+        en_marcha.posicion(ARRANCADO),
+    );
+
+    assert!(
+        matches!(
+            (del_motor, del_planificador, de_escuchar),
+            (Some(del_motor), Some(del_planificador), Some(de_escuchar))
+                if del_motor < del_planificador && del_planificador < de_escuchar
+        ),
+        "el planificador no estaba montado entre el motor y la escucha: se esperaba el aviso del \
+         socket del motor, luego la marca del planificador y luego la línea de escucha, en ese orden \
+         (salieron en {del_motor:?}, {del_planificador:?} y {de_escuchar:?}). Salida:\n{}",
+        en_marcha.registro()
+    );
+}
+
+/// 1.34 (escenario 3) — **`SIGTERM` acaba con el proceso dentro de un plazo acotado.**
 ///
 /// La mitad que se mide: que la señal **se atiende**, que el cierre ordenado **recorre** sus pasos
-/// —el registro trae la señal y la parada del motor— y que el proceso **termina** sin quedarse
-/// colgado. Lo último tiene dos aserciones distintas y cada una dice lo suyo: que terminó dentro
-/// del plazo y que acabó con código `0` en vez de morir por la señal —un código de señal sería un
-/// `SIGTERM` que atendió el sistema, no Kesto, y la prueba no habría medido nada—.
+/// —el registro trae la señal, la parada del planificador y la del motor, en ese orden— y que el
+/// proceso **termina** sin quedarse colgado. Lo último tiene dos aserciones distintas y cada una dice
+/// lo suyo: que terminó dentro del plazo y que acabó con código `0` en vez de morir por la señal —un
+/// código de señal sería un `SIGTERM` que atendió el sistema, no Kesto, y la prueba no habría medido
+/// nada—.
+///
+/// El orden de las dos paradas es la mitad del requisito que el planificador añade: el reloj se para
+/// **dentro** del futuro de apagado, antes de que `serve` resuelva, y el motor se para **después** de
+/// `serve` —porque es quien espera de forma acotada a la ejecución en vuelo—. Las dos marcas existen
+/// justo para poder afirmarlo sobre el registro del proceso y no sobre una simulación: la del
+/// planificador la emite el módulo al apagar el reloj, la del motor la emite la cola al terminar sus
+/// trabajadores.
 ///
 /// La mitad que **no** se puede medir aquí, y se declara en vez de fingirse: «con una ejecución en
 /// curso». Reproducirla exigiría una copia de verdad dentro del motor, y el binario **no** tiene el
@@ -749,7 +807,7 @@ fn un_socket_de_docker_inalcanzable_no_impide_arrancar_y_el_motor_va_antes_del_l
 /// `pkill -x kesto` y comprueba que no quedan contenedores huérfanos.
 #[test]
 fn un_sigterm_acaba_con_el_proceso_dentro_del_plazo() {
-    let mut en_marcha = arrancar(&socket_muerto(), &[ARRANCADO]);
+    let mut en_marcha = arrancar(&socket_muerto(), &[PLANIFICADOR_EN_MARCHA, ARRANCADO]);
 
     // Antes de la señal, el proceso tiene que estar **atendiendo**, y no basta con la línea de
     // escucha: `main` la emite antes de atar el puerto y el controlador de `SIGTERM` se instala al
@@ -815,6 +873,36 @@ fn un_sigterm_acaba_con_el_proceso_dentro_del_plazo() {
         "el apagado no paró el motor: se esperaba la constancia de la parada del motor detrás de la \
          señal, porque el cierre ordenado lo para **después** de que el servidor deje de aceptar \
          conexiones. Salida:\n{}",
+        en_marcha.registro()
+    );
+
+    // Y el planificador: en este mismo proceso quedó montado y se paró. Es lo que convierte un
+    // «el proceso acabó» en «el proceso acabó habiendo parado antes el reloj», que es el escalón que
+    // el requisito añade.
+    assert!(
+        en_marcha.contiene(PLANIFICADOR_PARADO),
+        "el apagado no dejó constancia de haber parado el planificador: se esperaba que el cierre \
+         ordenado parara el reloj dentro del futuro que `serve` recibe, antes de que el servidor \
+         resolviera. Salida:\n{}",
+        en_marcha.registro()
+    );
+
+    // Y en el orden del requisito: el reloj se para **antes** que el motor. La comprobación es sobre
+    // las posiciones en el registro, no sobre dos «está presente» sueltos: un apagado que parara el
+    // motor primero y el reloj después también dejaría las dos marcas, y sería el orden contrario al
+    // que el requisito pide.
+    let (del_planificador, del_motor) = (
+        en_marcha.posicion(PLANIFICADOR_PARADO),
+        en_marcha.posicion(MOTOR_PARADO),
+    );
+    assert!(
+        matches!(
+            (del_planificador, del_motor),
+            (Some(del_planificador), Some(del_motor)) if del_planificador < del_motor
+        ),
+        "el planificador no se paró antes que el motor: se esperaba la marca de la parada del \
+         planificador antes de la del motor (salieron en {del_planificador:?} y {del_motor:?}). \
+         Salida:\n{}",
         en_marcha.registro()
     );
 }
