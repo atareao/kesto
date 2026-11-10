@@ -95,18 +95,30 @@ impl Planificador {
     /// Dispara una tarea: la encola en el motor, con los desenlaces de [`decidir`].
     ///
     /// Es **lo que el cierre de la biblioteca llama**, y también lo que una prueba llama para no
-    /// esperar un tick de calendario real. Consulta la puerta de parada y encola **bajo el mismo
-    /// candado**, que es la garantía de que un encolado o termina antes de que la puerta cierre o no
-    /// empieza —y eso cubre también el tick que la biblioteca dispare después de la parada—.
+    /// esperar un tick de calendario real. Consulta la puerta de parada **dentro de la misma sección
+    /// crítica que el encolado** —el candado [`super::planificacion::Interior`]—, que es la garantía
+    /// de que un encolado o termina antes de que la puerta cierre o no empieza —y eso cubre también
+    /// el tick que la biblioteca dispare después de la parada—.
+    ///
+    /// Es `pub(crate)` y no `pub`: la superficie pública del módulo es [`Planificador`], sus ajustes
+    /// y su error (lo decide `mod.rs`); a este cuerpo solo lo llaman el cierre de la biblioteca y
+    /// las pruebas del crate.
     ///
     /// Con la puerta cerrada no hace nada: no se planifica ni se encola trabajo nuevo.
-    pub async fn disparar(&self, job_id: Uuid) {
+    pub(crate) async fn disparar(&self, job_id: Uuid) {
+        // Chequeo rápido: con la puerta ya cerrada no se toma el candado siquiera. La bandera solo
+        // pasa de abierta a cerrada, así que verla cerrada es concluyente.
+        if !self.0.sigue_abierta() {
+            return;
+        }
+
         // La puerta y el encolado **bajo el mismo candado**: la sección crítica va de aquí hasta
         // que el encolado termina, así que un encolado o termina antes de que la puerta cierre o no
-        // empieza —y eso cubre también el tick que la biblioteca dispare después de la parada—.
+        // empieza —y eso cubre también el tick que la biblioteca dispare después de la parada—. Se
+        // vuelve a consultar la bandera ya con el candado tomado: es la lectura que decide.
         let mut estado = self.0.estado.lock().await;
 
-        if !estado.abierta {
+        if !self.0.sigue_abierta() {
             return;
         }
 
@@ -137,18 +149,22 @@ impl Planificador {
                     "la tarea del disparo ya no existe: se retira de la planificación"
                 );
 
-                if let Some(mango) = estado.planificadas.remove(&job_id) {
-                    estado.expresiones.remove(&job_id);
-
+                // El mango se toma **sin quitarlo de la tabla**: la entrada no sale hasta que el
+                // reloj confirme. Quitarla antes perdería el único mango con el que esa tarea se
+                // puede retirar del reloj, y la tarea seguiría disparando sin que nadie pudiera
+                // retirarla. La retirada no confirmada se reintenta en la siguiente reconciliación.
+                if let Some(mango) = estado.planificadas.get(&job_id).copied() {
                     // El reloj, tras el de estado: es el orden de cerrojo que declara
                     // [`super::planificacion::Interior`].
                     let reloj = self.0.reloj.lock().await;
 
-                    if let Err(error) = reloj.remove(&mango).await {
+                    if let Err(error) = estado.aplicar_retirada(job_id, reloj.remove(&mango).await)
+                    {
                         tracing::warn!(
                             job_id = %job_id,
                             %error,
-                            "el mango de la tarea retirada no se ha podido quitar del reloj"
+                            "el mango de la tarea retirada no se ha podido quitar del reloj: se \
+                             reintentará en la siguiente reconciliación"
                         );
                     }
                 }
@@ -160,7 +176,7 @@ impl Planificador {
                 );
 
                 // Un solo sentido: la puerta se cierra y no se reabre.
-                estado.abierta = false;
+                self.0.cerrar_la_puerta();
             }
         }
     }
