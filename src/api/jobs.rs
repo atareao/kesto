@@ -269,6 +269,26 @@ fn retencion_que_conserva(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppError> 
     Ok(())
 }
 
+/// El `400` de una expresión cron que el reloj no sabría leer.
+///
+/// La gramática la valida el módulo del planificador —con el **mismo** analizador que después la
+/// evaluará—, y no este recurso: si el borde validara por su cuenta, habría dos dueños de la
+/// gramática y el día que uno cambiara la validación aceptaría lo que el reloj no sabe leer. Aquí
+/// solo se traduce su rechazo a un `400` que **nombra el campo** del formulario que hay que
+/// corregir, junto al motivo del rechazo.
+///
+/// Se comprueba **antes de escribir**, y la usan las dos rutas que escriben una tarea, el alta y la
+/// edición: una petición rechazada no puede dejar fila.
+fn cron_que_el_reloj_sepa_leer(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppError> {
+    crate::scheduler::validar(&cuerpo.cron_expression).map_err(|error| {
+        AppError::InvalidInput(format!(
+            "el campo `cron_expression` no es una expresión cron válida: {error}"
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// Valida el cuerpo y lo convierte en el alta de la capa de acceso.
 ///
 /// La retención se comprueba **antes de tocar la base**: un cuerpo que no puede ser válido por sí
@@ -281,12 +301,15 @@ fn retencion_que_conserva(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppError> 
 ///
 /// La usan **las dos** rutas que escriben una tarea, el alta y la edición: el requisito de la
 /// retención es del par, y con la comprobación aquí no hay forma de añadir una tercera puerta de
-/// escritura que se olvide de ella.
+/// escritura que se olvide de ella. La expresión cron se comprueba a su lado, también antes de
+/// tocar la base: su gramática la dicta el planificador —el mismo analizador que la evaluará— y el
+/// rechazo tiene que llegar antes de que quede una fila escrita.
 async fn alta_desde(
     estado: &AppState,
     cuerpo: &AltaDeTareaDelCable,
 ) -> Result<AltaDeTarea, AppError> {
     retencion_que_conserva(cuerpo)?;
+    cron_que_el_reloj_sepa_leer(cuerpo)?;
 
     let target_id = target_resuelto(estado, &cuerpo.target_id).await?;
     let repository_id = repositorio_resuelto(estado, &cuerpo.repository_id).await?;
@@ -1617,6 +1640,245 @@ mod tests {
             guardadas,
             (0, 4, 6),
             "la fila no guardó la retención que informó la petición: {guardadas:?}"
+        );
+    }
+
+    //
+    // Cubre `api-resources`, requisito «El alta y la edición de una tarea validan su expresión
+    // cron». El porqué del reparto no es de arquitectura: la validación es **la misma** que evalúa
+    // el planificador —un analizador, una gramática, un solo sitio—, porque si el borde HTTP
+    // tuviera su propia idea de qué expresión vale, lo que la API aceptara y lo que el reloj
+    // entendiera podrían discrepar, y discreparían justo en los bordes (los segundos, los días de
+    // la semana), que es donde aparecen las expresiones raras. Y valida **antes de escribir**,
+    // porque una fila inválida que se escribe y luego se rechaza es peor que un rechazo: queda en
+    // la base, el panel la lista como programada y la reconciliación del planificador la salta en
+    // cada pasada. Las dos rutas que escriben —el alta y la edición— comparten el camino, así que
+    // las dos quedan cubiertas por el mismo sitio.
+
+    /// Una expresión que el analizador no entiende, para las tres pruebas del rechazo.
+    ///
+    /// No es una errata de seis campos —eso sería otro caso—: es texto que no es una expresión cron
+    /// en absoluto, así que su rechazo no depende de la forma del calendario que se acepte.
+    const EXPRESION_QUE_NO_PARSEA: &str = "cada lunes a las tres";
+
+    /// 1.6 — El alta con una expresión de cinco campos se escribe.
+    ///
+    /// Cubre `api-resources`, escenario «El alta con una expresión de cinco campos se escribe». Es
+    /// el guardarraíl de la validación nueva: la forma que la base ya guarda —`0 3 * * *`— tiene que
+    /// seguir entrando, y entra **de verdad**, con la fila escrita y no solo con el `201`. Una
+    /// validación que rechazara lo que ya era válido rompería las tareas existentes al editarlas, y
+    /// es exactamente lo que esta prueba impediría pasar inadvertido.
+    #[tokio::test]
+    async fn el_alta_con_una_expresion_de_cinco_campos_se_escribe() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-cron-valido").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-cron-valido").await;
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/jobs",
+            &cuerpo_de_tarea(&target, &repositorio),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "una expresión de cinco campos es válida y tiene que darse de alta: contestó {status} \
+             con {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let guardada: String =
+            sqlx::query_scalar("SELECT cron_expression FROM backup_jobs WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila de la tarea aceptada tiene que estar en la base");
+
+        assert_eq!(
+            guardada, "0 3 * * *",
+            "la fila no guardó la expresión que informó la petición: {guardada:?}"
+        );
+    }
+
+    /// 1.6 — El alta con una expresión inválida contesta `400` y no deja fila.
+    ///
+    /// Cubre `api-resources`, escenario «El alta con una expresión inválida contesta 400 y no deja
+    /// fila». El rechazo llega **antes de escribir**: lo que se afirma no es solo el `400`, es que
+    /// la tabla no tiene ninguna fila nueva —una petición rechazada que escribiera primero dejaría
+    /// una tarea que nadie programó—. El motivo tiene que decir por qué la expresión no vale: un
+    /// `400` mudo no le sirve de nada a quien tiene que corregir la casilla.
+    #[tokio::test]
+    async fn el_alta_con_una_expresion_invalida_contesta_400_y_no_deja_fila() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-cron-invalido").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-cron-invalido").await;
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_tarea(&target, &repositorio);
+        cuerpo_de_la_peticion["cron_expression"] = serde_json::json!(EXPRESION_QUE_NO_PARSEA);
+
+        let respuesta = post_json(router, "/api/v1/jobs", &cuerpo_de_la_peticion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "una expresión que el analizador no entiende es un formulario mal rellenado, no un \
+             servidor roto: contestó {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            !mensaje.trim().is_empty(),
+            "el motivo del rechazo tiene que decir por qué la expresión no vale, y llegó vacío"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla de tareas tiene que poder contarse");
+
+        assert_eq!(
+            filas, 0,
+            "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
+        );
+    }
+
+    /// 1.6 — La edición con una expresión inválida deja la fila como estaba.
+    ///
+    /// Cubre `api-resources`, escenario «La edición con una expresión inválida deja la fila como
+    /// estaba». La edición es cómo se arregla una expresión mala y también cómo se podría empeorar
+    /// sin límite, así que la validación es del par de rutas y no solo del alta. Lo que se comprueba
+    /// es la fila **en la base** y no la respuesta: un `400` que hubiera escrito antes de rechazar
+    /// contestaría lo mismo y dejaría la tarea con la expresión que el analizador no entiende.
+    #[tokio::test]
+    async fn la_edicion_con_una_expresion_invalida_deja_la_fila_como_estaba() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-cron-editado").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-cron-editado").await;
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea(&target, &repositorio),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "la tarea tiene que darse de alta antes de poder editarla"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let mut edicion = cuerpo_de_tarea(&target, &repositorio);
+        edicion["cron_expression"] = serde_json::json!(EXPRESION_QUE_NO_PARSEA);
+
+        let respuesta = put_json(router, &format!("/api/v1/jobs/{id}"), &edicion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "la edición que deja una expresión que el analizador no entiende tiene que rechazarse: \
+             contestó {status} con {cuerpo}"
+        );
+
+        let guardada: String =
+            sqlx::query_scalar("SELECT cron_expression FROM backup_jobs WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila de la tarea tiene que seguir en la base");
+
+        assert_eq!(
+            guardada, "0 3 * * *",
+            "el rechazo de la edición dejó la fila con la expresión nueva: {guardada:?}"
+        );
+    }
+
+    /// 1.6 — El motivo del `400` nombra el campo `cron_expression`.
+    ///
+    /// Cubre `api-resources`, escenario «El motivo nombra el campo». Es la regla de la casa para
+    /// todos los `400` de la superficie, y aquí es lo que hace falta: la regla de no repetir el
+    /// valor existe por las credenciales, y quien envió la expresión la tiene delante, así que lo
+    /// que le sirve es saber qué casilla del formulario corregir. Sin el nombre del campo, el motivo
+    /// del analizador podría hablar de «la expresión» sin decir a quién se refiere en un cuerpo de
+    /// siete campos.
+    #[tokio::test]
+    async fn el_motivo_del_rechazo_nombra_el_campo_cron_expression() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-del-campo").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-del-campo").await;
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_tarea(&target, &repositorio);
+        cuerpo_de_la_peticion["cron_expression"] = serde_json::json!(EXPRESION_QUE_NO_PARSEA);
+
+        let respuesta = post_json(router, "/api/v1/jobs", &cuerpo_de_la_peticion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "una expresión que no parsea tiene que rechazarse antes de comprobar el nombre del \
+             campo: contestó {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            mensaje.contains("cron_expression"),
+            "el motivo tiene que nombrar el campo del formulario que hay que corregir, y el \
+             mensaje fue {mensaje:?}"
         );
     }
 }
