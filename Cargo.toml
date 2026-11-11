@@ -1,6 +1,6 @@
 [package]
 name = "kesto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Lightweight backup orchestrator in a container: dumps MariaDB/PostgreSQL and host directories into rustic repositories on S3, with a live React panel."
 license = "MIT"
@@ -15,6 +15,261 @@ categories = ["command-line-utilities", "database"]
 publish = false
 
 # The published crate carries the Rust sources only.
-exclude = ["docs", "plans", "ui", ".github", "AGENTS.md", "GIT_FLOW.md", "cliff.toml", ".dockerignore", ".vampus.yml", "Dockerfile", ".justfile"]
+exclude = ["docs", "plans", "ui", ".github", "AGENTS.md", "GIT_FLOW.md", "cliff.toml", ".dockerignore", ".vampus.yml", "Dockerfile", ".justfile", "openspec"]
 
 [dependencies]
+axum = { version = "0.8.9", features = ["macros", "json", "tokio"] }
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+zeroize = "1.9.1"
+
+# OIDC flow (auth-capability), written by hand with reqwest + jsonwebtoken.
+# Every version below is the one already present in this machine's Cargo cache
+# (~/.cargo/registry): this repository must build offline, so versions are
+# resolved against the cache, not picked by reputation.
+#
+# `jsonwebtoken`: `default-features = false` leaves the crate with no crypto
+# backend of its own. On the 11.x line the backend sits behind a `CryptoProvider`
+# chosen by feature, and `aws_lc_rs` is an optional feature, not the default --
+# the crate declares `default = ["use_pem"]`. `rust_crypto` selects the pure-Rust
+# RustCrypto backend and keeps `aws-lc-rs` out of the tree (verified: zero
+# occurrences in `cargo tree`); `use_pem` is what reads the provider's JWKS keys.
+# Both features exist in the cached 11.1.0.
+#
+# NOT used, on purpose: `openidconnect` and `tower-sessions`. Neither is in the
+# local Cargo cache, and a dependency that forces a network fetch would break the
+# premise that this repository compiles with no connection. Check this note
+# before reaching for them.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+# `rustls-tls` (not the TLS default) keeps native-tls/OpenSSL out of the build and
+# is what the spec asks for; `json` is needed for discovery, the code exchange and
+# the JWKS. Note: reqwest 0.13.x renamed `rustls-tls` away and defaults to a
+# `rustls` feature that pulls `aws-lc-rs`, so the spec's feature name pins 0.12.x.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+axum-extra = { version = "0.10.3", features = ["cookie"] }
+rand = "0.8.8"
+urlencoding = "2.1.3"
+
+# Persistence (db-schema): SQLite through sqlx, plus the RustCrypto stack that
+# seals the three secret columns at rest. Same rule as above -- every version is
+# one already present in this machine's Cargo cache, because this repository must
+# build with no connection. Read these notes before touching a version.
+#
+# `sqlx` 0.8.6, NOT 0.9.0. Both resolve offline, so the cache is not the
+# discriminator: the tree is. In 0.9.0 the `sqlite` feature stops being an alias
+# of "bundled" and expands to `sqlite-bundled + sqlite-deserialize +
+# sqlite-load-extension + sqlite-unlock-notify`, which opens `libsqlite3-sys` to
+# `>=0.30.1, <0.38.0` (resolving to 0.37.0) and raises `flume` to 0.12.0; it also
+# demands MSRV 1.94.0. 0.8.6 requires `^0.30.1` and its `sqlite` is bundled and
+# nothing else. None of that is needed for an embedded database with WAL.
+#
+# `default-features = false` is NOT cosmetic: sqlx's default is
+# ["any", "macros", "migrate", "json"], and `any` pulls in the MySQL and
+# PostgreSQL drivers this project does not use. The six features are the minimum:
+# `runtime-tokio` because the runtime is Tokio, `sqlite` because it is the only
+# backend, `migrate` for `sqlx::migrate!()`, `macros` because the macro and
+# `FromRow` live there, `time` because the `Encode`/`Decode` impls for `time` sit
+# behind it -- in 0.8.6 `time` itself is an optional dependency of `sqlx-core` and
+# `sqlx-sqlite`, so the feature is what brings the impls in -- and `uuid` for the
+# same reason.
+#
+# `aes-gcm` 0.10 + `hkdf` 0.12 + `sha2` 0.10, NOT the 0.11/0.13/0.11 generation.
+# This is the generation already in the tree: `jsonwebtoken` with `rust_crypto`
+# brings `sha2` 0.10.9 and `hkdf` 0.12.4. The newer combination does resolve, but
+# it forks NINE crates in the active tree (`digest`, `crypto-common`,
+# `block-buffer`, `hmac`, `rand_core`, `cpufeatures`, `const-oid`...) because the
+# new generation uses `hybrid-array` where the old one uses `generic-array`. With
+# these there is a single `digest`, a single `crypto-common` and a single `sha2`.
+#
+# `time`, NOT `chrono`: `time` is already in the active tree -- `cookie` (through
+# axum-extra) and `simple_asn1` (through jsonwebtoken) both pull it -- so `chrono`
+# would be a second date family for nothing. The `time` feature below is what
+# turns the `Encode`/`Decode` impls on: in 0.8.6 `time` is an OPTIONAL dependency
+# of both `sqlx-core` and `sqlx-sqlite`, so without that feature the date columns
+# do not map.
+#
+# `uuid` with `v4`, to generate identifiers in the access layer. WARNING: `sqlx`
+# writes a `Uuid` as a 16-byte BLOB and SRS section 3 says `id TEXT`, so the
+# access layer stores `uuid::fmt::Hyphenated`. Do not add any feature that
+# changes that behaviour.
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "time", "uuid"] }
+aes-gcm = "0.10.3"
+hkdf = "0.12.4"
+sha2 = "0.10.9"
+uuid = { version = "1.29.0", features = ["v4"] }
+time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "serde"] }
+# Promoted from `[dev-dependencies]` by db-schema: the tests used it for the JWK
+# `n`/`e` parameters, and the encryption envelope (`v1:<nonce>:<ciphertext>`)
+# encodes with it in production. A crate in `[dependencies]` is already available
+# to tests, so it is declared here only, not in both sections. Pinned to 0.22
+# because ^0.22 is the only major already in the tree (jsonwebtoken and wiremock
+# both require ^0.22); 0.21 would duplicate it. The 0.23.1 that `hyper-util`
+# drags in is a second major and unavoidable -- it predates this change.
+base64 = "0.22.1"
+
+# Backup engine (backup-engine): the Docker API, the rustic backup library and
+# the stream plumbing between them. Unlike every block above, this one was NOT
+# resolved against an offline cache -- it is the first change in this repository
+# that needs the network to resolve, and the resulting `Cargo.lock` is part of
+# the deliverable, because CI runs `cargo test --locked`.
+#
+# `bollard` is the Docker API, and that is the whole reason it is here: the
+# extraction step in SRS section 4 runs the dump command with `docker exec` on
+# the database container, so the engine has to talk to the daemon rather than
+# shell out to a CLI. WHERE the daemon lives is deliberately not fixed in this
+# file nor in the code: this development machine has no Docker at all -- it runs
+# Podman, whose API is Docker-compatible, on
+# unix:///run/user/1000/podman/podman.sock -- so the endpoint is taken from
+# `DOCKER_HOST`, the conventional variable the library itself reads. Production
+# keeps the compose mount of /var/run/docker.sock, which is that variable's
+# default when it is unset.
+#
+# `rustic_core` 0.13.0 + `rustic_backend` 0.7.0 are the backup library, split in
+# two crates: the repository format and the backend transports. The pair is
+# declared at 0.x because that is how upstream ships it, and the important part
+# is that the two lines must not drift apart: `rustic_backend` declares
+# `rustic_core = "0"`, so any 0.x of `rustic_core` satisfies it and the resolver
+# unifies both on the SAME crate. Verified after resolving: one single
+# `rustic_core` in `Cargo.lock`. Pinning `rustic_core` to an exact minor is what
+# keeps a future `rustic_backend` bump from silently dragging a second copy in.
+#
+# `rustic_backend` with `default-features = false, features = ["opendal"]`: its
+# defaults are ["opendal", "rest", "rclone"], and this project only ever writes
+# to S3, which opendal is. `rest` and `rclone` are two transports -- an HTTP
+# REST server and a subprocess pipe to the rclone binary -- that Kesto never
+# speaks, so leaving them on would compile code that can never run and, in the
+# rclone case, imply an external binary the runtime image does not ship.
+#
+# `futures-util` is a PROMOTION, not a new crate in the tree: it is already
+# present as a transitive dependency (`futures-util` 0.3.34 sits in `Cargo.lock`
+# today, pulled in by axum/tower machinery). The version is pinned to the one
+# already there precisely so that promoting it does not fork it. The promotion
+# is needed because `bollard`'s log and progress endpoints return a `Stream`,
+# and draining that stream requires `StreamExt::next()` -- a trait method, so a
+# transitive dependency is not enough: the trait has to be in scope by name.
+# Same reasoning as the `base64` promotion above, and the same consequence: a
+# crate in `[dependencies]` is already available to tests, so it is not repeated
+# under `[dev-dependencies]`.
+#
+# MSRV: both libraries ask for 1.91 and this project is on `edition = "2024"`
+# (>= 1.85) with a toolchain of 1.97, so the floor is met with room to spare.
+#
+# NOT used, on purpose: `opendal` and `jiff`. `opendal` arrives through
+# `rustic_backend`'s `opendal` feature, and `jiff` is re-exported by
+# `rustic_core` -- the engine takes the clock from `rustic_core::jiff::Zoned::now()`
+# -- so neither needs a line here. `time` and `chrono` are NOT declared either:
+# `time` is already declared above and stays a single 0.3.55. Note the tree did
+# gain a `chrono` 0.4.45 that nothing here asked for -- it hangs off
+# `opendal-service-ftp` -> `suppaftp`, i.e. a transport Kesto never uses -- so
+# it is a passenger, not a decision. It does NOT make `time` and `chrono`
+# collide: no crate here feeds one into the other.
+#
+# MEASURED AFTER RESOLVING -- the RustCrypto fork did reopen, and this is the
+# data, not a suspicion. `rustic_core` 0.13.0 pulls `scrypt` 0.12.0 ->
+# `pbkdf2` 0.13 / `salsa20` 0.11 / `cipher` 0.5, and `opendal` 0.58.2 pulls
+# `reqsign-core` / `reqsign-aws-v4` / `opendal-service-swift`; both need the
+# `hybrid-array` generation, where the `aes-gcm` 0.10 / `hkdf` 0.12 / `sha2` 0.10
+# block above needs the `generic-array` one. The result, side by side in
+# `Cargo.lock`: `digest` 0.10.7 + 0.11.3, `crypto-common` 0.1.7 + 0.2.2,
+# `block-buffer` 0.10.4 + 0.12.1, `hmac` 0.12.1 + 0.13.0, `sha2` 0.10.9 + 0.11.1,
+# `sha1` 0.10.7 + 0.11.0, `md-5` 0.10.6 + 0.11.0, `pbkdf2` 0.12.2 + 0.13.0,
+# `scrypt` 0.11.0 + 0.12.0, `salsa20` 0.10.2 + 0.11.0, `cipher` 0.4.4 + 0.5.2,
+# `inout` 0.1.4 + 0.2.5, `const-oid` 0.9.6 + 0.10.2, `cpufeatures` 0.2.17 + 0.3.1,
+# and `rand_core` 0.6.4 + 0.9.5 + 0.10.1, all three now present. `generic-array`
+# 0.14.7 and `hybrid-array` 0.4.15 each stay single -- the fork is the two
+# generations coexisting, not a duplicate within one. This is RECORDED, not
+# fixed: no existing version line was changed to square the tree, because the
+# deduplication decision belongs to whoever owns the engine change. Read this
+# before touching a version in either block.
+bollard = "0.18.1"
+rustic_core = "0.13.0"
+rustic_backend = { version = "0.7.0", default-features = false, features = ["opendal"] }
+futures-util = "0.3.34"
+
+# Scheduler (scheduler): the clock that turns `backup_jobs.cron_expression` into
+# a job that actually fires. Like the block above, this one is NOT resolved
+# against an offline cache -- and here it is measured, not assumed: neither
+# `tokio-cron-scheduler` nor `croner` is present in this machine's Cargo cache
+# (~/.cargo/registry), so `Cargo.lock` was resolved WITH the network ONCE and is
+# part of the deliverable, because CI runs `cargo test --locked`.
+#
+# `tokio-cron-scheduler` 0.15.1 is the crate SRS section 2 names ("Task
+# Scheduler (tokio-cron)") and the reason the `src/scheduler` module of section 7
+# exists. Only its in-memory API is used -- `JobScheduler::new()` -> `add(Job)`
+# -> `start()` -> `remove(&Uuid)` -> `shutdown()`, plus the `JobToRunAsync`
+# variant, because firing calls the engine's queue and that is async. Its
+# persistence API (`JobBuilder`, the `JobCode` trait, `MetaDataStorage` and
+# `NotificationStore`) is NOT used, and the reason is not effort: `backup_jobs`
+# is already the store, and mirroring it into the library's own would create two
+# truths that can drift. The line carries its defaults and nothing else --
+# `default` is `[]` in 0.15.1 -- so the `nats_storage` / `postgres_storage`
+# backends, the `signal` and `log` features and the optional `english-to-cron`
+# all stay off.
+#
+# `croner` 3 is declared as a DIRECT dependency on purpose, and the major is the
+# whole point. `tokio-cron-scheduler` 0.15.1 depends on `croner ^3.0.0` -- it
+# does NOT use the `cron` crate -- so declaring the SAME major is what makes the
+# resolver unify both requirements into ONE single copy; declaring any other
+# major would ship two cron grammars, and validating with a different parser than
+# the one that evaluates the string would accept expressions the clock cannot
+# read, which is the exact failure the validation exists to prevent. Hiding
+# behind a re-export of the library would tie the grammar to a third party's
+# packaging detail. Same promotion play as `base64` and `futures-util` above,
+# and the same consequence: a crate in `[dependencies]` is already available to
+# tests, so it is not repeated under `[dev-dependencies]`.
+#
+# DECLARED COST, measured and not minimised: `tokio-cron-scheduler` 0.15.1
+# carries `chrono` 0.4 and `chrono-tz` as NON-optional dependencies, so the tree
+# gains a second date family next to the `time` this project chose on purpose
+# (see the db-schema block above). The scheduler module never converts a date
+# across the two families: if it needs one from the library it keeps it inside
+# the module and never crosses it with the `time` values of section 3. The
+# `chrono` already in the tree before this change was a passenger -- a single
+# path, `suppaftp` -> `opendal-service-ftp` -> `opendal` -> `rustic_backend`, a
+# transport Kesto never uses -- and not a decision; `chrono-tz` is new with this
+# change, and it arrives only through `tokio-cron-scheduler` (in `croner` 3 it is
+# a dev-dependency, so it does not reach a downstream tree).
+#
+# MSRV: neither crate declares a `rust-version` -- checked in the registry index
+# and on crates.io, both come back empty -- so neither raises the floor. This
+# project is on `edition = "2024"` (>= 1.85) with a toolchain of 1.97.
+tokio-cron-scheduler = "0.15.1"
+croner = "3"
+# `chrono` is declared DIRECTLY for one reason and one only: the single crossing point in
+# `src/scheduler/validacion.rs` (`Agenda::proxima_tras`). Both `croner` and
+# `tokio-cron-scheduler` measure the calendar in `chrono` -- it is already their non-optional
+# dependency, and already in the tree (see the note above) -- while the rest of Kesto and SRS
+# section 3 measure dates in `time`. The public surface of the scheduler keeps `time`
+# (`Agenda::proxima_tras` receives and returns `time::OffsetDateTime`), so the `time` -> `chrono`
+# -> `croner` -> `time` conversion happens INSIDE the module, at that one documented point, and
+# not at every call site. Declaring `chrono` a direct dependency -- instead of reaching for it
+# through a re-export that does not exist: `croner` re-exports only `CronIterator` and hides its
+# `chrono` -- is what lets that crossing name `chrono::DateTime` without depending on a third
+# party's bundling. This AMENDS the earlier "`time`, NOT `chrono`" note in the db-schema block:
+# that note was written before the scheduler existed and is still true of the persistence layer;
+# `chrono` is here for the clock's grammar, not to measure any stored date. The version resolves
+# against the `chrono` 0.4 already in the tree and in this machine's cache, so no new crate is
+# fetched.
+chrono = "0.4"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1"
+# `log` entra **solo** para las pruebas, y por un motivo concreto: el puente `log` → `tracing`
+# que la prueba 1.37 («la contraseña no sale en el registro») tiene que montar por su cuenta,
+# porque el arnés de captura no lo monta a propósito —ver `src/test_support.rs`—. En producción
+# se usa el puente de `tracing-subscriber`, así que este crate no necesita `log` en
+# `[dependencies]`. La versión es la que ya está en el árbol (la trae `bollard`), así que
+# promoverla no toca `Cargo.lock`.
+log = "0.4.34"
+# Local fake OIDC provider: it serves `authorization_endpoint`, `token_endpoint`
+# and `jwks_uri`, and no test ever reaches the internet.
+wiremock = "0.6.5"
+# A real RSA keypair, so the ID token is signed RS256 for real (never stubbed).
+# `pem` (already part of rsa's defaults) is what lets the public key be exported
+# as a JWK.
+rsa = { version = "0.9.10", features = ["pem"] }
