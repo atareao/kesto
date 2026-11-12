@@ -1,4 +1,8 @@
 ---
+
+> **Estado: COMPLETED** — cerrado el **2026-11-12**. Issue [#17](https://github.com/atareao/kesto/issues/17).
+> Verificado: imagen de **200 MB**, contenedor `(healthy)`, `/api/v1/health` → `200 auth_mode:"disabled"`;
+> backend `just check` **425 + 5** pruebas, panel **121**. Doc: `docs/FEATURE-008-despliegue-produccion.md`.
 # Plan 008 — Despliegue en producción: Dockerfile y compose (`despliegue-produccion`)
 
 - **Issue:** #17
