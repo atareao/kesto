@@ -3,6 +3,8 @@ import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import App from './App'
+import { instalarEventSourceFalso } from './services/eventosDePrueba'
+import { ProveedorDeEventos } from './services/events'
 
 /**
  * Pruebas de las rutas del panel (§3.1/§3.2): cada entrada del menú abre su
@@ -23,13 +25,23 @@ function montar(entrada = '/') {
   })
   return render(
     <QueryClientProvider client={cliente}>
-      <MemoryRouter initialEntries={[entrada]}>
-        <Ubicacion />
-        <App />
-      </MemoryRouter>
+      <ProveedorDeEventos>
+        <MemoryRouter initialEntries={[entrada]}>
+          <Ubicacion />
+          <App />
+        </MemoryRouter>
+      </ProveedorDeEventos>
     </QueryClientProvider>,
   )
 }
+
+beforeEach(() => {
+  instalarEventSourceFalso()
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 const ENTRADAS: ReadonlyArray<{ etiqueta: string; ruta: string }> = [
   { etiqueta: 'Dashboard', ruta: '/' },

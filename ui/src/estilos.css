@@ -63,6 +63,25 @@ main:focus {
   min-height: 200px;
 }
 
+/*
+ * Barra indeterminada: Ant Design no tiene un modo «sin porcentaje» —su
+ * `Progress` cae a 0—, así que se anima el relleno de un `Progress` al 100 %.
+ * Es lo que se pinta cuando el motor publica `percentage: null`.
+ */
+.progreso-indeterminado .ant-progress-bg {
+  width: 35% !important;
+  animation: progreso-indeterminado 1.4s ease-in-out infinite;
+}
+
+@keyframes progreso-indeterminado {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
 /* Texto solo para lectores de pantalla. */
 .sr-only {
   position: absolute;

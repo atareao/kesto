@@ -1,11 +1,33 @@
-import { EnConstruccion } from '../components/EnConstruccion/EnConstruccion'
+import { Typography } from 'antd'
+import { ProgresoEnVivo } from '../components/ProgresoEnVivo/ProgresoEnVivo'
+import { TablaDeTareasEnCurso } from '../components/TablaDeTareasEnCurso/TablaDeTareasEnCurso'
+import { TarjetasDeResumen } from '../components/TarjetasDeResumen/TarjetasDeResumen'
 
-/** Pantalla de Dashboard (Fase 4): tarjetas de resumen y avance en vivo. */
+/**
+ * Dashboard (§6): el resumen del sistema y el avance de la copia en curso.
+ *
+ * Las tarjetas y la tabla se alimentan de la API; el `Progress` se alimenta del
+ * stream SSE, que es la única fuente que sabe de una copia que está pasando
+ * ahora mismo.
+ */
 export default function Dashboard() {
   return (
-    <EnConstruccion
-      titulo="Dashboard"
-      descripcion="Aquí irán las tarjetas de repositorios, tareas activas y espacio consumido, y el avance de la copia en curso."
-    />
+    <section aria-labelledby="titulo-de-la-pantalla">
+      <Typography.Title id="titulo-de-la-pantalla" level={1} style={{ marginTop: 0 }}>
+        Dashboard
+      </Typography.Title>
+
+      <TarjetasDeResumen />
+
+      <Typography.Title level={2} style={{ marginTop: 24 }}>
+        Copia en curso
+      </Typography.Title>
+      <ProgresoEnVivo />
+
+      <Typography.Title level={2} style={{ marginTop: 24 }}>
+        Tareas activas
+      </Typography.Title>
+      <TablaDeTareasEnCurso />
+    </section>
   )
 }
