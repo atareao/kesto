@@ -1,4 +1,4 @@
-import { formatearBytes, formatearFecha, formatearUuid } from './format'
+import { formatearBytes, formatearDuracion, formatearFecha, formatearUuid } from './format'
 
 describe('formatearFecha', () => {
   it('pasa un RFC3339 a hora local con la zona visible', () => {
@@ -37,6 +37,23 @@ describe('formatearFecha', () => {
     expect(formatearFecha('no-es-una-fecha')).toBe('—')
     expect(formatearFecha(null)).toBe('—')
     expect(formatearFecha(undefined)).toBe('—')
+  })
+})
+
+describe('formatearDuracion', () => {
+  it('calcula la duración entre dos instantes', () => {
+    expect(formatearDuracion('2026-01-02T03:00:00Z', '2026-01-02T03:00:45Z')).toBe('45 s')
+    expect(formatearDuracion('2026-01-02T03:00:00Z', '2026-01-02T03:05:00Z')).toBe('5 min')
+    expect(formatearDuracion('2026-01-02T03:00:00Z', '2026-01-02T04:30:00Z')).toBe('1 h 30 min')
+  })
+
+  it('dice «en curso» mientras no hay fin', () => {
+    expect(formatearDuracion('2026-01-02T03:00:00Z', null)).toBe('en curso')
+  })
+
+  it('no inventa una duración con valores ilegibles', () => {
+    expect(formatearDuracion('no-es-una-fecha', '2026-01-02T03:00:00Z')).toBe('—')
+    expect(formatearDuracion('2026-01-02T03:05:00Z', '2026-01-02T03:00:00Z')).toBe('—')
   })
 })
 

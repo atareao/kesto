@@ -1,4 +1,4 @@
-import { Alert, Badge, Empty, Table, Typography } from 'antd'
+import { Alert, Badge, Button, Empty, Table, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { useEjecuciones } from '../../hooks/useEjecuciones'
 import { useTareas } from '../../hooks/useTareas'
@@ -109,6 +109,11 @@ export function TablaDeTareasEnCurso() {
         showIcon
         message="No se pudieron cargar las tareas"
         description={mensajeDeError(tareas.error)}
+        action={
+          <Button size="small" onClick={() => void tareas.refetch()}>
+            Reintentar
+          </Button>
+        }
       />
     )
   }

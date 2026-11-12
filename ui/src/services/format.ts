@@ -58,6 +58,36 @@ export function formatearUuid(id: string): string {
   ].join('-')
 }
 
+/**
+ * Duración legible entre dos instantes RFC3339. Sin `fin` la ejecución sigue
+ * viva y se dice «en curso»; con valores ilegibles o un fin anterior al inicio,
+ * se pinta `—` en vez de una cifra inventada.
+ */
+export function formatearDuracion(
+  inicio: string | null | undefined,
+  fin: string | null | undefined,
+): string {
+  if (fin === null || fin === undefined || fin === '') return 'en curso'
+  if (inicio === null || inicio === undefined || inicio === '') return SIN_VALOR
+
+  const desde = Date.parse(inicio)
+  const hasta = Date.parse(fin)
+  if (Number.isNaN(desde) || Number.isNaN(hasta) || hasta < desde) return SIN_VALOR
+
+  const segundosTotales = Math.round((hasta - desde) / 1000)
+  if (segundosTotales < 60) return `${segundosTotales} s`
+
+  const minutosTotales = Math.floor(segundosTotales / 60)
+  if (minutosTotales < 60) {
+    const segundos = segundosTotales % 60
+    return segundos === 0 ? `${minutosTotales} min` : `${minutosTotales} min ${segundos} s`
+  }
+
+  const horas = Math.floor(minutosTotales / 60)
+  const minutos = minutosTotales % 60
+  return minutos === 0 ? `${horas} h` : `${horas} h ${minutos} min`
+}
+
 // Binarias, como el `KiB` del sistema de ficheros: el panel habla de lo que
 // ocupa una copia, no de lo que dice el fabricante de un disco.
 const UNIDADES = ['B', 'KiB', 'MiB', 'GiB', 'TiB'] as const

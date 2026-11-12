@@ -183,6 +183,11 @@ export default function Tareas() {
           showIcon
           message="No se pudieron cargar las tareas"
           description={mensajeDeError(tareas.error)}
+          action={
+            <Button size="small" onClick={() => void tareas.refetch()}>
+              Reintentar
+            </Button>
+          }
           style={{ marginBottom: 16 }}
         />
       )}

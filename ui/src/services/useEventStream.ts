@@ -37,11 +37,23 @@ export const NOMBRE_DEL_EVENTO = 'execution_progress'
 /** Estado de la conexión, para pintar un aviso si el stream no está vivo. */
 export type EstadoDeLaConexion = 'conectando' | 'abierto' | 'reconectando' | 'detenido'
 
+/**
+ * Líneas que guarda la consola por ejecución. Es un tope, no una promesa: una
+ * copia larga emite muchos eventos y la consola no puede crecer sin fin en
+ * memoria. Se conservan **las últimas**.
+ */
+export const LIMITE_DE_LINEAS = 200
+
 /** Lo que ve un consumidor: la conexión y el último progreso de cada ejecución. */
 export interface ContextoDeEventos {
   estado: EstadoDeLaConexion
   /** Último evento conocido de cada ejecución, indexado por `execution_id`. */
   ejecuciones: ReadonlyMap<string, EventoDeEjecucion>
+  /**
+   * Eventos recibidos de cada ejecución, indexado por `execution_id`, con un
+   * máximo de `LIMITE_DE_LINEAS` y en orden de llegada. Alimenta la consola.
+   */
+  historial: ReadonlyMap<string, readonly EventoDeEjecucion[]>
 }
 
 /** El contexto y las dos operaciones con las que el proveedor cuenta consumidores. */
@@ -73,8 +85,20 @@ function useContextoDelStream(): ValorDelStream {
  * ejecución, indexado por `execution_id`.
  */
 export function useEventStream(): ContextoDeEventos {
-  const { estado, ejecuciones } = useContextoDelStream()
-  return { estado, ejecuciones }
+  const { estado, ejecuciones, historial } = useContextoDelStream()
+  return { estado, ejecuciones, historial }
+}
+
+/**
+ * Las líneas de la consola de **una** ejecución, en orden de llegada y con el
+ * tope de `LIMITE_DE_LINEAS`. Los eventos de otras ejecuciones no aparecen.
+ */
+export function useLineasDeEjecucion(executionId: string): {
+  lineas: readonly EventoDeEjecucion[]
+  estado: EstadoDeLaConexion
+} {
+  const { estado, historial } = useContextoDelStream()
+  return { estado, lineas: historial.get(executionId) ?? [] }
 }
 
 /**

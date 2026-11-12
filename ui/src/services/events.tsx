@@ -20,6 +20,7 @@ import {
   ContextoDelStream,
   ESPERA_BASE_MS,
   ESPERA_MAXIMA_MS,
+  LIMITE_DE_LINEAS,
   NOMBRE_DEL_EVENTO,
   RUTA_DE_EVENTOS,
 } from './useEventStream'
@@ -80,6 +81,9 @@ export function ProveedorDeEventos({
   const [ejecuciones, setEjecuciones] = useState<ReadonlyMap<string, EventoDeEjecucion>>(
     () => new Map(),
   )
+  const [historial, setHistorial] = useState<
+    ReadonlyMap<string, readonly EventoDeEjecucion[]>
+  >(() => new Map())
   const [hayConsumidores, setHayConsumidores] = useState(false)
   const consumidores = useRef(0)
 
@@ -126,6 +130,14 @@ export function ProveedorDeEventos({
           siguientes.set(progreso.execution_id, progreso)
           return siguientes
         })
+
+        setHistorial((previo) => {
+          const anteriores = previo.get(progreso.execution_id) ?? []
+          const siguientes = [...anteriores, progreso].slice(-LIMITE_DE_LINEAS)
+          const mapa = new Map(previo)
+          mapa.set(progreso.execution_id, siguientes)
+          return mapa
+        })
       })
 
       fuente.addEventListener('error', () => {
@@ -149,8 +161,8 @@ export function ProveedorDeEventos({
   }, [hayConsumidores, url])
 
   const valor = useMemo<ValorDelStream>(
-    () => ({ estado, ejecuciones, suscribir, desuscribir }),
-    [estado, ejecuciones, suscribir, desuscribir],
+    () => ({ estado, ejecuciones, historial, suscribir, desuscribir }),
+    [estado, ejecuciones, historial, suscribir, desuscribir],
   )
 
   return <ContextoDelStream.Provider value={valor}>{children}</ContextoDelStream.Provider>
