@@ -76,8 +76,17 @@ export function useSesion(): EstadoDeSesion {
     queryKey: CLAVE_DE_SESION,
     queryFn: obtenerSesion,
     enabled: modo === 'oidc',
-    // Un `401` sin reintentos: si no, el panel machacaría la ruta en bucle.
+    // Un `401` es una respuesta, no un fallo pasajero: ni se reintenta en la
+    // consulta…
     retry: false,
+    // …ni al montar otro observador. Sin esto, el desvío a `/sesion` desmonta la
+    // guarda y monta la pantalla, y la relectura volvía a pedir la sesión: dos
+    // peticiones donde la spec quiere una. Un `401` es definitivo hasta que algo
+    // lo invalide (`refrescar`, la salida o el `401` de `clienteDeConsultas`).
+    retryOnMount: false,
+    // Con sesión válida, tampoco se relee por el mero hecho de que otro
+    // componente la observe: los cambios de sesión son por evento, no por montaje.
+    refetchOnMount: false,
   })
 
   // Un 401 no es un error que enseñar: es «no hay sesión».
@@ -86,7 +95,9 @@ export function useSesion(): EstadoDeSesion {
 
   return {
     modo,
-    sesion: consultaDeSesion.data ?? null,
+    // Tras un `401` de la relectura, TanStack Query conserva el `data` anterior:
+    // `sinSesion` manda y la sesión se publica como ausente, no obsoleta.
+    sesion: esSinSesion ? null : (consultaDeSesion.data ?? null),
     cargando: salud.isPending || (modo === 'oidc' && consultaDeSesion.isPending),
     sinSesion: esSinSesion,
     error: esSinSesion ? null : error,

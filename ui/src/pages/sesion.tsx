@@ -14,7 +14,7 @@ import { useCerrarSesion, useSesion } from '../services/session'
  * - **Salir:** `POST /auth/logout`, se vacía la caché y se vuelve aquí.
  */
 export default function Sesion() {
-  const { modo, sesion, cargando, sinSesion, error, refrescar } = useSesion()
+  const { modo, sesion, cargando, error, refrescar } = useSesion()
   const cierre = useCerrarSesion()
   const navegar = useNavigate()
 
@@ -54,9 +54,9 @@ export default function Sesion() {
     )
   }
 
-  // Tras un `401` de la relectura, TanStack Query conserva el `data` anterior:
-  // `sinSesion` manda sobre un `sesion` obsoleto.
-  if (modo === 'oidc' && sesion !== null && !sinSesion) {
+  // `useSesion` publica `sesion: null` en cuanto la relectura da `401`, así que
+  // basta con que haya sesión para pintar la identidad.
+  if (modo === 'oidc' && sesion !== null) {
     return (
       <section aria-labelledby="titulo-de-la-pantalla">
         <Typography.Title id="titulo-de-la-pantalla" level={1} style={{ marginTop: 0 }}>

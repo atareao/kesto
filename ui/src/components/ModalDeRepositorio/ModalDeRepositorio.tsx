@@ -1,5 +1,7 @@
-import { useState } from 'react'
+import { useImperativeHandle, useRef, useState } from 'react'
+import type { Ref } from 'react'
 import { Alert, Form, Input, Modal, Space, Typography } from 'antd'
+import type { FormInstance } from 'antd'
 import { useActualizarRepositorio, useCrearRepositorio } from '../../hooks/useRepositorios'
 import type { AltaRepository, Repository } from '../../services/api/types'
 import { mensajeDeError } from '../../services/errores'
@@ -46,12 +48,117 @@ function valoresDe(repositorio: Repository): ValoresDeRepositorio {
   }
 }
 
+interface PropsDelFormularioDeRepositorio {
+  repositorio: Repository | null
+  formulario: Ref<FormInstance<ValoresDeRepositorio>>
+}
+
+/**
+ * El formulario, dueño de su propia instancia (`Form.useForm`).
+ *
+ * Se pinta con `key={repositorio?.id ?? 'nuevo'}`: cada entidad estrena
+ * instancia, así que `initialValues` se aplica de verdad y un secreto tecleado
+ * para una fila **nunca** viaja a otra.
+ */
+function FormularioDeRepositorio({
+  repositorio,
+  formulario,
+}: PropsDelFormularioDeRepositorio) {
+  const [form] = Form.useForm<ValoresDeRepositorio>()
+  useImperativeHandle(formulario, () => form, [form])
+
+  return (
+    <Form
+      form={form}
+      layout="vertical"
+      requiredMark
+      initialValues={repositorio === null ? VALORES_POR_DEFECTO : valoresDe(repositorio)}
+    >
+      <Form.Item
+        label="Nombre"
+        name="name"
+        rules={[{ required: true, message: 'Escribe un nombre.' }]}
+      >
+        <Input placeholder="p. ej. copias-s3" />
+      </Form.Item>
+
+      <Form.Item
+        label="Endpoint"
+        name="endpoint"
+        rules={[{ required: true, message: 'Escribe el endpoint.' }]}
+      >
+        <Input placeholder="https://s3.example.com" />
+      </Form.Item>
+
+      <Space size="middle" wrap align="start">
+        <Form.Item
+          label="Bucket"
+          name="bucket"
+          rules={[{ required: true, message: 'Escribe el bucket.' }]}
+        >
+          <Input placeholder="copias" />
+        </Form.Item>
+        <Form.Item
+          label="Región"
+          name="region"
+          rules={[{ required: true, message: 'Escribe la región.' }]}
+        >
+          <Input placeholder="eu-west-1" />
+        </Form.Item>
+      </Space>
+
+      <Form.Item
+        label="ID de la clave de acceso"
+        name="access_key_id"
+        rules={[{ required: true, message: 'Escribe el identificador de la clave.' }]}
+      >
+        <Input placeholder="AKIA…" />
+      </Form.Item>
+
+      <Form.Item
+        label="Clave secreta"
+        name="secret_access_key"
+        extra={
+          repositorio?.has_secret_access_key === true
+            ? 'Ya hay una clave secreta guardada; déjala vacía para conservarla.'
+            : undefined
+        }
+      >
+        <Input.Password autoComplete="new-password" />
+      </Form.Item>
+
+      <Form.Item
+        label="Passphrase"
+        name="passphrase"
+        extra={
+          repositorio?.has_passphrase === true
+            ? 'Ya hay una passphrase guardada; déjala vacía para conservarla.'
+            : undefined
+        }
+      >
+        <Input.Password autoComplete="new-password" />
+      </Form.Item>
+
+      {repositorio !== null &&
+        (repositorio.has_secret_access_key || repositorio.has_passphrase) && (
+          <Typography.Text type="secondary">
+            Los secretos guardados no se muestran: solo se indica que existen.
+          </Typography.Text>
+        )}
+    </Form>
+  )
+}
+
 /**
  * Alta y edición de un repositorio.
  *
  * `has_secret_access_key` y `has_passphrase` son lo único que una lectura dice
  * de los secretos: el valor no se pinta nunca. Al editar, un campo vacío se
  * omite del `PUT` para que el backend conserve el guardado.
+ *
+ * El formulario es un subcomponente con `key` por entidad (ver
+ * `FormularioDeRepositorio`): editar una fila no arrastra el estado de la
+ * anterior, ni el secreto tecleado para otro recurso.
  */
 export function ModalDeRepositorio({
   abierto,
@@ -59,7 +166,7 @@ export function ModalDeRepositorio({
   onCerrar,
   onGuardado,
 }: PropsDeModalDeRepositorio) {
-  const [form] = Form.useForm<ValoresDeRepositorio>()
+  const formularioRef = useRef<FormInstance<ValoresDeRepositorio>>(null)
   const [errorGeneral, setErrorGeneral] = useState<string | null>(null)
   const crear = useCrearRepositorio()
   const actualizar = useActualizarRepositorio()
@@ -72,6 +179,9 @@ export function ModalDeRepositorio({
 
   const alGuardar = async () => {
     setErrorGeneral(null)
+
+    const form = formularioRef.current
+    if (form === null) return
 
     let valores: ValoresDeRepositorio
     try {
@@ -122,85 +232,11 @@ export function ModalDeRepositorio({
         <Alert type="error" showIcon message={errorGeneral} style={{ marginBottom: 16 }} />
       )}
 
-      <Form
+      <FormularioDeRepositorio
         key={repositorio?.id ?? 'nuevo'}
-        form={form}
-        layout="vertical"
-        requiredMark
-        initialValues={repositorio === null ? VALORES_POR_DEFECTO : valoresDe(repositorio)}
-      >
-        <Form.Item
-          label="Nombre"
-          name="name"
-          rules={[{ required: true, message: 'Escribe un nombre.' }]}
-        >
-          <Input placeholder="p. ej. copias-s3" />
-        </Form.Item>
-
-        <Form.Item
-          label="Endpoint"
-          name="endpoint"
-          rules={[{ required: true, message: 'Escribe el endpoint.' }]}
-        >
-          <Input placeholder="https://s3.example.com" />
-        </Form.Item>
-
-        <Space size="middle" wrap align="start">
-          <Form.Item
-            label="Bucket"
-            name="bucket"
-            rules={[{ required: true, message: 'Escribe el bucket.' }]}
-          >
-            <Input placeholder="copias" />
-          </Form.Item>
-          <Form.Item
-            label="Región"
-            name="region"
-            rules={[{ required: true, message: 'Escribe la región.' }]}
-          >
-            <Input placeholder="eu-west-1" />
-          </Form.Item>
-        </Space>
-
-        <Form.Item
-          label="ID de la clave de acceso"
-          name="access_key_id"
-          rules={[{ required: true, message: 'Escribe el identificador de la clave.' }]}
-        >
-          <Input placeholder="AKIA…" />
-        </Form.Item>
-
-        <Form.Item
-          label="Clave secreta"
-          name="secret_access_key"
-          extra={
-            repositorio?.has_secret_access_key === true
-              ? 'Ya hay una clave secreta guardada; déjala vacía para conservarla.'
-              : undefined
-          }
-        >
-          <Input.Password autoComplete="new-password" />
-        </Form.Item>
-
-        <Form.Item
-          label="Passphrase"
-          name="passphrase"
-          extra={
-            repositorio?.has_passphrase === true
-              ? 'Ya hay una passphrase guardada; déjala vacía para conservarla.'
-              : undefined
-          }
-        >
-          <Input.Password autoComplete="new-password" />
-        </Form.Item>
-
-        {repositorio !== null &&
-          (repositorio.has_secret_access_key || repositorio.has_passphrase) && (
-            <Typography.Text type="secondary">
-              Los secretos guardados no se muestran: solo se indica que existen.
-            </Typography.Text>
-          )}
-      </Form>
+        repositorio={repositorio}
+        formulario={formularioRef}
+      />
     </Modal>
   )
 }

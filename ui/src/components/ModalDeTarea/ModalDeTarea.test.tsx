@@ -1,14 +1,62 @@
+import { useState } from 'react'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { instalarFetchFalso } from '../../pruebas/fetchDePrueba'
 import { repositorio, tarea, target } from '../../pruebas/fixtures'
+import type { Job } from '../../services/api/types'
 import { ModalDeTarea } from './ModalDeTarea'
 
 type Usuario = ReturnType<typeof userEvent.setup>
 
 const TARGETS = [target({ id: 't1', name: 'web' })]
 const REPOSITORIOS = [repositorio({ id: 'r1', name: 's3' })]
+
+/**
+ * Arnés que reproduce el ciclo real de la pantalla de Tareas: abrir edición de
+ * una fila, cerrar y abrir la de otra. La instancia de `ModalDeTarea` no se
+ * desmonta entre filas, que es justo el escenario del hallazgo B1.
+ */
+function Arnes({ filas }: { filas: readonly Job[] }) {
+  const [abierto, setAbierto] = useState(false)
+  const [enEdicion, setEnEdicion] = useState<Job | null>(null)
+
+  return (
+    <>
+      {filas.map((fila) => (
+        <button
+          key={fila.id}
+          type="button"
+          onClick={() => {
+            setEnEdicion(fila)
+            setAbierto(true)
+          }}
+        >
+          {`Editar ${fila.id}`}
+        </button>
+      ))}
+      <ModalDeTarea
+        abierto={abierto}
+        tarea={enEdicion}
+        targets={TARGETS}
+        repositorios={REPOSITORIOS}
+        onCerrar={() => setAbierto(false)}
+        onGuardado={() => setAbierto(false)}
+      />
+    </>
+  )
+}
+
+function montarArnes(filas: readonly Job[]) {
+  const cliente = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+  })
+  return render(
+    <QueryClientProvider client={cliente}>
+      <Arnes filas={filas} />
+    </QueryClientProvider>,
+  )
+}
 
 function montar({ tareaEditada = null }: { tareaEditada?: ReturnType<typeof tarea> | null } = {}) {
   const cliente = new QueryClient({
@@ -152,5 +200,42 @@ describe('ModalDeTarea', () => {
 
     await waitFor(() => expect(fetch.a('/api/v1/jobs/j7')).toHaveLength(1))
     expect(fetch.a('/api/v1/jobs/j7')[0]?.method).toBe('PUT')
+  })
+
+  it('al cerrar y editar otra fila, el formulario muestra los valores de la nueva fila', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
+    })
+
+    const fila1 = tarea({
+      id: 'j1',
+      target_id: 't1',
+      repository_id: 'r1',
+      cron_expression: '1 1 1 * * *',
+      keep_daily: 1,
+    })
+    const fila2 = tarea({
+      id: 'j2',
+      target_id: 't1',
+      repository_id: 'r1',
+      cron_expression: '2 2 2 * * *',
+      keep_daily: 2,
+    })
+
+    montarArnes([fila1, fila2])
+
+    // Editar la fila 1: se cambia un campo para que el estado quede "sucio".
+    await usuario.click(screen.getByRole('button', { name: 'Editar j1' }))
+    const cron1 = await screen.findByRole('textbox', { name: 'Expresión cron' })
+    await usuario.clear(cron1)
+    await usuario.type(cron1, '9 9 9 * * *')
+
+    // Cerrar y abrir la edición de la fila 2.
+    await usuario.click(screen.getByRole('button', { name: 'Cancelar' }))
+    await usuario.click(screen.getByRole('button', { name: 'Editar j2' }))
+
+    expect(await screen.findByRole('textbox', { name: 'Expresión cron' })).toHaveValue('2 2 2 * * *')
+    expect(screen.getByRole('spinbutton', { name: 'Diarias' })).toHaveValue('2')
   })
 })

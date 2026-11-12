@@ -1,5 +1,7 @@
-import { useState } from 'react'
+import { useImperativeHandle, useRef, useState } from 'react'
+import type { Ref } from 'react'
 import { Alert, Form, InputNumber, Modal, Select, Space, Switch } from 'antd'
+import type { FormInstance } from 'antd'
 import { ErrorDeApi } from '../../services/api/envelope'
 import type { AltaJob, Job, Repository, Target } from '../../services/api/types'
 import { mensajeDeError } from '../../services/errores'
@@ -50,6 +52,88 @@ function valoresDe(tarea: Job): ValoresDeTarea {
   }
 }
 
+interface PropsDelFormularioDeTarea {
+  tarea: Job | null
+  targets: readonly Target[]
+  repositorios: readonly Repository[]
+  formulario: Ref<FormInstance<ValoresDeTarea>>
+}
+
+/**
+ * El formulario, dueño de su propia instancia (`Form.useForm`).
+ *
+ * Vive en un subcomponente que el padre pinta con `key={tarea?.id ?? 'nueva'}`:
+ * cada entidad estrena instancia, así que `initialValues` se aplica de verdad y
+ * editar una fila **nunca** arrastra lo que se escribió en otra.
+ */
+function FormularioDeTarea({
+  tarea,
+  targets,
+  repositorios,
+  formulario,
+}: PropsDelFormularioDeTarea) {
+  const [form] = Form.useForm<ValoresDeTarea>()
+  useImperativeHandle(formulario, () => form, [form])
+
+  return (
+    <Form
+      form={form}
+      layout="vertical"
+      requiredMark
+      initialValues={tarea === null ? VALORES_POR_DEFECTO : valoresDe(tarea)}
+    >
+      <Form.Item
+        label="Target"
+        name="target_id"
+        rules={[{ required: true, message: 'Elige un target.' }]}
+      >
+        <Select
+          placeholder="Elige un target"
+          options={targets.map((target) => ({ value: target.id, label: target.name }))}
+        />
+      </Form.Item>
+
+      <Form.Item
+        label="Repositorio"
+        name="repository_id"
+        rules={[{ required: true, message: 'Elige un repositorio.' }]}
+      >
+        <Select
+          placeholder="Elige un repositorio"
+          options={repositorios.map((repositorio) => ({
+            value: repositorio.id,
+            label: repositorio.name,
+          }))}
+        />
+      </Form.Item>
+
+      <Form.Item
+        label="Expresión cron"
+        name="cron_expression"
+        rules={[{ required: true, message: 'Escribe una expresión cron.' }]}
+      >
+        <GeneradorCron />
+      </Form.Item>
+
+      <Space size="middle" wrap>
+        <Form.Item label="Diarias" name="keep_daily">
+          <InputNumber min={0} precision={0} />
+        </Form.Item>
+        <Form.Item label="Semanales" name="keep_weekly">
+          <InputNumber min={0} precision={0} />
+        </Form.Item>
+        <Form.Item label="Mensuales" name="keep_monthly">
+          <InputNumber min={0} precision={0} />
+        </Form.Item>
+      </Space>
+
+      <Form.Item label="Activa" name="enabled" valuePropName="checked">
+        <Switch />
+      </Form.Item>
+    </Form>
+  )
+}
+
 /**
  * Alta y edición de una tarea en un `Modal` con `Form`.
  *
@@ -59,6 +143,10 @@ function valoresDe(tarea: Job): ValoresDeTarea {
  *   con las tres a cero: no conservaría nada.
  * - Un `400` del servidor se pinta junto a `cron_expression` y el modal **no** se
  *   cierra: la validación del cliente es una ayuda, no la última palabra.
+ *
+ * El formulario es un subcomponente con `key` por entidad (ver
+ * `FormularioDeTarea`): la instancia de `rc-field-form` se recrea en cada fila y
+ * el `destroyOnHidden` del modal no deja valores de una edición anterior.
  */
 export function ModalDeTarea({
   abierto,
@@ -68,7 +156,7 @@ export function ModalDeTarea({
   onCerrar,
   onGuardado,
 }: PropsDeModalDeTarea) {
-  const [form] = Form.useForm<ValoresDeTarea>()
+  const formularioRef = useRef<FormInstance<ValoresDeTarea>>(null)
   const [errorGeneral, setErrorGeneral] = useState<string | null>(null)
   const crear = useCrearTarea()
   const actualizar = useActualizarTarea()
@@ -81,6 +169,9 @@ export function ModalDeTarea({
 
   const alGuardar = async () => {
     setErrorGeneral(null)
+
+    const form = formularioRef.current
+    if (form === null) return
 
     let valores: ValoresDeTarea
     try {
@@ -139,62 +230,13 @@ export function ModalDeTarea({
         />
       )}
 
-      <Form
+      <FormularioDeTarea
         key={tarea?.id ?? 'nueva'}
-        form={form}
-        layout="vertical"
-        requiredMark
-        initialValues={tarea === null ? VALORES_POR_DEFECTO : valoresDe(tarea)}
-      >
-        <Form.Item
-          label="Target"
-          name="target_id"
-          rules={[{ required: true, message: 'Elige un target.' }]}
-        >
-          <Select
-            placeholder="Elige un target"
-            options={targets.map((target) => ({ value: target.id, label: target.name }))}
-          />
-        </Form.Item>
-
-        <Form.Item
-          label="Repositorio"
-          name="repository_id"
-          rules={[{ required: true, message: 'Elige un repositorio.' }]}
-        >
-          <Select
-            placeholder="Elige un repositorio"
-            options={repositorios.map((repositorio) => ({
-              value: repositorio.id,
-              label: repositorio.name,
-            }))}
-          />
-        </Form.Item>
-
-        <Form.Item
-          label="Expresión cron"
-          name="cron_expression"
-          rules={[{ required: true, message: 'Escribe una expresión cron.' }]}
-        >
-          <GeneradorCron />
-        </Form.Item>
-
-        <Space size="middle" wrap>
-          <Form.Item label="Diarias" name="keep_daily">
-            <InputNumber min={0} precision={0} />
-          </Form.Item>
-          <Form.Item label="Semanales" name="keep_weekly">
-            <InputNumber min={0} precision={0} />
-          </Form.Item>
-          <Form.Item label="Mensuales" name="keep_monthly">
-            <InputNumber min={0} precision={0} />
-          </Form.Item>
-        </Space>
-
-        <Form.Item label="Activa" name="enabled" valuePropName="checked">
-          <Switch />
-        </Form.Item>
-      </Form>
+        tarea={tarea}
+        targets={targets}
+        repositorios={repositorios}
+        formulario={formularioRef}
+      />
     </Modal>
   )
 }
