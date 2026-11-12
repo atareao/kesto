@@ -29,6 +29,12 @@ Empaquetar el binario Kesto y el panel `ui/dist` en una imagen reproducible (mul
 ### Fase 0 — Preparación y contratos
 - Confirmar versiones de las imágenes base, el layout (§7: `src/` + `ui/` en la raíz) y el contrato de variables de entorno (`docs/ENTORNO.md`).
 
+### Fase 0 — medición (línea base antes de tocar nada)
+- `just check` en **verde**: **425** pruebas del backend + **5** del panel.
+- `_require-image` del `.justfile` aborta hoy por falta de `Dockerfile` (base medida de las tareas 1.2).
+- `release.yml` se salta el job `image` sin `Dockerfile` (`preflight` detecta `has_image=false`).
+- Contrato de variables de `src/config.rs`: `KESTO_MASTER_KEY` obligatoria siempre; las `OIDC_*` son un todo o nada (en OIDC, `KESTO_SECRET` obligatoria); `RUST_LOG`/`BIND_ADDRESS`/`DATABASE_URL` se leen sin prefijo y vacío ≠ defecto; `DEFAULT_DATABASE_URL=sqlite:///app/data/kesto.db`.
+
 ### Fase 1 — Dockerfile y contexto de build
 - `Dockerfile` multi-stage (backend + panel + runtime) y `.dockerignore`.
 - Verificación: build reproducible y arranque en modo `disabled` solo con `KESTO_MASTER_KEY`.
@@ -39,6 +45,12 @@ Empaquetar el binario Kesto y el panel `ui/dist` en una imagen reproducible (mul
 ### Fase 3 — Verificación y documentación
 - Arrancar la imagen, comprobar `/api/v1/health` (`auth_mode: "disabled"`) y el panel servido.
 - `docs/FEATURE-008-despliegue-produccion.md`.
+
+### Fase 3 — verificación (medida)
+- Build `ghcr.io/atareao/kesto:latest`/`:0.2.0` → **200 MB**; sin `cargo`/`rustc`/`node`/`pnpm` en la imagen; `id` → `uid=10001`.
+- `HEALTHCHECK` presente; el contenedor llega a `(healthy)`; `GET /api/v1/health` → `200` `auth_mode:"disabled"` (version 0.2.0); `GET /` → `200` `text/html`; el volumen `kesto_data` persiste entre contenedores.
+- Rechazos: sin master key falla `compose config` (exit 1); OIDC parcial → `la configuración de OIDC está incompleta: falta OIDC_CLIENT_SECRET`; `BIND_ADDRESS=` → `tiene un valor con formato inválido`; credencial corta → `WARN KESTO_MASTER_KEY mide menos de 32 caracteres` y arranca.
+- `.github/` sin cambios.
 
 ## Riesgos y cabos
 

@@ -46,7 +46,7 @@ Un solo origen es lo que hace que la cookie de sesión y el cliente del panel fu
 
 ### Requirement: El compose reproduce el despliegue de referencia del §8
 
-El repositorio SHALL incluir un fichero de compose (`compose.yaml`) con el servicio del §8: nombre `kesto`, `image: kesto:latest`, `container_name: kesto-app`, `restart: always` y el puerto `"8080:8080"`.
+El repositorio SHALL incluir un fichero de compose (`compose.yaml`) con el servicio del §8: nombre `kesto`, `image: ghcr.io/atareao/kesto:latest`, `container_name: kesto-app`, `restart: always` y el puerto `"8080:8080"`.
 
 El servicio SHALL declarar las tres variables de entorno de arranque del §8 —`RUST_LOG=info,kesto=debug`, `DATABASE_URL=sqlite:///app/data/kesto.db` y `BIND_ADDRESS=0.0.0.0:8080`— y SHALL montar los cuatro volúmenes del §8:
 
@@ -60,7 +60,7 @@ El fichero SHALL declarar el volumen nombrado `kesto_data`. Los tres montajes de
 #### Scenario: El servicio del §8 está declarado
 - **GIVEN** el fichero `compose.yaml`
 - **WHEN** se lee la definición del servicio `kesto`
-- **THEN** SHALL declarar `image: kesto:latest`, `container_name: kesto-app` y `restart: always`
+- **THEN** SHALL declarar `image: ghcr.io/atareao/kesto:latest`, `container_name: kesto-app` y `restart: always`
 - **AND** SHALL publicar el puerto `"8080:8080"`
 
 #### Scenario: Las variables de entorno del §8 están presentes
@@ -77,7 +77,7 @@ El fichero SHALL declarar el volumen nombrado `kesto_data`. Los tres montajes de
 
 ### Requirement: La configuración y los secretos entran por el entorno y nunca en claro
 
-`KESTO_MASTER_KEY` SHALL ser obligatoria **siempre** y SHALL llegar al contenedor por el entorno —el `.env` del despliegue o un gestor de secretos del host—, **nunca** escrita en la imagen ni en el `compose.yaml` versionado: una clave en una capa de la imagen o en un fichero que se sube al repositorio es una clave que hay que tratar como filtrada.
+`KESTO_MASTER_KEY` SHALL ser obligatoria **siempre** y SHALL llegar al contenedor por el entorno —el `.env` del despliegue o un gestor de secretos del host—, **nunca** escrita en la imagen ni en el `compose.yaml` versionado: una clave en una capa de la imagen o en un fichero que se sube al repositorio es una clave que hay que tratar como filtrada. El `compose.yaml` SHALL exigir la variable con la forma `${KESTO_MASTER_KEY:?...}`, de modo que `podman compose up` —y su validación `compose config`— SHALL negarse a levantar el servicio y NO SHALL crear el contenedor cuando falte; el binario, además, SHALL fallar si la variable no está definida en su propio proceso.
 
 `KESTO_MASTER_KEY` es la clave de la que se deriva la del cifrado en reposo (`repositories.secret_access_key`, `repositories.passphrase` y `backup_targets.db_password`), así que SHALL tratarse como un secreto de larga vida: **rotarla deja ilegibles los secretos ya guardados**.
 
@@ -86,10 +86,10 @@ Las tres variables que gobiernan el modo OIDC —`OIDC_ISSUER_URL`, `OIDC_CLIENT
 Una credencial del despliegue con menos de **32 caracteres** SHALL avisar y **arrancar igualmente**: es un aviso de higiene, no una puerta de arranque. Las variables que el binario lee **sin** prefijo —`RUST_LOG`, `BIND_ADDRESS` y `DATABASE_URL`— conservan su nombre tal cual, y una `BIND_ADDRESS` o un `RUST_LOG` **presentes pero vacíos** SHALL ser error de arranque, **no** un retorno al valor por defecto.
 
 #### Scenario: Sin la clave maestra no hay arranque
-- **GIVEN** una puesta en marcha del contenedor sin `KESTO_MASTER_KEY`
-- **WHEN** el proceso arranca
-- **THEN** SHALL fallar por falta de la clave maestra
-- **AND** la causa SHALL quedar en el registro del contenedor
+- **GIVEN** una puesta en marcha del servicio sin `KESTO_MASTER_KEY`
+- **WHEN** se ejecuta `podman compose up` (o su validación `compose config`)
+- **THEN** SHALL negarse a levantar el servicio por falta de la clave maestra
+- **AND** NO SHALL crearse el contenedor
 
 #### Scenario: El OIDC es un todo o nada
 - **GIVEN** un despliegue con `OIDC_ISSUER_URL` y `OIDC_CLIENT_ID` pero sin `OIDC_CLIENT_SECRET`
