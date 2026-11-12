@@ -1,5 +1,7 @@
 # Plan 007 — Panel web (`ui-panel`)
 
+> **Estado: COMPLETED** — cerrado el **2026-11-12**. Issue [#15](https://github.com/atareao/kesto/issues/15). Change OpenSpec `ui-panel`, con delta de `api-shell`. Verificado: backend **425 pruebas de la suite + 5 de `tests/arranque.rs`** (`just check` en verde, clippy sin avisos) y panel **24 ficheros / 121 pruebas** (`just ui-check` en verde, `tsc --noEmit` y `eslint` limpios, `vite build` OK). Documento de la feature: `docs/FEATURE-007-ui-panel.md`. El `Dockerfile` y el `compose` del §8 quedan para el change siguiente.
+
 - **Issue:** #15
 - **SRS:** `docs/DEFINITION.md` §2 (frontend), §5 (API/SSE), §6 (pantallas), §7 (estructura)
 - **Change OpenSpec:** `openspec/changes/ui-panel/`

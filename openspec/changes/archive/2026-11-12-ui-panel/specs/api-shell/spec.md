@@ -53,6 +53,13 @@ Los assets con hash en el nombre SHALL poder cachearse como inmutables, y `index
 - **THEN** SHALL contestar `404` o `400`
 - **AND** NO SHALL entregarse ningún fichero de fuera del directorio
 
+#### Scenario: Las formas codificadas del traversal se quedan dentro del panel
+- **GIVEN** una petición a `/%2e%2e%2fCargo.toml`, a `/%2fCargo.toml` y a `/..%2fCargo.toml`
+- **WHEN** se atienden
+- **THEN** SHALL contestar `200` con `index.html` las que no empiezan por punto, porque la URI cruda no se decodifica y se resuelve como una ruta del cliente
+- **AND** SHALL contestar `404` con la envoltura la que sí empieza por punto
+- **AND** NO SHALL entregarse ningún fichero de fuera del directorio en ninguno de los tres casos
+
 #### Scenario: Sin panel compilado el backend sigue en pie
 - **GIVEN** un árbol sin `ui/dist`
 - **WHEN** se pide `GET /`
@@ -63,3 +70,18 @@ Los assets con hash en el nombre SHALL poder cachearse como inmutables, y `index
 - **WHEN** se pide `POST /tareas`
 - **THEN** SHALL contestar `405` con la envoltura
 - **AND** NO SHALL servirse el documento del panel
+
+### Requirement: Las respuestas del servidor declaran sus cabeceras de seguridad
+
+Todas las respuestas del servidor SHALL llevar `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` y una `Content-Security-Policy` que prohíba enmarcar el panel (`frame-ancestors 'none'` como mínimo). El `Content-Type` y el `Cache-Control` de cada respuesta NO SHALL verse alterados: lo que se añade son cabeceras de seguridad, y el tipo y la caché siguen siendo la decisión del servido de ficheros.
+
+Las cabeceras SHALL declararse una sola vez, **alrededor** del router que compone la API y el panel, y NO SHALL declararse por ruta. El panel es el *fallback* de ese router, así que una capa colgada de él cubriría lo que el panel produce —el documento, los assets y también los `404` de `/api/` de su guardia de prefijo, que corre dentro del propio *fallback*—, pero dejaría fuera lo que contestan las rutas declaradas de la API. Al envolver el router compuesto, la política es la misma para todo lo que sale de este origen y no depende de qué mitad atendió la petición. Esta capa NO SHALL cambiar la envoltura de `/api/v1`: ni el cuerpo, ni el código de estado, ni los encabezados que ya fijaba.
+
+#### Scenario: Las cabeceras de seguridad acompañan a toda respuesta del origen
+- **GIVEN** el panel desplegado con `ui/dist/index.html` y `ui/dist/assets/app-abc123.js`
+- **WHEN** se pide `GET /`, `GET /assets/app-abc123.js` y `GET /api/v1/health`
+- **THEN** las tres respuestas SHALL contestar `200`
+- **AND** las tres SHALL llevar `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` y `Referrer-Policy: no-referrer`
+- **AND** las tres SHALL llevar una `Content-Security-Policy` que contenga `frame-ancestors 'none'`
+- **AND** el `Content-Type` y el `Cache-Control` del documento y del asset SHALL ser los que fija el servido del panel
+- **AND** el cuerpo de `GET /api/v1/health` SHALL seguir siendo la envoltura de la API
