@@ -1,0 +1,77 @@
+/*
+ * Estilos mínimos que Ant Design no cubre: el enlace de salto al contenido, el
+ * foco visible y el texto solo para lectores de pantalla. El resto del aspecto
+ * lo pone el sistema de diseño de Ant Design v5.
+ */
+
+/* Enlace de salto: fuera de la vista hasta que recibe el foco con teclado. */
+.enlace-de-salto {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 1000;
+  padding: 8px 16px;
+  background: #ffffff;
+  color: #1677ff;
+  border: 1px solid #1677ff;
+  border-radius: 4px;
+  text-decoration: none;
+}
+
+.enlace-de-salto:focus {
+  left: 8px;
+  top: 8px;
+}
+
+/* Foco visible y consistente en todo el panel (§3.5). */
+:focus-visible {
+  outline: 2px solid #1677ff;
+  outline-offset: 2px;
+}
+
+/* El `main` recibe el foco por programa desde el enlace de salto: sin anillo. */
+main:focus {
+  outline: none;
+}
+
+.marca-del-panel {
+  display: flex;
+  align-items: center;
+  height: 64px;
+  padding: 0 24px;
+  font-size: 18px;
+}
+
+.cabecera-del-panel {
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  background: #ffffff;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.contenido-del-panel {
+  padding: 24px;
+}
+
+.centrado {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 200px;
+}
+
+/* Texto solo para lectores de pantalla. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
