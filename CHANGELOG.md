@@ -1,4 +1,32 @@
 # Changelog
+## [0.3.0] - 2026-11-12
+
+### Bug Fixes
+
+- *(ui)* Aísla el formulario por fila y exige sesión en las rutas
+- *(panel)* Cabeceras de seguridad y un único texto para el 404
+
+### Documentation
+
+- *(ui-panel)* Propuesta OpenSpec y plan 007 del panel web
+- *(ui-panel)* Cierra el change con doc de feature y specs fusionadas
+- *(despliegue-produccion)* Propuesta OpenSpec y plan 008
+- *(despliegue-produccion)* Doc de la feature y spec al día
+- *(despliegue-produccion)* Archiva el change y cierra el plan
+
+### Features
+
+- *(ui)* Andamiaje del panel React + Antd
+- *(ui)* Servicios del panel — contrato, cliente, formato, SSE y sesión
+- *(ui)* Layout, rutas y pantalla de sesión
+- *(ui)* Dashboard y Tareas
+- *(ui)* Histórico, Snapshots y Ajustes
+- *(panel)* Sirve ui/dist desde Axum con fallback SPA
+- *(deploy)* Dockerfile multi-stage y compose de producción
+
+### Miscellaneous Tasks
+
+- *(deploy)* Versiona .env.example pese a la regla .env.*
 ## [0.2.0] - 2026-11-11
 
 ### Bug Fixes
@@ -85,6 +113,7 @@
 - *(openspec)* Archiva api-endpoints y cierra el plan 004
 - *(engine)* Resuelve el arbol con bollard y rustic, y commitea el lock
 - *(scheduler)* Las dos dependencias del reloj y su lock resuelto con red
+- Release v0.2.0
 
 ### Testing
 
