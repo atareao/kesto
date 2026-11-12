@@ -211,12 +211,19 @@ where
 /// y no hay que «arreglarlo» envolviéndolo a mano: un `404` no revela ningún
 /// recurso ni ningún método, así que no hay nada que proteger detrás, y forzar
 /// el *gate* ahí acoplaría las dos mitades y rompería la partición.
-async fn not_found() -> AppError {
+///
+/// Es `pub(crate)` porque el servido del panel —[`crate::panel`]— sustituye este
+/// *fallback* por el suyo y tiene que contestar **el mismo** `404` a lo que empiece
+/// por `/api/`: una segunda copia del texto sería una segunda verdad del contrato.
+pub(crate) async fn not_found() -> AppError {
     AppError::NotFound("la ruta solicitada no existe".to_owned())
 }
 
 /// Fallback de los métodos no declarados: `405` con la envoltura de error.
-async fn metodo_no_permitido() -> AppError {
+///
+/// `pub(crate)` por el mismo motivo que [`not_found`]: el panel contesta este `405`
+/// a los métodos que no son de lectura.
+pub(crate) async fn metodo_no_permitido() -> AppError {
     AppError::MethodNotAllowed("el método no está permitido en esta ruta".to_owned())
 }
 

@@ -15,6 +15,7 @@ pub mod db;
 pub mod docker;
 pub mod engine;
 pub mod error;
+pub mod panel;
 pub mod rustic;
 pub mod scheduler;
 pub mod secret;
@@ -48,7 +49,12 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.bind_address).await?;
 
-    axum::serve(listener, api::api_router(state))
+    // El panel compilado se sirve desde el mismo origen que la API, y **detrás** de ella: la
+    // composición vive en [`panel::app`], que no toca el router de `/api/v1`. La ruta es la del
+    // despliegue —`ui/dist` relativa al directorio de trabajo— y no una variable de entorno: el
+    // binario y su panel viajan juntos, y un panel que no está deja el `404` de la casa sin
+    // impedir el arranque.
+    axum::serve(listener, panel::app(state, panel::PANEL_POR_DEFECTO))
         .with_graceful_shutdown(shutdown)
         .await
 }

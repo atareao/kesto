@@ -256,8 +256,27 @@ croner = "3"
 # fetched.
 chrono = "0.4"
 
-[dev-dependencies]
+# Static panel (ui-panel): the compiled `ui/dist` is served by the same binary, so the
+# file-serving machinery comes from `tower-http`. `fs` is what brings `ServeFile`, which guesses
+# the `Content-Type` from the extension and answers `HEAD` and conditional requests without a
+# second implementation here. `set-header` is what brings `SetResponseHeaderLayer`, the layer that
+# declares the panel's security headers (`nosniff`, `frame-ancestors 'none'`, `DENY`,
+# `no-referrer`) once, on the composed router, without a second middleware of our own. Neither
+# feature pulls a new crate into the tree. `ServeDir` is deliberately NOT used as a global
+# fallback -- a route of `/api/v1` that fell into the SPA would be a silent contract break, so the
+# panel is composed behind the API router and the prefix guard lives in `src/panel.rs`.
+#
+# `tower` is a PROMOTION, not a new crate in the tree: it is already there as axum's own
+# dependency (and was already a dev-dependency for `ServiceExt::oneshot` in the test
+# harness). Serving a file per request needs `ServiceExt::oneshot` in production code, so
+# the line moves up here with the same version, and the `util` feature is the one that
+# carries the extension trait. Same play as `base64` and `futures-util` above, and the
+# same consequence: a crate in `[dependencies]` is already available to tests, so it is
+# not repeated under `[dev-dependencies]`.
+tower-http = { version = "0.6.11", features = ["fs", "set-header"] }
 tower = { version = "0.5.3", features = ["util"] }
+
+[dev-dependencies]
 http-body-util = "0.1"
 # `log` entra **solo** para las pruebas, y por un motivo concreto: el puente `log` → `tracing`
 # que la prueba 1.37 («la contraseña no sale en el registro») tiene que montar por su cuenta,
