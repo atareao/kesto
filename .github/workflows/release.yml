@@ -76,8 +76,9 @@ jobs:
       # Arranca la imagen y espera a que el puerto HTTP conteste. Solo prueba que
       # el contenedor levanta, que las migraciones corren y que el servidor se
       # ata al puerto: es deliberadamente laxo porque tiene que valer para
-      # cualquier versión. Endurecerlo (un /healthz de verdad) cuando la API
-      # defina uno.
+      # cualquier versión. `KESTO_MASTER_KEY` es obligatoria siempre (el binario
+      # se niega a arrancar sin ella), de ahí el valor de prueba. Endurecerlo
+      # (un /healthz de verdad) cuando la API defina uno.
       - name: Smoke test the image
         run: |
           set -euo pipefail
@@ -85,6 +86,7 @@ jobs:
           docker run -d --name kesto-smoke -p 8080:8080 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -e RUST_LOG=info \
+            -e KESTO_MASTER_KEY='smoke-test-master-key-con-mas-de-32-caracteres' \
             -e DATABASE_URL='sqlite:///app/data/kesto.db' \
             -e BIND_ADDRESS='0.0.0.0:8080' \
             kesto:release-candidate
