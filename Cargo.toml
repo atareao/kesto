@@ -257,12 +257,14 @@ croner = "3"
 chrono = "0.4"
 
 # Static panel (ui-panel): the compiled `ui/dist` is served by the same binary, so the
-# file-serving machinery comes from `tower-http`. Only the `fs` feature is on: it is what
-# brings `ServeFile`, which guesses the `Content-Type` from the extension and answers
-# `HEAD` and conditional requests without a second implementation here. `ServeDir` is
-# deliberately NOT used as a global fallback -- a route of `/api/v1` that fell into the
-# SPA would be a silent contract break, so the panel is composed behind the API router
-# and the prefix guard lives in `src/panel.rs`.
+# file-serving machinery comes from `tower-http`. `fs` is what brings `ServeFile`, which guesses
+# the `Content-Type` from the extension and answers `HEAD` and conditional requests without a
+# second implementation here. `set-header` is what brings `SetResponseHeaderLayer`, the layer that
+# declares the panel's security headers (`nosniff`, `frame-ancestors 'none'`, `DENY`,
+# `no-referrer`) once, on the composed router, without a second middleware of our own. Neither
+# feature pulls a new crate into the tree. `ServeDir` is deliberately NOT used as a global
+# fallback -- a route of `/api/v1` that fell into the SPA would be a silent contract break, so the
+# panel is composed behind the API router and the prefix guard lives in `src/panel.rs`.
 #
 # `tower` is a PROMOTION, not a new crate in the tree: it is already there as axum's own
 # dependency (and was already a dev-dependency for `ServiceExt::oneshot` in the test
@@ -271,7 +273,7 @@ chrono = "0.4"
 # carries the extension trait. Same play as `base64` and `futures-util` above, and the
 # same consequence: a crate in `[dependencies]` is already available to tests, so it is
 # not repeated under `[dev-dependencies]`.
-tower-http = { version = "0.6.11", features = ["fs"] }
+tower-http = { version = "0.6.11", features = ["fs", "set-header"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [dev-dependencies]

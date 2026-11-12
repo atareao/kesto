@@ -19,12 +19,12 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderValue, Method, header};
+use axum::http::{HeaderName, HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
+use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::error::AppError;
 use crate::state::AppState;
 
 /// Ruta del panel compilado, relativa al directorio de trabajo del proceso.
@@ -47,10 +47,6 @@ const CACHE_DEL_ASSET: &str = "public, max-age=31536000, immutable";
 /// ya no existen.
 const CACHE_DEL_DOCUMENTO: &str = "no-cache";
 
-/// El motivo del `404` del panel: el mismo texto que el de la API, para que el cliente no
-/// distinga por el mensaje qué mitad contestó.
-const NO_HAY_NADA: &str = "la ruta solicitada no existe";
-
 /// Compone el servidor completo: la API y, detrás, el panel.
 ///
 /// El panel entra como **fallback** del router de la API, y no como rutas propias, por dos
@@ -65,11 +61,73 @@ const NO_HAY_NADA: &str = "la ruta solicitada no existe";
 pub fn app(state: AppState, panel: impl Into<PathBuf>) -> Router {
     let panel = Arc::new(panel.into());
 
-    crate::api::api_router(state).fallback(move |peticion: Request| {
+    let router = crate::api::api_router(state).fallback(move |peticion: Request| {
         let panel = Arc::clone(&panel);
 
         async move { atender(&panel, peticion).await }
-    })
+    });
+
+    con_cabeceras_de_seguridad(router)
+}
+
+/// Añade las cabeceras de seguridad a las respuestas del servidor.
+///
+/// Son cuatro, y responden a lo que un navegador hace con esta superficie —el panel pinta HTML y
+/// ejecuta el JavaScript de sus assets— y no a lo que espera un cliente de datos:
+///
+/// - `X-Content-Type-Options: nosniff` corta el sniffing de tipo: sin ella un navegador puede
+///   ejecutar como script un asset servido con un `Content-Type` que no lo es.
+/// - `Content-Security-Policy: frame-ancestors 'none'` y `X-Frame-Options: DENY` prohíben
+///   enmarcar el panel. Las dos, y no una: `frame-ancestors` es la que manda hoy, y `DENY` es lo
+///   que todavía miran los navegadores que no la implementan. La política se limita a
+///   `frame-ancestors` a propósito —una `default-src` inventada aquí rompería el panel, que
+///   carga sus propios assets y pide estilos en línea— y se amplía cuando haya algo que
+///   restringir de verdad.
+/// - `Referrer-Policy: no-referrer` evita que la URL del panel, que puede llevar el identificador
+///   de una tarea o de una ejecución, viaje en el `Referer` de una salida a otro origen.
+///
+/// # Por qué la capa envuelve el router entero
+///
+/// Porque estas cabeceras describen la respuesta HTTP de este origen, y este origen sirve dos
+/// mitades. Una capa colgada del *fallback* cubriría lo que el panel produce —el documento, los
+/// assets y también los `404` de `/api/` de su guardia de prefijo, porque el guardia corre
+/// **dentro** del propio *fallback*—, pero dejaría fuera lo que contesta el router de la API por
+/// sus rutas declaradas: `/api/v1/health` saldría sin `nosniff` ni política de enmarcado, y las
+/// cabeceras de una misma superficie dependerían de qué mitad atendió la petición. Puesta
+/// **alrededor** del router compuesto, la política es una sola para todo lo que sale de aquí.
+/// Eso es lo que la spec declara y lo que el test de las cabeceras comprueba sobre las tres
+/// formas de respuesta: el documento, un asset y una ruta de la API.
+///
+/// Lo que la capa **no** toca: el `Content-Type` y el `Cache-Control` de cada respuesta. Cada
+/// `SetResponseHeaderLayer` fija **su** cabecera y ninguna otra, así que la decisión de tipo y de
+/// caché del servido de ficheros (`ServeFile` y [`cache_de`]) sigue siendo suya.
+fn con_cabeceras_de_seguridad(router: Router) -> Router {
+    router
+        .layer(cabecera(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(cabecera(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        ))
+        .layer(cabecera(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(cabecera(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+}
+
+/// Una capa que fija una cabecera de seguridad en toda respuesta.
+///
+/// `overriding` y no `if_not_present`: son decisiones de este módulo y no un relleno de último
+/// recurso, así que si algo las pusiera antes, manda ésta. Se dice explícitamente porque con
+/// `if_not_present` el valor que llega al navegador lo elegiría otro y aquí no se vería.
+fn cabecera(nombre: HeaderName, valor: HeaderValue) -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(nombre, valor)
 }
 
 /// Atiende una petición que el router de la API ha declinado.
@@ -89,7 +147,7 @@ async fn atender(panel: &Path, peticion: Request) -> Response {
     }
 
     let Some(relativa) = camino_seguro(camino) else {
-        return AppError::NotFound(NO_HAY_NADA.to_owned()).into_response();
+        return crate::api::not_found().await.into_response();
     };
 
     let fichero = panel.join(&relativa);
@@ -106,7 +164,7 @@ async fn atender(panel: &Path, peticion: Request) -> Response {
 
     // Sin panel compilado el arranque sigue en pie y la petición contesta el `404` de la casa:
     // un backend sin `ui/dist` tiene que compilar, arrancar y pasar su suite.
-    AppError::NotFound(NO_HAY_NADA.to_owned()).into_response()
+    crate::api::not_found().await.into_response()
 }
 
 /// ¿La ruta pertenece a la API?
@@ -316,6 +374,56 @@ mod tests {
         );
     }
 
+    /// Escenario «Las cabeceras de seguridad acompañan a toda respuesta del origen».
+    ///
+    /// La capa envuelve el router **compuesto**, así que la política es la misma para las dos
+    /// mitades: por eso las tres rutas del recorrido incluyen una de la API, que es la que
+    /// distingue esta decisión de una capa colgada solo del *fallback*.
+    #[tokio::test]
+    async fn las_respuestas_del_servidor_llevan_las_cabeceras_de_seguridad() {
+        let panel = panel_de_prueba();
+        let router = app(estado_desarrollo().await, panel.ruta());
+
+        // Las tres formas de respuesta del origen: el documento, un asset y una ruta de la API.
+        for ruta in ["/", "/assets/app-abc123.js", "/api/v1/health"] {
+            let respuesta = get(router.clone(), ruta).await;
+
+            assert_eq!(respuesta.status(), StatusCode::OK, "la ruta {ruta}");
+
+            for (nombre, esperada) in [
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::X_FRAME_OPTIONS, "DENY"),
+                (header::REFERRER_POLICY, "no-referrer"),
+            ] {
+                assert_eq!(
+                    header_text(&respuesta, nombre.clone()).as_deref(),
+                    Some(esperada),
+                    "la ruta {ruta} no lleva la cabecera {} con el valor {esperada}",
+                    nombre.as_str()
+                );
+            }
+
+            let csp = header_text(&respuesta, header::CONTENT_SECURITY_POLICY).unwrap_or_default();
+            assert!(
+                csp.contains("frame-ancestors 'none'"),
+                "la ruta {ruta} no prohíbe enmarcarse: {csp:?}"
+            );
+        }
+
+        // Y la capa no cambia lo que ya había: el documento sigue siendo el documento, el asset
+        // sigue siendo el asset y la salud sigue contestando su envoltura con su `200`.
+        assert_eq!(body_text(get(router.clone(), "/").await).await, DOCUMENTO);
+        assert_eq!(
+            body_text(get(router.clone(), "/assets/app-abc123.js").await).await,
+            ASSET
+        );
+
+        let salud = get(router, "/api/v1/health").await;
+
+        assert_eq!(salud.status(), StatusCode::OK);
+        assert_eq!(body_json(salud).await["data"]["auth_mode"], "disabled");
+    }
+
     /// Escenario «Una ruta de la API no cae en el fallback».
     #[tokio::test]
     async fn una_ruta_de_la_api_no_cae_en_el_fallback() {
@@ -391,6 +499,76 @@ mod tests {
                 "la ruta {ruta} entregó un fichero de fuera del panel: {texto}"
             );
         }
+    }
+
+    /// Escenario «Las formas codificadas del traversal se quedan dentro del panel».
+    ///
+    /// Lo que se afirma es el desenlace **completo**, no la ausencia de una cadena: el candado de
+    /// [`camino_seguro`] no decodifica nada, así que `%2e%2e%2f` y `%2f` no llevan ni una barra ni
+    /// un punto de verdad y la URI entera cae como ruta del cliente —`200` con `index.html`—. Eso
+    /// es lo que hace que la prueba no sea vacua: si alguien decodificara antes de unir, ese
+    /// `%2e%2e%2fCargo.toml` sería `../Cargo.toml`, el fichero existiría y aquí se serviría, en vez
+    /// del documento. Un `!contains("[package]")` a secas pasaría igual sin candado ninguno,
+    /// porque esos nombres nunca existen en disco.
+    ///
+    /// Y `..%2f` sí empieza por punto, así que lo rechaza el candado **sin** tocar el sistema de
+    /// ficheros: `404` con la envoltura.
+    #[tokio::test]
+    async fn las_formas_codificadas_del_traversal_se_quedan_dentro_del_panel() {
+        let panel = panel_de_prueba();
+        let router = app(estado_desarrollo().await, panel.ruta());
+
+        for ruta in ["/%2e%2e%2fCargo.toml", "/%2fCargo.toml"] {
+            let respuesta = get(router.clone(), ruta).await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::OK,
+                "la ruta {ruta} no se decodifica: es una ruta del cliente"
+            );
+            assert_eq!(
+                body_text(respuesta).await,
+                DOCUMENTO,
+                "la ruta {ruta} entregó algo que no es el documento del panel"
+            );
+        }
+
+        let rechazada = get(router, "/..%2fCargo.toml").await;
+
+        assert_eq!(
+            rechazada.status(),
+            StatusCode::NOT_FOUND,
+            "una ruta que empieza por punto no puede pasar del candado"
+        );
+        assert!(
+            !body_text(rechazada).await.contains("[package]"),
+            "la ruta con el separador codificado entregó un fichero de fuera del panel"
+        );
+    }
+
+    /// El `404` del panel es el de la API: una sola verdad del contrato.
+    ///
+    /// El texto no vive en el panel —se consume [`crate::api::not_found`]—, así que esta prueba
+    /// comprueba el desenlace que el cliente ve: la ruta que el panel declina por salirse del
+    /// directorio y la ruta de la API que no existe contestan el mismo mensaje. Con una segunda
+    /// copia del literal en el panel, un cambio en el de la API dejaría mudas a las dos mitades
+    /// por caminos distintos, que es justo lo que esta prueba delata.
+    #[tokio::test]
+    async fn el_404_del_panel_es_el_de_la_api() {
+        let panel = panel_de_prueba();
+        let router = app(estado_desarrollo().await, panel.ruta());
+
+        let de_la_api = body_json(get(router.clone(), "/api/v1/no-existe").await).await;
+        let del_panel = body_json(get(router, "/../Cargo.toml").await).await;
+
+        assert_eq!(
+            de_la_api["message"], del_panel["message"],
+            "el `404` del panel y el de la API tienen que compartir mensaje"
+        );
+        assert_eq!(de_la_api["status"], del_panel["status"]);
+        // Y el valor, no solo la coincidencia: sin esto el `404` podría degradarse a cualquier
+        // otro código en las dos mitades a la vez y la prueba seguiría verde.
+        assert_eq!(del_panel["status"], 404);
     }
 
     /// Escenario «Sin panel compilado el backend sigue en pie».
