@@ -5,3 +5,4 @@
 /ui/coverage
 .env
 .env.*
+!.env.example
