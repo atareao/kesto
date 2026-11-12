@@ -1,0 +1,7 @@
+# pnpm 12 ya no lee el campo `pnpm` de package.json: los ajustes viven aquí.
+# Permitimos explícitamente el único script de instalación que necesitamos (el
+# binario de esbuild, que usan Vite y Vitest). Sin esta lista, `pnpm install`
+# termina con ERR_PNPM_IGNORED_BUILDS y rompería el CI. Todo lo demás sigue
+# bloqueado por defecto.
+allowBuilds:
+  esbuild: true

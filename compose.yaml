@@ -1,0 +1,42 @@
+# Despliegue de producción de Kesto (SRS §8).
+#
+# La clave maestra y los secretos NO viven aquí: entran por el entorno del
+# host (`.env` del despliegue o gestor de secretos). Copia `.env.example` a
+# `.env` y rellénalo antes de `podman compose up -d`.
+services:
+  kesto:
+    image: ghcr.io/atareao/kesto:latest
+    container_name: kesto-app
+    restart: always
+    ports:
+      - "8080:8080"
+    # Secretos OPCIONALES por `.env`: solo entran si el operador los
+    # descomenta ahí. NO se cablean en `environment:` porque una `OIDC_*`
+    # presente pero VACÍA se lee como «presente» (src/config.rs::resolve_auth
+    # deduce el modo de la mera presencia de las tres): declararlas aquí con
+    # valor por defecto vacío forzaría el modo OIDC y rompería el arranque por
+    # defecto, que debe ser `Disabled`.
+    env_file:
+      - .env
+    environment:
+      RUST_LOG: info,kesto=debug
+      DATABASE_URL: sqlite:///app/data/kesto.db
+      BIND_ADDRESS: 0.0.0.0:8080
+      # Obligatoria siempre. Sin ella el arranque falla (src/config.rs).
+      KESTO_MASTER_KEY: ${KESTO_MASTER_KEY:?falta KESTO_MASTER_KEY}
+    volumes:
+      # Socket del daemon para el `exec` de bollard, en solo lectura.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Fuentes de copia de ejemplo del §8, en solo lectura.
+      - /var/www:/backup_sources/var_www:ro
+      - /etc/nginx:/backup_sources/nginx_config:ro
+      # Persistencia interna (SQLite) de la aplicación.
+      - kesto_data:/app/data
+    # En un host estándar el socket del daemon es `root:docker` con modo
+    # `srw-rw----`, y el proceso corre como uid 10001: sin el grupo del daemon
+    # no puede abrirlo. El gid DEPENDE DEL HOST (`getent group docker`); en dev
+    # lo salva `just run` con `--userns=keep-id`. Descomenta y ajusta el gid:
+    # group_add: ["<gid-del-grupo-docker>"]
+
+volumes:
+  kesto_data:
