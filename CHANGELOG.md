@@ -1,4 +1,9 @@
 # Changelog
+## [0.3.1] - 2026-11-12
+
+### Bug Fixes
+
+- *(release)* Pasa KESTO_MASTER_KEY al smoke test de la imagen
 ## [0.3.0] - 2026-11-12
 
 ### Bug Fixes
@@ -27,6 +32,7 @@
 ### Miscellaneous Tasks
 
 - *(deploy)* Versiona .env.example pese a la regla .env.*
+- Release v0.3.0
 ## [0.2.0] - 2026-11-11
 
 ### Bug Fixes
