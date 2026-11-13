@@ -2,7 +2,7 @@
 
 - **Issue:** [#41](https://github.com/atareao/kesto/issues/41)
 - **Change OpenSpec:** `openspec/changes/dockerfile-copy-mtime/`
-- **Estado:** en curso
+- **Estado:** completado
 
 ## Objetivo
 
@@ -27,13 +27,13 @@ Corregir el `Dockerfile` para que la imagen publicada contenga el binario real d
 
 ## Tareas
 
-- [ ] Aprobar el change proposal.
-- [ ] Rama `hotfix/dockerfile-copy-mtime` desde `main`.
-- [ ] RED: guard estático en el test estructural.
-- [ ] GREEN: `touch` en el `Dockerfile`.
-- [ ] Verificar build local + `just check` + `just scripts-test`.
-- [ ] Release nueva y verificar el manifest (amd64 + arm64, `latest` == `X.Y.Z`).
-- [ ] `docs/FEATURE-012-*.md`, renombrar el plan y archivar el change.
+- [x] Aprobar el change proposal.
+- [x] Rama `hotfix/dockerfile-copy-mtime` desde `main`.
+- [x] RED: guard estático en el test estructural.
+- [x] GREEN: `touch` en el `Dockerfile`.
+- [x] Verificar build local + `just check` + `just scripts-test`.
+- [x] Release nueva y verificar el manifest (amd64 + arm64, `latest` == `X.Y.Z`) → v0.5.2 publicada: Image amd64 10m56s, arm64 14m32s, smoke y manifest verdes; `latest` == `0.5` == `0.5.2` con amd64+arm64.
+- [x] `docs/FEATURE-012-*.md`, renombrar el plan y archivar el change.
 
 ## Criterios de aceptación
 
