@@ -54,6 +54,9 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.has_image == 'true'
     runs-on: ubuntu-26.04
+    concurrency:
+      group: release-image
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
 
@@ -131,6 +134,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute latest tag guard
+        id: latest_guard
+        run: |
+          set -euo pipefail
+          mapfile -t tag_list < <(
+            git ls-remote --tags origin 'refs/tags/v*' \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##; s/\^{}//' \
+              | grep -E '^v?[0-9]' || true
+          )
+          is_latest="$(scripts/latest-tag-guard.sh "${GITHUB_REF_NAME#v}" "${tag_list[@]+"${tag_list[@]}"}")"
+          echo "is_latest=${is_latest}" >> "$GITHUB_OUTPUT"
+
       - name: Container metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -139,7 +155,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.latest_guard.outputs.is_latest == 'true' }}
 
       - name: Build and push (amd64 + arm64)
         uses: docker/build-push-action@v7
