@@ -9,11 +9,6 @@ readme = "README.md"
 keywords = ["backup", "rustic", "s3", "docker", "postgresql"]
 categories = ["command-line-utilities", "database"]
 
-# Guard, not a life sentence: `cargo publish` refuses to run while this is here,
-# and the release workflow reads it to skip the crates.io job. DELETE THIS LINE
-# when the crate is actually worth publishing.
-publish = false
-
 # The published crate carries the Rust sources only.
 exclude = ["docs", "plans", "ui", ".github", "AGENTS.md", "GIT_FLOW.md", "cliff.toml", ".dockerignore", ".vampus.yml", "Dockerfile", ".justfile", "openspec"]
 
