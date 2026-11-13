@@ -20,5 +20,5 @@
 
 - [x] 3.1 `docs/FEATURE-010-latest-tag-guard.md`: qué es, ficheros implicados, cómo funciona el guard, cómo verificar y follow-ups. Verificación: el documento existe y cubre las cuatro secciones.
 - [x] 3.2 `just check` en verde (no cambia código Rust/UI, pero se confirma que nada se rompe). Verificación: fmt, clippy y test pasan. **Hecho:** 425 + 5 en verde.
-- [ ] 3.3 `openspec validate latest-tag-guard --strict` en verde. Verificación: sale «valid».
-- [ ] 3.4 Archivar el change (`openspec archive latest-tag-guard`) y renombrar `plans/PLAN-010.md` a `plans/PLAN-010-COMPLETED.md`. Verificación: el delta queda fundido en `openspec/specs/deploy/spec.md`.
+- [x] 3.3 `openspec validate latest-tag-guard --strict` en verde. Verificación: sale «valid».
+- [x] 3.4 Archivar el change (`openspec archive latest-tag-guard`) y renombrar `plans/PLAN-010.md` a `plans/PLAN-010-COMPLETED.md`. Verificación: el delta queda fundido en `openspec/specs/deploy/spec.md`.

@@ -2,7 +2,7 @@
 
 **Issue:** [#32](https://github.com/atareao/kesto/issues/32)
 **Change OpenSpec:** `openspec/changes/latest-tag-guard/` (capability `deploy`)
-**Estado:** en curso
+**Estado:** completado
 
 ## Contexto
 
@@ -34,3 +34,7 @@ Que `:latest` resuelva siempre al manifiesto de la release más alta, y que la c
 
 - Valorar si `compose.yaml` debería fijar una versión concreta en vez de `latest` para despliegues reproducibles (queda fuera de este plan).
 - Repetir el patrón de guard si en el futuro se publican artefactos con alias de canal (por ejemplo `stable`).
+
+## Follow-ups abiertos
+
+- **Remedio del registro (tarea 2.1):** `ghcr.io/atareao/kesto:latest` quedó en 0.3.3; reetiquetar a 0.4.0 requiere credenciales con `write:packages` (el token `gho_` de `gh` no las tiene). Comando: `skopeo copy --all docker://ghcr.io/atareao/kesto:0.4.0 docker://ghcr.io/atareao/kesto:latest`. Documentado en `docs/FEATURE-010-latest-tag-guard.md`.
