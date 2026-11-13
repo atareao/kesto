@@ -130,3 +130,69 @@ development ────●──●──●──●──●──●──�
                  \    /   \  /
 feature           ●──●     ●─●
 ```
+
+## Detalle íntegro procedente de `AGENTS.md`
+
+> Bloques **literales** que estaban en el `AGENTS.md` de Kesto y se movieron aquí en la poda v2 (2026-10-31). El `AGENTS.md` conserva las reglas imperativas y el puntero a este documento. **No se crea `docs/PIPELINE.md`**: todo el detalle de git/release vive aquí.
+
+## Git Flow — obligatorio
+
+**Este proyecto usa gitflow siempre: nada se commitea directamente en `main` ni en `development`.**
+
+| Rama | Base | Uso |
+|---|---|---|
+| `main` | — | Producción. Un merge aquí **dispara una release**. |
+| `development` | `main` | Integración (rama activa de trabajo) |
+| `feature/<kebab-case>` | `development` | Nuevas funcionalidades |
+| `hotfix/<kebab-case>` | `main` | Correcciones urgentes sobre producción |
+
+```bash
+git checkout development && git pull --ff-only
+git checkout -b feature/<nombre>
+# ... trabajo ...
+git push -u origin feature/<nombre>
+gh pr create --base development --head feature/<nombre>
+```
+
+- Mensajes: conventional commits con gitmoji (`✨ feat:`, `🐛 fix:`, `🚑️ hotfix:`, `📝 docs:`, `✅ test:`, `🔧 chore:`…). Flujo completo y tabla de gitmoji en `GIT_FLOW.md`; automatización en la skill `gitflow`.
+- **Ojo con la skill `gitflow`**: sus pasos de formateo asumen `backend/` y `frontend/`. Aquí el layout es `src/` + `ui/`: adapta los comandos, no los directorios.
+- Formateo **antes** de cada commit: `cargo fmt --all` → `cargo clippy -- -D warnings` → `cargo test`; en `ui/`: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test`. Si el formateo toca ficheros, commit aparte (`🎨 style: apply formatting`).
+- Nunca hagas `git commit` directo en `main`: ahí solo entran PRs de release desde `development`.
+
+## Pipeline (GitHub Actions)
+
+| Workflow | Se dispara con | Hace |
+|---|---|---|
+| `ci.yml` | PR y push a `development`/`main` | `preflight` detecta el árbol → `backend` (`fmt --check`, `clippy -D warnings`, `test --locked`) → `frontend` (npm o pnpm según el lockfile) |
+| `release-prepare.yml` | push a `main` (solo eso) | bump con vampus, CHANGELOG con git-cliff, tag `vX.Y.Z`, sincroniza `development` |
+| `release.yml` | tag `v*` | imagen multi-arquitectura a `ghcr.io/atareao/kesto` + crate a crates.io + GitHub Release |
+
+Lo que hay que saber antes de tocarlo:
+
+- **Un merge a `main` ES una release.** No se etiqueta a mano: `release-prepare` decide el bump desde los conventional commits (`feat` → minor, `!:` / `BREAKING CHANGE` → major, resto → patch) y empuja el tag, que es lo que dispara `release.yml`.
+- **Dos guardas deliberadas** para no publicar basura, ambas auto-activables: la imagen se salta mientras no existan `Dockerfile` y `ui/package.json`; el crate se salta mientras `Cargo.toml` diga `publish = false`. **Quita `publish = false` cuando el crate merezca publicarse**: crates.io no permite borrar versiones, solo yank.
+- **El job `frontend` del CI se salta solo** mientras no exista `ui/package.json`, y elige npm o pnpm por el lockfile presente. No hace falta tocarlo cuando llegue la UI.
+- **Secretos necesarios antes de la primera release**: `GH_PAT` (PAT con `contents: write`) y `CARGO_REGISTRY_TOKEN`. Sin `GH_PAT` el tag no dispara `release.yml`, porque un tag empujado con el `GITHUB_TOKEN` por defecto no dispara workflows.
+- La versión vive en **tres sitios** que deben ir sincronizados: `Cargo.toml`, la entrada `[[package]]` de `Cargo.lock` y `.vampus.yml:current_version`. `release-prepare` los resincroniza y falla en alto si vampus no sube nada; si lo tocas a mano, toca los tres.
+- El CI corre exactamente `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` y `cargo test --locked`: replica esos comandos antes de cada push para no descubrir el fallo en el PR.
+
+## Planes y documentación — regla fija
+
+Dos directorios en la raíz, siempre:
+
+**1) `plans/`** — un fichero por plan, correlativo de tres dígitos y sin huecos (el siguiente número = mayor existente + 1; `plans/` es la única fuente del contador):
+
+| Estado | Nombre |
+|---|---|
+| En curso | `plans/PLAN-001.md` |
+| Terminado | `plans/PLAN-001-COMPLETED.md` |
+| Aparcado | `plans/PLAN-001-PENDING.md` |
+
+Los planes **se renombran, nunca se borran** (`git mv`). El renombrado al cerrar o aparcar lo haces tú al terminar, no el subagente que escribe el plan.
+
+**2) `docs/`** — un documento por feature entregada, correlativo y emparejado con su plan: `docs/FEATURE-001-<slug>.md` (slug en kebab-case). `docs/DEFINITION.md` es el SRS de referencia y no se mezcla con las features.
+
+Ciclo de vida de una feature: change proposal de OpenSpec aprobado → `plans/PLAN-NNN.md` → implementación TDD → al cerrar, `docs/FEATURE-NNN-<slug>.md` con lo que realmente quedó construido (contratos, endpoints, esquema, decisiones y deuda pendiente) → `plans/PLAN-NNN-COMPLETED.md`.
+
+⚠️ **`@plan-writer` escribe `PLAN.md` en la raíz por defecto.** En este repo los planes van a `plans/PLAN-NNN.md`: pásale la ruta de destino explícita y el contenido completo del plan en el prompt.
+
