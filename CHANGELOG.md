@@ -4,21 +4,17 @@
 ### Dependencies
 
 - *(ui)* Fuerza minimatch >=11.0.1 por GHSA-g3hv-75wg-m249
-## [0.3.1] - 2026-11-12
-
-### Bug Fixes
-
-- *(release)* Pasa KESTO_MASTER_KEY al smoke test de la imagen
 
 ### Miscellaneous Tasks
 
-- Release v0.3.1
-## [0.3.0] - 2026-11-12
+- Release v0.3.2
+## [0.3.1] - 2026-11-12
 
 ### Bug Fixes
 
 - *(ui)* Aísla el formulario por fila y exige sesión en las rutas
 - *(panel)* Cabeceras de seguridad y un único texto para el 404
+- *(release)* Pasa KESTO_MASTER_KEY al smoke test de la imagen
 
 ### Documentation
 
@@ -42,6 +38,7 @@
 
 - *(deploy)* Versiona .env.example pese a la regla .env.*
 - Release v0.3.0
+- Release v0.3.1
 ## [0.2.0] - 2026-11-11
 
 ### Bug Fixes
