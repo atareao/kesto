@@ -1,4 +1,17 @@
 # Changelog
+## [0.5.0] - 2026-11-13
+
+### Documentation
+
+- *(latest-tag-guard)* Cierra el change con doc de feature y specs
+
+### Features
+
+- *(ci)* Publicar latest solo en la release más alta
+
+### Miscellaneous Tasks
+
+- Permitir disparo manual de release-prepare (workflow_dispatch)
 ## [0.4.0] - 2026-11-13
 
 ### Documentation
@@ -8,6 +21,10 @@
 ### Features
 
 - *(deploy)* Group_add configurable por DOCKER_GID para el socket
+
+### Miscellaneous Tasks
+
+- Release v0.4.0
 ## [0.3.3] - 2026-11-13
 
 ### Miscellaneous Tasks
