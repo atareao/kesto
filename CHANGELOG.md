@@ -1,4 +1,19 @@
 # Changelog
+## [0.5.1] - 2026-11-13
+
+### Documentation
+
+- *(release-image-rapida)* Change proposal, spec delta y PLAN-011
+- Documentación del proyecto (AGENTS, GIT_FLOW, arquitectura, entorno) y assets
+- *(release-image-rapida)* Doc de feature, cierre del plan y archivo del change
+
+### Miscellaneous Tasks
+
+- *(release)* Build nativo por arquitectura, manifest list y sccache
+
+### Testing
+
+- *(ci)* Prueba estructural del pipeline de release + receta just y CI
 ## [0.5.0] - 2026-11-13
 
 ### Documentation
@@ -12,6 +27,7 @@
 ### Miscellaneous Tasks
 
 - Permitir disparo manual de release-prepare (workflow_dispatch)
+- Release v0.5.0
 ## [0.4.0] - 2026-11-13
 
 ### Documentation
