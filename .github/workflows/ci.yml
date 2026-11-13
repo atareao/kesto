@@ -74,6 +74,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Scripts tests
+        run: for f in scripts/*.test.sh; do echo "── $f"; bash "$f"; done
+
   frontend:
     name: Frontend
     needs: preflight
