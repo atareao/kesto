@@ -1,31 +1,34 @@
+# Relevo — release v0.5.2: la imagen publica el binario real (fix del mtime con COPY)
 
-# Relevo — release 0.5.0 publicada (crate + GitHub Release); imagen en construcción
-
-`main` y `development` en **0.5.0**. Tag `v0.5.0`. Issue **#32 cerrado**.
+`main` y `development` en **0.5.2**. Tag `v0.5.2` (patch). Issues **#38** y **#41** cerrados. Imagen `latest` == `0.5` == `0.5.2` (manifest list `amd64`+`arm64`, arranca y sirve).
 
 ## Lo hecho en esta sesión
 
-1. **Verificación del handoff anterior:** los tres builds de imagen (0.3.2/0.3.3/0.4.0) en success; se **detectó** que `latest` apuntaba a 0.3.3 por una carrera en `release.yml`.
-2. **Fix del guard de `latest`** (issue #32): PR #33 (fix, TDD) + PR #34 (cierre: delta fundido, change archivado, `docs/FEATURE-010-latest-tag-guard.md`, `plans/PLAN-010-COMPLETED.md`). Fusionados en `development`.
-3. **Incidente de GitHub:** el merge `development→main` (PR #35) devolvió **502** y GitHub **perdió el evento de push**: `main` quedó con el contenido (#164ee75) pero **no** disparó `release-prepare` ni actualizó el estado del PR (quedó OPEN). No existía forma de reintentar (sin `workflow_dispatch`).
-4. **Recuperación:** PR #36 añade `workflow_dispatch` a `release-prepare.yml`; se cerró el PR #35 atascado; PR #37 `development→main` reintentó y **sí** disparó `release-prepare` → **0.5.0** (minor por el `feat` de #33).
-5. **`release.yml`** con `v0.5.0`: **Crate ✅** (crates.io `0.5.0`), **GitHub Release ✅** `v0.5.0` (Latest). El paso `Compute latest tag guard` del job de imagen **se ejecutó con éxito**; el build multi-arch sigue **en construcción**.
+Sesión en dos tramos: cerrar la feature #38 (imagen de release rápida) y corregir el bug que esa feature destapó.
+
+### Tramo 1 — FEATURE-011: imagen de release rápida (#38)
+
+1. Change `release-image-rapida`; PR #39 (feature→development) y PR #40 (development→main), ambos con CI verde.
+2. `release.yml` desdoblado en `preflight, image(matrix), smoke, manifest, publish, release`: runners **nativos** `ubuntu-26.04`/`ubuntu-26.04-arm`, publicación `push-by-digest=true` por arquitectura, ensamblado del manifest list con `docker buildx imagetools create`. `Dockerfile`: `sccache` (`RUSTC_WRAPPER=sccache`, backend GHA solo con secretos) + capa de dependencias.
+3. Release **v0.5.1**: imágenes nativas rapidísimas (amd64 9m43s, arm64 9m31s, frente a ~2 h), pero el **smoke test falló** → el job `manifest` quedó `skipped`; `:latest` siguió en **0.3.3**.
+
+### Tramo 2 — Hotfix del mtime (#41)
+
+1. Diagnóstico: `COPY` de Docker **preserva el mtime**; el `src/main.rs` del checkout era más antiguo que el `fn main() {}` dummy del build → Cargo daba el crate por fresco y **no recompilaba** (2ª compilación: **0.42 s**) → se publicaba el binario vacío.
+2. Change `dockerfile-copy-mtime`; rama `hotfix/dockerfile-copy-mtime` desde `main` (gitflow); RED→GREEN; PR **#42** mergeado a `main`.
+3. Fix: `RUN find src -type f -exec touch {} +` antes del build real, más un **guard estático** (comprobación nº 7 de `scripts/release-image-workflow.test.sh`).
+4. Release **v0.5.2**: Image amd64 **10m56s**, arm64 **14m32s**; **smoke ✅**, **manifest ✅**.
 
 ## Verificado
 
-- crates.io: `kesto` max_version **`0.5.0`**.
-- GitHub Release **v0.5.0** (Latest).
-- `development` sincronizado (`Cargo.toml` y `.vampus.yml` en 0.5.0).
-- `just check` verde (425 + 5); `openspec validate --specs --strict` → 12 passed; CI de #33/#34/#36/#37 en verde.
+- `podman manifest inspect ghcr.io/atareao/kesto:{latest,0.5,0.5.2}` → mismo index `application/vnd.oci.image.index.v1+json` con `amd64` + `arm64` (digest amd64 idéntico).
+- `:latest` arranca (2 s) y `GET /api/v1/health` → `200`, `"version":"0.5.2"`.
+- crates.io `kesto` **0.5.2**; GitHub Release **v0.5.2**.
+- `just check` verde (425 + 5); `just scripts-test` verde (incluye el nuevo guard).
 
 ## Pendiente / siguiente
 
-1. **Verificar `latest` al acabar el build de imagen** (es lo que valida el fix): `podman manifest inspect ghcr.io/atareao/kesto:latest` debe coincidir con `:0.5.0` (digest amd64+arm64). Si el build falla, `latest` seguiría en 0.3.3.
-2. **Follow-ups del deploy** (`docs/FEATURE-008-…`): `HSTS` si el TLS no lo termina un proxy; backup del volumen `kesto_data`. El del socket ya está hecho.
-3. **Nota:** la prueba del socket **real** no se pudo ejecutar aquí (sin daemon accesible); se validó por `podman compose config`.
-
-## Avisos
-
-- **Trabajo ajeno sin commitear** (NO incluir en PRs): `AGENTS.md`, `GIT_FLOW.md`, `docs/{ARQUITECTURA,COMANDOS,DECISIONES-SRS,ENTORNO,ESTADO}.md` y `assets/`. Sin tocar.
-- Overrides de pnpm en `ui/` → van en **`pnpm-workspace.yaml`**.
-- **Incidente GitHub (502) + pérdida de evento de push:** si un merge a `main` no dispara `release-prepare`, ahora se puede relanzar con `gh workflow run release-prepare.yml --ref main`.
+1. Fitur/cierre: `docs/FEATURE-012-dockerfile-copy-mtime.md`, change archivado (`openspec/changes/archive/2026-11-13-dockerfile-copy-mtime/`), plan renombrado a `plans/PLAN-012-COMPLETED.md` (todo en el PR de cierre `docs/feature-012-cierre`).
+2. Follow-ups del deploy (FEATURE-008): `HSTS` si el TLS lo termina un proxy; backup del volumen `kesto_data`.
+3. La prueba del socket **real** no se pudo ejecutar aquí (sin daemon accesible); se validó por `podman compose config`.
+4. Recordatorio: `podman run` **no** re-pule si la imagen existe en local; al verificar tags, forzar `podman pull` antes.
