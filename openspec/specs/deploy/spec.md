@@ -265,3 +265,18 @@ La imagen SHALL contener el mismo binario y el mismo panel compilado que antes, 
 - **WHEN** se inspecciona el runtime
 - **THEN** NO SHALL contener el toolchain de compilación
 - **AND** el proceso SHALL correr con el usuario sin privilegios
+
+### Requirement: La imagen contiene el binario real del crate
+
+El `Dockerfile` SHALL garantizar que el binario de release se compila a partir del código fuente real y NO SHALL publicar un artefacto de la caché de compilación. Cuando la etapa de dependencias use el patrón dummy, el build SHALL invalidar la huella de Cargo del crate tras copiar el código, de modo que Cargo lo recompile.
+
+#### Scenario: la imagen arranca con el binario real
+- **GIVEN** el `Dockerfile` con caché de dependencias por el patrón dummy
+- **WHEN** se construye y se arranca la imagen
+- **THEN** el binario SHALL corresponder al código fuente real
+- **AND** el contenedor SHALL escuchar en el puerto HTTP (smoke test superado)
+
+#### Scenario: el guard estático detecta la regresión
+- **GIVEN** `scripts/release-image-workflow.test.sh`
+- **WHEN** el `Dockerfile` copia el código real sin invalidar la huella de Cargo
+- **THEN** el test SHALL fallar
