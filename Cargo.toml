@@ -1,6 +1,6 @@
 [package]
 name = "kesto"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 description = "Lightweight backup orchestrator in a container: dumps MariaDB/PostgreSQL and host directories into rustic repositories on S3, with a live React panel."
 license = "MIT"

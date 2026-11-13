@@ -1,4 +1,18 @@
 # Changelog
+## [0.4.0] - 2026-11-13
+
+### Documentation
+
+- *(permiso-socket-daemon)* Cierra el change con doc de feature y specs
+
+### Features
+
+- *(deploy)* Group_add configurable por DOCKER_GID para el socket
+## [0.3.3] - 2026-11-13
+
+### Miscellaneous Tasks
+
+- Release v0.3.3
 ## [0.3.2] - 2026-11-13
 
 ### Dependencies
