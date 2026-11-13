@@ -1,4 +1,13 @@
 # Changelog
+## [0.5.2] - 2026-11-13
+
+### Bug Fixes
+
+- *(release)* Invalidar la huella de Cargo tras COPY para que la imagen compile el binario real
+
+### Documentation
+
+- *(openspec)* Change proposal del hotfix del mtime con COPY (#41)
 ## [0.5.1] - 2026-11-13
 
 ### Documentation
@@ -10,6 +19,7 @@
 ### Miscellaneous Tasks
 
 - *(release)* Build nativo por arquitectura, manifest list y sccache
+- Release v0.5.1
 
 ### Testing
 
