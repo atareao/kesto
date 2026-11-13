@@ -33,10 +33,12 @@ services:
       # Persistencia interna (SQLite) de la aplicación.
       - kesto_data:/app/data
     # En un host estándar el socket del daemon es `root:docker` con modo
-    # `srw-rw----`, y el proceso corre como uid 10001: sin el grupo del daemon
-    # no puede abrirlo. El gid DEPENDE DEL HOST (`getent group docker`); en dev
-    # lo salva `just run` con `--userns=keep-id`. Descomenta y ajusta el gid:
-    # group_add: ["<gid-del-grupo-docker>"]
+    # `srw-rw----`, y el proceso corre como uid/gid 10001: sin el grupo del
+    # daemon no puede abrirlo. El gid DEPENDE DEL HOST y se pasa por `DOCKER_GID`
+    # (`getent group docker`) sin editar este fichero. El defecto es el propio gid
+    # del proceso (10001): inofensivo, y mantiene el arranque en dev (sin daemon)
+    # sin configurar nada. En local lo cubre `just run` con `--userns=keep-id`.
+    group_add: ["${DOCKER_GID:-10001}"]
 
 volumes:
   kesto_data:

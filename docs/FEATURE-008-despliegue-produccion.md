@@ -71,7 +71,7 @@ just ui-dev
 ## Follow-ups
 
 - Las rutas de respaldo del §8 (`/var/www`, `/etc/nginx`) son **ejemplo del host**: el operador debe ajustarlas a su entorno.
-- **Permiso del socket del daemon:** en un host Docker estándar el socket es `root:docker` con modo `srw-rw----` y el proceso corre como uid `10001`, así que hay que darle el grupo del daemon (`group_add` en `compose.yaml`, con el gid del host) o ajustar los permisos. En local lo cubre `just run` con `--userns=keep-id`.
+- **Permiso del socket del daemon:** en un host Docker estándar el socket es `root:docker` con modo `srw-rw----` y el proceso corre como uid/gid `10001`, así que necesita el grupo del daemon. Ya **no se edita el fichero**: `compose.yaml` declara `group_add: ["${DOCKER_GID:-10001}"]` y basta definir `DOCKER_GID` (`getent group docker`) en el `.env`. Sin definirla, el defecto (el propio gid `10001`) mantiene el arranque en modo de desarrollo. En local lo cubre `just run` con `--userns=keep-id`.
 - Considerar `Strict-Transport-Security` si el TLS no lo termina un proxy.
 - El job `image` de `release.yml` se **enciende solo** al existir `Dockerfile` + `ui/package.json`: publica multi-arquitectura a ghcr.
 - Sin gestión de usuarios ni backup del volumen: fuera del alcance de este change.
