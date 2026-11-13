@@ -44,8 +44,8 @@ default:
 # Los tres checks del CI, en su orden. Ejecútalo antes de cada commit
 check: fmt clippy test
 
-# Los tres del backend más los cuatro del panel
-check-all: check ui-check
+# Los tres del backend, las pruebas de `scripts/` y los cuatro del panel
+check-all: check scripts-test ui-check
 
 # Formato: solo comprueba
 fmt:
@@ -62,6 +62,10 @@ clippy:
 # Tests unitarios (#[cfg(test)]) y de integración (tests/)
 test:
     cargo test --locked
+
+# Pruebas de los scripts de `scripts/` (guard de `latest`, estructura del release)
+scripts-test:
+    @for f in scripts/*.test.sh; do echo "── $f"; bash "$f"; done
 
 # Rustdoc: falla con cualquier warning, enlaces rotos incluidos
 doc:

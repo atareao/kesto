@@ -31,12 +31,48 @@ FROM rust:1.97-bookworm AS rust-builder
 
 WORKDIR /app
 
+# sccache: cachea la compilación en la caché de GitHub Actions. El binario se
+# instala desde el release oficial, precompilado por arquitectura.
+ARG SCCACHE_VERSION=0.19.0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && arch="$(uname -m)" \
+    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${arch}-unknown-linux-musl.tar.gz" \
+       | tar -xz -C /usr/local/bin --strip-components=1 \
+         "sccache-v${SCCACHE_VERSION}-${arch}-unknown-linux-musl/sccache"
+
+# sccache envuelve a rustc. El backend GHA solo se enciende si llegan las
+# credenciales de la caché de Actions (secretos de BuildKit); en local queda
+# apagado y el build no se rompe.
+ENV RUSTC_WRAPPER=sccache \
+    CARGO_INCREMENTAL=0
+
+# Caché de dependencias: se compilan las dependencias contra un `main.rs` vacío,
+# de modo que esta capa se reutiliza mientras Cargo.toml/Cargo.lock no cambien.
+COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=secret,id=actions_cache_url \
+    --mount=type=secret,id=actions_runtime_token \
+    set -eux; \
+    export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)"; \
+    export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)"; \
+    export SCCACHE_GHA_ENABLED="$([ -n "${ACTIONS_CACHE_URL}" ] && echo true || echo false)"; \
+    mkdir -p src; \
+    echo 'fn main() {}' > src/main.rs; \
+    cargo build --release --locked; \
+    rm -rf src
+
 # `migrations/` es imprescindible: `sqlx::migrate!()` (src/db/migrate.rs) lee
 # el directorio en tiempo de compilación y lo incrusta en el binario.
-COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
-RUN cargo build --release --locked
+RUN --mount=type=secret,id=actions_cache_url \
+    --mount=type=secret,id=actions_runtime_token \
+    set -eux; \
+    export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)"; \
+    export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)"; \
+    export SCCACHE_GHA_ENABLED="$([ -n "${ACTIONS_CACHE_URL}" ] && echo true || echo false)"; \
+    cargo build --release --locked
 
 # ── Etapa 3: runtime mínimo ────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
