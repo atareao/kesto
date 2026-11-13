@@ -61,4 +61,14 @@ else
   bad "el Dockerfile no separa la capa de dependencias (se esperaban >=2 'cargo build --release', hay ${builds:-0})"
 fi
 
+# 7. El Dockerfile invalida la huella de Cargo tras copiar el código real:
+#    'COPY' de Docker preserva el mtime, y el 'src/main.rs' del checkout es más
+#    antiguo que el dummy creado durante el build, así que sin adelantar el mtime
+#    Cargo considera el crate fresco y no lo recompila (se publica 'fn main() {}').
+if grep -qE 'find[[:space:]]+src[[:space:]]+-type[[:space:]]+f[[:space:]]+-exec[[:space:]]+touch' "${df}"; then
+  ok "el Dockerfile adelanta el mtime del código real (touch antes del build real)"
+else
+  bad "el Dockerfile no invalida la huella de Cargo tras 'COPY src' (falta 'find src -type f -exec touch')"
+fi
+
 exit "${fail}"
