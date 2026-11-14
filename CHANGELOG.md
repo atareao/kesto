@@ -1,4 +1,19 @@
 # Changelog
+## [0.6.1] - 2026-11-14
+
+### Bug Fixes
+
+- *(copia)* No dejar la instantánea de una copia fallida y hacer legible el volcado restaurado
+
+### Documentation
+
+- Relevo tras release v0.6.0
+- *(sdd)* Change proposal de higiene de la copia (#52, #53)
+- *(handoff)* Relevo de FEATURE-015 (higiene de la copia)
+
+### Miscellaneous Tasks
+
+- *(sdd)* Archivar higiene-de-la-copia y cerrar PLAN-015 (#52, #53)
 ## [0.6.0] - 2026-11-14
 
 ### Bug Fixes
@@ -27,6 +42,7 @@
 
 - *(openspec)* Archivar dockerfile-copy-mtime y fundir el delta en specs/deploy (#41)
 - *(sdd)* Archivar sqlite-copy-engine y cerrar PLAN-014 (#11)
+- Release v0.6.0
 ## [0.5.2] - 2026-11-13
 
 ### Bug Fixes
