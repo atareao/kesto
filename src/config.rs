@@ -33,6 +33,11 @@ const ENV_OIDC_REDIRECT_URL: &str = "OIDC_REDIRECT_URL";
 /// en otro socket, así que una ruta fija en el binario haría imposible ejercitar
 /// el motor sin un Docker de verdad.
 const ENV_DOCKER_HOST: &str = "DOCKER_HOST";
+
+/// Segundos de la cabecera `Strict-Transport-Security` (`KESTO_HSTS_MAX_AGE`).
+///
+/// Es opcional: sin ella la cabecera queda apagada.
+const ENV_KESTO_HSTS_MAX_AGE: &str = "KESTO_HSTS_MAX_AGE";
 /// Socket del motor de contenedores por defecto: la ruta del §8 del SRS.
 ///
 /// Es la ruta que la biblioteca de Docker usa cuando `DOCKER_HOST` no está
@@ -115,6 +120,13 @@ pub struct Config {
     /// el motor no lee el entorno del proceso por su cuenta, y eso es lo que deja
     /// que dos pruebas quieran dos sockets distintos a la vez.
     pub docker_host: String,
+
+    /// Antigüedad (segundos) de la cabecera `Strict-Transport-Security` (`KESTO_HSTS_MAX_AGE`).
+    ///
+    /// `None` —variable ausente— deja la cabecera apagada: en el despliegue estándar
+    /// el TLS lo termina un proxy, y la HSTS es suya. Con un valor presente, toda
+    /// respuesta lleva `Strict-Transport-Security: max-age=<n>`.
+    pub hsts_max_age: Option<u64>,
 }
 
 /// Fallo de configuración: la aplicación no puede arrancar.
@@ -219,6 +231,29 @@ impl Config {
             Some(raw) => raw.trim().to_owned(),
         };
 
+        // La HSTS es opcional, pero una variable presente e inservible —vacía o
+        // no numérica— es un error de arranque, como `RUST_LOG` o `BIND_ADDRESS`:
+        // un operador que cree haber encendido la HSTS y arranca sin ella no lo
+        // notaría.
+        let hsts_max_age = match lookup.get(ENV_KESTO_HSTS_MAX_AGE) {
+            None => None,
+            Some(raw) => {
+                let recortado = raw.trim();
+                if recortado.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        name: ENV_KESTO_HSTS_MAX_AGE,
+                    });
+                }
+                Some(
+                    recortado
+                        .parse::<u64>()
+                        .map_err(|_| ConfigError::InvalidValue {
+                            name: ENV_KESTO_HSTS_MAX_AGE,
+                        })?,
+                )
+            }
+        };
+
         let auth = Self::resolve_auth(
             lookup.get(ENV_OIDC_ISSUER_URL),
             lookup.get(ENV_OIDC_CLIENT_ID),
@@ -277,6 +312,7 @@ impl Config {
             master_key: SecretString::new(master_key),
             log_filter,
             docker_host,
+            hsts_max_age,
         })
     }
 
@@ -429,6 +465,54 @@ mod tests {
         assert_eq!(config.bind_address.to_string(), "0.0.0.0:8080");
         assert_eq!(config.database_url, "sqlite:///app/data/kesto.db");
         assert_eq!(config.log_filter, "info");
+    }
+
+    #[test]
+    fn sin_hsts_la_cabecera_queda_desactivada() {
+        let lookup = lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY)]);
+
+        let config = Config::from_lookup(&lookup).expect("sin HSTS la configuración es válida");
+
+        assert_eq!(config.hsts_max_age, None);
+    }
+
+    #[test]
+    fn la_hsts_configurada_se_lee() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_HSTS_MAX_AGE", "31536000"),
+        ]);
+
+        let config = Config::from_lookup(&lookup).expect("una HSTS válida se acepta");
+
+        assert_eq!(config.hsts_max_age, Some(31_536_000));
+    }
+
+    #[test]
+    fn una_hsts_vacia_es_error_de_arranque() {
+        let lookup = lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY), ("KESTO_HSTS_MAX_AGE", "")]);
+
+        let error = Config::from_lookup(&lookup).expect_err("una HSTS vacía no arranca");
+
+        assert!(
+            matches!(error, ConfigError::InvalidValue { name } if name == "KESTO_HSTS_MAX_AGE"),
+            "se esperaba InvalidValue para KESTO_HSTS_MAX_AGE, llegó {error:?}"
+        );
+    }
+
+    #[test]
+    fn una_hsts_no_numerica_es_error_de_arranque() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_HSTS_MAX_AGE", "treinta"),
+        ]);
+
+        let error = Config::from_lookup(&lookup).expect_err("una HSTS no numérica no arranca");
+
+        assert!(
+            matches!(error, ConfigError::InvalidValue { name } if name == "KESTO_HSTS_MAX_AGE"),
+            "se esperaba InvalidValue para KESTO_HSTS_MAX_AGE, llegó {error:?}"
+        );
     }
 
     #[test]
