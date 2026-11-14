@@ -176,4 +176,18 @@ pub enum Error {
     /// No se han podido listar las instantáneas del repositorio.
     #[error("no se han podido listar las instantáneas de `{destino}`: {motivo}")]
     ListadoFallido { destino: String, motivo: String },
+
+    /// No se ha podido retirar del repositorio la instantánea de una copia que no se dio por
+    /// buena.
+    ///
+    /// Es el fallo de la **limpieza**, no el de la copia, y por eso no sustituye al motivo que se
+    /// guarda en la fila de la ejecución: el motor olvida la instantánea de una copia fallida de
+    /// mejor esfuerzo, así que este fallo no cambia el veredicto. Lo que deja **puede** ser un
+    /// residuo —una instantánea que ninguna ejecución `success` reclama, que una purga posterior
+    /// podrá llevarse—, pero no siempre: si el identificador no llegaba a ser un hex completo, no
+    /// había ninguna instantánea que retirar y no queda nada. Por eso el `Display` **no** promete
+    /// residuo: dice lo que no se pudo hacer, y el matiz vive aquí. El motivo nombra el `destino` y
+    /// lo que dijo la biblioteca, que nunca incluye material de clave.
+    #[error("no se ha podido retirar la instantánea de `{destino}`: {motivo}")]
+    OlvidoFallido { destino: String, motivo: String },
 }
