@@ -83,12 +83,13 @@ CREATE TABLE IF NOT EXISTS repositories (
 CREATE TABLE IF NOT EXISTS backup_targets (
     id TEXT PRIMARY KEY NOT NULL, -- UUIDv4
     name TEXT NOT NULL,
-    target_type TEXT NOT NULL CHECK(target_type IN ('mariadb', 'postgresql', 'directory')),
+    target_type TEXT NOT NULL CHECK(target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')),
     container_name TEXT,          -- Nullable si es un directorio local
-    db_user TEXT,                 -- Requerido para DBs
-    db_password TEXT,             -- Encrypted/Plain para DBs
+    db_user TEXT,                 -- Requerido para bases de cliente/servidor
+    db_password TEXT,             -- Cifrado en reposo
     db_name TEXT,                 -- Opcional (NULL implica dump global)
     host_path TEXT,               -- Requerido para tipo 'directory'
+    db_path TEXT,                 -- Requerido para tipo 'sqlite': ruta absoluta del .db dentro del contenedor
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -123,6 +124,8 @@ CREATE TABLE IF NOT EXISTS job_executions (
 
 ```
 
+> **Nota (migración `0003`):** el valor `sqlite` del enumerado de `target_type` y la columna `db_path` llegaron con la feature de SQLite (issue #11). Como SQLite **no** permite modificar un `CHECK` con `ALTER TABLE`, esa migración **reconstruye** `backup_targets` —crear la tabla nueva con el `CHECK` ampliado y la columna, copiar las filas, borrar la vieja y renombrar— preservando las filas existentes (`db_path` a `NULL`) y sin romper las claves foráneas que la referencian.
+
 ---
 
 ## 4. Definición de Flujos de Ejecución
@@ -146,6 +149,12 @@ pg_dumpall -U <db_user>
 
 ```
 
+3. **SQLite:**
+```bash
+sqlite3 <db_path> .dump
+```
+
+El volcado de SQLite es un **volcado SQL** —las sentencias que reconstruyen el esquema y los datos—, no una copia del fichero. `sqlite3 <db_path> .dump` se ejecuta **dentro del contenedor del target** y lee la base de forma **consistente en caliente**, de modo que la copia es válida con el **modo WAL** activo y con la base **en uso**, sin detener el servicio. No se copia el `.db` con un `cp` —ni su `-wal`—: con WAL activo el `.db` puede ir por detrás de su `.wal` y la copia resultante puede restaurarse con corrupción o con datos perdidos sin que nada lo delate. El contenedor del target debe disponer del binario `sqlite3`.
 
 
 ```
