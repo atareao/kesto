@@ -117,6 +117,7 @@ impl Aparato {
                 db_password: None,
                 db_name: None,
                 host_path: Some(destino),
+                db_path: None,
             })
             .await
             .expect("el alta del target no puede fallar")

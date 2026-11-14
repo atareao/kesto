@@ -1,28 +1,27 @@
-# Relevo — FEATURE-013 (HSTS + backup) en development; #11 pendiente
+# Relevo — FEATURE-014 (SQLite como motor de copia) lista en PR; #11 en curso
 
-`main` en **0.5.2** (`19d5c2f`); `development` en **`7304485`** (FEATURE-013 + este relevo, **sin releasear**). Issues **#25**, **#22**, **#41**, **#38**, **#44** cerrados en esta sesión.
+`main` en **0.5.2**; `development` sin cambios nuevos en esta sesión. Trabajo de esta sesión en la rama **`feature/sqlite-copy-engine`** (issue **#11**), con `plans/PLAN-014.md` y el change `openspec/changes/sqlite-copy-engine/`.
 
 ## Lo hecho en esta sesión
 
-### 1. Housekeeping
+### FEATURE-014 — SQLite como motor de copia (#11)
 
-- **#25** (publicar el crate) y **#22** (override de minimatch) ya estaban **resueltos**: se cerraron con la evidencia (crate `kesto` en crates.io hasta 0.5.2; override en `ui/pnpm-workspace.yaml`, minimatch → 11.0.8, sin alertas abiertas).
-- Borradas 5 ramas remotas de PRs ya mergeados.
-
-### 2. FEATURE-013 — HSTS opcional + backup del volumen de datos (#44)
-
-- Change `deploy-endurecimiento` (SDD), TDD RED→GREEN, PR **#45** mergeado a `development`.
-- **HSTS:** variable opcional `KESTO_HSTS_MAX_AGE` (entero ≥ 0). Ausente → sin cabecera (defecto; la HSTS del proxy); presente → toda respuesta lleva `Strict-Transport-Security: max-age=<n>`, incluidos los `404`/`405` (la capa va en el router raíz). Vacía o no numérica → error de arranque.
-- **Backup:** receta `just backup-datos [destino]` (localiza el volumen `kesto_data`, para el contenedor, exporta y rearranca). Recuperación documentada en `docs/FEATURE-013-deploy-endurecimiento.md`.
-- `just check` verde (**431** passed, +6); `openspec validate --specs --strict` → 12 passed.
+- Ciclo SDD + TDD completo en la rama `feature/sqlite-copy-engine`.
+- **Nuevo `target_type = 'sqlite'`** con `container_name` + `db_path` (ruta absoluta del `.db` dentro del contenedor); no usa `db_user`/`db_password`/`db_name`/`host_path`.
+- **Copia consistente en caliente**: `sqlite3 -readonly <db_path> .dump` dentro del contenedor, streaming a `rustic`; válida con WAL y con la base en uso; sin ficheros temporales. El `-readonly` cierra el éxito silencioso (sin él, una ruta inexistente creaba una base vacía y salía con 0).
+- **Migración `0003_sqlite_target.sql`**: reconstruye `backup_targets` (añade `db_path`, amplía el `CHECK`), preservando filas e índices y con `foreign_keys` bajo control.
+- **Panel**: opción `sqlite` en el formulario de fuentes, con sus campos condicionales.
+- **Docs**: `docs/DEFINITION.md` §3/§4, ejemplo en `compose.yaml`, `docs/FEATURE-014-sqlite-copy-engine.md`.
+- Code review (rust-reviewer + react-reviewer): **sin bloqueantes**; los hallazgos menores se corrigieron.
 
 ## Verificado
 
-- `just check` verde; la receta `backup-datos` probada contra un volumen real (con y sin contenedor en marcha): produce `.tar.gz` con `kesto.db`+`-wal` y deja el contenedor arriba.
-- CI del PR #45 en verde.
+- `just check-all` verde: **441 + 5** tests backend, **128** tests UI, `tsc`, `eslint` y `vite build` OK.
+- `openspec validate sqlite-copy-engine --strict` en verde.
 
 ## Pendiente / siguiente
 
-1. **Release:** FEATURE-013 vive en `development`; el próximo merge `development → main` la publica (bump automático por los conventional commits).
-2. **#11 — SQLite como motor de copia:** feature grande (nuevo motor de extracción; toca `src/engine/`, `src/rustic/`, el esquema de `jobs`/`targets` y el panel). **Recomendado abrirla en sesión nueva** con su ciclo SDD completo.
-3. Recordatorios heredados: `podman run` no re-pule si la imagen existe en local (forzar `podman pull` al verificar tags); la prueba del socket real no se puede ejecutar aquí (sin daemon accesible en el CI).
+1. **PR de `feature/sqlite-copy-engine` a `development`** y CI en verde; luego cerrar #11 con el merge.
+2. **Verificación manual pendiente:** copia real de una base SQLite en uso con WAL, restaurada sin errores. Exige un motor de contenedores accesible (no disponible en este entorno). El e2e equivalente en `src/engine/mod.rs` está bajo `#[ignore]`; conviene añadir una variante SQLite al arnés e2e (hoy solo cubre `mariadb-dump`).
+3. Al fusionar: `openspec archive sqlite-copy-engine` está hecho en la rama; renombrar `plans/PLAN-014.md` a `plans/PLAN-014-COMPLETED.md` (también en la rama).
+4. Recordatorios heredados: forzar `podman pull` al verificar tags; el CI no levanta daemon de contenedores.

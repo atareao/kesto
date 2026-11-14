@@ -49,6 +49,7 @@ export function target(campos: Partial<Target> & { id: string }): Target {
     has_db_password: false,
     db_name: null,
     host_path: '/srv/datos',
+    db_path: null,
     created_at: '2026-01-01T00:00:00Z',
     ...campos,
   }

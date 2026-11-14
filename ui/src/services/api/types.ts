@@ -17,7 +17,7 @@
 export type ModoDeAutenticacion = 'disabled' | 'oidc'
 
 /** Clase de origen de una copia. Es el `CHECK` de `targets.target_type` (§3). */
-export type TipoDeTarget = 'directory' | 'mariadb' | 'postgresql'
+export type TipoDeTarget = 'directory' | 'mariadb' | 'postgresql' | 'sqlite'
 
 /** Estado de una ejecución. Es el `CHECK` de `executions.status` (§3). */
 export type Estado = 'pending' | 'running' | 'success' | 'failed'
@@ -35,6 +35,13 @@ export interface Target {
   has_db_password: boolean
   db_name: string | null
   host_path: string | null
+  /**
+   * Ruta absoluta del `.db` **dentro** del contenedor; solo tiene valor en un
+   * `sqlite`. La clave **siempre** viaja en la lectura (el backend no la omite
+   * cuando va a `null`), así que aquí es obligatoria. No es un secreto: viaja en
+   * claro en las dos direcciones.
+   */
+  db_path: string | null
   /** RFC3339, en UTC. */
   created_at: string
 }
@@ -53,6 +60,8 @@ export interface AltaTarget {
   db_password?: string | null
   db_name?: string | null
   host_path?: string | null
+  /** Solo un `sqlite`: la ruta del `.db` dentro del contenedor. */
+  db_path?: string | null
 }
 
 // ─── Repositorios ────────────────────────────────────────────────────────────

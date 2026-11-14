@@ -12,6 +12,7 @@ import type {
   Sesion,
   Snapshot,
   Target,
+  TipoDeTarget,
 } from './types'
 
 // Estas pruebas son el candado de los literales del cable: si alguien cambia
@@ -26,10 +27,61 @@ describe('tipos del cable', () => {
     expect(new Set(estados).size).toBe(4)
   })
 
-  it('los tipos de target son los tres que sabe extraer el motor', () => {
-    const tipos = ['directory', 'mariadb', 'postgresql'] satisfies Array<Target['target_type']>
+  it('los tipos de target son los cuatro que sabe extraer el motor', () => {
+    const tipos = ['directory', 'mariadb', 'postgresql', 'sqlite'] satisfies Array<
+      Target['target_type']
+    >
 
-    expect(tipos).toHaveLength(3)
+    expect(tipos).toHaveLength(4)
+  })
+
+  it('todo tipo de target está cubierto por el panel', () => {
+    // Candado de exhaustividad: si el backend estrena una variante en
+    // `TipoDeTarget`, este `Record` deja de compilar y `tsc` falla antes que el
+    // panel se desalinee en silencio.
+    const cubiertos: Record<TipoDeTarget, true> = {
+      directory: true,
+      mariadb: true,
+      postgresql: true,
+      sqlite: true,
+    }
+
+    expect(Object.values(cubiertos).every(Boolean)).toBe(true)
+  })
+
+  it('una lectura sqlite trae su db_path, que no es secreto', () => {
+    const sqlite: Target = {
+      id: '0199f0aa-0000-7000-8000-000000000002',
+      name: 'kesto-db',
+      target_type: 'sqlite',
+      container_name: 'kesto',
+      db_user: null,
+      has_db_password: false,
+      db_name: null,
+      host_path: null,
+      db_path: '/var/lib/kesto/kesto.db',
+      created_at: '2026-01-02T03:04:05Z',
+    }
+
+    expect(sqlite.db_path).toBe('/var/lib/kesto/kesto.db')
+    // El `db_path` describe la fuente, no la autentica: el DTO de lectura no lo
+    // esconde, a diferencia de los tres secretos del §3.
+    expect(sqlite.has_db_password).toBe(false)
+    expect(sqlite.db_user).toBeNull()
+    expect(sqlite.db_name).toBeNull()
+    expect(sqlite.host_path).toBeNull()
+  })
+
+  it('un alta sqlite lleva contenedor y db_path, y ni host ni credenciales', () => {
+    const alta: AltaTarget = {
+      name: 'kesto-db',
+      target_type: 'sqlite',
+      container_name: 'kesto',
+      db_path: '/var/lib/kesto/kesto.db',
+    }
+
+    expect(alta.db_path).toBe('/var/lib/kesto/kesto.db')
+    expect(alta.name).toBe('kesto-db')
   })
 
   it('las lecturas traen el booleano del secreto y nunca el secreto', () => {
@@ -42,6 +94,7 @@ describe('tipos del cable', () => {
       has_db_password: true,
       db_name: 'wordpress',
       host_path: null,
+      db_path: null,
       created_at: '2026-01-02T03:04:05Z',
     }
     const repository: Repository = {
@@ -56,11 +109,14 @@ describe('tipos del cable', () => {
       created_at: '2026-01-02T03:04:05Z',
     }
 
-    // El secreto solo existe como booleano en la lectura: el objeto no tiene
-    // ninguna propiedad con el valor.
-    expect(Object.keys(target)).not.toContain('db_password')
-    expect(Object.keys(repository)).not.toContain('secret_access_key')
-    expect(Object.keys(repository)).not.toContain('passphrase')
+    // El secreto solo existe como booleano en la lectura: declararlo aquí
+    // (`db_password`, `secret_access_key`, `passphrase`) rompería la
+    // compilación por exceso de propiedad sobre un literal local.
+    expect([target.has_db_password, repository.has_secret_access_key, repository.has_passphrase]).toEqual([
+      true,
+      true,
+      true,
+    ])
   })
 
   it('los tipos de escritura sí llevan los campos secretos, opcionales', () => {

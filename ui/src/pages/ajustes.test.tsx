@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { instalarFetchFalso } from '../pruebas/fetchDePrueba'
 import type { ManejadorDeFetch, RespuestaSimulada } from '../pruebas/fetchDePrueba'
 import { repositorio, target } from '../pruebas/fixtures'
+import { elegirEnSelect, limpiarDesplegables } from '../pruebas/selectDeAntd'
 import Ajustes from './ajustes'
 
 const TARGET_MARIADB = target({
@@ -59,6 +60,8 @@ function manejadorCon(sobre: Partial<Record<string, ManejadorDeFetch>> = {}): Ma
 
 beforeEach(() => {
   vi.unstubAllGlobals()
+  // Restos de desplegables de Antd colgados en `document.body` por otro caso.
+  limpiarDesplegables()
 })
 
 afterEach(() => {
@@ -153,6 +156,58 @@ describe('pantalla de Ajustes', () => {
     expect(
       within(dialogo).queryByLabelText('Contenedor'),
     ).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('da de alta un target sqlite y lo enseña en la tabla', async () => {
+    const usuario = userEvent.setup()
+    const creado = target({
+      id: 't9',
+      name: 'kesto-db',
+      target_type: 'sqlite',
+      container_name: 'kesto',
+      host_path: null,
+      db_path: '/var/lib/kesto/kesto.db',
+    })
+    let listado = [TARGET_MARIADB]
+    const fetch = instalarFetchFalso(
+      manejadorCon({
+        'GET /api/v1/targets': () => ({ status: 200, data: listado }),
+        'POST /api/v1/targets': () => {
+          listado = [...listado, creado]
+          return { status: 201, data: creado }
+        },
+      }),
+    )
+
+    const { unmount } = montar()
+    await screen.findByRole('table', { name: 'Targets' })
+
+    await usuario.click(screen.getByRole('button', { name: 'Nuevo target' }))
+    const dialogo = await screen.findByRole('dialog')
+    await usuario.type(within(dialogo).getByLabelText('Nombre'), 'kesto-db')
+    await elegirEnSelect(usuario, 'Tipo', 'SQLite', dialogo)
+    await usuario.type(within(dialogo).getByLabelText('Contenedor'), 'kesto')
+    await usuario.type(within(dialogo).getByLabelText(/ruta del \.db/i), '/var/lib/kesto/kesto.db')
+    await usuario.click(within(dialogo).getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() => {
+      expect(fetch.a('/api/v1/targets').filter((llamada) => llamada.method === 'POST')).toHaveLength(1)
+    })
+    const alta = fetch.a('/api/v1/targets').find((llamada) => llamada.method === 'POST')
+    expect(alta?.cuerpo).toMatchObject({
+      name: 'kesto-db',
+      target_type: 'sqlite',
+      container_name: 'kesto',
+      db_path: '/var/lib/kesto/kesto.db',
+    })
+    // Un sqlite no manda ni ruta de host ni credenciales de base de datos.
+    expect(alta?.cuerpo).not.toHaveProperty('host_path')
+
+    // La tabla se recarga y la fila nueva queda a la vista con su destino.
+    const tabla = screen.getByRole('table', { name: 'Targets' })
+    expect(await within(tabla).findByText('kesto-db')).toBeInTheDocument()
+    expect(within(tabla).getByText('kesto · /var/lib/kesto/kesto.db')).toBeInTheDocument()
     unmount()
   })
 

@@ -15,6 +15,8 @@ export interface ValoresDeTarget {
   db_password?: string
   db_name?: string
   host_path?: string
+  /** Solo un `sqlite`: la ruta del `.db` dentro del contenedor. */
+  db_path?: string
 }
 
 export interface PropsDeModalDeTarget {
@@ -29,6 +31,7 @@ const VALORES_POR_DEFECTO: ValoresDeTarget = {
   name: '',
   target_type: 'directory',
   host_path: '',
+  db_path: '',
 }
 
 function valoresDe(target: Target): ValoresDeTarget {
@@ -39,6 +42,7 @@ function valoresDe(target: Target): ValoresDeTarget {
     db_user: target.db_user ?? '',
     db_name: target.db_name ?? '',
     host_path: target.host_path ?? '',
+    db_path: target.db_path ?? '',
     // El secreto no se lee nunca: el campo llega vacío y vacío significa
     // «conserva el que hay».
     db_password: '',
@@ -63,6 +67,9 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
 
   const tipo = Form.useWatch('target_type', form) ?? 'directory'
   const esDirectorio = tipo === 'directory'
+  // Un sqlite comparte el contenedor con las bases de datos, pero se describe
+  // con la ruta del `.db` en vez de con usuario, contraseña y nombre de base.
+  const esSqlite = tipo === 'sqlite'
 
   return (
     <Form
@@ -85,11 +92,12 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
             { value: 'directory', label: 'Directorio' },
             { value: 'mariadb', label: 'MariaDB' },
             { value: 'postgresql', label: 'PostgreSQL' },
+            { value: 'sqlite', label: 'SQLite' },
           ]}
         />
       </Form.Item>
 
-      {esDirectorio ? (
+      {esDirectorio && (
         <Form.Item
           label="Ruta del host"
           name="host_path"
@@ -97,7 +105,9 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
         >
           <Input placeholder="/srv/datos" />
         </Form.Item>
-      ) : (
+      )}
+
+      {!esDirectorio && (
         <Space size="middle" wrap align="start">
           <Form.Item
             label="Contenedor"
@@ -106,35 +116,47 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
           >
             <Input placeholder="nombre-del-contenedor" />
           </Form.Item>
-          <Form.Item
-            label="Usuario de la base de datos"
-            name="db_user"
-            rules={[{ required: true, message: 'Escribe el usuario.' }]}
-          >
-            <Input placeholder="kesto" />
-          </Form.Item>
-          <Form.Item
-            label="Contraseña de la base de datos"
-            name="db_password"
-            extra={
-              target?.has_db_password === true
-                ? 'Ya hay una contraseña guardada; déjala vacía para conservarla.'
-                : undefined
-            }
-          >
-            <Input.Password autoComplete="new-password" />
-          </Form.Item>
-          <Form.Item
-            label="Base de datos"
-            name="db_name"
-            rules={[{ required: true, message: 'Escribe el nombre de la base.' }]}
-          >
-            <Input placeholder="kesto" />
-          </Form.Item>
+          {esSqlite ? (
+            <Form.Item
+              label="Ruta del .db en el contenedor"
+              name="db_path"
+              rules={[{ required: true, message: 'Escribe la ruta del fichero .db.' }]}
+            >
+              <Input placeholder="/var/lib/kesto/kesto.db" />
+            </Form.Item>
+          ) : (
+            <>
+              <Form.Item
+                label="Usuario de la base de datos"
+                name="db_user"
+                rules={[{ required: true, message: 'Escribe el usuario.' }]}
+              >
+                <Input placeholder="kesto" />
+              </Form.Item>
+              <Form.Item
+                label="Contraseña de la base de datos"
+                name="db_password"
+                extra={
+                  target?.has_db_password === true
+                    ? 'Ya hay una contraseña guardada; déjala vacía para conservarla.'
+                    : undefined
+                }
+              >
+                <Input.Password autoComplete="new-password" />
+              </Form.Item>
+              <Form.Item
+                label="Base de datos"
+                name="db_name"
+                rules={[{ required: true, message: 'Escribe el nombre de la base.' }]}
+              >
+                <Input placeholder="kesto" />
+              </Form.Item>
+            </>
+          )}
         </Space>
       )}
 
-      {target !== null && target.has_db_password && (
+      {target !== null && target.has_db_password && !esSqlite && (
         <Typography.Text type="secondary">
           Las credenciales guardadas no se muestran: solo se indica que existen.
         </Typography.Text>
@@ -146,8 +168,9 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
 /**
  * Alta y edición de un target.
  *
- * El `target_type` condiciona los campos: un directorio pide `host_path`, y una
- * base de datos pide contenedor, usuario, contraseña y nombre de la base. La
+ * El `target_type` condiciona los campos: un directorio pide `host_path`; una
+ * base de datos pide contenedor, usuario, contraseña y nombre de la base; y un
+ * `sqlite` pide el contenedor y la ruta del `.db`, sin credenciales. La
  * contraseña **nunca** se pinta: en una lectura solo se conoce
  * `has_db_password`, y en un `PUT` un campo vacío se omite para que el backend
  * conserve la guardada.
@@ -186,11 +209,18 @@ export function ModalDeTarget({ abierto, target, onCerrar, onGuardado }: PropsDe
       cuerpo.host_path = valores.host_path ?? ''
     } else {
       cuerpo.container_name = valores.container_name ?? ''
-      cuerpo.db_user = valores.db_user ?? ''
-      cuerpo.db_name = valores.db_name ?? ''
-      // Un secreto vacío no viaja: mandarlo borraría el guardado.
-      if (valores.db_password !== undefined && valores.db_password !== '') {
-        cuerpo.db_password = valores.db_password
+
+      if (valores.target_type === 'sqlite') {
+        // Un sqlite se sitúa con el contenedor y la ruta del `.db`: no tiene
+        // usuario, ni secreto, ni nombre de base que mandar.
+        cuerpo.db_path = valores.db_path ?? ''
+      } else {
+        cuerpo.db_user = valores.db_user ?? ''
+        cuerpo.db_name = valores.db_name ?? ''
+        // Un secreto vacío no viaja: mandarlo borraría el guardado.
+        if (valores.db_password !== undefined && valores.db_password !== '') {
+          cuerpo.db_password = valores.db_password
+        }
       }
     }
 
