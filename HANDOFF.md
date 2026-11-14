@@ -1,6 +1,6 @@
 # Relevo — FEATURE-013 (HSTS + backup) en development; #11 pendiente
 
-`main` en **0.5.2** (`19d5c2f`); `development` en **`72e99c3`** (FEATURE-013 mergeada, **sin releasear**). Issues **#25**, **#22**, **#41**, **#38** cerrados en esta sesión.
+`main` en **0.5.2** (`19d5c2f`); `development` en **`7304485`** (FEATURE-013 + este relevo, **sin releasear**). Issues **#25**, **#22**, **#41**, **#38**, **#44** cerrados en esta sesión.
 
 ## Lo hecho en esta sesión
 
