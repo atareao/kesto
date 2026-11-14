@@ -6,6 +6,7 @@ import App from './App'
 import { instalarFetchFalso } from './pruebas/fetchDePrueba'
 import { instalarEventSourceFalso } from './services/eventosDePrueba'
 import { ProveedorDeEventos } from './services/events'
+import { ProveedorDeTema } from './services/tema'
 
 /**
  * Pruebas de las rutas del panel (§3.1/§3.2): cada entrada del menú abre su
@@ -35,14 +36,16 @@ function montar(entrada = '/') {
     throw new Error(`ruta inesperada: ${ruta}`)
   })
   return render(
-    <QueryClientProvider client={cliente}>
-      <ProveedorDeEventos>
-        <MemoryRouter initialEntries={[entrada]}>
-          <Ubicacion />
-          <App />
-        </MemoryRouter>
-      </ProveedorDeEventos>
-    </QueryClientProvider>,
+    <ProveedorDeTema>
+      <QueryClientProvider client={cliente}>
+        <ProveedorDeEventos>
+          <MemoryRouter initialEntries={[entrada]}>
+            <Ubicacion />
+            <App />
+          </MemoryRouter>
+        </ProveedorDeEventos>
+      </QueryClientProvider>
+    </ProveedorDeTema>,
   )
 }
 

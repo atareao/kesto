@@ -1,22 +1,26 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { ProveedorDeTema } from '../../services/tema'
 import { Layout } from './Layout'
 
 /**
- * Pruebas del layout: accesibilidad (§3.5) y menú plegable en ventana estrecha
- * (§3.3). El layout se monta dentro de un router porque usa `Link`, `Outlet` y
- * `useLocation`.
+ * Pruebas del layout: accesibilidad (§3.5), menú plegable en ventana estrecha
+ * (§3.3) y tema (§ identidad visual y tema). El layout se monta dentro de un
+ * router porque usa `Link`, `Outlet` y `useLocation`, y dentro del proveedor de
+ * tema porque la cabecera y el logo dependen del modo activo.
  */
 function montarLayout() {
   return render(
-    <MemoryRouter initialEntries={['/']}>
-      <Routes>
-        <Route element={<Layout />}>
-          <Route index element={<p>contenido de la pantalla</p>} />
-        </Route>
-      </Routes>
-    </MemoryRouter>,
+    <ProveedorDeTema>
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route element={<Layout />}>
+            <Route index element={<p>contenido de la pantalla</p>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    </ProveedorDeTema>,
   )
 }
 
@@ -46,6 +50,31 @@ describe('accesibilidad del layout', () => {
 
     const boton = screen.getByRole('button', { name: 'Plegar el menú' })
     expect(boton).toHaveAttribute('aria-expanded', 'true')
+  })
+})
+
+describe('tema del layout', () => {
+  afterEach(() => {
+    window.localStorage.clear()
+    delete document.documentElement.dataset.tema
+  })
+
+  it('arranca en oscuro y muestra el conmutador en la cabecera', () => {
+    montarLayout()
+
+    expect(document.documentElement.dataset.tema).toBe('oscuro')
+
+    const cabecera = document.querySelector('.cabecera-del-panel')
+    expect(cabecera).not.toBeNull()
+    expect(
+      within(cabecera as HTMLElement).getByRole('switch', { name: 'Cambiar a tema claro' }),
+    ).toBeInTheDocument()
+  })
+
+  it('muestra el logo de Kesto en el menú lateral', () => {
+    montarLayout()
+
+    expect(screen.getByTestId('logo-del-panel')).toBeInTheDocument()
   })
 })
 
