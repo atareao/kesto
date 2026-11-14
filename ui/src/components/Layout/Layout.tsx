@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { ReactNode } from 'react'
-import { Button, Layout as LayoutDeAntd, Menu, Typography } from 'antd'
+import { Button, Layout as LayoutDeAntd, Menu, Typography, theme } from 'antd'
 import {
   CameraOutlined,
   DashboardOutlined,
@@ -12,15 +12,24 @@ import {
   UserOutlined,
 } from '@ant-design/icons'
 import { Link, Outlet, useLocation } from 'react-router-dom'
+import { ConmutadorDeTema } from '../ConmutadorDeTema/ConmutadorDeTema'
+import { useTema } from '../../services/useTema'
+import iconoClaro from '../../assets/kesto-icon.png'
+import iconoOscuro from '../../assets/kesto-icon-dark.png'
 
 /**
  * El armazón del panel: menú lateral con las pantallas del §6, cabecera con el
- * botón de plegado y el `main` donde se pinta la ruta activa.
+ * conmutador de tema y el botón de plegado, y el `main` donde se pinta la ruta
+ * activa.
  *
  * Accesibilidad (§3.5): la navegación es un `nav` con nombre accesible, el
  * contenido vive en un `main` enfocable (`tabIndex={-1}`) al que apunta el
  * enlace de salto, y el botón de plegado anuncia su estado con `aria-expanded`.
  * El foco visible lo pone `estilos.css` con `:focus-visible`.
+ *
+ * Tema (§ identidad visual y tema): la cabecera y el lateral toman sus colores
+ * del tema activo (`theme.useToken()`), sin ningún color fijado a mano, y el
+ * logo del lateral cambia de variante según el modo.
  */
 
 interface EntradaDelMenu {
@@ -47,6 +56,9 @@ function esLaActiva(rutaActual: string, ruta: string): boolean {
 export function Layout() {
   const { pathname } = useLocation()
   const [plegado, setPlegado] = useState(false)
+  const { token } = theme.useToken()
+  const { modo } = useTema()
+  const esOscuro = modo === 'oscuro'
 
   const activa = ENTRADAS.find((entrada) => esLaActiva(pathname, entrada.ruta))
 
@@ -63,6 +75,11 @@ export function Layout() {
     ),
   }))
 
+  // El logo va sobre la superficie del lateral; cada variante se lee sobre su fondo.
+  const logoDelPanel = esOscuro ? iconoOscuro : iconoClaro
+  const colorDeSuperficie = token.colorBgContainer
+  const temaDelMenu = esOscuro ? 'dark' : 'light'
+
   return (
     <LayoutDeAntd style={{ minHeight: '100vh' }}>
       <a className="enlace-de-salto" href="#contenido">
@@ -75,15 +92,21 @@ export function Layout() {
         trigger={null}
         breakpoint="lg"
         onBreakpoint={setPlegado}
-        theme="light"
+        theme={temaDelMenu}
         width={220}
+        style={{ background: colorDeSuperficie }}
       >
         <div className="marca-del-panel">
-          <Typography.Text strong>Kesto</Typography.Text>
+          <img className="logo-del-panel" data-testid="logo-del-panel" src={logoDelPanel} alt="" />
+          <Typography.Text strong style={{ color: token.colorText }}>
+            Kesto
+          </Typography.Text>
         </div>
         <nav id="menu-principal" aria-label="Principal">
           <Menu
             mode="inline"
+            theme={temaDelMenu}
+            style={{ background: 'transparent' }}
             selectedKeys={activa === undefined ? [] : [activa.ruta]}
             items={entradas}
           />
@@ -91,7 +114,13 @@ export function Layout() {
       </LayoutDeAntd.Sider>
 
       <LayoutDeAntd>
-        <LayoutDeAntd.Header className="cabecera-del-panel">
+        <LayoutDeAntd.Header
+          className="cabecera-del-panel"
+          style={{
+            background: token.colorBgContainer,
+            borderBottom: `1px solid ${token.colorSplit}`,
+          }}
+        >
           <Button
             type="text"
             aria-label={plegado ? 'Desplegar el menú' : 'Plegar el menú'}
@@ -100,6 +129,7 @@ export function Layout() {
             onClick={() => setPlegado((previo) => !previo)}
             icon={plegado ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
           />
+          <ConmutadorDeTema className="conmutador-de-tema" />
         </LayoutDeAntd.Header>
         {/* `Layout.Content` ya se pinta como `<main>`: el id y el foco van en él. */}
         <LayoutDeAntd.Content id="contenido" tabIndex={-1} className="contenido-del-panel">
@@ -109,3 +139,4 @@ export function Layout() {
     </LayoutDeAntd>
   )
 }
+
