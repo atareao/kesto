@@ -1,12 +1,10 @@
-# Relevo — FEATURE-014 (SQLite como motor de copia) lista en PR; #11 en curso
+# Relevo — FEATURE-014 (SQLite) mergeada y #11 cerrado; verificación manual pendiente
 
-`main` en **0.5.2**; `development` sin cambios nuevos en esta sesión. Trabajo de esta sesión en la rama **`feature/sqlite-copy-engine`** (issue **#11**), con `plans/PLAN-014.md` y el change `openspec/changes/sqlite-copy-engine/`.
+`main` en **0.5.2**; `development` en **1139b1c** (merge del PR **#48**, FEATURE-014). Issue **#11** cerrado. **`main` todavía no incluye FEATURE-014**: el próximo merge `development → main` la publica (bump automático por los conventional commits).
 
-## Lo hecho en esta sesión
+## Lo hecho en esta sesión — FEATURE-014: SQLite como motor de copia (#11)
 
-### FEATURE-014 — SQLite como motor de copia (#11)
-
-- Ciclo SDD + TDD completo en la rama `feature/sqlite-copy-engine`.
+- Ciclo SDD + TDD completo; change `sqlite-copy-engine` archivado y `plans/PLAN-014-COMPLETED.md`.
 - **Nuevo `target_type = 'sqlite'`** con `container_name` + `db_path` (ruta absoluta del `.db` dentro del contenedor); no usa `db_user`/`db_password`/`db_name`/`host_path`.
 - **Copia consistente en caliente**: `sqlite3 -readonly <db_path> .dump` dentro del contenedor, streaming a `rustic`; válida con WAL y con la base en uso; sin ficheros temporales. El `-readonly` cierra el éxito silencioso (sin él, una ruta inexistente creaba una base vacía y salía con 0).
 - **Migración `0003_sqlite_target.sql`**: reconstruye `backup_targets` (añade `db_path`, amplía el `CHECK`), preservando filas e índices y con `foreign_keys` bajo control.
@@ -17,11 +15,11 @@
 ## Verificado
 
 - `just check-all` verde: **441 + 5** tests backend, **128** tests UI, `tsc`, `eslint` y `vite build` OK.
-- `openspec validate sqlite-copy-engine --strict` en verde.
+- `openspec validate --specs --strict` → 12 passed.
+- **CI del PR #48 en verde** (Backend, Frontend, Preflight).
 
 ## Pendiente / siguiente
 
-1. **PR de `feature/sqlite-copy-engine` a `development`** y CI en verde; luego cerrar #11 con el merge.
-2. **Verificación manual pendiente:** copia real de una base SQLite en uso con WAL, restaurada sin errores. Exige un motor de contenedores accesible (no disponible en este entorno). El e2e equivalente en `src/engine/mod.rs` está bajo `#[ignore]`; conviene añadir una variante SQLite al arnés e2e (hoy solo cubre `mariadb-dump`).
-3. Al fusionar: `openspec archive sqlite-copy-engine` está hecho en la rama; renombrar `plans/PLAN-014.md` a `plans/PLAN-014-COMPLETED.md` (también en la rama).
-4. Recordatorios heredados: forzar `podman pull` al verificar tags; el CI no levanta daemon de contenedores.
+1. **Verificación manual:** copia real de una base SQLite **en uso** con WAL, restaurada sin errores. Exige un motor de contenedores accesible (no disponible en este entorno). Follow-up recomendado: añadir una variante SQLite al e2e `#[ignore]` de `src/engine/mod.rs` (hoy solo cubre `mariadb-dump`).
+2. **Release:** FEATURE-014 vive en `development`; el próximo merge `development → main` la publica.
+3. Recordatorios heredados: forzar `podman pull` al verificar tags; el CI no levanta daemon de contenedores.
