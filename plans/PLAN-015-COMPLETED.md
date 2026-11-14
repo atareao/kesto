@@ -2,7 +2,7 @@
 
 - **Issues:** [#52](https://github.com/atareao/kesto/issues/52) y [#53](https://github.com/atareao/kesto/issues/53)
 - **Change SDD:** `openspec/changes/higiene-de-la-copia/`
-- **Estado:** propuesta; pendiente de aprobación
+- **Estado:** completada (PR #54)
 
 ## Objetivo
 

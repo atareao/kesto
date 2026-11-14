@@ -40,5 +40,5 @@
 
 ## Cierre
 
-- [ ] PR a `development`, CI en verde; cierra #52 y #53.
-- [ ] Renombrar `plans/PLAN-015.md` a `plans/PLAN-015-COMPLETED.md` y archivar el change.
+- [x] PR a `development`, CI en verde; cierra #52 y #53.
+- [x] Renombrar `plans/PLAN-015.md` a `plans/PLAN-015-COMPLETED.md` y archivar el change.
