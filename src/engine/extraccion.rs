@@ -321,13 +321,19 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
         }
 
         // Una fuente `sqlite` se copia **desde dentro** del contenedor con el cliente de la
-        // propia base: `sqlite3 <db_path> .dump`. `.dump` produce un volcado SQL —las
+        // propia base: `sqlite3 -readonly <db_path> .dump`. `.dump` produce un volcado SQL —las
         // sentencias que reconstruyen el esquema y los datos—, no una copia de bytes, y por eso
         // es consistente con la base en uso y con el modo WAL activo: un `cp` del `.db` —y de
         // su `-wal`— sería una copia de bytes en un instante, que puede restaurarse con
         // corrupción o con datos perdidos sin que nada lo delate. Y no es un `.backup`: el
         // volcado sale por `stdout` y viaja en streaming al repositorio, sin fichero temporal
         // en el lado de Kesto, que es lo que el §4 prohíbe.
+        //
+        // Y el `-readonly` no es decorativo: sin él `sqlite3` **crea** el fichero si la ruta no
+        // existe, y `.dump` sobre una base recién creada —vacía— no emite nada y sale con
+        // código 0. La ejecución acabaría en `success` con un volcado vacío, que es la peor
+        // clase de fallo: una copia que existe, ocupa sitio y no se puede restaurar. Con
+        // `-readonly` una ruta inexistente falla y el código de salida deja de mentir.
         //
         // El comando no lleva credenciales —un fichero SQLite no tiene usuario ni contraseña—,
         // así que su entorno va vacío y no hay nada que ocultar en la línea de comandos.
@@ -339,16 +345,21 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
             )?;
             let db_path = exigido(objetivo, "db_path", objetivo.db_path.as_deref())?;
 
-            // La ruta acaba en la línea de comandos como **primer** argumento posicional, y un
-            // `db_path` que empezara por `-` lo leería `sqlite3` como una opción —`-help`,
-            // `-version`— y el volcado cambiaría sin que nada lo note. La guarda es la misma
-            // que la del usuario y el nombre de base.
+            // La ruta acaba en la línea de comandos como argumento posicional, y un `db_path`
+            // que empezara por `-` lo leería `sqlite3` como una opción —`-help`, `-version`— y
+            // el volcado cambiaría sin que nada lo note. La guarda es la misma que la del
+            // usuario y el nombre de base.
             let db_path = sin_ser_bandera(objetivo, "db_path", db_path)?;
 
             Ok(Ruta::PorContenedor {
                 contenedor: contenedor.to_owned(),
                 orden: Orden {
-                    cmd: vec!["sqlite3".to_owned(), db_path.to_owned(), ".dump".to_owned()],
+                    cmd: vec![
+                        "sqlite3".to_owned(),
+                        "-readonly".to_owned(),
+                        db_path.to_owned(),
+                        ".dump".to_owned(),
+                    ],
                     env: Vec::new(),
                 },
             })
@@ -385,7 +396,7 @@ fn datos_de_una_base(objetivo: &Objetivo) -> Result<(&str, &str, Option<&str>), 
 
 /// Rechaza un valor que la línea de comandos leería como una bandera.
 ///
-/// Es la guarda de los dos campos que acaban en el `cmd` —`db_user` y `db_name`—: no hay
+/// Es la guarda de los campos que acaban en el `cmd` —`db_user`, `db_name` y `db_path`—: no hay
 /// intérprete de por medio, así que un `db_name` como `--all-databases` se pega como argumento
 /// suelto y **el cliente lo lee como una opción**, de modo que el alcance que decidió la fila
 /// del §3 se salta sin que nada lo note. Un nombre de base o de usuario que empiece por `-` no
@@ -626,7 +637,7 @@ pub enum ErrorDeExtraccion {
 
     /// El objetivo trae un valor que la línea de comandos leería como una bandera.
     ///
-    /// Los campos que acaban en la línea de comandos —`db_user` y `db_name`— los escribe un
+    /// Los campos que acaban en la línea de comandos —`db_user`, `db_name` y `db_path`— los escribe un
     /// operador autenticado, pero eso no los hace inofensivos: no hay intérprete de por medio,
     /// así que un valor como `--all-databases` se pega como argumento suelto y **el cliente lo
     /// lee como una opción**, y el alcance que había decidido la fila del §3 se salta sin que
@@ -1261,15 +1272,21 @@ mod tests {
         );
     }
 
-    /// El comando de un `sqlite` es `sqlite3 <db_path> .dump`, y **no** un `cp`.
+    /// El comando de un `sqlite` es `sqlite3 -readonly <db_path> .dump`, y **no** un `cp`.
     ///
     /// Es el escenario «la copia no es un `cp` del fichero». El `.dump` es la API de copia de
     /// SQLite: produce sentencias SQL, es consistente con la base abierta y con WAL activo, y
     /// su `stdout` es lo que viaja al repositorio. Un `cp` del `.db` —o de su `-wal`— sería una
     /// copia de bytes en un instante sin garantía, y el `.backup` escribiría un fichero en vez
-    /// de hablar por la salida. Se afirma además el **orden** de los tres argumentos: la ruta
-    /// va posicional y la guarda contra banderas de más abajo solo tiene sentido si es ahí
-    /// donde acaba.
+    /// de hablar por la salida.
+    ///
+    /// El `-readonly` es obligatorio y por eso se afirma aquí: sin él `sqlite3` **crea** el
+    /// fichero si la ruta no existe y `.dump` sobre una base vacía no emite nada y sale con
+    /// código 0, así que una ruta mal tecleada daría una ejecución en `success` con un volcado
+    /// vacío. Con `-readonly`, una ruta que no existe falla y el código de salida deja de
+    /// mentir. Se afirma además el **orden** de los argumentos —la bandera primero, la ruta
+    /// posicional después y el `.dump` al final—: la guarda contra banderas de más abajo solo
+    /// tiene sentido si la ruta acaba ahí.
     #[test]
     fn el_comando_de_un_sqlite_es_el_dump_de_su_fichero_y_no_un_cp() {
         let (contenedor, orden) = por_contenedor(&objetivo_sqlite(Some("/var/lib/kesto/kesto.db")));
@@ -1277,8 +1294,14 @@ mod tests {
         assert_eq!(contenedor, "contenedor-de-la-base");
         assert_eq!(
             orden.cmd,
-            argv(&["sqlite3", "/var/lib/kesto/kesto.db", ".dump"]),
-            "el comando de un sqlite no es `sqlite3 <db_path> .dump`: {:?}",
+            argv(&["sqlite3", "-readonly", "/var/lib/kesto/kesto.db", ".dump"]),
+            "el comando de un sqlite no es `sqlite3 -readonly <db_path> .dump`: {:?}",
+            orden.cmd
+        );
+
+        assert!(
+            orden.cmd.iter().any(|argumento| argumento == "-readonly"),
+            "sin `-readonly` una ruta inexistente crea el fichero y el exit code miente: {:?}",
             orden.cmd
         );
 

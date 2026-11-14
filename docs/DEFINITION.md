@@ -151,10 +151,10 @@ pg_dumpall -U <db_user>
 
 3. **SQLite:**
 ```bash
-sqlite3 <db_path> .dump
+sqlite3 -readonly <db_path> .dump
 ```
 
-El volcado de SQLite es un **volcado SQL** —las sentencias que reconstruyen el esquema y los datos—, no una copia del fichero. `sqlite3 <db_path> .dump` se ejecuta **dentro del contenedor del target** y lee la base de forma **consistente en caliente**, de modo que la copia es válida con el **modo WAL** activo y con la base **en uso**, sin detener el servicio. No se copia el `.db` con un `cp` —ni su `-wal`—: con WAL activo el `.db` puede ir por detrás de su `.wal` y la copia resultante puede restaurarse con corrupción o con datos perdidos sin que nada lo delate. El contenedor del target debe disponer del binario `sqlite3`.
+El volcado de SQLite es un **volcado SQL** —las sentencias que reconstruyen el esquema y los datos—, no una copia del fichero. `sqlite3 -readonly <db_path> .dump` se ejecuta **dentro del contenedor del target** y lee la base de forma **consistente en caliente**, de modo que la copia es válida con el **modo WAL** activo y con la base **en uso**, sin detener el servicio. El `-readonly` es obligatorio: sin él `sqlite3` **crea** el fichero si la ruta no existe y `.dump` sobre una base vacía no emite nada y sale con código 0, así que una ruta mal escrita daría una ejecución en `success` con un volcado vacío. No se copia el `.db` con un `cp` —ni su `-wal`—: con WAL activo el `.db` puede ir por detrás de su `.wal` y la copia resultante puede restaurarse con corrupción o con datos perdidos sin que nada lo delate. El contenedor del target debe disponer del binario `sqlite3`.
 
 
 ```

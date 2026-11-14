@@ -35,7 +35,7 @@ Los índices SHALL nombrarse `idx_{tabla}_{columna}`.
 - **GIVEN** una base con las migraciones aplicadas
 - **WHEN** se inserta un `target_type = 'sqlite'` con SQL directo
 - **THEN** la inserción SHALL aceptarse
-- **AND** un `target,`target_type = 'sqlite3'` SHALL rechazarse
+- **AND** un `target_type = 'sqlite3'` SHALL rechazarse
 
 #### Scenario: Cada clave foránea tiene su índice
 - **GIVEN** una base con las migraciones aplicadas

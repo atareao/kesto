@@ -915,8 +915,22 @@ mod tests {
 
         // Los índices añadidos al SRS siguen ahí —los de las tablas hijas no se tocan,
         // y el de `backup_targets` es el implícito de su clave primaria—, y no queda
-        // ninguna tabla temporal en el esquema.
-        for tabla in ["backup_jobs", "job_executions"] {
+        // ninguna tabla temporal en el esquema. Se afirman los **nombres concretos** y no
+        // solo que haya alguno: la reconstrucción tiene que dejar de vuelta los tres
+        // índices del SRS, y un `!is_empty()` daría por bueno un índice suelto.
+        for (tabla, esperados) in [
+            (
+                "backup_jobs",
+                ["idx_backup_jobs_target_id", "idx_backup_jobs_repository_id"],
+            ),
+            (
+                "job_executions",
+                [
+                    "idx_job_executions_job_id",
+                    "idx_job_executions_status_started_at",
+                ],
+            ),
+        ] {
             let indices = sqlx::query_scalar::<_, String>(
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 \
                  AND name LIKE 'idx_%' ORDER BY name",
@@ -926,10 +940,12 @@ mod tests {
             .await
             .expect("los índices deben poder consultarse");
 
-            assert!(
-                !indices.is_empty(),
-                "la reconstrucción se dejó los índices de {tabla} por el camino"
-            );
+            for esperado in esperados {
+                assert!(
+                    indices.iter().any(|indice| indice == esperado),
+                    "la reconstrucción se dejó {esperado} de {tabla} por el camino: {indices:?}"
+                );
+            }
         }
 
         let tablas = sqlx::query_scalar::<_, String>(
