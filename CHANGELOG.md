@@ -1,4 +1,32 @@
 # Changelog
+## [0.6.0] - 2026-11-14
+
+### Bug Fixes
+
+- *(sqlite)* Copia en solo lectura y erratas de spec (#11)
+- *(ui)* Db_path como campo obligatorio de lectura (#11)
+
+### Documentation
+
+- FEATURE-012 del hotfix del mtime y relevo de sesión
+- *(plan)* Renombrar PLAN-012 a COMPLETED (#41)
+- Relevo de sesión (FEATURE-013 en development; #11 pendiente)
+- Refrescar el relevo (hash de development y #44 cerrado)
+- *(sdd)* Change proposal de SQLite como motor de copia (#11)
+- *(sqlite)* SRS, compose de ejemplo y feature 014 (#11)
+- *(sqlite)* Cierre del plan, tasks y relevo (#11)
+- Relevo tras merge de FEATURE-014 (#11)
+
+### Features
+
+- *(deploy)* HSTS opcional (KESTO_HSTS_MAX_AGE) y receta just backup-datos
+- *(sqlite)* Tipo de origen SQLite con copia en caliente (#11)
+- *(ui)* Fuente SQLite en el panel de fuentes (#11)
+
+### Miscellaneous Tasks
+
+- *(openspec)* Archivar dockerfile-copy-mtime y fundir el delta en specs/deploy (#41)
+- *(sdd)* Archivar sqlite-copy-engine y cerrar PLAN-014 (#11)
 ## [0.5.2] - 2026-11-13
 
 ### Bug Fixes
@@ -8,6 +36,10 @@
 ### Documentation
 
 - *(openspec)* Change proposal del hotfix del mtime con COPY (#41)
+
+### Miscellaneous Tasks
+
+- Release v0.5.2
 ## [0.5.1] - 2026-11-13
 
 ### Documentation
