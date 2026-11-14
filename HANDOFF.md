@@ -1,35 +1,43 @@
-# Relevo — higiene de la copia entregada y publicada en v0.6.1
+# Relevo — FEATURE-016: identidad visual y tema claro/oscuro
 
-`main` y `development` en **`dffb9cf`** (`chore: release v0.6.1`), versión **0.6.1**, tag **`v0.6.1`**. **Sin PRs ni issues abiertos.**
+`main` en **`dffb9cf`** y `development` en **`5fe61f6`**, versión **0.6.1**, tag **`v0.6.1`**. **Sin issues ni PRs abiertos.** El laboratorio sigue **levantado** (ver §Lab).
 
-## Lo hecho en esta sesión
+## Tarea pendiente (empezar por aquí)
 
-### FEATURE-015 — Higiene de la copia (#52, #53)
+**Mejorar el aspecto visual de Kesto.** El usuario lo pidió con estos assets y decisiones:
 
-Ciclo SDD + TDD completo; **PR #54** mergeado. Change `higiene-de-la-copia` archivado (`openspec/changes/archive/2026-11-14-higiene-de-la-copia/`) y `plans/PLAN-015-COMPLETED.md`.
+- Los assets están en **`~/Descargas/kesto-web-assets/`**.
+- **Tema claro/oscuro con oscuro por defecto**, y un **toggle** que persiste la elección (`localStorage`). No sigue al sistema: oscuro salvo que el usuario cambie a claro.
+- Alcance acordado: **marca + tema + pulido de páginas** (no solo marca).
 
-- **#52 — sin instantáneas huérfanas.** Cuando una copia acaba en `failed` **después** de que el archivado escribiera su instantánea, el motor la **olvida** (`Repositorio::olvidar_instantanea` → `delete_snapshots`). Cubre las **tres** ramas de `copiar_el_volcado`: fallo del productor, pánico del hilo y entrega incompleta. De **mejor esfuerzo**, sin sustituir el motivo original (helper puro `descartar_copia_fallida`); el camino `directory` no se toca.
-- **#53 — volcados legibles.** El nodo del volcado declara `Metadata { mode: Some(0o644), .. }` en vez de `Metadata::default()`, que dejaba el `.sql` restaurado en modo `000`.
-- **Nuevos:** `Error::OlvidoFallido` (`src/rustic/error.rs`), `Repositorio::olvidar_instantanea` (`src/rustic/repositorio.rs`), `descartar_copia_fallida`/`olvidar_la_instantanea` (`src/engine/ejecucion.rs`).
-- **Docs:** `docs/FEATURE-015-higiene-de-la-copia.md` y nota en `docs/DEFINITION.md` §4.B. `lab/` añadido a `.gitignore`.
-- Code review (rust-reviewer): sin bloqueantes; los 5 hallazgos cerrados antes de archivar (incl. el ALTO: cobertura del cableado, con dos pruebas e2e `#[ignore]` que muerden contra la mutación).
+### Flujo obligatorio (SDD + TDD)
 
-### Release v0.6.1
+1. **Abrir el GitHub Issue** de la feature (`gh issue create ... --assignee @me`): es el punto de entrada, ninguna feature empieza sin él.
+2. `plans/PLAN-016.md` (siguiente número libre; `plans/` es la única fuente del contador).
+3. Change SDD: `openspec new change <nombre>` y rellenar `proposal.md` + `specs/` + `tasks.md`.
+4. **Parar y esperar aprobación** del usuario antes de escribir código.
+5. TDD rojo→verde→refactor. Al cerrar: `docs/FEATURE-016-<slug>.md` y renombrar el plan a `PLAN-016-COMPLETED.md`.
 
-- PR de release **#56** (`development → main`) mergeado. `Prepare Release` subió **0.6.0 → 0.6.1** (bump **patch**, por los `🐛 fix`) y etiquetó `v0.6.1`.
-- El tag disparó `release.yml` (**success**): imagen en **ghcr.io**, crate `kesto` en **crates.io** (`max_version: 0.6.1`) y GitHub Release **"kesto v0.6.1"**. `development` resincronizado con `main`.
+> `@plan-writer` escribe `PLAN.md` en la raíz por defecto: pásale **ruta explícita** (`plans/PLAN-016.md`) y el **contenido completo** del plan en el prompt.
 
-## Verificación
+## Reconocimiento ya hecho (no repetirlo)
 
-- `just check-all` verde: **445 + 5** tests backend, **128** tests UI, `tsc`, `eslint`, `vite build`.
-- CI de los PR #54, #55 y #56 en verde; workflows `Prepare Release` y `Release` de v0.6.1 en verde.
-- **Verificación real en el banco (RustFS + `restic`)**, confirmada también con la imagen **publicada 0.6.1**: copia fallida (`sqlite` con ruta inexistente) → `failed` y el repositorio **sin** instantánea nueva (7 → 7; antes 7 → 8 con una de 0 bytes); restauración → `.sql` en modo **`644`** (legible), 41 814 B.
-- Issues **#52** y **#53** cerrados.
+### Assets (`~/Descargas/kesto-web-assets/`)
 
-## Pendiente / siguiente
+- `favicons/`: `favicon.ico` + pngs **16/32/48/64**, `apple-touch-icon.png` (180), `android-chrome-192/512`, `maskable-icon-512`, `mstile-150x150`, más **`site.webmanifest`** (`name`/`short_name` Kesto, `theme_color #123048`, `background_color #F8FAFC`, `display standalone`) y **`head-tags.html`** (bloque listo con `<link rel="icon">`, apple-touch, manifest, `msapplication-*`, `theme-color` y OG).
+- `logos/`: `kesto-icon.png|webp`, `kesto-icon-dark.png|webp`, `kesto-icon-512/1024.png`, `kesto-icon-mono-dark.png`, `kesto-icon-mono-white.png`, `kesto-logo-horizontal.png|webp`, `kesto-logo-horizontal-dark.png|webp`.
+- `social/`: `og-image-light.png`, `og-image-dark.png`, `social-avatar-light/dark-800x800.png`.
+- `brand/brand-tokens.json` y `brand/kesto-theme.css` (misma fuente): navy **`#123048`**, cyan **`#2194AA`**, teal **`#33998D`**, verde **`#7EBC50`**, naranja **`#F08724`**, fondo claro **`#F8FAFC`**, fondo oscuro **`#0D1B2A`**, texto claro `#123048`, texto oscuro `#F8FAFC`.
 
-1. **Backlog:** vacío (sin issues abiertos). Follow-ups anotados en `docs/FEATURE-015-higiene-de-la-copia.md`: el residuo de un olvido que **falle** se limpia en la próxima purga → mejora posible: reintento de olvido o purga manual de instantáneas huérfanas. Heredados de FEATURE-014: copia binaria con `.backup` (API `sqlite3_backup`) frente al `.dump` lógico, y Litestream como replicación continua.
-2. Al abrir una feature nueva: empezar por su **GitHub Issue**, luego `plans/PLAN-016.md` y el change SDD.
+### Panel actual (`ui/`)
+
+- Stack: **Antd v5.29**, React 19, Vite 7, React Router 7, TanStack Query 5. Tests con vitest + Testing Library.
+- **No hay `ConfigProvider` ni tema configurado**: se pinta el **tema claro por defecto** de Antd. No hay ni un token de marca.
+- `src/components/Layout/Layout.tsx`: `Sider` con `theme="light"`; cabecera y `marca-del-panel` sin logo (solo el texto «Kesto»).
+- `src/estilos.css`: **colores hardcodeados** (`#ffffff`, `#f0f0f0`, `#1677ff`) en `.cabecera-del-panel`, `.enlace-de-salto`, `:focus-visible` → habrá que tokenizarlos/adaptarlos a ambos temas.
+- `ui/index.html`: **sin favicons, sin manifest, sin meta/OG**.
+- **No existe `ui/public/`** todavía: los assets de marca aún no se sirven. Habrá que crearlo (favicons y manifest a la raíz de `public/`, logos a `src/assets/` o `public/`).
+- Rutas y pantallas del panel: Dashboard, Tareas, Histórico, Snapshots, Ajustes, Sesión, No encontrada (todas bajo `Layout` → `SoloConSesion`). Candidatas al pulido: espaciados, tarjetas y Dashboard.
 
 ## Lab (dejado arriba)
 
@@ -45,3 +53,8 @@ Red podman `kesto-lab`, todo alcanzable por nombre:
 
 - El CI **no** levanta daemon de contenedores: los e2e van `#[ignore]` (`cargo test -- --ignored`). `DOCKER_HOST=unix:///run/user/1000/podman/podman.sock` en esta máquina.
 - El binario del host (glibc nueva) **no** corre en la imagen `bookworm`: para probar contra RustFS, usar la imagen publicada del tag.
+- Antes de cada commit: `just check` (backend) y, en `ui/`, `pnpm run lint` → `npx tsc --noEmit` → `pnpm test`. Git flow con gitmoji; nada directo a `main`/`development`.
+
+## Cierre de la sesión anterior
+
+FEATURE-015 (higiene de la copia, issues #52/#53) entregada y publicada en **v0.6.1**; detalles en `docs/FEATURE-015-higiene-de-la-copia.md` y `plans/PLAN-015-COMPLETED.md`.
