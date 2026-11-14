@@ -10,7 +10,7 @@ import type {
   Repository,
   Snapshot,
   Target,
-} from '../services/api/types'
+} from '../src/services/api/types'
 
 export function repositorio(campos: Partial<Repository> & { id: string }): Repository {
   return {

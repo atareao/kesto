@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { EventSourceFalso, eventoDePrueba, instalarEventSourceFalso } from './eventosDePrueba'
+import { EventSourceFalso, eventoDePrueba, instalarEventSourceFalso } from '../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from './events'
 import { NOMBRE_DEL_EVENTO, useEjecucion, useEventStream } from './useEventStream'
 
