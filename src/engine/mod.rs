@@ -3026,4 +3026,117 @@ mod tests {
 
         contenedor.retirar().await;
     }
+
+    /// **Una copia que no se da por buena no deja su instantánea en el repositorio.**
+    ///
+    /// Es el RED del cableado de #52 y la única prueba que lo recorre de punta a punta con un
+    /// contenedor de verdad: el archivado escribe su instantánea **antes** de que el motor pueda
+    /// comprobar nada —vuelve `Ok` aunque el volcado no se entregara entero—, así que una copia que
+    /// acaba en `Failed` tiene que **retirar** esa instantánea o deja un residuo que ninguna
+    /// ejecución `success` reclama.
+    ///
+    /// El desenlace se fuerza con un `mariadb-dump` que sale con uno: el volcado no declara su
+    /// final, `el_volcado_se_entrego` falla y el motor retira lo que el archivado escribió. Se
+    /// comprueba en las dos direcciones: la fila queda en `Failed` con su motivo, **y** el
+    /// repositorio no tiene ninguna instantánea. Lo segundo es lo que muerde contra la mutación: si
+    /// el olvido se quitara, la instantánea seguiría ahí y esta prueba lo vería.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn una_copia_que_no_se_da_por_buena_no_deja_su_instantanea() {
+        const GUION: &str = r##"printf "#!/bin/sh\nexit 1\n" > /usr/local/bin/mariadb-dump; chmod +x /usr/local/bin/mariadb-dump"##;
+
+        let contenedor = crate::test_support::ContenedorDePrueba::nuevo(
+            "una_copia_que_no_se_da_por_buena_no_deja_su_instantanea",
+        )
+        .await;
+        instalar_el_binario_del_volcado(contenedor.nombre(), GUION).await;
+
+        let aparato = Aparato::nuevo().await;
+        let target = aparato
+            .target_de_contenedor(contenedor.nombre(), None)
+            .await;
+        let tarea = aparato.tarea_normal(target).await;
+
+        let socket = crate::test_support::socket_del_motor()
+            .expect("estas pruebas necesitan un socket de motor de contenedores");
+        let motor = aparato.motor_y_ajustes(Ajustes::nuevos(socket).con_abridor(abridor_local));
+
+        let ejecucion = motor.encolar(tarea).await.expect("tiene que entrar");
+        let fila = esperar_el_final_con(
+            &aparato.dependencias.ejecuciones,
+            &ejecucion.id,
+            PLAZO_DEL_CONTENEDOR,
+        )
+        .await;
+
+        assert_eq!(
+            fila.status,
+            Estado::Failed,
+            "un contenedor que sale con uno no puede dar una copia buena"
+        );
+        assert!(
+            fila.error_message.is_some(),
+            "una copia fallida tiene que dejar su motivo en la fila"
+        );
+
+        assert_eq!(
+            aparato.instantaneas(),
+            0,
+            "la instantánea que el archivado escribió antes de decidir tenía que haberse retirado, \
+             y el repositorio dice que le quedan {}",
+            aparato.instantaneas()
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// **Y una copia cuyo contenedor no está tampoco deja su instantánea.**
+    ///
+    /// Es el **otro** desenlace de [`copiar_el_volcado`] que olvida la instantánea, y el que un
+    /// volcado que sale con uno **no** cubre: cuando el propio productor termina con un error —aquí,
+    /// el `exec` contra un contenedor que no existe—, el motor recibe el `Err` del hilo y no llega a
+    /// consultar la entrega. El archivado ya escribió una instantánea vacía antes de que el motor
+    /// pudiera decidir, así que también tiene que retirarse.
+    ///
+    /// Se mide contra el motor de contenedores del host porque hasta conectar con él hace falta el
+    /// socket; no hace falta ningún contenedor de verdad, que es lo que la hace barata.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn una_copia_con_un_contenedor_que_no_esta_no_deja_su_instantanea() {
+        let aparato = Aparato::nuevo().await;
+        let target = aparato
+            .target_de_contenedor("kesto-contenedor-que-no-existe", None)
+            .await;
+        let tarea = aparato.tarea_normal(target).await;
+
+        let socket = crate::test_support::socket_del_motor()
+            .expect("estas pruebas necesitan un socket de motor de contenedores");
+        let motor = aparato.motor_y_ajustes(Ajustes::nuevos(socket).con_abridor(abridor_local));
+
+        let ejecucion = motor.encolar(tarea).await.expect("tiene que entrar");
+        let fila = esperar_el_final_con(
+            &aparato.dependencias.ejecuciones,
+            &ejecucion.id,
+            PLAZO_DEL_CONTENEDOR,
+        )
+        .await;
+
+        assert_eq!(
+            fila.status,
+            Estado::Failed,
+            "un contenedor que no existe no puede dar una copia buena"
+        );
+        assert!(
+            fila.error_message.is_some(),
+            "una copia fallida tiene que dejar su motivo en la fila"
+        );
+
+        assert_eq!(
+            aparato.instantaneas(),
+            0,
+            "la instantánea que el archivado escribió antes de decidir tenía que haberse retirado, \
+             y el repositorio dice que le quedan {}",
+            aparato.instantaneas()
+        );
+    }
 }

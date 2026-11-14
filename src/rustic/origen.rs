@@ -787,11 +787,34 @@ impl ReadSource for OrigenDelVolcado {
 
         // El volcado no existe en ningún sistema de ficheros de Kesto, así que su camino es su
         // nombre: es el que el motor le puso al pedirlo y el que aparecerá en el snapshot.
+        //
+        // El modo se fija a `0o644` —lectura para el dueño, el grupo y el resto— y **no** se deja
+        // en el `mode: None` de `Metadata::default()`. El valor vale para las dos herramientas que
+        // pueden leer esta instantánea, pero por razones distintas, y conviene no confundirlas:
+        // **restic** aplica el modo del nodo tal cual, así que con `None` graba un `000` y el `.sql`
+        // restaurado sale sin permisos de lectura hasta un `chmod` a mano; **rustic**, en cambio,
+        // con `None` no da `000` —hereda el modo de creación del fichero—, de modo que ahí el fallo
+        // no se ve, que es justo el motivo de fijarlo en vez de confiar en él. Y tiene que ser
+        // `0o644` a secas, **no** `0o100644`: restic lee el campo como el modo pelado del nodo y un
+        // tipo de fichero dentro lo interpretaría mal. Los ficheros de un target `directory` sí
+        // conservan sus permisos porque son ficheros de verdad; el volcado es la única entrada cuya
+        // metadata la elige Kesto. Es un volcado, no un ejecutable ni un secreto.
+        //
+        // Y el tamaño del nodo queda en `0`: `Metadata::default()` no lo trae y nadie lo rellena.
+        // Un volcado en streaming no conoce su longitud hasta el final, así que no hay un número que
+        // poner aquí, y `rustic_core` **no** lo completa por su cuenta al terminar. El efecto
+        // conocido: la instantánea declara `size = 0` para el volcado aunque por dentro haya
+        // millones de bytes, y el atajo de un restore que da por hecho que «un fichero vacío ya
+        // existe» puede saltarse un destino de 0 bytes con el mismo nombre. Es una limitación de la
+        // biblioteca, no un fallo de esta copia: queda dicha en vez de fingida.
         let path = PathBuf::from(&self.nombre);
         let node = Node::new_node(
             OsStr::new(self.nombre.as_str()),
             NodeType::File,
-            Metadata::default(),
+            Metadata {
+                mode: Some(0o644),
+                ..Metadata::default()
+            },
         );
 
         let lector = LectorDeVolcado {
@@ -1479,6 +1502,20 @@ mod tests {
         assert!(
             entrada.open.is_some(),
             "la entrada no trae cómo abrirse, así que la biblioteca no puede leer nada"
+        );
+
+        // El modo del nodo es lo que hereda el fichero al restaurarlo. El volcado no existe como
+        // fichero en ningún sistema de ficheros de Kesto —llega en streaming—, así que su
+        // `Metadata` se construye a mano. El valor tiene que ser `0o644` tanto para **restic** —que
+        // aplica el modo del nodo tal cual, de modo que el `None` por defecto deja el `.sql` en
+        // `000` e ilegible hasta un `chmod`— como para **rustic** —donde `None` no da `000` porque
+        // hereda el modo de creación—, y a secas: `0o100644` metería un tipo de fichero dentro del
+        // campo que restic lee como el modo pelado.
+        assert_eq!(
+            entrada.node.meta.mode,
+            Some(0o644),
+            "el nodo del volcado no declara modo `0o644`: un `.sql` restaurado saldría sin \
+             permisos de lectura y no se podría usar sin intervenir a mano"
         );
 
         drop(productor);

@@ -66,7 +66,8 @@ use crate::db::entities::{Ejecucion, Estado};
 use crate::docker::{Cliente, Orden};
 use crate::rustic::{
     Acceso, AvanceDelVolcado, AvisoDeProgreso, BarrasDelMotor, Copia, CopiaHecha,
-    ProductorDelVolcado, PuestaEnMarcha, Retencion, TunelDelVolcado, tunel_del_volcado,
+    ProductorDelVolcado, PuestaEnMarcha, Repositorio, Retencion, TunelDelVolcado,
+    tunel_del_volcado,
 };
 
 // ── Las acciones que el panel pinta ──────────────────────────────────────────
@@ -623,7 +624,7 @@ fn copiar_el_directorio(
 /// has too many arguments (8/7)», así que no es un atributo olvidado.
 #[allow(clippy::too_many_arguments)]
 fn copiar_el_volcado(
-    repositorio: &crate::rustic::Repositorio,
+    repositorio: &Repositorio,
     acceso: &Acceso,
     contenedor: &str,
     orden: Orden,
@@ -701,15 +702,26 @@ fn copiar_el_volcado(
         Ok(Ok(resultado)) => resultado,
         // El productor llegó a su término con un error propio de la extracción: no hay hechos que
         // contar y su motivo —ya redactado y recortado en el hilo del productor, que es el que
-        // tiene la orden— es el mejor que se puede guardar.
-        Ok(Err(motivo)) => return Err(Cierre::fallida(motivo)),
+        // tiene la orden— es el mejor que se puede guardar. Pero el archivado ya escribió su
+        // instantánea, así que se olvida: una copia que no se da por buena no puede dejar su
+        // instantánea en el repositorio.
+        Ok(Err(motivo)) => {
+            return Err(descartar_copia_fallida(
+                || olvidar_la_instantanea(repositorio, &hecho.id),
+                motivo,
+            ));
+        }
         // El hilo del productor se cayó con un pánico. No se publica su contenido —el texto de un
-        // pánico es arbitrario y podría llevar cualquier cosa—, pero tampoco se calla.
+        // pánico es arbitrario y podría llevar cualquier cosa—, pero tampoco se calla. Y por lo
+        // mismo que arriba, la instantánea que el archivado escribió se retira.
         Err(_) => {
-            return Err(Cierre::fallida(recortar(
-                "el hilo que extraía el volcado se ha caído sin dejar hechos: la copia no se \
-                 puede dar por buena",
-            )));
+            return Err(descartar_copia_fallida(
+                || olvidar_la_instantanea(repositorio, &hecho.id),
+                recortar(
+                    "el hilo que extraía el volcado se ha caído sin dejar hechos: la copia no se \
+                     puede dar por buena",
+                ),
+            ));
         }
     };
 
@@ -719,12 +731,67 @@ fn copiar_el_volcado(
     // por buena una copia que existe, ocupa sitio y no se puede restaurar.
     match el_volcado_se_entrego(entrega.completa(), resultado.codigo, hecho.ficheros) {
         Ok(()) => Ok(hecho),
-        Err(fallo) => Err(Cierre::fallida(motivo_del_fallo(
-            fallo,
-            &resultado,
-            hecho.ficheros,
-        ))),
+        // La copia no se da por buena y su instantánea ya está escrita: se olvida de mejor
+        // esfuerzo y el cierre conserva el motivo del volcado.
+        Err(fallo) => Err(descartar_copia_fallida(
+            || olvidar_la_instantanea(repositorio, &hecho.id),
+            motivo_del_fallo(fallo, &resultado, hecho.ficheros),
+        )),
     }
+}
+
+/// El cierre de una copia que **no** se da por buena después de que el archivado ya escribiera su
+/// instantánea.
+///
+/// Olvida esa instantánea —de **mejor esfuerzo**— y devuelve el fallo **original**. El olvido no
+/// decide el veredicto: si falla, se registra y la ejecución acaba igualmente en `failed` por lo
+/// que de verdad pasó. La razón está en el requisito: el fallo que importa —y el que el operador
+/// tiene que leer— es el de la copia, y convertir «no pude limpiar» en un error que oculta «no
+/// pude copiar» sería peor que el residuo, que una purga posterior se llevará. Y un pánico aquí
+/// se llevaría por delante al hilo del trabajador, que tiene que seguir con la siguiente copia.
+///
+/// # Por qué el olvido entra como cierre y no como repositorio
+///
+/// El olvido es lo único que este cierre necesita del mundo, y recibirlo como `FnOnce` —en vez de
+/// un [`Repositorio`]— es lo que hace la función **pura**: se puede probar que el motivo sobrevive
+/// a un fallo del olvido y que no se entra en pánico sin un repositorio de verdad y, con él, sin
+/// Docker. Quien llama le pasa el `olvidar_instantanea` del repositorio ya abierto.
+///
+/// [`Repositorio`]: crate::rustic::Repositorio
+fn descartar_copia_fallida<F>(olvidar: F, motivo: String) -> Cierre
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    // El olvido va primero y su fallo **no** toca `motivo`: lo único que puede hacer aquí es dejar
+    // constancia en el registro —donde el operador lo verá— de que, además de que la copia falló,
+    // quedó un residuo. El texto del fallo es el del módulo de la biblioteca, compuesto con
+    // `display_log`, que no lleva material de clave.
+    if let Err(fallo_del_olvido) = olvidar() {
+        tracing::warn!(
+            motivo = %fallo_del_olvido,
+            "no se ha podido retirar la instantánea de una copia que no se ha dado por buena: \
+             queda como residuo hasta la próxima purga"
+        );
+    }
+
+    Cierre::fallida(motivo)
+}
+
+/// Olvida, de **mejor esfuerzo**, la instantánea que el archivado escribió para una copia que no se
+/// ha dado por buena.
+///
+/// Es la única cosa que hace falta para cerrar una copia fallida, y por eso los tres desenlaces de
+/// [`copiar_el_volcado`] la comparten en vez de repetir la misma clausura: el cierre la recibe como
+/// [`FnOnce`] —lo que mantiene a [`descartar_copia_fallida`] pura— y aquí se le da el repositorio ya
+/// abierto y el identificador en hex de la instantánea.
+///
+/// El error de la biblioteca se aplancha a [`String`] con `to_string`, que es lo que
+/// [`descartar_copia_fallida`] consume, y **no** lleva material de clave: es el texto compuesto con
+/// `display_log` del módulo de la biblioteca.
+fn olvidar_la_instantanea(repositorio: &Repositorio, id: &str) -> Result<(), String> {
+    repositorio
+        .olvidar_instantanea(id)
+        .map_err(|causa| causa.to_string())
 }
 
 /// Lanza el hilo del productor, que es quien conduce el `exec`.
@@ -1242,7 +1309,13 @@ fn candado<T>(candado: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FalloDelVolcado, el_volcado_se_entrego, nombre_del_volcado};
+    use std::cell::Cell;
+
+    use super::{
+        FalloDelVolcado, descartar_copia_fallida, el_volcado_se_entrego, nombre_del_volcado,
+    };
+
+    use crate::db::entities::Estado;
 
     /// **La condición de éxito de un volcado son las tres cosas, y ninguna es el `Ok` del
     /// archivado.**
@@ -1341,6 +1414,76 @@ mod tests {
             nombre_del_volcado("años"),
             "a_os.sql",
             "el saneado es ASCII: el nombre acaba en una instantánea que leen otras herramientas"
+        );
+    }
+
+    /// **Un fallo al olvidar la instantánea de una copia fallida no cambia el motivo ni tumba al
+    /// worker.**
+    ///
+    /// Es la costura que hace testeable la retirada de #52 sin un repositorio —y, con él, sin
+    /// Docker—: lo que se mide es que el motivo **original** del volcado sobrevive a un fallo del
+    /// olvido, que el olvido se intenta exactamente una vez, y que la función **vuelve** en vez de
+    /// entrar en pánico (un pánico aquí se llevaría por delante al hilo del trabajador).
+    #[test]
+    fn descartar_una_copia_fallida_conserva_el_motivo_original_aunque_falle_el_olvido() {
+        let intentos = Cell::new(0);
+
+        let cierre = descartar_copia_fallida(
+            || {
+                intentos.set(intentos.get() + 1);
+                Err("el destino no deja retirar la instantánea".to_owned())
+            },
+            "el volcado no se entregó entero".to_owned(),
+        );
+
+        assert_eq!(
+            intentos.get(),
+            1,
+            "la instantánea de una copia que no se da por buena tenía que intentar olvidarse una \
+             vez"
+        );
+        assert_eq!(
+            cierre.estado,
+            Estado::Failed,
+            "la copia no se dio por buena y su cierre no es `failed`"
+        );
+        assert_eq!(
+            cierre.snapshot_id, None,
+            "una copia que no se da por buena no puede publicar un `snapshot_id`"
+        );
+        assert_eq!(
+            cierre.motivo.as_deref(),
+            Some("el volcado no se entregó entero"),
+            "el motivo de la retirada sustituyó al del volcado: el operador tiene que leer por qué \
+             falló la copia, no por qué no se pudo limpiar el residuo —que la purga siguiente se \
+             llevará—"
+        );
+    }
+
+    /// **El olvido que va bien tampoco cambia el veredicto: sigue siendo `failed` por el motivo
+    /// original.**
+    ///
+    /// La mitad que impide que «olvidar» se cuele como una vía de éxito: la copia no se dio por
+    /// buena porque el volcado no llegó entero, y que la instantánea se retire limpia no la
+    /// convierte en buena.
+    #[test]
+    fn descartar_una_copia_fallida_es_failed_con_el_motivo_original_cuando_el_olvido_va_bien() {
+        let cierre =
+            descartar_copia_fallida(|| Ok(()), "el proceso de extracción salió con 3".to_owned());
+
+        assert_eq!(
+            cierre.estado,
+            Estado::Failed,
+            "el olvido fue bien y con eso la copia se coló como buena: sigue sin serlo"
+        );
+        assert_eq!(
+            cierre.snapshot_id, None,
+            "una copia que no se da por buena no puede publicar un `snapshot_id`"
+        );
+        assert_eq!(
+            cierre.motivo.as_deref(),
+            Some("el proceso de extracción salió con 3"),
+            "el motivo del cierre no es el original del volcado"
         );
     }
 }

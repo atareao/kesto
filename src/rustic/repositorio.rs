@@ -714,6 +714,49 @@ impl Repositorio {
             .map(|instantanea| ResumenDeSnapshot::desde(instantanea, &self.destino))
             .collect()
     }
+
+    /// Olvida una instantánea: la retira del repositorio por su identificador.
+    ///
+    /// Es para una copia que **no se ha dado por buena** después de que el archivado ya escribiera
+    /// su instantánea —la biblioteca silencia el fallo del lector y guarda la instantánea sin el
+    /// volcado dentro; ver el encabezado del módulo—. El motor la llama para no dejar en el
+    /// repositorio el residuo de una copia que no llegó a serlo: una instantánea que sale en el
+    /// explorador, cuenta como espacio y no la retira la retención, que solo corre tras copias
+    /// exitosas.
+    ///
+    /// La retirada es **de mejor esfuerzo** y quien la llama decide qué hacer con su fallo: el
+    /// motor la trata como limpieza y **no** cambia por ella el veredicto de la ejecución.
+    ///
+    /// El identificador se pasa en **hex completo** —el de [`CopiaHecha::id`] y el que el listado
+    /// publica—, y no en la forma corta del `Display` de `SnapshotId`, que son ocho caracteres y
+    /// es un prefijo ambiguo.
+    ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// Retirar es escribir en el repositorio, y con el backend de S3 la biblioteca construye su
+    /// **propio** runtime y bloquea el hilo para hablar con el destino: llamar a esto desde dentro
+    /// de otro runtime entra en **pánico** —medido, literal: «Cannot start a runtime from within a
+    /// runtime.»—. Quien la llama es el hilo del trabajador del motor, que es un `std::thread`
+    /// pelado y no está dentro de ninguno.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::OlvidoFallido`] si el identificador no es un hex completo o si el
+    /// repositorio no deja retirar la instantánea.
+    pub fn olvidar_instantanea(&self, id: &str) -> Result<(), Error> {
+        let fallo = |motivo: String| Error::OlvidoFallido {
+            destino: self.destino.clone(),
+            motivo,
+        };
+
+        let instantanea: SnapshotId = id
+            .parse()
+            .map_err(|error: Box<rustic_core::RusticError>| fallo(error.display_log()))?;
+
+        self.repo
+            .delete_snapshots(&[instantanea])
+            .map_err(|error| fallo(error.display_log()))
+    }
 }
 
 /// Construye el destino de S3 a partir de la fila.
@@ -2716,6 +2759,89 @@ mod tests {
              dice {}",
             informe.bytes_a_reclamar
         );
+
+        drop(repositorio);
+    }
+
+    /// **24.** `olvidar_instantanea` retira del repositorio la instantánea que se le nombra.
+    ///
+    /// Es lo que el motor usa para no dejar residuo cuando una copia no se da por buena: la
+    /// instantánea la escribió el archivado antes de que el motor pudiera decidir, así que hay
+    /// que poder retirarla por su identificador en hex completo —el de
+    /// [`CopiaHecha`](super::CopiaHecha)—. La prueba archiva de verdad, comprueba que está, la
+    /// olvida y comprueba que ya no está **listando el repositorio**, que es la única forma de
+    /// saber que se ha ido y no solo que el olvido no dio error.
+    #[test]
+    fn olvidar_instantanea_retira_la_instantanea_del_repositorio() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
+
+        let hecho = archivar(
+            &repositorio,
+            &copia,
+            b"-- tienda\nCREATE TABLE tienda (id INT);\n",
+        )
+        .expect("archivar no puede fallar");
+
+        let antes = repositorio
+            .listar_snapshots(100)
+            .expect("el repositorio se puede listar");
+        assert_eq!(
+            antes.len(),
+            1,
+            "el destino recién inicializado tenía que tener una sola instantánea y dice {}",
+            antes.len()
+        );
+
+        repositorio
+            .olvidar_instantanea(&hecho.id)
+            .expect("retirar la instantánea recién escrita no puede fallar");
+
+        let despues = repositorio
+            .listar_snapshots(100)
+            .expect("el repositorio se puede listar");
+        assert!(
+            despues.iter().all(|resumen| resumen.id != hecho.id),
+            "la instantánea `{}` sigue en el repositorio después de olvidarla",
+            hecho.id
+        );
+        assert_eq!(
+            despues.len(),
+            0,
+            "el repositorio tenía una sola instantánea y tras olvidarla dice {}",
+            despues.len()
+        );
+
+        drop(repositorio);
+    }
+
+    /// **25.** `olvidar_instantanea` con un identificador que no es un hex válido devuelve un
+    /// error del módulo y **no** entra en pánico.
+    ///
+    /// El identificador viaja como cadena desde la fila de la ejecución, así que un valor vacío o
+    /// mal formado tiene que salir como [`Error::OlvidoFallido`] —nunca como un pánico dentro de
+    /// la biblioteca, que se llevaría por delante al hilo del trabajador—. Se miden el vacío y el
+    /// que no es hex.
+    #[test]
+    fn olvidar_instantanea_con_un_identificador_invalido_devuelve_error_sin_panico() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+
+        for id in ["", "no-es-un-hexadecimal"] {
+            let fallo = repositorio
+                .olvidar_instantanea(id)
+                .expect_err("un identificador que no es un hex completo no puede olvidarse");
+
+            assert!(
+                matches!(fallo, Error::OlvidoFallido { .. }),
+                "el fallo de olvidar un identificador inválido no es `OlvidoFallido`: {fallo:?}"
+            );
+        }
 
         drop(repositorio);
     }

@@ -180,6 +180,8 @@ Posterior a cada snapshot exitoso, el motor de ejecuciones desencadena la purga 
 3. Eliminación de datos huérfanos mediante la ejecución interna del proceso `prune`.
 4. Liberación del bloqueo del repositorio.
 
+Además, **una copia que no se da por buena retira su instantánea**: si el archivado escribió ya una instantánea (la biblioteca silencia el fallo del lector y guarda la instantánea sin el volcado dentro) y el motor decide que la copia acaba en `failed`, el motor **olvida** esa instantánea (`delete_snapshots`) de **mejor esfuerzo**: si la retirada falla, la ejecución acaba igualmente en `failed` con el motivo **original** del volcado —el fallo que importa— y el residuo queda para la próxima purga. Así el repositorio no acumula instantáneas de 0 bytes que ninguna ejecución `success` reclama, que no se limpiarían nunca porque la retención solo corre tras copias exitosas. Los volcados restaurados declaran modo `0o644`, de modo que un `.sql` restaurado es legible sin un `chmod` a mano.
+
 ---
 
 ## 5. Especificación de API REST & SSE
