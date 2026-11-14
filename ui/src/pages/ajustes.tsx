@@ -30,12 +30,15 @@ const NOMBRE_DEL_TIPO: Record<Target['target_type'], string> = {
   directory: 'Directorio',
   mariadb: 'MariaDB',
   postgresql: 'PostgreSQL',
+  sqlite: 'SQLite',
 }
 
 /** El destino de una copia, según su tipo. */
 function destinoDe(target: Target): string {
   if (target.target_type === 'directory') return target.host_path ?? '—'
   const contenedor = target.container_name ?? '—'
+  // Un sqlite no tiene nombre de base: lo que lo sitúa es la ruta del `.db`.
+  if (target.target_type === 'sqlite') return `${contenedor} · ${target.db_path ?? '—'}`
   const base = target.db_name ?? '—'
   return `${contenedor} · ${base}`
 }

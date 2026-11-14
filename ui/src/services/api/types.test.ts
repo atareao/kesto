@@ -26,10 +26,51 @@ describe('tipos del cable', () => {
     expect(new Set(estados).size).toBe(4)
   })
 
-  it('los tipos de target son los tres que sabe extraer el motor', () => {
-    const tipos = ['directory', 'mariadb', 'postgresql'] satisfies Array<Target['target_type']>
+  it('los tipos de target son los cuatro que sabe extraer el motor', () => {
+    const tipos = ['directory', 'mariadb', 'postgresql', 'sqlite'] satisfies Array<
+      Target['target_type']
+    >
 
-    expect(tipos).toHaveLength(3)
+    expect(tipos).toHaveLength(4)
+  })
+
+  it('una lectura sqlite trae su db_path, que no es secreto', () => {
+    const sqlite: Target = {
+      id: '0199f0aa-0000-7000-8000-000000000002',
+      name: 'kesto-db',
+      target_type: 'sqlite',
+      container_name: 'kesto',
+      db_user: null,
+      has_db_password: false,
+      db_name: null,
+      host_path: null,
+      db_path: '/var/lib/kesto/kesto.db',
+      created_at: '2026-01-02T03:04:05Z',
+    }
+
+    expect(sqlite.db_path).toBe('/var/lib/kesto/kesto.db')
+    // El `db_path` describe la fuente, no la autentica: el DTO de lectura no lo
+    // esconde, a diferencia de los tres secretos del §3.
+    expect(sqlite.has_db_password).toBe(false)
+    expect(sqlite.db_user).toBeNull()
+    expect(sqlite.db_name).toBeNull()
+    expect(sqlite.host_path).toBeNull()
+    expect(Object.keys(sqlite)).not.toContain('db_password')
+  })
+
+  it('un alta sqlite lleva contenedor y db_path, y ni host ni credenciales', () => {
+    const alta: AltaTarget = {
+      name: 'kesto-db',
+      target_type: 'sqlite',
+      container_name: 'kesto',
+      db_path: '/var/lib/kesto/kesto.db',
+    }
+
+    expect(alta.db_path).toBe('/var/lib/kesto/kesto.db')
+    expect(alta).not.toHaveProperty('host_path')
+    expect(alta).not.toHaveProperty('db_user')
+    expect(alta).not.toHaveProperty('db_password')
+    expect(alta).not.toHaveProperty('db_name')
   })
 
   it('las lecturas traen el booleano del secreto y nunca el secreto', () => {
