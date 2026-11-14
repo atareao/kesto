@@ -104,7 +104,7 @@ WAL SHALL convivir con ficheros `-wal` y `-shm` **junto a la base**, así que **
 
 ### Requirement: Las cuatro tablas del §3 se reproducen exactas, con sus `CHECK`, sus cascadas y los índices añadidos
 
-Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`.
+Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`.
 
 Las restricciones SHALL estar **en la base** y no solo en Rust: un `INSERT` hecho con `sqlite3` a mano tiene que chocar con el mismo `CHECK` que choca la aplicación. Es la única forma de que el enumerado sea una garantía y no una convención.
 
@@ -125,13 +125,19 @@ Los índices SHALL nombrarse `idx_{tabla}_{columna}`.
 - **GIVEN** una base con las migraciones aplicadas
 - **WHEN** se enumeran las tablas y sus columnas
 - **THEN** SHALL existir `repositories`, `backup_targets`, `backup_jobs` y `job_executions`
-- **AND** sus columnas SHALL ser las del §3
+- **AND** sus columnas SHALL ser las del §3, más `backup_targets.db_path`
 
 #### Scenario: Los enumerados están garantizados por un `CHECK`
 - **GIVEN** una base con las migraciones aplicadas
 - **WHEN** se intenta insertar un `target_type` o un `status` fuera de su enumerado, con SQL directo
 - **THEN** la inserción SHALL fallar
 - **AND** NO SHALL depender de que la validación la haya hecho la aplicación
+
+#### Scenario: El `CHECK` de `target_type` admite `sqlite`
+- **GIVEN** una base con las migraciones aplicadas
+- **WHEN** se inserta un `target_type = 'sqlite'` con SQL directo
+- **THEN** la inserción SHALL aceptarse
+- **AND** un `target_type = 'sqlite3'` SHALL rechazarse
 
 #### Scenario: Cada clave foránea tiene su índice
 - **GIVEN** una base con las migraciones aplicadas
@@ -332,3 +338,21 @@ Que sea **el único** pool de la instancia no es una preferencia de estilo: SQLi
 - **WHEN** la aplicación arranca y el estado queda construido
 - **THEN** SHALL existir **un** pool sobre ese fichero
 - **AND** NO SHALL haberse abierto un segundo fichero ni un segundo pool sobre el mismo
+
+### Requirement: La ampliación del enumerado `target_type` reconstruye la tabla, porque SQLite no altera un `CHECK` en sitio
+
+La migración `0003` SHALL añadir `sqlite` al `CHECK` de `target_type` y la columna `db_path`, y SHALL hacerlo **reconstruyendo** `backup_targets` —crear la tabla nueva con el `CHECK` y la columna, copiar las filas, borrar la vieja y renombrar—, porque SQLite no permite modificar un `CHECK` existente con `ALTER TABLE`. La reconstrucción SHALL preservar todas las filas existentes, con `db_path` a `NULL`, y SHALL recrear los índices de la tabla. El manejo de `foreign_keys` durante la reconstrucción SHALL ser correcto, de modo que la operación no dispare cascadas ni deje filas huérfanas.
+
+El porqué: la tabla del §3 fue declarada con el enumerado cerrado y la feature lo amplía con un valor más. Rehacer la tabla es el procedimiento canónico de SQLite para cambiar un `CHECK`; hacerlo con cuidado —dentro de la propia migración, sin pérdida de filas y con las claves foráneas bajo control— es lo único que mantiene la garantía de la base intacta.
+
+#### Scenario: La migración conserva las filas existentes
+- **GIVEN** una base con targets `mariadb`, `postgresql` y `directory` ya escritos
+- **WHEN** se aplica la migración `0003`
+- **THEN** todas las filas SHALL seguir ahí, con las mismas columnas de antes
+- **AND** su `db_path` SHALL ser `NULL`
+
+#### Scenario: Los índices sobreviven a la reconstrucción
+- **GIVEN** una base migrada a `0003`
+- **WHEN** se consultan los índices de `backup_targets` y de las tablas con FK a ella
+- **THEN** los índices declarados SHALL seguir existiendo
+- **AND** las claves foráneas que apuntan a `backup_targets` NO SHALL quedar rotas

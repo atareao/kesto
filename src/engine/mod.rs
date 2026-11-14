@@ -1262,6 +1262,7 @@ mod tests {
                     db_password: None,
                     db_name: None,
                     host_path: Some(fuente.ruta().to_string_lossy().into_owned()),
+                    db_path: None,
                 })
                 .await
                 .expect("el alta del target no puede fallar")
@@ -1295,6 +1296,7 @@ mod tests {
                     db_password: None,
                     db_name: None,
                     host_path: None,
+                    db_path: None,
                 })
                 .await
                 .expect("el alta del target no puede fallar")
@@ -1313,6 +1315,7 @@ mod tests {
                     db_password: contrasena.map(|valor| SecretString::new(valor.to_owned())),
                     db_name: None,
                     host_path: None,
+                    db_path: None,
                 })
                 .await
                 .expect("el alta del target no puede fallar")

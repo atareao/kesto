@@ -265,3 +265,52 @@ La imagen SHALL contener el mismo binario y el mismo panel compilado que antes, 
 - **WHEN** se inspecciona el runtime
 - **THEN** NO SHALL contener el toolchain de compilación
 - **AND** el proceso SHALL correr con el usuario sin privilegios
+
+### Requirement: La imagen contiene el binario real del crate
+
+El `Dockerfile` SHALL garantizar que el binario de release se compila a partir del código fuente real y NO SHALL publicar un artefacto de la caché de compilación. Cuando la etapa de dependencias use el patrón dummy, el build SHALL invalidar la huella de Cargo del crate tras copiar el código, de modo que Cargo lo recompile.
+
+#### Scenario: la imagen arranca con el binario real
+- **GIVEN** el `Dockerfile` con caché de dependencias por el patrón dummy
+- **WHEN** se construye y se arranca la imagen
+- **THEN** el binario SHALL corresponder al código fuente real
+- **AND** el contenedor SHALL escuchar en el puerto HTTP (smoke test superado)
+
+#### Scenario: el guard estático detecta la regresión
+- **GIVEN** `scripts/release-image-workflow.test.sh`
+- **WHEN** el `Dockerfile` copia el código real sin invalidar la huella de Cargo
+- **THEN** el test SHALL fallar
+
+### Requirement: Cabecera HSTS opcional
+
+La aplicación SHALL poder emitir la cabecera `Strict-Transport-Security` cuando se configure la variable de entorno `KESTO_HSTS_MAX_AGE`. Ausente, la aplicación NO SHALL emitir la cabecera. Presente con un valor entero `>= 0`, toda respuesta SHALL llevar `Strict-Transport-Security: max-age=<n>`. Presente pero vacía o no numérica SHALL ser un error de arranque.
+
+#### Scenario: sin configuración no hay cabecera
+- **GIVEN** la aplicación arrancada sin `KESTO_HSTS_MAX_AGE`
+- **WHEN** se pide cualquier recurso
+- **THEN** la respuesta NO SHALL incluir `Strict-Transport-Security`
+
+#### Scenario: configurada, toda respuesta la lleva
+- **GIVEN** la aplicación arrancada con `KESTO_HSTS_MAX_AGE=31536000`
+- **WHEN** se pide cualquier recurso, incluidas las rutas no declaradas y los métodos no permitidos
+- **THEN** la respuesta SHALL incluir `Strict-Transport-Security: max-age=31536000`
+
+#### Scenario: un valor inválido mata el arranque
+- **GIVEN** `KESTO_HSTS_MAX_AGE` con un valor vacío o no numérico
+- **WHEN** la aplicación resuelve la configuración
+- **THEN** SHALL devolver un error de arranque
+
+### Requirement: Respaldo del volumen de datos
+
+SHALL existir un procedimiento reproducible para respaldar y recuperar el volumen nombrado de datos de la aplicación, y una receta `just backup-datos` que lo ejecute de forma consistente.
+
+#### Scenario: la receta produce un archivo consistente
+- **GIVEN** un despliegue en marcha con el volumen `kesto_data`
+- **WHEN** se ejecuta `just backup-datos <destino>`
+- **THEN** SHALL producirse un archivo comprimido del volumen
+- **AND** el contenedor SHALL quedar en marcha al terminar
+
+#### Scenario: la recuperación está documentada
+- **GIVEN** un archivo de respaldo del volumen
+- **WHEN** el operador consulta la documentación
+- **THEN** SHALL encontrar el procedimiento para restaurarlo

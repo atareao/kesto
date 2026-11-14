@@ -18,8 +18,10 @@ mod secretos;
 mod particion;
 
 use axum::Router;
+use axum::http::{HeaderValue, header};
 use axum::routing::{get, post};
 use serde::Serialize;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::api::response::Data;
 use crate::auth::middleware;
@@ -135,6 +137,15 @@ pub fn api_router(state: AppState) -> Router {
             .merge(events::router()),
     };
 
+    // Cabecera HSTS opcional: si el operador configuró `KESTO_HSTS_MAX_AGE`, toda
+    // respuesta —incluidos los *fallbacks* de 404 y 405, que la capa envuelve por
+    // estar en el router raíz— la lleva. Sin configurar, el valor es `None` y la
+    // capa no inserta nada.
+    let hsts_value: Option<HeaderValue> = state
+        .config
+        .hsts_max_age
+        .and_then(|edad| HeaderValue::from_str(&format!("max-age={edad}")).ok());
+
     router
         // Dos fallbacks, no uno: el de rutas cubre lo que no está declarado, y
         // el de métodos cubre lo que sí lo está con otro verbo. Sin el segundo,
@@ -147,6 +158,10 @@ pub fn api_router(state: AppState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(metodo_no_permitido)
         .layer(axum::middleware::from_fn(trazar))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            move |_respuesta: &axum::response::Response| hsts_value.clone(),
+        ))
         .with_state(state)
 }
 
@@ -417,9 +432,12 @@ mod tests {
     use super::{api_router, protected_router};
     use crate::api::response::{ApiResponse, Data};
     use crate::test_support::{
-        auth_oidc, body_json, body_text, cookie_de_sesion, estado_desarrollo, estado_oidc, get,
-        get_with_cookie, header_text, post, post_with_cookie, router_desarrollo, router_oidc,
+        auth_oidc, body_json, body_text, cookie_de_sesion, estado_con_base, estado_desarrollo,
+        estado_oidc, get, get_with_cookie, header_text, lookup_from, post, post_with_cookie,
+        router_desarrollo, router_oidc,
     };
+
+    use crate::config::Config;
 
     /// Ruta de negocio ficticia: hoy ningún change declara rutas de negocio, así
     /// que la partición se prueba con esta, colgada de la mitad protegida por el
@@ -446,6 +464,40 @@ mod tests {
                 0,
                 "el estado de {modo} escucha en {} y no en un puerto efímero",
                 estado.config.bind_address
+            );
+        }
+    }
+
+    /// Clave maestra para los estados que esta prueba construye a mano.
+    const MASTER_KEY_HSTS: &str = "clave-maestra-para-hsts-00000000000000000000000000000000000000";
+
+    #[tokio::test]
+    async fn sin_hsts_ninguna_respuesta_lleva_la_cabecera() {
+        let respuesta = get(router_desarrollo().await, "/api/v1/health").await;
+
+        assert_eq!(
+            header_text(&respuesta, header::STRICT_TRANSPORT_SECURITY),
+            None,
+            "sin configurar la HSTS no debe haber cabecera"
+        );
+    }
+
+    #[tokio::test]
+    async fn con_hsts_toda_respuesta_lleva_la_cabecera() {
+        let config = Config::from_lookup(&lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY_HSTS),
+            ("KESTO_HSTS_MAX_AGE", "31536000"),
+        ]))
+        .expect("la configuración con HSTS es válida");
+        let router = api_router(estado_con_base(config).await);
+
+        for uri in ["/api/v1/health", "/api/v1/no-existe"] {
+            let respuesta = get(router.clone(), uri).await;
+
+            assert_eq!(
+                header_text(&respuesta, header::STRICT_TRANSPORT_SECURITY).as_deref(),
+                Some("max-age=31536000"),
+                "la respuesta de {uri} debe llevar la HSTS"
             );
         }
     }

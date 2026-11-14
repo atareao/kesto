@@ -984,6 +984,7 @@ mod tests {
             db_password: None,
             db_name: None,
             host_path: Some(format!("/srv/{nombre}")),
+            db_path: None,
         }
     }
 
@@ -996,6 +997,7 @@ mod tests {
             db_password: Some(secreto(PASSWORD_DE_TARGET)),
             db_name: Some(format!("base-{nombre}")),
             host_path: None,
+            db_path: None,
             ..alta_target_de_directorio(nombre)
         }
     }

@@ -1,31 +1,25 @@
+# Relevo — FEATURE-014 (SQLite) mergeada y #11 cerrado; verificación manual pendiente
 
-# Relevo — release 0.5.0 publicada (crate + GitHub Release); imagen en construcción
+`main` en **0.5.2**; `development` en **1139b1c** (merge del PR **#48**, FEATURE-014). Issue **#11** cerrado. **`main` todavía no incluye FEATURE-014**: el próximo merge `development → main` la publica (bump automático por los conventional commits).
 
-`main` y `development` en **0.5.0**. Tag `v0.5.0`. Issue **#32 cerrado**.
+## Lo hecho en esta sesión — FEATURE-014: SQLite como motor de copia (#11)
 
-## Lo hecho en esta sesión
-
-1. **Verificación del handoff anterior:** los tres builds de imagen (0.3.2/0.3.3/0.4.0) en success; se **detectó** que `latest` apuntaba a 0.3.3 por una carrera en `release.yml`.
-2. **Fix del guard de `latest`** (issue #32): PR #33 (fix, TDD) + PR #34 (cierre: delta fundido, change archivado, `docs/FEATURE-010-latest-tag-guard.md`, `plans/PLAN-010-COMPLETED.md`). Fusionados en `development`.
-3. **Incidente de GitHub:** el merge `development→main` (PR #35) devolvió **502** y GitHub **perdió el evento de push**: `main` quedó con el contenido (#164ee75) pero **no** disparó `release-prepare` ni actualizó el estado del PR (quedó OPEN). No existía forma de reintentar (sin `workflow_dispatch`).
-4. **Recuperación:** PR #36 añade `workflow_dispatch` a `release-prepare.yml`; se cerró el PR #35 atascado; PR #37 `development→main` reintentó y **sí** disparó `release-prepare` → **0.5.0** (minor por el `feat` de #33).
-5. **`release.yml`** con `v0.5.0`: **Crate ✅** (crates.io `0.5.0`), **GitHub Release ✅** `v0.5.0` (Latest). El paso `Compute latest tag guard` del job de imagen **se ejecutó con éxito**; el build multi-arch sigue **en construcción**.
+- Ciclo SDD + TDD completo; change `sqlite-copy-engine` archivado y `plans/PLAN-014-COMPLETED.md`.
+- **Nuevo `target_type = 'sqlite'`** con `container_name` + `db_path` (ruta absoluta del `.db` dentro del contenedor); no usa `db_user`/`db_password`/`db_name`/`host_path`.
+- **Copia consistente en caliente**: `sqlite3 -readonly <db_path> .dump` dentro del contenedor, streaming a `rustic`; válida con WAL y con la base en uso; sin ficheros temporales. El `-readonly` cierra el éxito silencioso (sin él, una ruta inexistente creaba una base vacía y salía con 0).
+- **Migración `0003_sqlite_target.sql`**: reconstruye `backup_targets` (añade `db_path`, amplía el `CHECK`), preservando filas e índices y con `foreign_keys` bajo control.
+- **Panel**: opción `sqlite` en el formulario de fuentes, con sus campos condicionales.
+- **Docs**: `docs/DEFINITION.md` §3/§4, ejemplo en `compose.yaml`, `docs/FEATURE-014-sqlite-copy-engine.md`.
+- Code review (rust-reviewer + react-reviewer): **sin bloqueantes**; los hallazgos menores se corrigieron.
 
 ## Verificado
 
-- crates.io: `kesto` max_version **`0.5.0`**.
-- GitHub Release **v0.5.0** (Latest).
-- `development` sincronizado (`Cargo.toml` y `.vampus.yml` en 0.5.0).
-- `just check` verde (425 + 5); `openspec validate --specs --strict` → 12 passed; CI de #33/#34/#36/#37 en verde.
+- `just check-all` verde: **441 + 5** tests backend, **128** tests UI, `tsc`, `eslint` y `vite build` OK.
+- `openspec validate --specs --strict` → 12 passed.
+- **CI del PR #48 en verde** (Backend, Frontend, Preflight).
 
 ## Pendiente / siguiente
 
-1. **Verificar `latest` al acabar el build de imagen** (es lo que valida el fix): `podman manifest inspect ghcr.io/atareao/kesto:latest` debe coincidir con `:0.5.0` (digest amd64+arm64). Si el build falla, `latest` seguiría en 0.3.3.
-2. **Follow-ups del deploy** (`docs/FEATURE-008-…`): `HSTS` si el TLS no lo termina un proxy; backup del volumen `kesto_data`. El del socket ya está hecho.
-3. **Nota:** la prueba del socket **real** no se pudo ejecutar aquí (sin daemon accesible); se validó por `podman compose config`.
-
-## Avisos
-
-- **Trabajo ajeno sin commitear** (NO incluir en PRs): `AGENTS.md`, `GIT_FLOW.md`, `docs/{ARQUITECTURA,COMANDOS,DECISIONES-SRS,ENTORNO,ESTADO}.md` y `assets/`. Sin tocar.
-- Overrides de pnpm en `ui/` → van en **`pnpm-workspace.yaml`**.
-- **Incidente GitHub (502) + pérdida de evento de push:** si un merge a `main` no dispara `release-prepare`, ahora se puede relanzar con `gh workflow run release-prepare.yml --ref main`.
+1. **Verificación manual:** copia real de una base SQLite **en uso** con WAL, restaurada sin errores. Exige un motor de contenedores accesible (no disponible en este entorno). Follow-up recomendado: añadir una variante SQLite al e2e `#[ignore]` de `src/engine/mod.rs` (hoy solo cubre `mariadb-dump`).
+2. **Release:** FEATURE-014 vive en `development`; el próximo merge `development → main` la publica.
+3. Recordatorios heredados: forzar `podman pull` al verificar tags; el CI no levanta daemon de contenedores.

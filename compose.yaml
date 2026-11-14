@@ -42,3 +42,34 @@ services:
 
 volumes:
   kesto_data:
+
+# ---
+# Ejemplo de fuente SQLite (§4): un servicio autoalojado cuya base vive DENTRO
+# de su propio contenedor (Vaultwarden, Miniflux, Immich…). NO se monta en
+# Kesto ni se lee del host: se declara como target `sqlite` con
+# `container_name` —el contenedor donde vive el fichero— y `db_path` —la ruta
+# absoluta del `.db` dentro de él—, sin `db_user`, `db_password`, `db_name` ni
+# `host_path`. Kesto copia con `sqlite3 <db_path> .dump` por el socket del
+# daemon (consistente en caliente: válido con WAL y sin parar el servicio).
+#
+# El contenedor del target DEBE traer el binario `sqlite3`: si su imagen no lo
+# incluye, añade una capa que lo instale (`apk add --no-cache sqlite` /
+# `apt-get install -y sqlite3`) o usa una imagen que ya lo traiga.
+#
+# Alta equivalente por API (el panel hace lo mismo en Ajustes → Fuentes):
+#
+#   curl -fsS -X POST http://localhost:8080/api/v1/targets \
+#     -H 'content-type: application/json' \
+#     -d '{"name":"vaultwarden","target_type":"sqlite",
+#          "container_name":"vaultwarden","db_path":"/data/db.sqlite"}'
+#
+# services:
+#   vaultwarden:
+#     image: vaultwarden/server:latest
+#     container_name: vaultwarden
+#     restart: always
+#     volumes:
+#       - vaultwarden_data:/data     # aquí vive /data/db.sqlite
+#
+# volumes:
+#   vaultwarden_data:
