@@ -211,6 +211,38 @@ health:
     echo "❌ Sin respuesta HTTP en ${url} tras 60s."
     exit 1
 
+# ── Respaldo del volumen de datos ──────────────────────────────────────────
+
+# Exporta el volumen de datos (SQLite) a un `.tar.gz` consistente.
+#
+# Uso: `just backup-datos [destino]` (destino por defecto: `respaldos/`).
+# Localiza el volumen por sufijo (`kesto_data`, o `<proyecto>_kesto_data` bajo
+# `podman compose`); para el contenedor que lo monta —SQLite y su WAL deben
+# quedar quietos durante la copia—, exporta el volumen y lo vuelve a arrancar.
+backup-datos destino="respaldos":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    vol="$(podman volume ls -q | grep -E '(^|_)kesto_data$' | head -n1 || true)"
+    if [ -z "${vol}" ]; then
+        echo "❌ No se encontró ningún volumen '*kesto_data'. ¿Está desplegado Kesto?" >&2
+        exit 1
+    fi
+    mkdir -p "{{ destino }}"
+    sello="$(date -u +%Y%m%dT%H%M%SZ)"
+    archivo="{{ destino }}/kesto-data-${sello}.tar.gz"
+    ctr="$(podman ps -q --filter "volume=${vol}" | head -n1 || true)"
+    if [ -n "${ctr}" ]; then
+        echo "→ parando ${ctr} para una copia consistente"
+        podman stop "${ctr}" >/dev/null
+    fi
+    echo "→ exportando el volumen ${vol}"
+    podman volume export "${vol}" | gzip > "${archivo}"
+    if [ -n "${ctr}" ]; then
+        echo "→ rearrancando ${ctr}"
+        podman start "${ctr}" >/dev/null
+    fi
+    echo "✅ Respaldo en ${archivo} ($(du -h "${archivo}" | cut -f1))"
+
 # ── Gitflow (SIEMPRE: nada directo en main ni en development) ──────────────
 
 # Crea una rama feature desde development
