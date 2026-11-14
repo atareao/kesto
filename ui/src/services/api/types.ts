@@ -36,10 +36,12 @@ export interface Target {
   db_name: string | null
   host_path: string | null
   /**
-   * Ruta absoluta del `.db` **dentro** del contenedor; solo la lleva un `sqlite`.
-   * No es un secreto: viaja en claro en las dos direcciones.
+   * Ruta absoluta del `.db` **dentro** del contenedor; solo tiene valor en un
+   * `sqlite`. La clave **siempre** viaja en la lectura (el backend no la omite
+   * cuando va a `null`), así que aquí es obligatoria. No es un secreto: viaja en
+   * claro en las dos direcciones.
    */
-  db_path?: string | null
+  db_path: string | null
   /** RFC3339, en UTC. */
   created_at: string
 }

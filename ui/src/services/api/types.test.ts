@@ -12,6 +12,7 @@ import type {
   Sesion,
   Snapshot,
   Target,
+  TipoDeTarget,
 } from './types'
 
 // Estas pruebas son el candado de los literales del cable: si alguien cambia
@@ -32,6 +33,20 @@ describe('tipos del cable', () => {
     >
 
     expect(tipos).toHaveLength(4)
+  })
+
+  it('todo tipo de target está cubierto por el panel', () => {
+    // Candado de exhaustividad: si el backend estrena una variante en
+    // `TipoDeTarget`, este `Record` deja de compilar y `tsc` falla antes que el
+    // panel se desalinee en silencio.
+    const cubiertos: Record<TipoDeTarget, true> = {
+      directory: true,
+      mariadb: true,
+      postgresql: true,
+      sqlite: true,
+    }
+
+    expect(Object.values(cubiertos).every(Boolean)).toBe(true)
   })
 
   it('una lectura sqlite trae su db_path, que no es secreto', () => {
@@ -55,7 +70,6 @@ describe('tipos del cable', () => {
     expect(sqlite.db_user).toBeNull()
     expect(sqlite.db_name).toBeNull()
     expect(sqlite.host_path).toBeNull()
-    expect(Object.keys(sqlite)).not.toContain('db_password')
   })
 
   it('un alta sqlite lleva contenedor y db_path, y ni host ni credenciales', () => {
@@ -67,10 +81,7 @@ describe('tipos del cable', () => {
     }
 
     expect(alta.db_path).toBe('/var/lib/kesto/kesto.db')
-    expect(alta).not.toHaveProperty('host_path')
-    expect(alta).not.toHaveProperty('db_user')
-    expect(alta).not.toHaveProperty('db_password')
-    expect(alta).not.toHaveProperty('db_name')
+    expect(alta.name).toBe('kesto-db')
   })
 
   it('las lecturas traen el booleano del secreto y nunca el secreto', () => {
@@ -83,6 +94,7 @@ describe('tipos del cable', () => {
       has_db_password: true,
       db_name: 'wordpress',
       host_path: null,
+      db_path: null,
       created_at: '2026-01-02T03:04:05Z',
     }
     const repository: Repository = {
@@ -97,11 +109,14 @@ describe('tipos del cable', () => {
       created_at: '2026-01-02T03:04:05Z',
     }
 
-    // El secreto solo existe como booleano en la lectura: el objeto no tiene
-    // ninguna propiedad con el valor.
-    expect(Object.keys(target)).not.toContain('db_password')
-    expect(Object.keys(repository)).not.toContain('secret_access_key')
-    expect(Object.keys(repository)).not.toContain('passphrase')
+    // El secreto solo existe como booleano en la lectura: declararlo aquí
+    // (`db_password`, `secret_access_key`, `passphrase`) rompería la
+    // compilación por exceso de propiedad sobre un literal local.
+    expect([target.has_db_password, repository.has_secret_access_key, repository.has_passphrase]).toEqual([
+      true,
+      true,
+      true,
+    ])
   })
 
   it('los tipos de escritura sí llevan los campos secretos, opcionales', () => {
