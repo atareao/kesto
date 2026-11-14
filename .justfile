@@ -94,9 +94,13 @@ ui-install: _require-ui
 ui-dev: _require-ui
     cd ui && pnpm run dev
 
-# Type-check del panel
+# Type-check del panel (script `typecheck` de ui/package.json: fuente única)
 ui-typecheck: _require-ui
-    cd ui && npx tsc --noEmit
+    cd ui && pnpm run typecheck
+
+# Type-check de los tests del panel (script `typecheck:test`, tsconfig.test.json)
+ui-typecheck-tests: _require-ui
+    cd ui && pnpm run typecheck:test
 
 # Lint del panel
 ui-lint: _require-ui
@@ -110,8 +114,8 @@ ui-test: _require-ui
 ui-build: _require-ui
     cd ui && pnpm run build
 
-# Los cuatro pasos del CI para el panel
-ui-check: _require-ui ui-typecheck ui-lint ui-test ui-build
+# Los pasos del CI para el panel, en su orden (typecheck app → tests → lint → test → build)
+ui-check: _require-ui ui-typecheck ui-typecheck-tests ui-lint ui-test ui-build
 
 # ── Desarrollo ─────────────────────────────────────────────────────────────
 
