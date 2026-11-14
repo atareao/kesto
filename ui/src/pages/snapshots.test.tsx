@@ -1,9 +1,9 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { instalarFetchFalso } from '../pruebas/fetchDePrueba'
-import type { ManejadorDeFetch, RespuestaSimulada } from '../pruebas/fetchDePrueba'
-import { repositorio, snapshot } from '../pruebas/fixtures'
+import { instalarFetchFalso } from '../../tests/fetchDePrueba'
+import type { ManejadorDeFetch, RespuestaSimulada } from '../../tests/fetchDePrueba'
+import { repositorio, snapshot } from '../../tests/fixtures'
 import Snapshots from './snapshots'
 
 const HEX = '0123456789abcdef'.repeat(4)

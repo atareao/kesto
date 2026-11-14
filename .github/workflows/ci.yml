@@ -111,14 +111,20 @@ jobs:
       - name: Install dependencies
         run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm install --frozen-lockfile' || 'npm ci' }}
 
+      # Los dos type-check salen de los scripts de `ui/package.json`, que son la
+      # fuente única: `typecheck` (app) y `typecheck:test` (tests, con su propio
+      # tsconfig). No se invoca `tsc` a mano aquí.
       - name: Type-check
-        run: npx tsc --noEmit
+        run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run typecheck' || 'npm run typecheck' }}
+
+      - name: Type-check tests
+        run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run typecheck:test' || 'npm run typecheck:test' }}
 
       - name: Lint
         run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run lint' || 'npm run lint' }}
 
       - name: Test
-        run: npx vitest run
+        run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run test' || 'npm run test' }}
 
       - name: Build
         run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run build' || 'npm run build' }}

@@ -1,5 +1,5 @@
 import { render, screen } from '@testing-library/react'
-import { EventSourceFalso, eventoDePrueba, instalarEventSourceFalso } from '../../services/eventosDePrueba'
+import { EventSourceFalso, eventoDePrueba, instalarEventSourceFalso } from '../../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from '../../services/events'
 import { NOMBRE_DEL_EVENTO } from '../../services/useEventStream'
 import { ProgresoEnVivo } from './ProgresoEnVivo'

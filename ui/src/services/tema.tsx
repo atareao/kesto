@@ -11,7 +11,7 @@
  * contexto, el hook y los tokens viven en `useTema.ts`.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   CLAVE_DE_TEMA,
@@ -52,13 +52,19 @@ export function ProveedorDeTema({ children }: { children: ReactNode }) {
     sincronizarDocumento(modo)
   }, [modo])
 
-  const alternar = useCallback(() => {
+  const alternar = () => {
     const siguiente: ModoDeTema = modo === 'oscuro' ? 'claro' : 'oscuro'
     guardarTema(siguiente)
     setModo(siguiente)
-  }, [modo])
+  }
 
-  const valor = useMemo<ValorDelTema>(() => ({ modo, alternar }), [modo, alternar])
+  // Sin `useMemo`/`useCallback` a propósito: `ProveedorDeTema` solo se
+  // re-renderiza cuando cambia `modo` (su único estado) y su padre es
+  // `<StrictMode>` sin estado propio, de modo que el objeto de contexto se
+  // recrea como mucho una vez por conmutación de tema y no arrastra re-renders
+  // de más. Memoizarlo sería complejidad sin beneficio. Si algún día se
+  // envuelve el proveedor con un padre con estado, hay que reevaluarlo.
+  const valor: ValorDelTema = { modo, alternar }
 
   return <ContextoDelTema.Provider value={valor}>{children}</ContextoDelTema.Provider>
 }

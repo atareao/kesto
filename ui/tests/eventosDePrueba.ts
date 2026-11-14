@@ -3,12 +3,13 @@
  * `src/test_support.rs` en el backend—: un `EventSource` de mentira con el que
  * se controla a mano qué emite y cuántas conexiones quedan vivas.
  *
- * Vive en `src/` porque es código de apoyo de pruebas, no de la aplicación: no
- * lo importa nada del panel, así que no entra en el bundle.
+ * Vive en `tests/` —fuera de `src/`— porque es código de apoyo de pruebas, no
+ * de la aplicación: no lo importa nada del panel, así que no entra en el bundle
+ * ni en el tsconfig de aplicación.
  */
 
 import { act } from '@testing-library/react'
-import type { EventoDeEjecucion } from './api/types'
+import type { EventoDeEjecucion } from '../src/services/api/types'
 
 /** Un `EventSource` que no habla con nadie y al que se le emiten eventos a mano. */
 export class EventSourceFalso {

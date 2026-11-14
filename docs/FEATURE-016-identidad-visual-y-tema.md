@@ -49,6 +49,5 @@ Viene dentro del panel; no hay que activar nada. El panel se construye con `pnpm
 
 ## Follow-ups
 
-- **BAJO 8** — `useCallback`/`useMemo` en `tema.tsx` son redundantes (cambian con `modo`); simplificables.
-- **BAJO 9** — `"types": ["node"]` en `ui/tsconfig.json` se añadió por `identidadDeMarca.test.ts` (`process.cwd()`); habilita globales de Node en todo el código de app. Acotable a un `tsconfig` de tests o resolviendo con `new URL(..., import.meta.url)`.
+- **Cerrados con `refactor-tema-memoization`** (`plans/PLAN-017-COMPLETED.md`, issue #62): los antiguos **BAJO 8** (`useCallback`/`useMemo` redundantes en `tema.tsx`) y **BAJO 9** (`"types": ["node"]` en `ui/tsconfig.json`) se resuelven en ese refactor —se retiran las memoizaciones redundantes y los tipos de Node se acotan al tooling y a los tests, dejando el `tsconfig.json` de aplicación con `"types": []`—.
 - El bundle del panel ronda los 1.3 MB (403 kB gzip) por Antd en un único chunk; `manualChunks`/code-splitting es una mejora futura.

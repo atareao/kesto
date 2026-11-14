@@ -1,7 +1,7 @@
 import { render, screen, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { instalarFetchFalso } from '../../pruebas/fetchDePrueba'
-import { repositorio, snapshot, tarea } from '../../pruebas/fixtures'
+import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
+import { repositorio, snapshot, tarea } from '../../../tests/fixtures'
 import { TarjetasDeResumen } from './TarjetasDeResumen'
 
 function montar() {
