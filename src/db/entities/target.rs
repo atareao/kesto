@@ -35,6 +35,11 @@ pub enum TipoDeTarget {
     Postgresql,
     /// Copia de un directorio del host.
     Directory,
+    /// Copia de una base SQLite que vive **dentro** de un contenedor.
+    ///
+    /// El valor almacenado es `sqlite`, no `sqlite3`: el segundo es el binario que hace
+    /// la copia y el primero, el tipo de fuente.
+    Sqlite,
 }
 
 /// Fila de `backup_targets`, con su `db_password` ya descifrado.
@@ -56,6 +61,10 @@ pub struct Target {
     pub db_name: Option<String>,
     /// Ruta del host; `None` si es una base de datos.
     pub host_path: Option<String>,
+    /// Ruta del fichero `.db` **dentro** del contenedor; `None` si no es `sqlite`.
+    ///
+    /// Va en claro —no es un secreto—: el motor la usa tal cual para armar el `exec`.
+    pub db_path: Option<String>,
     /// Fecha de alta, en UTC.
     pub created_at: OffsetDateTime,
 }
@@ -77,6 +86,8 @@ pub struct AltaDeTarget {
     pub db_name: Option<String>,
     /// Ruta del host.
     pub host_path: Option<String>,
+    /// Ruta del fichero `.db` dentro del contenedor.
+    pub db_path: Option<String>,
 }
 
 /// La capa de acceso de `backup_targets`.
@@ -95,7 +106,7 @@ pub struct Targets {
 
 /// Columnas del `SELECT`, en el orden del §3 —el mismo que recorre [`desde_fila`]—.
 const SQL_LEER: &str = "SELECT id, name, target_type, container_name, db_user, db_password, db_name, \
-     host_path, created_at FROM backup_targets WHERE id = ?1";
+     host_path, db_path, created_at FROM backup_targets WHERE id = ?1";
 
 /// Listado de todos los targets.
 ///
@@ -103,24 +114,24 @@ const SQL_LEER: &str = "SELECT id, name, target_type, container_name, db_user, d
 /// el mismo segundo empatan —`CURRENT_TIMESTAMP` no tiene más resolución— y el orden
 /// entre dos llamadas seguidas dejaría de ser estable. El `id` es el desempate.
 const SQL_LISTAR: &str = "SELECT id, name, target_type, container_name, db_user, db_password, db_name, \
-     host_path, created_at FROM backup_targets ORDER BY created_at, id";
+     host_path, db_path, created_at FROM backup_targets ORDER BY created_at, id";
 
 /// Alta de un target, devolviendo la fila tal y como quedó.
 ///
 /// El `RETURNING` evita el segundo viaje: el `created_at` es el que puso la base y no
 /// hay carrera entre el `INSERT` y un `SELECT` posterior.
 const SQL_ALTA: &str = "INSERT INTO backup_targets \
-     (id, name, target_type, container_name, db_user, db_password, db_name, host_path) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+     (id, name, target_type, container_name, db_user, db_password, db_name, host_path, db_path) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
      RETURNING id, name, target_type, container_name, db_user, db_password, db_name, host_path, \
-     created_at";
+     db_path, created_at";
 
 /// Actualización de la fila entera.
 ///
 /// `created_at` **no** entra: es la fecha de nacimiento de la fila, no un campo que se
 /// edite —reescribirla cambiaría la historia y el orden del listado—.
 const SQL_ACTUALIZAR: &str = "UPDATE backup_targets SET name = ?1, target_type = ?2, container_name = ?3, \
-     db_user = ?4, db_password = ?5, db_name = ?6, host_path = ?7 WHERE id = ?8";
+     db_user = ?4, db_password = ?5, db_name = ?6, host_path = ?7, db_path = ?8 WHERE id = ?9";
 
 /// Borrado por identificador.
 const SQL_BORRAR: &str = "DELETE FROM backup_targets WHERE id = ?1";
@@ -175,6 +186,8 @@ impl Targets {
             .bind(&db_password)
             .bind(&alta.db_name)
             .bind(&alta.host_path)
+            // El `db_path` va en claro: es una ruta dentro del contenedor, no un secreto.
+            .bind(&alta.db_path)
             .fetch_one(&self.pool)
             .await
             .map_err(error_de_consulta(SQL_ALTA))?;
@@ -243,6 +256,7 @@ impl Targets {
             .bind(&db_password)
             .bind(&target.db_name)
             .bind(&target.host_path)
+            .bind(&target.db_path)
             .bind(target.id.hyphenated().to_string())
             .execute(&self.pool)
             .await
@@ -338,6 +352,7 @@ fn desde_fila(fila: &SqliteRow, clave: &Clave) -> Result<Target, DbError> {
         db_password,
         db_name: columna(fila, "db_name")?,
         host_path: columna(fila, "host_path")?,
+        db_path: columna(fila, "db_path")?,
         created_at: columna(fila, "created_at")?,
     })
 }
@@ -374,6 +389,7 @@ mod tests {
             db_password: Some(secreto(PASSWORD)),
             db_name: Some(format!("base-{nombre}")),
             host_path: None,
+            db_path: None,
         }
     }
 
@@ -387,6 +403,21 @@ mod tests {
             db_password: None,
             db_name: None,
             host_path: Some(ruta.to_owned()),
+            db_path: None,
+        }
+    }
+
+    /// Un target `sqlite`: contenedor y ruta del `.db` **dentro** de él, sin credenciales.
+    fn alta_sqlite(nombre: &str, ruta: &str) -> AltaDeTarget {
+        AltaDeTarget {
+            name: nombre.to_owned(),
+            target_type: TipoDeTarget::Sqlite,
+            container_name: Some(format!("contenedor-{nombre}")),
+            db_user: None,
+            db_password: None,
+            db_name: None,
+            host_path: None,
+            db_path: Some(ruta.to_owned()),
         }
     }
 
@@ -588,6 +619,122 @@ mod tests {
             "un target de directorio no lleva contraseña de base"
         );
         assert_eq!(leido.db_name, None);
+        assert_eq!(
+            leido.db_path, None,
+            "un target de directorio no lleva la ruta de un .db"
+        );
+    }
+
+    /// 1.54 — Un target `sqlite` da ida y vuelta **con su `db_path`**, y la ruta no es un secreto.
+    ///
+    /// `container_name` + `db_path` describen la fuente, igual que `container_name` + `db_*`
+    /// describen una de cliente/servidor: el `db_path` es la ruta del `.db` **dentro del
+    /// contenedor**. Se comprueba además que se guarde **en claro** —cifrarla la dejaría
+    /// inservible para el `exec` del motor y en una ruta no hay nada que proteger— y que
+    /// la actualización de fila entera la lleve: sin la columna en el `UPDATE`, cambiar de
+    /// ruta dejaría la vieja escrita y el motor leería un fichero que ya no es.
+    #[tokio::test]
+    async fn un_target_sqlite_da_ida_y_vuelta_con_su_db_path() {
+        let (_directorio, pool, targets) = capa().await;
+
+        let dado_de_alta = targets
+            .alta(alta_sqlite("target-1-54", "/var/lib/kesto/kesto.db"))
+            .await
+            .expect("el alta de un target sqlite no puede fallar");
+
+        assert_eq!(dado_de_alta.target_type, TipoDeTarget::Sqlite);
+        assert_eq!(
+            dado_de_alta.db_path.as_deref(),
+            Some("/var/lib/kesto/kesto.db")
+        );
+
+        let leido = targets
+            .leer(&dado_de_alta.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila recién dada de alta debe estar");
+
+        assert_eq!(leido.target_type, TipoDeTarget::Sqlite);
+        assert_eq!(
+            leido.container_name.as_deref(),
+            Some("contenedor-target-1-54")
+        );
+        assert_eq!(leido.db_path.as_deref(), Some("/var/lib/kesto/kesto.db"));
+        assert_eq!(
+            leido.host_path, None,
+            "un sqlite no es una fuente de fichero del host"
+        );
+        assert_eq!(leido.db_user, None, "un sqlite no tiene usuario de base");
+        assert!(
+            leido.db_password.is_none(),
+            "un sqlite no tiene credencial de base"
+        );
+        assert_eq!(leido.db_name, None, "un sqlite no tiene base por nombre");
+
+        // En la columna, el tipo es el **texto** que acepta el `CHECK` y la ruta está tal
+        // cual: el motor la leerá de aquí para armar el `exec`.
+        let almacenado: (String, String) =
+            sqlx::query_as("SELECT target_type, db_path FROM backup_targets WHERE id = ?1")
+                .bind(dado_de_alta.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("el tipo y la ruta deben poder leerse");
+
+        assert_eq!(
+            almacenado.0, "sqlite",
+            "el tipo no se guardó como el texto del enumerado"
+        );
+        assert_eq!(
+            almacenado.1, "/var/lib/kesto/kesto.db",
+            "el db_path no se guardó tal cual: la ruta no es un secreto y el motor la \
+             necesita legible"
+        );
+
+        // La actualización lleva la ruta, en los dos sentidos.
+        let mut con_otra = leido.clone();
+        con_otra.db_path = Some("/var/lib/kesto/otra.db".to_owned());
+
+        assert!(
+            targets
+                .actualizar(&con_otra)
+                .await
+                .expect("la actualización no puede fallar"),
+            "la fila existía, así que la actualización debe decir que sí"
+        );
+
+        let con_la_otra = targets
+            .leer(&con_otra.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe seguir existiendo");
+
+        assert_eq!(
+            con_la_otra.db_path.as_deref(),
+            Some("/var/lib/kesto/otra.db"),
+            "la actualización no escribió el db_path nuevo"
+        );
+
+        let mut sin_ruta = con_la_otra.clone();
+        sin_ruta.db_path = None;
+
+        assert!(
+            targets
+                .actualizar(&sin_ruta)
+                .await
+                .expect("la actualización no puede fallar"),
+            "la fila existía, así que la actualización debe decir que sí"
+        );
+
+        let limpio = targets
+            .leer(&sin_ruta.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe seguir existiendo");
+
+        assert_eq!(
+            limpio.db_path, None,
+            "el db_path vaciado no se escribió como NULL"
+        );
     }
 
     /// 1.32 — **La cascada de los tres niveles**: borrar un target deja sin tareas sus

@@ -516,6 +516,7 @@ mod tests {
                 db_password: None,
                 db_name: None,
                 host_path: Some("/srv/target-1-1".to_owned()),
+                db_path: None,
             })
             .await
             .expect("el alta del target por la capa del estado no puede fallar");

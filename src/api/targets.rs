@@ -50,29 +50,31 @@ pub fn router() -> Router<AppState> {
 
 /// El cuerpo del alta de un target, tal y como llega por el cable.
 ///
-/// `target_type` viaja como **texto** —`directory`, `mariadb` o `postgresql`—, que es
-/// exactamente lo que el `CHECK` del §3 acepta en la columna y lo que hace legible el §3 con
-/// `sqlite3`; el enum de la capa de acceso no viaja porque no implementa `serde`, y el
-/// vocabulario del cable es de esta capa. Los tres campos de texto opcionales son `Option`
-/// porque `NULL` y cadena vacía **no** son lo mismo, y `db_password` es `Option<SecretString>`
-/// porque `SecretString` no implementa `Serialize`: una respuesta que lo llevara no compila.
+/// `target_type` viaja como **texto** —`directory`, `mariadb`, `postgresql` o `sqlite`—, que es
+/// exactamente lo que el `CHECK` del §3 acepta en la columna; el enum de la capa de acceso no
+/// viaja porque no implementa `serde`, y el vocabulario del cable es de esta capa. Los campos de
+/// texto opcionales son `Option` porque `NULL` y cadena vacía **no** son lo mismo, y
+/// `db_password` es `Option<SecretString>` porque `SecretString` no implementa `Serialize`: una
+/// respuesta que lo llevara no compila.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AltaDeTargetDelCable {
     /// Nombre del target.
     pub name: String,
-    /// Tipo de fuente: `directory`, `mariadb` o `postgresql`.
+    /// Tipo de fuente: `directory`, `mariadb`, `postgresql` o `sqlite`.
     pub target_type: String,
     /// Contenedor del que extraer el volcado; no lo admite un `directory`.
     pub container_name: Option<String>,
-    /// Usuario de la base; no lo admite un `directory`.
+    /// Usuario de la base; no lo admite un `directory` ni un `sqlite`.
     pub db_user: Option<String>,
-    /// Contraseña de la base; es el tercer secreto del §3 y no lo admite un `directory`.
+    /// Contraseña de la base; es el tercer secreto del §3 y no lo admiten `directory` ni `sqlite`.
     pub db_password: Option<SecretString>,
     /// Base concreta del volcado; `None` significa el volcado global.
     pub db_name: Option<String>,
     /// Ruta del host; solo la admite un `directory`.
     pub host_path: Option<String>,
+    /// Ruta absoluta del `.db` **dentro** del contenedor; solo la admite un `sqlite`.
+    pub db_path: Option<String>,
 }
 
 /// Un target tal y como viaja por el cable: lo que devuelve la API.
@@ -101,6 +103,12 @@ pub struct TargetDelCable {
     pub db_name: Option<String>,
     /// Ruta del host, o `null`.
     pub host_path: Option<String>,
+    /// Ruta del `.db` dentro del contenedor, o `null`; solo la lleva un `sqlite`.
+    ///
+    /// Sale en claro, como el resto de campos no secretos: es lo que el panel necesita para
+    /// repintar el formulario de edición sin volver a pedir la fila, y no hay nada que proteger
+    /// en una ruta.
+    pub db_path: Option<String>,
     /// Fecha de alta, en RFC3339.
     pub created_at: String,
 }
@@ -125,6 +133,7 @@ impl TargetDelCable {
                 .is_some_and(|secreto| !secreto.expose().is_empty()),
             db_name: fila.db_name.clone(),
             host_path: fila.host_path.clone(),
+            db_path: fila.db_path.clone(),
             created_at: fila.created_at.format(&Rfc3339).map_err(|error| {
                 AppError::Other(format!("la fecha de la fila no se pudo formatear: {error}"))
             })?,
@@ -135,30 +144,33 @@ impl TargetDelCable {
 /// El texto del cable de un tipo de target.
 ///
 /// El cable habla el mismo texto que la columna del §3 guarda —su `CHECK` acepta `mariadb`,
-/// `postgresql` y `directory`, en minúsculas—, y el vocabulario es de esta capa: el enum de
-/// la capa de acceso no implementa `serde` y no viaja. Las pruebas fijan los tres literales,
-/// así que un cambio de vocabulario en la base no puede pasar inadvertido en el cable.
+/// `postgresql`, `directory` y `sqlite`, en minúsculas—, y el vocabulario es de esta capa: el
+/// enum de la capa de acceso no implementa `serde` y no viaja. Las pruebas fijan los literales,
+/// así que un cambio de vocabulario en la base no puede pasar inadvertido en el cable. El texto
+/// es `sqlite` y no `sqlite3`: el segundo es el binario que hace la copia.
 fn texto_del_tipo(tipo: TipoDeTarget) -> &'static str {
     match tipo {
         TipoDeTarget::Mariadb => "mariadb",
         TipoDeTarget::Postgresql => "postgresql",
         TipoDeTarget::Directory => "directory",
+        TipoDeTarget::Sqlite => "sqlite",
     }
 }
 
 /// El tipo del cable, convertido al de la capa de acceso.
 ///
-/// Un valor que no sea uno de los tres contesta `400` **nombrando el campo** y sin repetir el
-/// valor: el texto llegó por el cable, y la regla de la casa es nombrar el campo, nunca lo que
-/// traía.
+/// Un valor que no sea uno de los del vocabulario contesta `400` **nombrando el campo** y sin
+/// repetir el valor: el texto llegó por el cable, y la regla de la casa es nombrar el campo,
+/// nunca lo que traía.
 fn tipo_del_cable(texto: &str) -> Result<TipoDeTarget, AppError> {
     match texto {
         "mariadb" => Ok(TipoDeTarget::Mariadb),
         "postgresql" => Ok(TipoDeTarget::Postgresql),
         "directory" => Ok(TipoDeTarget::Directory),
+        "sqlite" => Ok(TipoDeTarget::Sqlite),
         _ => Err(AppError::InvalidInput(
-            "el campo `target_type` no admite ese valor: se espera `directory`, `mariadb` o \
-             `postgresql`"
+            "el campo `target_type` no admite ese valor: se espera `directory`, `mariadb`, \
+             `postgresql` o `sqlite`"
                 .to_owned(),
         )),
     }
@@ -243,7 +255,8 @@ fn prohibir(campo: &str, valor: Option<&str>) -> Result<(), AppError> {
 /// datos**: con él, un `PUT` que no informe `db_password` conserva el que estaba —el panel no
 /// tiene el valor, porque la API no lo devuelve—; en un alta llega `None`, y entonces el
 /// secreto es obligatorio. Un `directory` no lo mira nunca, porque no admite credenciales: si
-/// el tipo nuevo es `directory`, el secreto se descarta aunque la fila lo tuviera.
+/// el tipo nuevo es `directory`, el secreto se descarta aunque la fila lo tuviera. Un `sqlite`
+/// tampoco: no tiene credenciales de base que conservar.
 fn alta_desde(
     cuerpo: &AltaDeTargetDelCable,
     almacenada: Option<&SecretString>,
@@ -256,6 +269,7 @@ fn alta_desde(
             prohibir("container_name", cuerpo.container_name.as_deref())?;
             prohibir("db_user", cuerpo.db_user.as_deref())?;
             prohibir("db_name", cuerpo.db_name.as_deref())?;
+            prohibir("db_path", cuerpo.db_path.as_deref())?;
 
             if cuerpo.db_password.is_some() {
                 return Err(no_admitido("db_password"));
@@ -269,6 +283,7 @@ fn alta_desde(
                 db_password: None,
                 db_name: None,
                 host_path: Some(host_path),
+                db_path: None,
             })
         }
         TipoDeTarget::Mariadb | TipoDeTarget::Postgresql => {
@@ -288,6 +303,7 @@ fn alta_desde(
             let db_name = opcional_no_vacio("db_name", cuerpo.db_name.as_deref())?;
 
             prohibir("host_path", cuerpo.host_path.as_deref())?;
+            prohibir("db_path", cuerpo.db_path.as_deref())?;
 
             Ok(AltaDeTarget {
                 name: cuerpo.name.clone(),
@@ -297,6 +313,37 @@ fn alta_desde(
                 db_password: Some(db_password),
                 db_name,
                 host_path: None,
+                db_path: None,
+            })
+        }
+        // Una fuente `sqlite` se describe con las **dos** piezas que la sitúan: el contenedor
+        // donde vive el fichero y la ruta del `.db` dentro de él. Sin cualquiera de las dos el
+        // motor no tiene a qué apuntar, y el fallo aparecería en la primera copia en vez de en
+        // el formulario. No admite ninguna pieza de una base de cliente/servidor ni una ruta de
+        // host: el `.db` no se lee del sistema de ficheros de Kesto, se volca desde dentro del
+        // contenedor.
+        TipoDeTarget::Sqlite => {
+            let container_name =
+                exigir_presente("container_name", cuerpo.container_name.as_deref())?;
+            let db_path = exigir_presente("db_path", cuerpo.db_path.as_deref())?;
+
+            prohibir("db_user", cuerpo.db_user.as_deref())?;
+            prohibir("db_name", cuerpo.db_name.as_deref())?;
+            prohibir("host_path", cuerpo.host_path.as_deref())?;
+
+            if cuerpo.db_password.is_some() {
+                return Err(no_admitido("db_password"));
+            }
+
+            Ok(AltaDeTarget {
+                name: cuerpo.name.clone(),
+                target_type,
+                container_name: Some(container_name),
+                db_user: None,
+                db_password: None,
+                db_name: None,
+                host_path: None,
+                db_path: Some(db_path),
             })
         }
     }
@@ -400,6 +447,7 @@ pub async fn actualizar(
         db_password: alta.db_password,
         db_name: alta.db_name,
         host_path: alta.host_path,
+        db_path: alta.db_path,
         created_at: actual.created_at,
     };
 
@@ -1289,5 +1337,218 @@ mod tests {
             "la credencial tiene que descartarse de verdad, no quedarse huérfana en la columna que \
              el tipo nuevo ya no va a mirar: quedó {guardada:?}"
         );
+    }
+
+    /// 1.55 — Un alta `sqlite` con `container_name` y `db_path` contesta `201` y escribe la ruta.
+    ///
+    /// Cubre `api-resources` (escenario «Un sqlite con sus campos es válido»). La ruta se
+    /// afirma en los **dos** sitios: en la respuesta, porque es lo que el panel necesita para
+    /// pintar el formulario de edición sin volver a pedir la fila, y en la columna, porque es
+    /// de donde el motor la leerá para armar su `exec`. Y se afirma que la fuente `sqlite` no
+    /// arrastra ninguna credencial: no tiene usuario ni contraseña de base que guardar.
+    #[tokio::test]
+    async fn un_alta_sqlite_con_sus_campos_es_valida_y_escribe_la_ruta() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let cuerpo_de_la_peticion = serde_json::json!({
+            "name": "target-1-55",
+            "target_type": "sqlite",
+            "container_name": "contenedor-sqlite",
+            "db_path": "/var/lib/kesto/kesto.db",
+        });
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/targets",
+            &cuerpo_de_la_peticion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un `sqlite` con su contenedor y su ruta es un target completo: contestó {status} con \
+             {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["target_type"], "sqlite",
+            "el tipo tiene que volver como el texto del cable desde el que se pidió: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["db_path"], "/var/lib/kesto/kesto.db",
+            "el `db_path` tiene que volver en la respuesta, que es lo que el panel pinta al \
+             editar: {cuerpo}"
+        );
+        assert!(
+            cuerpo["data"]["db_user"].is_null() && cuerpo["data"]["host_path"].is_null(),
+            "un `sqlite` no tiene usuario de base ni ruta de host, así que sus campos tienen que \
+             quedar nulos: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["has_db_password"], false,
+            "un `sqlite` no tiene credencial de base: {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let guardado: (String, String) =
+            sqlx::query_as("SELECT target_type, db_path FROM backup_targets WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que estar en el fichero con el que se abrió el estado");
+
+        assert_eq!(
+            guardado,
+            ("sqlite".to_owned(), "/var/lib/kesto/kesto.db".to_owned()),
+            "la columna tiene que guardar el texto del enumerado y la ruta tal cual"
+        );
+    }
+
+    /// 1.56 — Un `sqlite` sin `container_name` o sin `db_path` se rechaza nombrando el campo.
+    ///
+    /// Cubre la mitad de «exigir» para el tipo nuevo: las dos piezas que describen la fuente
+    /// son el contenedor donde vive el fichero y la ruta del fichero dentro de él, y sin
+    /// cualquiera de las dos el motor no tiene a qué apuntar. El rechazo tiene que llegar en
+    /// el borde HTTP —la tabla del §3 acepta esa fila, porque sus columnas son anulables— y
+    /// no puede dejar fila escrita.
+    #[tokio::test]
+    async fn un_sqlite_sin_container_name_o_sin_db_path_se_rechaza_nombrando_el_campo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let router = api_router(estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        ));
+
+        // El otro campo de los dos sí va en cada vuelta: así lo que provoca el rechazo es el
+        // que falta, y no una petición a la que le faltara todo.
+        for (campo, cuerpo_de_la_peticion) in [
+            (
+                "container_name",
+                serde_json::json!({
+                    "name": "target-1-56-contenedor",
+                    "target_type": "sqlite",
+                    "db_path": "/var/lib/kesto/kesto.db",
+                }),
+            ),
+            (
+                "db_path",
+                serde_json::json!({
+                    "name": "target-1-56-ruta",
+                    "target_type": "sqlite",
+                    "container_name": "contenedor-sqlite",
+                }),
+            ),
+        ] {
+            let respuesta =
+                post_json(router.clone(), "/api/v1/targets", &cuerpo_de_la_peticion).await;
+
+            let status = respuesta.status();
+            let cuerpo = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "un `sqlite` sin `{campo}` está incompleto: contestó {status} con {cuerpo}"
+            );
+
+            let mensaje = cuerpo["message"]
+                .as_str()
+                .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+            assert!(
+                mensaje.contains(campo),
+                "el rechazo tiene que nombrar el campo que falta —`{campo}`—, y el mensaje fue \
+                 {mensaje:?}"
+            );
+
+            let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+                .fetch_one(&pool)
+                .await
+                .expect("la tabla tiene que ser contable sobre el fichero del estado");
+
+            assert_eq!(
+                filas, 0,
+                "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
+            );
+        }
+    }
+
+    /// 1.57 — Un `sqlite` que informa un campo de base o de host se rechaza nombrando el campo.
+    ///
+    /// Cubre la mitad de «prohibir» para el tipo nuevo, y son **cuatro** campos los que no
+    /// admite: `db_user`, `db_password`, `db_name` y `host_path`. Es la misma razón que en el
+    /// `directory`: la tabla los guardaría tan contenta y el motor no sabría qué hacer con
+    /// ellos, así que el fallo aparecería en la primera copia en vez de en el formulario.
+    /// Ninguno de los cuatro puede dejar fila escrita.
+    #[tokio::test]
+    async fn un_sqlite_con_campos_de_base_o_de_host_se_rechaza_nombrando_el_campo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let router = api_router(estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        ));
+
+        for (campo, valor) in [
+            ("db_user", serde_json::json!("usuario-de-base")),
+            ("db_password", serde_json::json!(CONTRASENA_DE_TARGET)),
+            ("db_name", serde_json::json!("base-de-pruebas")),
+            ("host_path", serde_json::json!("/srv/datos")),
+        ] {
+            let mut cuerpo_de_la_peticion = serde_json::json!({
+                "name": "target-1-57",
+                "target_type": "sqlite",
+                "container_name": "contenedor-sqlite",
+                "db_path": "/var/lib/kesto/kesto.db",
+            });
+            cuerpo_de_la_peticion[campo] = valor;
+
+            let respuesta =
+                post_json(router.clone(), "/api/v1/targets", &cuerpo_de_la_peticion).await;
+
+            let status = respuesta.status();
+            let cuerpo = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "un `sqlite` que informa `{campo}` es un formulario incoherente: contestó {status} \
+                 con {cuerpo}"
+            );
+
+            let mensaje = cuerpo["message"]
+                .as_str()
+                .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+            assert!(
+                mensaje.contains(campo),
+                "el rechazo tiene que nombrar el campo que lo provoca —`{campo}`—, y el mensaje \
+                 fue {mensaje:?}"
+            );
+
+            let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+                .fetch_one(&pool)
+                .await
+                .expect("la tabla tiene que ser contable sobre el fichero del estado");
+
+            assert_eq!(
+                filas, 0,
+                "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
+            );
+        }
     }
 }

@@ -530,6 +530,7 @@ mod tests {
             db_password: None,
             db_name: None,
             host_path: Some(format!("/srv/{nombre}")),
+            db_path: None,
         }
     }
 

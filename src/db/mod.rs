@@ -120,6 +120,33 @@ pub enum DbError {
         causa: sqlx::migrate::MigrateError,
     },
 
+    /// El esquema falló **alrededor** del migrador, no dentro de él.
+    ///
+    /// Tomar la conexión con la que se aplican las migraciones, apagar y volver a
+    /// encender su `foreign_keys` y comprobar el resultado no lo hace el migrador por
+    /// su cuenta: lo hace [`migrate::aplicar`], y que cualquiera de esos pasos falle
+    /// es un fallo de arranque igual que una migración rota —no un modo degradado—
+    /// porque el esquema no se sabe en qué estado quedó.
+    #[error("no se pudo aplicar el esquema de la base: {causa}")]
+    EsquemaNoAplicado {
+        /// Motivo, tal y como lo informa `sqlx`.
+        #[source]
+        causa: sqlx::Error,
+    },
+
+    /// Las migraciones dejaron **filas huérfanas** en la base.
+    ///
+    /// El esquema se mueve con `foreign_keys` **apagado** (ver [`migrate::aplicar`]),
+    /// así que la base no rechaza por su cuenta una fila que apunte a una tabla que ya
+    /// no está. Esta comprobación es la que convierte ese silencio en un fallo de
+    /// arranque, y el mensaje nombra las **tablas** —que son parte del esquema y no un
+    /// valor de nadie— para que el diagnóstico sea un sitio donde mirar.
+    #[error("las migraciones dejaron filas huérfanas en: {tablas}")]
+    HuerfanosTrasMigrar {
+        /// Tablas con filas huérfanas, sin repetir y en orden alfabético.
+        tablas: String,
+    },
+
     /// Una consulta de la capa de acceso falló.
     ///
     /// Lleva el **texto de la consulta** además de la causa, y eso es deliberado:
@@ -855,6 +882,7 @@ mod tests {
                 db_password: Some(SecretString::new(PASSWORD_DE_BASE.to_owned())),
                 db_name: Some("base-1-47".to_owned()),
                 host_path: None,
+                db_path: None,
             })
             .await
             .expect("el alta del target no puede fallar");

@@ -159,6 +159,8 @@ pub struct Objetivo {
     pub db_name: Option<String>,
     /// Ruta del directorio tal y como la ve este proceso; `None` si es una base.
     pub host_path: Option<String>,
+    /// Ruta del `.db` **dentro** del contenedor; `None` salvo en un `sqlite`.
+    pub db_path: Option<String>,
 }
 
 impl From<&Target> for Objetivo {
@@ -175,6 +177,7 @@ impl From<&Target> for Objetivo {
             db_password: fila.db_password.clone(),
             db_name: fila.db_name.clone(),
             host_path: fila.host_path.clone(),
+            db_path: fila.db_path.clone(),
         }
     }
 }
@@ -235,8 +238,9 @@ pub enum Ruta {
 /// # Errors
 ///
 /// Devuelve [`ErrorDeExtraccion::CampoQueFalta`] si el objetivo no trae un campo que su tipo
-/// necesita —`host_path` para un directorio, `container_name` y `db_user` para una base—,
-/// [`ErrorDeExtraccion::CampoEnBlanco`] si lo trae informado y no sirve, y
+/// necesita —`host_path` para un directorio, `container_name` y `db_user` para una base,
+/// `container_name` y `db_path` para un `sqlite`—, [`ErrorDeExtraccion::CampoEnBlanco`] si lo
+/// trae informado y no sirve, y
 /// [`ErrorDeExtraccion::ValorQuePareceBandera`] si el valor de un campo que acaba en la línea
 /// de comandos empieza por `-` —y entonces el cliente de volcado lo leería como una opción y
 /// el alcance del volcado cambiaría sin que nada lo note—. Un `db_user` ausente en un target
@@ -312,6 +316,40 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
                 orden: Orden {
                     cmd,
                     env: entorno_del_exec(TipoDeTarget::Postgresql, objetivo.db_password.as_ref()),
+                },
+            })
+        }
+
+        // Una fuente `sqlite` se copia **desde dentro** del contenedor con el cliente de la
+        // propia base: `sqlite3 <db_path> .dump`. `.dump` produce un volcado SQL —las
+        // sentencias que reconstruyen el esquema y los datos—, no una copia de bytes, y por eso
+        // es consistente con la base en uso y con el modo WAL activo: un `cp` del `.db` —y de
+        // su `-wal`— sería una copia de bytes en un instante, que puede restaurarse con
+        // corrupción o con datos perdidos sin que nada lo delate. Y no es un `.backup`: el
+        // volcado sale por `stdout` y viaja en streaming al repositorio, sin fichero temporal
+        // en el lado de Kesto, que es lo que el §4 prohíbe.
+        //
+        // El comando no lleva credenciales —un fichero SQLite no tiene usuario ni contraseña—,
+        // así que su entorno va vacío y no hay nada que ocultar en la línea de comandos.
+        TipoDeTarget::Sqlite => {
+            let contenedor = exigido(
+                objetivo,
+                "container_name",
+                objetivo.container_name.as_deref(),
+            )?;
+            let db_path = exigido(objetivo, "db_path", objetivo.db_path.as_deref())?;
+
+            // La ruta acaba en la línea de comandos como **primer** argumento posicional, y un
+            // `db_path` que empezara por `-` lo leería `sqlite3` como una opción —`-help`,
+            // `-version`— y el volcado cambiaría sin que nada lo note. La guarda es la misma
+            // que la del usuario y el nombre de base.
+            let db_path = sin_ser_bandera(objetivo, "db_path", db_path)?;
+
+            Ok(Ruta::PorContenedor {
+                contenedor: contenedor.to_owned(),
+                orden: Orden {
+                    cmd: vec!["sqlite3".to_owned(), db_path.to_owned(), ".dump".to_owned()],
+                    env: Vec::new(),
                 },
             })
         }
@@ -737,12 +775,14 @@ impl ErrorDeExtraccion {
 /// El texto con el que se nombra un tipo de target: el mismo que guarda el `CHECK` del §3.
 ///
 /// El motivo se lee en el panel y nombra el tipo como lo nombra la base —`mariadb`, no
-/// `Mariadb`—, que es como el operador lo ve al mirar la columna.
+/// `Mariadb`—, que es como el operador lo ve al mirar la columna. Un `sqlite` se nombra
+/// `sqlite`, no `sqlite3`: el segundo es el binario.
 fn nombre_del_tipo(tipo: TipoDeTarget) -> &'static str {
     match tipo {
         TipoDeTarget::Mariadb => "mariadb",
         TipoDeTarget::Postgresql => "postgresql",
         TipoDeTarget::Directory => "directory",
+        TipoDeTarget::Sqlite => "sqlite",
     }
 }
 
@@ -840,6 +880,12 @@ fn entorno_del_exec(tipo: TipoDeTarget, contrasena: Option<&SecretString>) -> Ve
         // contesta con el entorno vacío en vez de con un pánico: un motor no se cae por un
         // camino que no debía recorrerse.
         TipoDeTarget::Directory => return Vec::new(),
+
+        // Un `sqlite` no tiene credenciales de base: un fichero SQLite no guarda usuario ni
+        // contraseña. La rama existe para que el `match` sea exhaustivo y para que un día que
+        // alguien le dé contraseña a este tipo —cosa que el §3 no contempla— lo vea aquí y no
+        // en un `MYSQL_PWD` que ningún cliente leería.
+        TipoDeTarget::Sqlite => return Vec::new(),
     };
 
     // Lo que se construye aquí es la credencial en claro dentro de una cadena, y es
@@ -1061,6 +1107,7 @@ mod tests {
             db_password: Some(secreto(CONTRASENA)),
             db_name: db_name.map(ToOwned::to_owned),
             host_path: None,
+            db_path: None,
         }
     }
 
@@ -1073,6 +1120,7 @@ mod tests {
             db_password: Some(secreto(CONTRASENA)),
             db_name: db_name.map(ToOwned::to_owned),
             host_path: None,
+            db_path: None,
         }
     }
 
@@ -1085,6 +1133,24 @@ mod tests {
             db_password: None,
             db_name: None,
             host_path: host_path.map(ToOwned::to_owned),
+            db_path: None,
+        }
+    }
+
+    /// Un objetivo `sqlite`: contenedor, ruta del `.db` dentro de él y **nada** más.
+    ///
+    /// Sin usuario, sin credencial y sin nombre de base: un fichero SQLite no tiene ninguno de
+    /// los tres, y ponerlos aquí —aunque `ruta` no los mirara— dejaría la prueba afirmando un
+    /// comando que saliera bien con una fila que la API rechaza.
+    fn objetivo_sqlite(db_path: Option<&str>) -> Objetivo {
+        Objetivo {
+            tipo: TipoDeTarget::Sqlite,
+            container_name: Some("contenedor-de-la-base".to_owned()),
+            db_user: None,
+            db_password: None,
+            db_name: None,
+            host_path: None,
+            db_path: db_path.map(ToOwned::to_owned),
         }
     }
 
@@ -1193,6 +1259,129 @@ mod tests {
             "un volcado de una sola base no puede llevarse el servidor entero: {:?}",
             orden.cmd
         );
+    }
+
+    /// El comando de un `sqlite` es `sqlite3 <db_path> .dump`, y **no** un `cp`.
+    ///
+    /// Es el escenario «la copia no es un `cp` del fichero». El `.dump` es la API de copia de
+    /// SQLite: produce sentencias SQL, es consistente con la base abierta y con WAL activo, y
+    /// su `stdout` es lo que viaja al repositorio. Un `cp` del `.db` —o de su `-wal`— sería una
+    /// copia de bytes en un instante sin garantía, y el `.backup` escribiría un fichero en vez
+    /// de hablar por la salida. Se afirma además el **orden** de los tres argumentos: la ruta
+    /// va posicional y la guarda contra banderas de más abajo solo tiene sentido si es ahí
+    /// donde acaba.
+    #[test]
+    fn el_comando_de_un_sqlite_es_el_dump_de_su_fichero_y_no_un_cp() {
+        let (contenedor, orden) = por_contenedor(&objetivo_sqlite(Some("/var/lib/kesto/kesto.db")));
+
+        assert_eq!(contenedor, "contenedor-de-la-base");
+        assert_eq!(
+            orden.cmd,
+            argv(&["sqlite3", "/var/lib/kesto/kesto.db", ".dump"]),
+            "el comando de un sqlite no es `sqlite3 <db_path> .dump`: {:?}",
+            orden.cmd
+        );
+
+        for prohibido in ["cp", "cat", "tar", ".backup"] {
+            assert!(
+                !orden.cmd.iter().any(|argumento| argumento == prohibido),
+                "la copia de un sqlite no puede ser `{prohibido}`: el §4 pide el `.dump` por \
+                 `stdout`, y {:?} no lo es",
+                orden.cmd
+            );
+        }
+    }
+
+    /// Un `sqlite` no tiene credenciales: su entorno va **vacío**.
+    ///
+    /// Si el tipo arrastrara una variable de entorno, el valor viajaría al `exec` sin que nadie
+    /// lo leyera —y sin que nada protegiera un secreto que el tipo no tiene—. La prueba fija
+    /// que no hay ninguna.
+    #[test]
+    fn un_sqlite_no_lleva_entorno() {
+        let (_contenedor, orden) =
+            por_contenedor(&objetivo_sqlite(Some("/var/lib/kesto/kesto.db")));
+
+        assert!(
+            orden.env.is_empty(),
+            "un sqlite no tiene credencial de base, así que no puede llevar entorno: {:?}",
+            orden.env
+        );
+    }
+
+    /// Un `sqlite` sin `db_path` —o con el campo en blanco— se rechaza nombrando el campo.
+    ///
+    /// Es el escenario «el `db_path` falta o está en blanco». El ausente y el que solo tiene
+    /// espacios se distinguen a propósito —`CampoQueFalta` frente a `CampoEnBlanco`—, porque el
+    /// motivo manda al operador a un sitio distinto en cada caso: a rellenar el formulario o a
+    /// mirar una fila que dice tener una ruta que no nombra nada.
+    #[test]
+    fn un_sqlite_sin_db_path_utilizable_se_rechaza_nombrando_el_campo() {
+        for (db_path, esperado) in [(None, None), (Some("   "), Some("en blanco"))] {
+            let error = ruta(&objetivo_sqlite(db_path))
+                .expect_err("un sqlite sin una ruta utilizable no tiene comando");
+
+            match (error, esperado) {
+                (ErrorDeExtraccion::CampoQueFalta { tipo, campo }, None) => {
+                    assert_eq!(
+                        tipo, "sqlite",
+                        "el motivo tiene que nombrar el tipo `sqlite`"
+                    );
+                    assert_eq!(
+                        campo, "db_path",
+                        "el motivo tiene que nombrar el campo `db_path`"
+                    );
+                }
+                (ErrorDeExtraccion::CampoEnBlanco { tipo, campo }, Some(_)) => {
+                    assert_eq!(tipo, "sqlite");
+                    assert_eq!(campo, "db_path");
+                }
+                (otro, _) => panic!(
+                    "el rechazo de un `db_path` que no sirve tiene que ser del campo: {otro:?}"
+                ),
+            }
+        }
+    }
+
+    /// Un `db_path` que parece una bandera se rechaza: `sqlite3` lo leería como una opción.
+    ///
+    /// La ruta llega a la línea de comandos como argumento posicional **antes** del `.dump`, y
+    /// `sqlite3` interpreta un argumento que empieza por `-` como una opción —`-version` no abre
+    /// ningún fichero—. La guarda no recorta ni cita el valor: lo rechaza, porque una corrección
+    /// silenciosa convertiría una fila mal escrita en otro comando.
+    #[test]
+    fn un_db_path_que_parece_bandera_se_rechaza() {
+        let error = ruta(&objetivo_sqlite(Some("--version")))
+            .expect_err("un `db_path` que parece bandera no puede llegar al `exec`");
+
+        match error {
+            ErrorDeExtraccion::ValorQuePareceBandera { tipo, campo } => {
+                assert_eq!(tipo, "sqlite");
+                assert_eq!(campo, "db_path");
+            }
+            otro => panic!("el rechazo tiene que ser el de una bandera: {otro:?}"),
+        }
+    }
+
+    /// Un `sqlite` sin `container_name` también se rechaza: sin contenedor no hay dónde ejecutar.
+    ///
+    /// La fuente vive **dentro** de un contenedor, así que el contenedor es la otra pieza que no
+    /// puede faltar. Se comprueba junto al `db_path` para fijar que las dos son obligatorias y
+    /// que el motivo nombra la que falta.
+    #[test]
+    fn un_sqlite_sin_container_name_se_rechaza_nombrando_el_campo() {
+        let mut objetivo = objetivo_sqlite(Some("/var/lib/kesto/kesto.db"));
+        objetivo.container_name = None;
+
+        let error = ruta(&objetivo).expect_err("un sqlite sin contenedor no tiene dónde ejecutar");
+
+        match error {
+            ErrorDeExtraccion::CampoQueFalta { tipo, campo } => {
+                assert_eq!(tipo, "sqlite");
+                assert_eq!(campo, "container_name");
+            }
+            otro => panic!("el rechazo tiene que ser el de un campo que falta: {otro:?}"),
+        }
     }
 
     /// **La contraseña no está en el `cmd` y sí en la variable de entorno de su tipo.**
@@ -1606,6 +1795,7 @@ mod tests {
             db_password: Some(secreto(CONTRASENA)),
             db_name: Some("almacen".to_owned()),
             host_path: Some("/backup_sources/almacen".to_owned()),
+            db_path: Some("/var/lib/kesto/kesto.db".to_owned()),
             created_at: time::OffsetDateTime::now_utc(),
         };
 
@@ -1626,6 +1816,7 @@ mod tests {
             objetivo.host_path.as_deref(),
             Some("/backup_sources/almacen")
         );
+        assert_eq!(objetivo.db_path.as_deref(), Some("/var/lib/kesto/kesto.db"));
     }
 
     /// El motivo se recorta **por carácter**, y lo dice.

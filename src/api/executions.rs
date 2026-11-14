@@ -261,6 +261,7 @@ mod tests {
                 db_password: None,
                 db_name: None,
                 host_path: Some("/srv/datos".to_owned()),
+                db_path: None,
             })
             .await
             .expect("el target de prueba se da de alta");
