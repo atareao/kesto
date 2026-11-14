@@ -4,7 +4,7 @@
 
 ## Qué es
 
-Kesto ("caja" en esperanto) es un contenedor único que:
+Kesto —en esperanto, *arca*, *caja*, *cesto* o *cajón*— es un contenedor único que:
 
 - ejecuta `mariadb-dump` / `pg_dumpall` **dentro del contenedor de tu base de datos** (vía `exec` por la API del daemon) y transmite la salida **en streaming, sin pasar por disco**;
 - guarda el resultado en un **repositorio [rustic](https://github.com/rustic-rs/rustic) sobre S3** (MinIO, RusticFS, AWS);
