@@ -173,6 +173,7 @@ impl Aparato {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled,
+                name: None,
             })
             .await
             .expect("el alta de la tarea no puede fallar")

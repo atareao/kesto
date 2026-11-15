@@ -21,6 +21,12 @@
 //! herramienta, o cuya fila de `job_executions` se borró en cascada con su tarea— y el panel necesita
 //! saber **antes** de ofrecer la restauración si esa copia tiene destino, y cuál es.
 //!
+//! Y cada elemento lleva además **`job_name`** (anulable), el nombre de su tarea: sale del mismo
+//! vínculo —`snapshot → job_executions → backup_jobs`— sin pasar por el target, así que una
+//! instantánea cuya tarea no tenga nombre lo publica a `null` en vez de dejar el hueco. La `label`
+//! del elemento **no** cambia: sigue siendo el identificador de la tarea, y el nombre legible vive
+//! en su propio campo.
+//!
 //! # De dónde sale el listado, y por dónde **no** se abre el repositorio
 //!
 //! La lista la resuelve [`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots) y **no**
@@ -249,9 +255,18 @@ pub async fn listado(
         .objetivos_de_las_instantaneas(&identificadores, &fila.id)
         .await?;
 
+    // Y el nombre de la tarea, por el mismo vínculo pero sin pasar por el target: lo que hace falta
+    // es el `job_id` del objetivo —que ya vino resuelto en la lectura anterior— y el nombre de esa
+    // tarea. Otra vez **una sola** lectura para todo el lote, y solo de las tareas que aparecen:
+    // una instantánea sin vínculo no aporta identificador y sale con `null`, que es lo que el
+    // contrato publica para «no se sabe el nombre».
+    let tareas: Vec<Uuid> = objetivos.values().map(|objetivo| objetivo.job_id).collect();
+
+    let nombres = estado.db.tareas.nombres(&tareas).await?;
+
     // La vista se compone antes de envolverla porque formatear una fecha puede fallar: ese fallo es
     // un `500` con la causa al registro, y no una respuesta a la que le falte un elemento.
-    let vista = ListadoDelCable::desde(&instantaneas, &objetivos, truncated)?;
+    let vista = ListadoDelCable::desde(&instantaneas, &objetivos, &nombres, truncated)?;
 
     Ok(ApiResponse::new(
         StatusCode::OK,
@@ -595,14 +610,20 @@ impl ListadoDelCable {
     /// no lee la base: aquí solo se casa por el identificador de la instantánea, y la que no esté en
     /// el mapa sale con los tres campos de su target a `null`, que es lo que significa «esta copia no
     /// casó con ninguna ejecución» y **no** un hueco que rellenar.
+    ///
+    /// El `nombres` es la otra mitad del mismo reparto: el nombre de cada tarea, ya resuelto por
+    /// lotes, casado por el `job_id` que el objetivo trae. Una instantánea sin objetivo no tiene
+    /// `job_id` con el que casar y sale con `job_name` a `null` sin consultar el mapa —no hay tarea
+    /// cuyo nombre pedir—, y una cuya tarea no esté en el mapa sale igual: `null`.
     fn desde(
         instantaneas: &[ResumenDeSnapshot],
         objetivos: &HashMap<String, ObjetivoDeRestauracion>,
+        nombres: &HashMap<Uuid, Option<String>>,
         truncated: bool,
     ) -> Result<Self, AppError> {
         let snapshots = instantaneas
             .iter()
-            .map(|resumen| SnapshotDelCable::desde(resumen, objetivos.get(&resumen.id)))
+            .map(|resumen| SnapshotDelCable::desde(resumen, objetivos.get(&resumen.id), nombres))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
@@ -676,6 +697,16 @@ struct SnapshotDelCable {
     /// porque es el dato con el que el panel decide si deshabilitar la acción: saberlo **antes** de
     /// intentarlo es justo lo que evita un `422` que el operador no podía prever.
     target_type: Option<String>,
+    /// El nombre de la tarea que copió la instantánea; `null` si no se sabe.
+    ///
+    /// Anulable por los dos motivos del contrato: la instantánea puede no casar con ninguna tarea
+    /// —copia de otra herramienta, o vínculo borrado en cascada— y la tarea puede existir y no tener
+    /// nombre. Las dos cosas se publican igual, con `null`, y no hay por qué distinguirlas aquí: en
+    /// los dos casos el panel no tiene un nombre que pintar y cae al identificador.
+    ///
+    /// **No** sustituye a la `label`: ésta sigue siendo el identificador de la tarea, y el nombre
+    /// legible viaja en su propio campo para no cambiar lo que ya estaba escrito.
+    job_name: Option<String>,
 }
 
 impl SnapshotDelCable {
@@ -698,6 +729,7 @@ impl SnapshotDelCable {
     fn desde(
         resumen: &ResumenDeSnapshot,
         objetivo: Option<&ObjetivoDeRestauracion>,
+        nombres: &HashMap<Uuid, Option<String>>,
     ) -> Result<Self, AppError> {
         Ok(Self {
             id: resumen.id.clone(),
@@ -709,6 +741,12 @@ impl SnapshotDelCable {
             target_id: objetivo.map(|objetivo| objetivo.target_id.to_string()),
             target_name: objetivo.map(|objetivo| objetivo.target_name.clone()),
             target_type: objetivo.map(|objetivo| texto_del_tipo(objetivo.target_type).to_owned()),
+            // El nombre sale del mismo vínculo que los tres de arriba pero **no** del objetivo: el
+            // `job_id` del objetivo es la llave con la que se busca en el mapa que resolvió el
+            // manejador. Sin objetivo no hay llave —y el `and_then` deja el `null` sin consultar—;
+            // con él y sin entrada en el mapa, también `null`.
+            job_name: objetivo
+                .and_then(|objetivo| nombres.get(&objetivo.job_id).cloned().flatten()),
         })
     }
 }
@@ -808,7 +846,7 @@ mod tests {
     }
 
     /// Comprueba que un elemento del listado trae los seis datos del contrato, cada uno con su tipo,
-    /// y **las tres claves** del target.
+    /// **las tres claves** del target y la del nombre de la tarea.
     ///
     /// Los seis y no uno: el explorador es la única pantalla que enseña qué hay **dentro** del
     /// repositorio, y cada dato que falte deja una columna de la tabla sin poder pintarse. El tipo se
@@ -818,7 +856,9 @@ mod tests {
     /// De los tres del target se comprueba aquí **la presencia** y no el valor: el contrato los
     /// publica en todos los elementos —un elemento sin esas claves dejaría al panel sin poder
     /// distinguir «esta copia no tiene target» de «el servidor no lo dice»—, y cuáles llegan a `null`
-    /// y cuáles poblados lo miden las pruebas que siembran el vínculo.
+    /// y cuáles poblados lo miden las pruebas que siembran el vínculo. Lo mismo vale para `job_name`
+    /// y con más motivo: una instantánea **sin** vínculo es un caso legítimo y frecuente —una copia
+    /// de otra herramienta—, así que su `null` es un dato y no puede desaparecer de la respuesta.
     fn comprobar_elemento(elemento: &serde_json::Value, donde: &str) {
         assert!(
             elemento["id"].as_str().is_some_and(|id| !id.is_empty()),
@@ -869,6 +909,14 @@ mod tests {
              en **todos** los elementos, aunque sea a `null`: {elemento}"
             );
         }
+
+        for campo in CAMPOS_DEL_NOMBRE {
+            assert!(
+                elemento.get(campo).is_some(),
+                "el elemento {donde} no trae el campo `{campo}`, y el contrato lo publica en \
+             **todos** los elementos, aunque sea a `null`: {elemento}"
+            );
+        }
     }
 
     /// Los tres campos del target que el listado publica en **cada** elemento.
@@ -877,6 +925,14 @@ mod tests {
     /// identificador, el nombre y el tipo del target, y los tres a `null` cuando la instantánea no
     /// casó con ninguna ejecución.
     const CAMPOS_DEL_TARGET: [&str; 3] = ["target_id", "target_name", "target_type"];
+
+    /// El campo con el nombre de la tarea de origen, que el listado publica en **cada** elemento.
+    ///
+    /// Es anulable por contrato, y su `null` significa «no se sabe el nombre» —la instantánea no casó
+    /// con ninguna tarea, o su tarea no tiene nombre—: la clave tiene que viajar siempre para que el
+    /// panel pueda distinguir eso de «el servidor no lo publica». La `label` **no** es esto: sigue
+    /// siendo el identificador de la tarea, y por eso el nombre va en su propio campo.
+    const CAMPOS_DEL_NOMBRE: [&str; 1] = ["job_name"];
 
     /// Busca, por su identificador, el elemento del listado que corresponde a una instantánea.
     ///
@@ -1298,6 +1354,170 @@ mod tests {
         }
     }
 
+    /// 1.6 — Cada instantánea publica `job_name`: el nombre de su tarea, o `null`.
+    ///
+    /// Cubre `api-resources`, escenario «Cada instantánea declara el nombre de su tarea o null». Se
+    /// siembran **tres** instantáneas del mismo repositorio para que los dos motivos del `null` se
+    /// distingan en la misma respuesta:
+    ///
+    /// * una cuya tarea **sí** tiene nombre, que lo publica;
+    /// * otra cuya tarea **no** lo tiene —el estado de todas las tareas anteriores a este change—,
+    ///   que publica `null`;
+    /// * y una **sin vínculo** con ninguna ejecución, que también publica `null`.
+    ///
+    /// El nombre se escribe con SQL directo: la tarea se siembra por la capa de acceso —la única
+    /// forma de tener la cadena `instantánea → ejecución → tarea`— y lo que esta prueba mide es el
+    /// **listado**, no el alta de tareas, que tiene las suyas.
+    ///
+    /// Y se afirma que la `label` **no** cambia: SHALL seguir siendo la que la instantánea trae del
+    /// repositorio, para que el nombre nuevo no acabe sustituyéndola por la puerta de atrás.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_listado_publica_el_nombre_de_la_tarea_de_cada_instantanea_o_null() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &[
+                "2026-01-01T10:00:00Z",
+                "2026-01-02T10:00:00Z",
+                "2026-01-03T10:00:00Z",
+            ],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "explorador-1-6", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let con_nombre = siembra.identificadores[0].clone();
+        let sin_nombre = siembra.identificadores[1].clone();
+        // La tercera se queda **sin** vínculo: es la copia que el histórico no anotó.
+        let huerfana = siembra.identificadores[2].clone();
+
+        sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &con_nombre,
+            TipoDeTarget::Directory,
+            Some("/srv/explorador-1-6-con-nombre".to_owned()),
+        )
+        .await;
+
+        sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &sin_nombre,
+            TipoDeTarget::Directory,
+            Some("/srv/explorador-1-6-sin-nombre".to_owned()),
+        )
+        .await;
+
+        // La primera lectura, con **ninguna** tarea con nombre todavía: la clave tiene que estar en
+        // las tres y a `null` en las tres.
+        let respuesta = get(
+            router.clone(),
+            &format!("/api/v1/snapshots?repository_id={repositorio}"),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado tiene que contestar 200, y contestó {status} con {cuerpo}"
+        );
+
+        let listado = cuerpo["data"]["snapshots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
+
+        for instantanea in [&con_nombre, &sin_nombre, &huerfana] {
+            let elemento = elemento_con_id(listado, instantanea, &cuerpo);
+
+            assert!(
+                elemento.get("job_name").is_some(),
+                "la instantánea `{instantanea}` tiene que traer la **clave** `job_name`, aunque sea \
+                 a `null`: {cuerpo}"
+            );
+            assert!(
+                elemento["job_name"].is_null(),
+                "mientras ninguna de las tres tareas tiene nombre, `job_name` tiene que llegar a \
+                 `null`: {cuerpo}"
+            );
+        }
+
+        // Ahora se le pone nombre a la tarea de la primera instantánea, y **solo** a la suya.
+        sqlx::query(
+            "UPDATE backup_jobs SET name = ?1 WHERE id = \
+             (SELECT job_id FROM job_executions WHERE snapshot_id = ?2)",
+        )
+        .bind("copia nocturna")
+        .bind(&con_nombre)
+        .execute(&estado.db.pool)
+        .await
+        .expect("poner el nombre de la tarea es preparación de la prueba y no puede fallar");
+
+        let respuesta = get(
+            router,
+            &format!("/api/v1/snapshots?repository_id={repositorio}"),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado tiene que contestar 200, y contestó {status} con {cuerpo}"
+        );
+
+        let listado = cuerpo["data"]["snapshots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
+
+        let elemento = elemento_con_id(listado, &con_nombre, &cuerpo);
+
+        assert_eq!(
+            elemento["job_name"], "copia nocturna",
+            "la instantánea de la tarea con nombre tiene que publicarlo: {cuerpo}"
+        );
+
+        // Las otras dos siguen a `null`, cada una por su motivo: una porque su tarea no tiene
+        // nombre, y la otra porque no casó con ninguna tarea.
+        let elemento = elemento_con_id(listado, &sin_nombre, &cuerpo);
+
+        assert!(
+            elemento["job_name"].is_null(),
+            "una tarea sin nombre publica `job_name` a `null`, no una cadena vacía: {cuerpo}"
+        );
+
+        let elemento = elemento_con_id(listado, &huerfana, &cuerpo);
+
+        assert!(
+            elemento["job_name"].is_null(),
+            "una instantánea sin vínculo con ninguna tarea publica `job_name` a `null`: {cuerpo}"
+        );
+
+        // Y la `label` de las tres sigue siendo la que la instantánea trae del repositorio: el
+        // nombre nuevo vive en su propio campo y **no** sustituye a la etiqueta.
+        for instantanea in [&con_nombre, &sin_nombre, &huerfana] {
+            let elemento = elemento_con_id(listado, instantanea, &cuerpo);
+
+            assert_eq!(
+                elemento["label"], ETIQUETA_SEMBRADA,
+                "la `label` de la instantánea `{instantanea}` no puede cambiar por este change: \
+                 {cuerpo}"
+            );
+        }
+    }
+
     /// 1.29e — El listado va acotado a la ventana e indica que hay más.
     ///
     /// Cubre `repository`, escenario «El listado va acotado». La ventana no es una comodidad del panel:
@@ -1440,6 +1660,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 6,
                 enabled: true,
+                name: None,
             })
             .await
             .expect("la tarea de la restauración se da de alta");

@@ -532,6 +532,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
+                name: None,
             })
             .await
             .expect("el alta de la tarea por la capa del estado no puede fallar");

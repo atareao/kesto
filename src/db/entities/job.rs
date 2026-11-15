@@ -8,6 +8,9 @@
 //! **No tiene ninguna columna de secreto**, así que su capa de acceso **no** recibe la
 //! clave de cifrado: pasarle una que no se usa sugeriría que aquí se cifra algo.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteRow;
@@ -37,6 +40,14 @@ pub struct Tarea {
     pub enabled: bool,
     /// Fecha de alta, en UTC.
     pub created_at: OffsetDateTime,
+    /// Nombre legible de la tarea; `None` si no tiene.
+    ///
+    /// Es la columna que añade la `0005` (issue #65) y la única anulable de la tabla: el nombre es
+    /// opcional por contrato —una tarea sin él sigue siendo válida, y el panel cae al
+    /// identificador—, así que `None` es un estado del contrato y no un dato que falte. Nunca es
+    /// `Some("")`: un nombre en blanco lo guarda el alta como `NULL`, y `''` y `NULL` no se pintan
+    /// igual en el panel.
+    pub name: Option<String>,
 }
 
 /// Los datos de un alta. **Sin `id`**: lo genera la capa de acceso.
@@ -56,6 +67,12 @@ pub struct AltaDeTarea {
     pub keep_monthly: i64,
     /// Si la tarea está activa.
     pub enabled: bool,
+    /// Nombre legible de la tarea; `None` si se da de alta sin nombre.
+    ///
+    /// Llega **ya recortado y en blanco convertido a `None`**: el recorte y el paso del blanco a
+    /// `None` son del borde —el alta y la edición comparten ese validador—, porque una cadena vacía
+    /// en la columna fingiría un nombre que nadie escribió. Aquí no se vuelve a mirar.
+    pub name: Option<String>,
 }
 
 /// La capa de acceso de `backup_jobs`.
@@ -72,8 +89,12 @@ pub struct Tareas {
 // interpola un valor, ni siquiera para armarla en piezas.
 
 /// Columnas del `SELECT`, en el orden del §3 —el mismo que recorre [`desde_fila`]—.
+///
+/// `name` va la **última** porque es donde la deja el `ALTER TABLE ... ADD COLUMN` de la `0005`, y
+/// el orden es el que publica `PRAGMA table_info`: ponerla en otro sitio aquí haría que la consulta
+/// y el esquema se leyeran en dos órdenes distintos sin que nada lo delatara.
 const SQL_LEER: &str = "SELECT id, target_id, repository_id, cron_expression, keep_daily, keep_weekly, \
-     keep_monthly, enabled, created_at FROM backup_jobs WHERE id = ?1";
+     keep_monthly, enabled, created_at, name FROM backup_jobs WHERE id = ?1";
 
 /// Listado de todas las tareas.
 ///
@@ -81,25 +102,46 @@ const SQL_LEER: &str = "SELECT id, target_id, repository_id, cron_expression, ke
 /// el mismo segundo empatan —`CURRENT_TIMESTAMP` no tiene más resolución— y el orden
 /// entre dos llamadas seguidas dejaría de ser estable. El `id` es el desempate.
 const SQL_LISTAR: &str = "SELECT id, target_id, repository_id, cron_expression, keep_daily, keep_weekly, \
-     keep_monthly, enabled, created_at FROM backup_jobs ORDER BY created_at, id";
+     keep_monthly, enabled, created_at, name FROM backup_jobs ORDER BY created_at, id";
 
 /// Alta de una tarea, devolviendo la fila tal y como quedó.
 ///
 /// Si el `target_id` o el `repository_id` no existen, la clave foránea rechaza la fila:
 /// una tarea huérfana no llega a existir.
 const SQL_ALTA: &str = "INSERT INTO backup_jobs \
-     (id, target_id, repository_id, cron_expression, keep_daily, keep_weekly, keep_monthly, enabled) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+     (id, target_id, repository_id, cron_expression, keep_daily, keep_weekly, keep_monthly, enabled, name) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
      RETURNING id, target_id, repository_id, cron_expression, keep_daily, keep_weekly, keep_monthly, \
-     enabled, created_at";
+     enabled, created_at, name";
 
 /// Actualización de la fila entera.
 ///
 /// `created_at` **no** entra: es la fecha de nacimiento de la fila, no un campo que se
-/// edite —reescribirla cambiaría la historia y el orden del listado—.
+/// edite —reescribirla cambiaría la historia y el orden del listado—. `name` sí: es un campo del
+/// formulario que se puede corregir o borrar, y editar una tarea sin poder quitar su nombre
+/// dejaría una errata sin arreglo.
 const SQL_ACTUALIZAR: &str = "UPDATE backup_jobs SET target_id = ?1, repository_id = ?2, \
-     cron_expression = ?3, keep_daily = ?4, keep_weekly = ?5, keep_monthly = ?6, enabled = ?7 \
-     WHERE id = ?8";
+     cron_expression = ?3, keep_daily = ?4, keep_weekly = ?5, keep_monthly = ?6, enabled = ?7, \
+     name = ?8 WHERE id = ?9";
+
+/// Los nombres de **varias** tareas, resueltos en **una sola** lectura.
+///
+/// La usan los otros dos listados que publican el nombre de la tarea de cada fila —el del histórico
+/// y el de instantáneas—, y por eso es por lotes: la página del histórico llega a 200 filas, y
+/// resolverlas de una en una serían 200 consultas para pintar una pantalla.
+///
+/// La lista de identificadores **es un valor enlazado**: viaja como un array JSON en `?1` y
+/// `json_each` lo abre en filas dentro del propio SQLite, así que la sentencia es una constante y
+/// ningún identificador entra en su texto. Es la misma forma que la hermana por lotes de los
+/// objetivos de las instantáneas —`objetivos_de_las_instantaneas`, en `execution.rs`—, y por el
+/// mismo motivo: un `IN` con un marcador por identificador obligaría a **armar** la sentencia en
+/// piezas, y aquí la sentencia que se ejecuta y la que viaja en el error tienen que ser la misma
+/// constante.
+///
+/// No lleva `ORDER BY`: el resultado se recoge en un mapa por identificador, y el orden de un mapa
+/// no depende del de las filas.
+const SQL_NOMBRES: &str = "SELECT id, name FROM backup_jobs \
+     WHERE id IN (SELECT value FROM json_each(?1))";
 
 /// Borrado por identificador.
 const SQL_BORRAR: &str = "DELETE FROM backup_jobs WHERE id = ?1";
@@ -110,6 +152,12 @@ const SQL_BORRAR: &str = "DELETE FROM backup_jobs WHERE id = ?1";
 /// `SQL_*`: dice dónde falló, que es leer una columna. Es lo que el registro necesita
 /// saber cuando el fallo no viene del motor.
 const CONSULTA_MAPEO: &str = "mapeo de la fila de backup_jobs";
+
+/// Texto del error cuando lo que falla es **armar la lista** de identificadores que viaja enlazada.
+///
+/// La lista se arma antes de consultar, así que no es una sentencia ejecutada y no se confunde con
+/// las `SQL_*`: nombra el paso que falló, que es codificar los identificadores para que viajen.
+const CONSULTA_LISTA_DE_TAREAS: &str = "lista de identificadores de tareas";
 
 impl Tareas {
     /// Construye la capa de acceso sobre un pool.
@@ -140,6 +188,7 @@ impl Tareas {
             .bind(alta.keep_weekly)
             .bind(alta.keep_monthly)
             .bind(alta.enabled)
+            .bind(&alta.name)
             .fetch_one(&self.pool)
             .await
             .map_err(error_de_consulta(SQL_ALTA))?;
@@ -185,12 +234,76 @@ impl Tareas {
             .bind(tarea.keep_weekly)
             .bind(tarea.keep_monthly)
             .bind(tarea.enabled)
+            .bind(&tarea.name)
             .bind(tarea.id.hyphenated().to_string())
             .execute(&self.pool)
             .await
             .map_err(error_de_consulta(SQL_ACTUALIZAR))?;
 
         Ok(resultado.rows_affected() == 1)
+    }
+
+    /// Los nombres de varias tareas, resueltos en **una sola** lectura.
+    ///
+    /// Es la mitad que los listados del histórico y de instantáneas necesitan para publicar el
+    /// nombre de la tarea de cada fila sin pagar una consulta por fila: quien llama reúne los
+    /// `job_id` de su página y recibe aquí el nombre de cada una de golpe.
+    ///
+    /// **Una tarea sin nombre sale en el mapa con `None`**, y una tarea que no exista —o una fila sin
+    /// vínculo, que no llega a aportar identificador— **no sale**: el mapa devuelve `None` para las
+    /// dos cuando lo consulta quien llama, y eso es lo correcto, porque el contrato publica `null`
+    /// tanto si la tarea no tiene nombre como si la ejecución no casa con ninguna. Lo que el mapa
+    /// **no** hace es inventar entradas de relleno para identificadores que no pidió nadie.
+    ///
+    /// Las claves son los `Uuid`, no sus formas en texto: quien consulta tiene el identificador ya
+    /// convertido —lo sacó de una fila de la capa de acceso— y pasarle una segunda forma que tuviera
+    /// que normalizar sería devolverle el problema que esta capa ya resolvió.
+    ///
+    /// # Errors
+    ///
+    /// Un [`DbError::Consulta`] si la lista no se puede codificar o la sentencia falla.
+    pub async fn nombres(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, Option<String>>, DbError> {
+        // Sin identificadores no hay nada que resolver: la consulta sobra, y un listado de cero
+        // filas no tiene por qué costar una ida y vuelta a la base.
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // El array lo arma `serde_json`, que es quien sabe escapar: ningún identificador se pega al
+        // texto de la consulta. El fallo viaja como `sqlx::Error::Encode` —y no estrena una
+        // variante— porque es exactamente lo que significa: un valor que no se pudo codificar para
+        // viajar a la base.
+        let identificadores: Vec<String> =
+            ids.iter().map(|id| id.hyphenated().to_string()).collect();
+
+        let lista = serde_json::to_string(&identificadores).map_err(|causa| DbError::Consulta {
+            consulta: CONSULTA_LISTA_DE_TAREAS,
+            causa: sqlx::Error::Encode(Box::new(causa)),
+        })?;
+
+        let filas = sqlx::query(SQL_NOMBRES)
+            .bind(lista)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(error_de_consulta(SQL_NOMBRES))?;
+
+        let mut nombres = HashMap::with_capacity(ids.len());
+
+        for fila in &filas {
+            // El `IN` no casa nunca con `NULL`, así que una fila que ha llegado hasta aquí tiene su
+            // `id` escrito: leerlo no puede degenerar en una clave vacía.
+            let id = columna::<String>(fila, "id")?;
+            let id = Uuid::parse_str(&id).map_err(|causa| DbError::Consulta {
+                consulta: CONSULTA_MAPEO,
+                causa: sqlx::Error::Decode(Box::new(causa)),
+            })?;
+
+            if let Entry::Vacant(hueco) = nombres.entry(id) {
+                hueco.insert(columna::<Option<String>>(fila, "name")?);
+            }
+        }
+
+        Ok(nombres)
     }
 
     /// Borra la fila y devuelve si existía.
@@ -266,6 +379,7 @@ fn desde_fila(fila: &SqliteRow) -> Result<Tarea, DbError> {
         keep_monthly: columna(fila, "keep_monthly")?,
         enabled: columna(fila, "enabled")?,
         created_at: columna(fila, "created_at")?,
+        name: columna(fila, "name")?,
     })
 }
 
@@ -325,6 +439,7 @@ mod tests {
             keep_weekly: 4,
             keep_monthly: 12,
             enabled: true,
+            name: None,
         }
     }
 
@@ -556,6 +671,90 @@ mod tests {
         assert_eq!(
             ejecuciones_que_quedaron, 0,
             "la inserción huérfana dejó una ejecución"
+        );
+    }
+
+    /// 1.1 (entidad) — Un `INSERT` directo que omita `name` se acepta y deja la columna a `NULL`.
+    ///
+    /// Es la mitad que el pragma del esquema no mide por sí sola: la columna de la `0005` es
+    /// **anulable**, así que una fila escrita con SQL a mano —sin pasar por esta capa, que es como
+    /// la escribiría `sqlite3`— tiene que entrar sin el nombre y quedar a `NULL`. Una columna
+    /// declarada `NOT NULL` sin valor por defecto pasaría una prueba que solo mirara que existe y
+    /// rechazaría esta inserción.
+    #[tokio::test]
+    async fn un_alta_directa_sin_name_deja_la_columna_a_null() {
+        let (_directorio, pool, _tareas, target_id, repository_id) = base_con_tarea_posible().await;
+
+        let id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(id.hyphenated().to_string())
+        .bind(target_id.hyphenated().to_string())
+        .bind(repository_id.hyphenated().to_string())
+        .bind("0 3 * * *")
+        .execute(&pool)
+        .await
+        .expect(
+            "una fila sin `name` tiene que poder insertarse: si la columna fuera `NOT NULL` sin \
+             valor por defecto, esto fallaría",
+        );
+
+        let nombre =
+            sqlx::query_scalar::<_, Option<String>>("SELECT name FROM backup_jobs WHERE id = ?1")
+                .bind(id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("la columna `name` tiene que poder leerse en la fila insertada sin ella");
+
+        assert!(
+            nombre.is_none(),
+            "una fila insertada sin `name` tiene que quedar a NULL, y quedó {nombre:?}"
+        );
+    }
+
+    /// 1.2 (entidad) — `actualizar` con un nombre nuevo lo persiste en la columna.
+    ///
+    /// Hoy el nombre solo se prueba por el `PUT` de la API; esta prueba lo fija donde de verdad se
+    /// escribe, que es la sentencia de la capa de acceso. Un `UPDATE` que se dejara `name` fuera de
+    /// la lista de columnas —o que lo bindeara en otro hueco— pasaría el ciclo de la 1.28, que da de
+    /// alta sin nombre y nunca toca el campo, y entonces una edición posterior no guardaría nada.
+    #[tokio::test]
+    async fn la_actualizacion_persiste_el_nombre_nuevo() {
+        let (_directorio, _pool, tareas, target_id, repository_id) = base_con_tarea_posible().await;
+
+        let mut tarea = tareas
+            .alta(alta_tarea(&target_id, &repository_id, "0 3 * * *"))
+            .await
+            .expect("el alta no puede fallar");
+
+        assert!(
+            tarea.name.is_none(),
+            "el alta de la prueba entra sin nombre, así que lo que se mide es la edición"
+        );
+
+        tarea.name = Some("copia nocturna".to_owned());
+
+        assert!(
+            tareas
+                .actualizar(&tarea)
+                .await
+                .expect("la actualización no puede fallar"),
+            "la fila existía, así que la actualización debe decir que sí"
+        );
+
+        let releida = tareas
+            .leer(&tarea.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe seguir existiendo");
+
+        assert_eq!(
+            releida.name.as_deref(),
+            Some("copia nocturna"),
+            "el nombre pasado a `actualizar` tiene que quedar en la columna"
         );
     }
 }
