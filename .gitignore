@@ -6,6 +6,7 @@
 .env
 .env.*
 !.env.example
+vampus.tgz
 
 # Banco de pruebas local (RustFS, fuentes, restauraciones)
 /lab
