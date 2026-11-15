@@ -161,6 +161,74 @@ pub const PLAZO_DE_LA_RESTAURACION: Duration = Duration::from_secs(420);
 /// pueda nombrarlo en su motivo.
 pub const PLAZO_DE_INACTIVIDAD: Duration = Duration::from_secs(300);
 
+// ── Las sondas de arranque de las bases ────────────────────────────────────
+
+/// La sonda que da por arrancada una base: la orden y el entorno que la acompañan.
+///
+/// Es una función pura con forma de par de listas, para que los escenarios «la espera de una
+/// base no se conforma con que escuche» puedan afirmarla sin levantar nada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sonda {
+    /// El comando y sus argumentos.
+    pub cmd: Vec<String>,
+    /// Las variables de entorno que el proceso necesita para contestar.
+    pub entorno: Vec<String>,
+}
+
+impl Sonda {
+    /// El comando en la forma que pide [`Motor::ejecutar`].
+    pub fn argv(&self) -> Vec<&str> {
+        self.cmd.iter().map(String::as_str).collect()
+    }
+
+    /// El entorno en la forma que pide [`Motor::ejecutar`].
+    pub fn env(&self) -> Vec<&str> {
+        self.entorno.iter().map(String::as_str).collect()
+    }
+}
+
+/// La sonda de un PostgreSQL: una consulta de verdad contra [`BASE`].
+///
+/// `pg_isready` **no vale**: contesta que el servidor está listo durante la fase temporal del
+/// arranque de la imagen oficial —un servidor escuchando mientras `POSTGRES_DB` todavía no
+/// existe—, así que quien esperase con él sembraría antes de tiempo y se llevaría un
+/// `database "pruebas" does not exist`. La consulta contra [`BASE`] falla hasta que la base
+/// está y acepta consultas.
+pub fn sonda_de_postgres() -> Sonda {
+    Sonda {
+        cmd: vec![
+            "psql".to_owned(),
+            "-U".to_owned(),
+            "postgres".to_owned(),
+            "-d".to_owned(),
+            BASE.to_owned(),
+            "-c".to_owned(),
+            "SELECT 1".to_owned(),
+        ],
+        entorno: vec![format!("PGPASSWORD={CLAVE_DE_LA_BASE}")],
+    }
+}
+
+/// La sonda de un MariaDB: una consulta de verdad contra [`BASE`].
+///
+/// El cliente que no nombra base contesta que sí contra el servidor temporal del arranque,
+/// antes de que `MARIADB_DATABASE` exista: la base va en la orden, igual que en la siembra.
+pub fn sonda_de_mariadb() -> Sonda {
+    let clave = format!("-p{CLAVE_DE_LA_BASE}");
+
+    Sonda {
+        cmd: vec![
+            "mariadb".to_owned(),
+            "-uroot".to_owned(),
+            clave,
+            BASE.to_owned(),
+            "-e".to_owned(),
+            "SELECT 1".to_owned(),
+        ],
+        entorno: Vec::new(),
+    }
+}
+
 // ── El socket del motor ────────────────────────────────────────────────────
 
 /// Resuelve el socket del motor a partir de lo que traiga el entorno.
@@ -654,7 +722,13 @@ impl Motor {
         self.ejecutar(contenedor, &["sh", "-c", guion], &[]).await
     }
 
-    /// Insiste con una orden hasta que termina bien, y lo deja dicho si no llega a pasar.
+    /// Insiste con una orden —y su entorno— hasta que termina bien, y lo deja dicho si no llega
+    /// a pasar.
+    ///
+    /// Es la espera de arranque: lo que se le pide es una orden que **falle** mientras el
+    /// servicio no esté de verdad listo —una consulta contra su base, no un «¿estás?»—, porque
+    /// un servicio a medio arrancar puede contestar que sí. El entorno es lo que la orden
+    /// necesita para autenticarse, como el `PGPASSWORD` de [`sonda_de_postgres`].
     ///
     /// # Errors
     ///
@@ -663,12 +737,13 @@ impl Motor {
         &self,
         contenedor: &str,
         cmd: &[&str],
+        env: &[&str],
         plazo: Duration,
     ) -> Result<(), String> {
         let inicio = Instant::now();
 
         loop {
-            let ultimo = match self.ejecutar(contenedor, cmd, &[]).await {
+            let ultimo = match self.ejecutar(contenedor, cmd, env).await {
                 Ok(salida) if salida.codigo == 0 => return Ok(()),
                 Ok(salida) => format!("código {} · {}", salida.codigo, salida.error),
                 Err(causa) => causa,

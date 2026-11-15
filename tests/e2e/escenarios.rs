@@ -29,7 +29,8 @@ use super::arnes::{
     ACCESO_S3, BASE, CLAVE_DE_LA_BASE, Kesto, Motor, Mundo, PLAZO_DE_ARRANQUE,
     PLAZO_DE_INACTIVIDAD, PLAZO_DE_LA_COPIA, PLAZO_DE_LA_RESTAURACION, Receta, SECRETO_S3, Salida,
     comparar_arboles, comparar_filas, copiar_arbol, esperar_el_s3, imagen_de_alpine,
-    imagen_de_mariadb, imagen_de_postgres, puerto_libre, resolver_el_socket,
+    imagen_de_mariadb, imagen_de_postgres, puerto_libre, resolver_el_socket, sonda_de_mariadb,
+    sonda_de_postgres,
 };
 
 // ── La siembra y la comparación ────────────────────────────────────────────
@@ -163,14 +164,10 @@ async fn mariadb_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
         })
         .await;
 
-    let clave = format!("-p{CLAVE_DE_LA_BASE}");
+    let sonda = sonda_de_mariadb();
     mundo
         .motor
-        .esperar_orden(
-            &nombre,
-            &["mariadb", "-uroot", &clave, "-e", "SELECT 1"],
-            PLAZO_DE_ARRANQUE,
-        )
+        .esperar_orden(&nombre, &sonda.argv(), &sonda.env(), PLAZO_DE_ARRANQUE)
         .await
         .unwrap_or_else(|motivo| panic!("{motivo}"));
 
@@ -247,13 +244,10 @@ async fn postgres_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
         })
         .await;
 
+    let sonda = sonda_de_postgres();
     mundo
         .motor
-        .esperar_orden(
-            &nombre,
-            &["pg_isready", "-U", "postgres", "-d", BASE],
-            PLAZO_DE_ARRANQUE,
-        )
+        .esperar_orden(&nombre, &sonda.argv(), &sonda.env(), PLAZO_DE_ARRANQUE)
         .await
         .unwrap_or_else(|motivo| panic!("{motivo}"));
 
@@ -346,7 +340,7 @@ async fn alpine_con_sqlite(mundo: &mut Mundo, sufijo: &str) -> String {
 
     mundo
         .motor
-        .esperar_orden(&nombre, &["sqlite3", "-version"], PLAZO_DE_ARRANQUE)
+        .esperar_orden(&nombre, &["sqlite3", "-version"], &[], PLAZO_DE_ARRANQUE)
         .await
         .unwrap_or_else(|motivo| panic!("{motivo}"));
 
@@ -441,6 +435,68 @@ async fn target_directorio(kesto: &Kesto, nombre: &str, ruta: &Path) -> String {
                 .unwrap_or_else(|| panic!("la ruta `{}` no es UTF-8", ruta.display())),
         }))
         .await
+}
+
+// ══ Requisito: una base se da por arrancada cuando contesta por su base ════
+
+/// Escenario: la espera de PostgreSQL no se conforma con que el servidor escuche.
+///
+/// `pg_isready` contesta que sí durante la fase temporal del arranque de la imagen oficial
+/// —un servidor escuchando con `POSTGRES_DB` todavía sin crear—, y quien siembre entonces se
+/// encuentra con un `database "pruebas" does not exist`. La sonda tiene que **consultar** la
+/// base sembrable, que es lo único que falla hasta que la base está.
+#[test]
+fn la_sonda_de_postgres_consulta_la_base_sembrable() {
+    let sonda = sonda_de_postgres();
+
+    assert!(
+        !sonda
+            .cmd
+            .iter()
+            .any(|argumento| argumento.contains("pg_isready")),
+        "`pg_isready` no distingue el servidor temporal del definitivo: {}",
+        sonda.cmd.join(" ")
+    );
+    assert!(
+        sonda.cmd.iter().any(|argumento| argumento == "SELECT 1"),
+        "la sonda tiene que ser una consulta de verdad: {}",
+        sonda.cmd.join(" ")
+    );
+    assert!(
+        sonda.cmd.iter().any(|argumento| argumento == BASE),
+        "la consulta tiene que ir contra `{BASE}` y no contra la base por defecto: {}",
+        sonda.cmd.join(" ")
+    );
+    assert!(
+        sonda
+            .entorno
+            .iter()
+            .any(|variable| variable == &format!("PGPASSWORD={CLAVE_DE_LA_BASE}")),
+        "sin `PGPASSWORD` la consulta no puede autenticarse: {}",
+        sonda.entorno.join(" ")
+    );
+}
+
+/// Escenario: la espera de MariaDB no se conforma con que su cliente conteste.
+///
+/// El cliente que no nombra base —`mariadb -uroot -e 'SELECT 1'`— contesta que sí contra el
+/// servidor temporal del arranque, antes de que `MARIADB_DATABASE` exista, y la siembra
+/// entraría antes de tiempo igual que en PostgreSQL.
+#[test]
+fn la_sonda_de_mariadb_consulta_la_base_sembrable() {
+    let sonda = sonda_de_mariadb();
+
+    assert!(
+        sonda.cmd.iter().any(|argumento| argumento == BASE),
+        "la consulta tiene que ir contra `{BASE}`: la que no nombra base contesta que sí \
+         antes de que la base exista: {}",
+        sonda.cmd.join(" ")
+    );
+    assert!(
+        sonda.cmd.iter().any(|argumento| argumento == "SELECT 1"),
+        "la sonda tiene que ser una consulta de verdad: {}",
+        sonda.cmd.join(" ")
+    );
 }
 
 // ══ Requisito: batería de punta a punta por tipo de origen ═════════════════
@@ -1123,6 +1179,7 @@ async fn un_contenedor_que_no_drena_su_stdin_no_cuelga_la_restauracion() {
         .esperar_orden(
             &sordo,
             &["test", "-x", "/usr/local/bin/mariadb"],
+            &[],
             PLAZO_DE_ARRANQUE,
         )
         .await
