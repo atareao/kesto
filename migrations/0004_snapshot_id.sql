@@ -1,0 +1,22 @@
+-- Índice que faltaba: `job_executions.snapshot_id`.
+--
+-- La columna la declara la `0001` y la `0002` cubrió las otras cuatro consultas —las de las
+-- claves foráneas y la del listado del dashboard—, pero dejó ésta sin índice.
+--
+-- No es una clave foránea: es el identificador de la instantánea que anotó la ejecución, y la
+-- restauración lo usa como **punto de entrada**. La consulta que resuelve sobre qué target cae
+-- una instantánea —`SQL_OBJETIVO_DE_LA_INSTANTANEA` en `src/db/entities/execution.rs`— filtra
+-- por `e.snapshot_id = ?1` y ordena por `e.started_at DESC, e.id DESC`; su forma por lotes
+-- —`SQL_OBJETIVOS_DE_LAS_INSTANTANEAS`, la que resuelve las 200 instantáneas de una ventana del
+-- explorador— filtra por el array de `json_each` sobre la misma columna. Sin índice, las dos
+-- recorren entera la tabla que más crece —una fila por cada ejecución de cada copia— y encima
+-- ordenan lo recorrido.
+--
+-- Un índice **simple** y no compuesto con `started_at`: lo que la consulta necesita es localizar
+-- las filas de una instantánea —habitualmente una sola, porque una instantánea copiada dos veces
+-- lo hace desde dos ejecuciones distintas, y el orden solo desempata entre muy pocas—, y un
+-- índice sobre la columna del filtro deja el orden para esas pocas filas. El compuesto no cabría
+-- en el plan de la forma por lotes, donde el filtro entra por `json_each` y no por un valor
+-- constante.
+CREATE INDEX IF NOT EXISTS idx_job_executions_snapshot_id
+    ON job_executions(snapshot_id);

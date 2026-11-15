@@ -5,12 +5,12 @@ import {
   EventSourceFalso,
   eventoDePrueba,
   instalarEventSourceFalso,
-} from '../services/eventosDePrueba'
+} from '../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from '../services/events'
 import { NOMBRE_DEL_EVENTO } from '../services/useEventStream'
-import { instalarFetchFalso } from '../pruebas/fetchDePrueba'
-import type { ManejadorDeFetch, RespuestaSimulada } from '../pruebas/fetchDePrueba'
-import { ejecucion, target, tarea } from '../pruebas/fixtures'
+import { instalarFetchFalso } from '../../tests/fetchDePrueba'
+import type { ManejadorDeFetch, RespuestaSimulada } from '../../tests/fetchDePrueba'
+import { ejecucion, target, tarea } from '../../tests/fixtures'
 import Historico from './historico'
 
 type Usuario = ReturnType<typeof userEvent.setup>

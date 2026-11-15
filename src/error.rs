@@ -43,6 +43,15 @@ pub enum AppError {
     #[error("{0}")]
     Unauthorized(String),
 
+    /// La petición es correcta pero la operación no se puede cumplir en esta versión: es un `422`.
+    ///
+    /// Nace con la restauración de instantáneas: restaurar un target de base de datos es una
+    /// petición bien formada y con un vínculo que existe, pero la operación no está soportada
+    /// todavía. No es un `409` —no choca con el estado actual— ni un `400` —no está mal escrita—,
+    /// así que se explica el motivo para que el panel pueda decir «todavía no» y no «no existe».
+    #[error("{0}")]
+    UnprocessableEntity(String),
+
     /// La petición contradice el estado actual del recurso: es un `409`.
     ///
     /// Existe desde que hay motor de copias, y nace de un caso que ningún recurso tenía: encolar
@@ -112,6 +121,12 @@ impl IntoResponse for AppError {
             Self::Conflict(motivo) => {
                 tracing::debug!(motivo = %motivo, "petición rechazada");
                 (StatusCode::CONFLICT, motivo)
+            }
+            // El `422` es también un rechazo de la petición, y su motivo —«ese target todavía no
+            // se puede restaurar»— es lo que permite al panel distinguirlo de un recurso ausente.
+            Self::UnprocessableEntity(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición rechazada");
+                (StatusCode::UNPROCESSABLE_ENTITY, motivo)
             }
             // El `503` sí es del servidor: la causa va al registro y al cuerpo llega el mensaje
             // fijo de la indisponibilidad, que no repite ni el motivo ni nada de la petición.

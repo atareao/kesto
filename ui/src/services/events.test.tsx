@@ -1,8 +1,15 @@
 import { act, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { conexiones, EventSourceFalso, eventoDePrueba, exigirTodoCerrado, instalarEventSourceFalso } from './eventosDePrueba'
+import { conexiones, EventSourceFalso, eventoDePrueba, exigirTodoCerrado, instalarEventSourceFalso } from '../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from './events'
-import { ESPERA_BASE_MS, NOMBRE_DEL_EVENTO, useEjecucion, useEventStream } from './useEventStream'
+import {
+  ESPERA_BASE_MS,
+  LIMITE_DE_RESTAURACIONES,
+  NOMBRE_DEL_EVENTO,
+  NOMBRE_DEL_EVENTO_DE_RESTAURACION,
+  useEjecucion,
+  useEventStream,
+} from './useEventStream'
 
 // Ciclo de vida de la conexión: cuándo se abre, cuándo se reconecta y cuándo se
 // cierra. La interpretación del payload se prueba en `useEventStream.test.tsx`.
@@ -28,6 +35,27 @@ function Sonda() {
 
 function montar(ui: ReactNode) {
   return render(<ProveedorDeEventos>{ui}</ProveedorDeEventos>)
+}
+
+/** Cuenta las restauraciones que el proveedor recuerda, para ver su tope. */
+function ContadorDeRestauraciones() {
+  const { restauraciones } = useEventStream()
+
+  return <span data-testid="restauraciones">{restauraciones.size}</span>
+}
+
+/** El `data` literal del evento de restauración: siete campos, contadores a cero. */
+function eventoDeRestauracion(campos: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    execution_id: 'e1',
+    snapshot_id: 's1',
+    phase: 'restaurando',
+    files_done: 0,
+    files_total: 0,
+    bytes_done: 0,
+    bytes_total: 0,
+    ...campos,
+  }
 }
 
 /** Desmonta y comprueba que no queda ninguna conexión abierta. */
@@ -147,6 +175,36 @@ describe('ProveedorDeEventos', () => {
     EventSourceFalso.ultima().emitir(NOMBRE_DEL_EVENTO, eventoDePrueba({ current_action: 'volcando' }))
 
     expect(screen.getByTestId('progreso')).toHaveTextContent('volcando|50')
+    desmontarYComprobar(unmount)
+  })
+
+  it('descarta un `restore_progress` al que le faltan campos en vez de publicarlo a medias', () => {
+    const { unmount } = montar(<ContadorDeRestauraciones />)
+
+    EventSourceFalso.ultima().emitir(NOMBRE_DEL_EVENTO_DE_RESTAURACION, {
+      execution_id: 'e1',
+      phase: 'restaurando',
+    })
+
+    expect(screen.getByTestId('restauraciones')).toHaveTextContent('0')
+    desmontarYComprobar(unmount)
+  })
+
+  it('acota el mapa de restauraciones: recuerda las últimas, no todas', () => {
+    const { unmount } = montar(<ContadorDeRestauraciones />)
+
+    // Una sesión larga puede ver muchas restauraciones y el stream no guarda
+    // replay: el tope es lo que impide que el mapa crezca sin fin en memoria.
+    for (let i = 0; i <= LIMITE_DE_RESTAURACIONES; i += 1) {
+      EventSourceFalso.ultima().emitir(
+        NOMBRE_DEL_EVENTO_DE_RESTAURACION,
+        eventoDeRestauracion({ execution_id: `e${i}` }),
+      )
+    }
+
+    expect(screen.getByTestId('restauraciones')).toHaveTextContent(
+      String(LIMITE_DE_RESTAURACIONES),
+    )
     desmontarYComprobar(unmount)
   })
 })

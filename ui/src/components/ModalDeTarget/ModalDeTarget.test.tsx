@@ -7,9 +7,9 @@ import {
   elegirEnSelect,
   limpiarDesplegables,
   opcionesDe,
-} from '../../pruebas/selectDeAntd'
-import { instalarFetchFalso } from '../../pruebas/fetchDePrueba'
-import { target } from '../../pruebas/fixtures'
+} from '../../../tests/selectDeAntd'
+import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
+import { target } from '../../../tests/fixtures'
 import type { Target } from '../../services/api/types'
 import { ModalDeTarget } from './ModalDeTarget'
 

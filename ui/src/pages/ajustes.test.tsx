@@ -1,10 +1,10 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { instalarFetchFalso } from '../pruebas/fetchDePrueba'
-import type { ManejadorDeFetch, RespuestaSimulada } from '../pruebas/fetchDePrueba'
-import { repositorio, target } from '../pruebas/fixtures'
-import { elegirEnSelect, limpiarDesplegables } from '../pruebas/selectDeAntd'
+import { instalarFetchFalso } from '../../tests/fetchDePrueba'
+import type { ManejadorDeFetch, RespuestaSimulada } from '../../tests/fetchDePrueba'
+import { repositorio, target } from '../../tests/fixtures'
+import { elegirEnSelect, limpiarDesplegables } from '../../tests/selectDeAntd'
 import Ajustes from './ajustes'
 
 const TARGET_MARIADB = target({

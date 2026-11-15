@@ -174,6 +174,9 @@ describe('tipos del cable', () => {
       label: 'manual',
       files: 12,
       bytes: 4096,
+      target_id: 't',
+      target_name: 'web',
+      target_type: 'directory',
     }
     const health: Health = { version: '0.1.0', auth_mode: 'disabled' }
     const sesion: Sesion = { sub: 'u', email: 'u@example.org' }

@@ -1,10 +1,10 @@
 import { render, screen, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { EventSourceFalso, eventoDePrueba, instalarEventSourceFalso } from '../../services/eventosDePrueba'
+import { EventSourceFalso, eventoDePrueba, instalarEventSourceFalso } from '../../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from '../../services/events'
 import { NOMBRE_DEL_EVENTO } from '../../services/useEventStream'
-import { instalarFetchFalso } from '../../pruebas/fetchDePrueba'
-import { ejecucion, tarea, target } from '../../pruebas/fixtures'
+import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
+import { ejecucion, tarea, target } from '../../../tests/fixtures'
 import { TablaDeTareasEnCurso } from './TablaDeTareasEnCurso'
 
 function montar() {

@@ -2,10 +2,11 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
 import App from '../../App'
-import { instalarFetchFalso } from '../../pruebas/fetchDePrueba'
+import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
 import { crearClienteDeConsultas } from '../../services/clienteDeConsultas'
-import { instalarEventSourceFalso } from '../../services/eventosDePrueba'
+import { instalarEventSourceFalso } from '../../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from '../../services/events'
+import { ProveedorDeTema } from '../../services/tema'
 
 /**
  * La capa de sesión que exige la spec (§3.4):
@@ -25,13 +26,15 @@ function montar(entrada: string) {
     mutations: { retry: false },
   })
   return render(
-    <QueryClientProvider client={cliente}>
-      <ProveedorDeEventos>
-        <MemoryRouter initialEntries={[entrada]}>
-          <App />
-        </MemoryRouter>
-      </ProveedorDeEventos>
-    </QueryClientProvider>,
+    <ProveedorDeTema>
+      <QueryClientProvider client={cliente}>
+        <ProveedorDeEventos>
+          <MemoryRouter initialEntries={[entrada]}>
+            <App />
+          </MemoryRouter>
+        </ProveedorDeEventos>
+      </QueryClientProvider>
+    </ProveedorDeTema>,
   )
 }
 

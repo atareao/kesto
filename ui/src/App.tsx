@@ -12,7 +12,7 @@ import NoEncontrada from './pages/noEncontrada'
 /**
  * Las rutas del panel (§6). Todas cuelgan del layout, así que el menú lateral
  * sigue visible también en la pantalla de «no encontrada». El `BrowserRouter`
- * vive en `main.tsx`; aquí solo se declaran las rutas.
+ * vive en `PanelConTema.tsx`; aquí solo se declaran las rutas.
  *
  * Las pantallas —y la de «no encontrada»— van bajo `SoloConSesion`: en modo
  * `oidc` sin sesión no se renderizan, se va a la pantalla de sesión. La propia

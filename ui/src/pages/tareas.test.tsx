@@ -1,8 +1,8 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { instalarFetchFalso } from '../pruebas/fetchDePrueba'
-import { repositorio, tarea, target } from '../pruebas/fixtures'
+import { instalarFetchFalso } from '../../tests/fetchDePrueba'
+import { repositorio, tarea, target } from '../../tests/fixtures'
 import Tareas from './tareas'
 
 type Usuario = ReturnType<typeof userEvent.setup>

@@ -1,4 +1,4 @@
-import { Alert, Empty, Space, Typography } from 'antd'
+import { Alert, Empty, Space, Typography, theme } from 'antd'
 import type { EventoDeEjecucion } from '../../services/api/types'
 import { etiquetaDeEstado } from '../../services/estados'
 import { formatearBytes } from '../../services/format'
@@ -30,6 +30,7 @@ function Linea({ evento }: { evento: EventoDeEjecucion }) {
  * cae, se avisa: una consola congelada sin explicación parece una copia parada.
  */
 export function ConsolaDeEjecucion({ executionId }: PropsDeConsolaDeEjecucion) {
+  const { token } = theme.useToken()
   const { estado, lineas } = useLineasDeEjecucion(executionId ?? '')
 
   if (executionId === null) {
@@ -58,13 +59,17 @@ export function ConsolaDeEjecucion({ executionId }: PropsDeConsolaDeEjecucion) {
           style={{
             maxHeight: 320,
             overflowY: 'auto',
-            background: '#141414',
-            color: '#e6e6e6',
+            // La consola mantiene un fondo «de terminal» en ambos temas, pero
+            // derivado del tema activo: `colorBgSpotlight` (superficie oscura en
+            // claro, gris oscuro en oscuro) con su texto sólido. Fijar un gris a
+            // mano era justo lo que la spec prohíbe.
+            background: token.colorBgSpotlight,
+            color: token.colorTextLightSolid,
             fontFamily: 'monospace',
             fontSize: 12,
             lineHeight: 1.6,
             padding: 12,
-            borderRadius: 8,
+            borderRadius: token.borderRadiusLG,
           }}
         >
           {lineas.map((evento, indice) => (

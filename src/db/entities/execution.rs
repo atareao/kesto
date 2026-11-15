@@ -9,6 +9,9 @@
 //! **No tiene ninguna columna de secreto**, así que su capa de acceso **no** recibe la
 //! clave de cifrado: pasarle una que no se usa sugeriría que aquí se cifra algo.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteRow;
@@ -16,6 +19,7 @@ use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::db::DbError;
+use crate::db::entities::target::TipoDeTarget;
 
 /// Estado de una ejecución, tal y como lo declara el `CHECK` del §3.
 ///
@@ -135,6 +139,38 @@ pub struct FiltroDeEjecuciones {
     pub desplazamiento: i64,
 }
 
+/// El target sobre el que se restaura una instantánea, resuelto por la ejecución que la anotó.
+///
+/// Es lo que la restauración necesita saber y lo que el §3 **sí** permite resolver: una
+/// instantánea no guarda el nombre de su tarea —lo nombra la biblioteca al guardarla—, así que el
+/// único camino de una instantánea a su target es el vínculo que la ejecución dejó escrito:
+/// `job_executions.snapshot_id` → la tarea → su `target_id`. Inventar otro —deducirlo del nombre
+/// del target, o del resumen de la instantánea— sería adivinar sobre datos que no lo dicen.
+///
+/// Vive en el módulo de `job_executions` y no en el de `backup_targets` porque es la ejecución
+/// quien tiene el `snapshot_id`: la pregunta empieza en esta tabla y las otras dos entran a
+/// resolver las claves foráneas.
+#[derive(Debug, Clone)]
+pub struct ObjetivoDeRestauracion {
+    /// La tarea de la ejecución que anotó la instantánea.
+    pub job_id: Uuid,
+    /// El target de esa tarea.
+    pub target_id: Uuid,
+    /// El tipo de esa fuente, tal y como lo declara el `CHECK` del §3.
+    pub target_type: TipoDeTarget,
+    /// La ruta del host; `None` si la fuente no es un directorio.
+    ///
+    /// Es un `Option` porque **ningún `CHECK` de la base** exige la ruta a un target de
+    /// directorio: el §3 solo la pide en un comentario de columna —«Requerido para tipo
+    /// `directory`»— y quien la exige de verdad es el alta de targets, en el borde HTTP. Una
+    /// fila que llegue de otra vía —una importación, un `UPDATE` a mano— puede tener un
+    /// `directory` sin ruta, así que quien lo consuma no puede dar por hecho que está: la
+    /// restauración lo comprueba y contesta `422` si falta.
+    pub host_path: Option<String>,
+    /// El nombre del target, para que la respuesta pueda nombrarlo.
+    pub target_name: String,
+}
+
 // Las sentencias, como constantes: `DbError::Consulta` lleva el texto de la consulta,
 // así que la que se ejecuta y la que viaja en el error tienen que ser **la misma
 // cadena**. Con el literal repetido en los dos sitios, lo que se ejecuta y lo que se
@@ -223,6 +259,61 @@ const SQL_ACTUALIZAR: &str = "UPDATE job_executions SET status = ?1, snapshot_id
 
 /// Borrado por identificador.
 const SQL_BORRAR: &str = "DELETE FROM job_executions WHERE id = ?1";
+
+/// El target al que pertenece una instantánea, por el vínculo que dejó su ejecución.
+///
+/// Las tres tablas van unidas **por sus claves foráneas** —el plan del listado filtrado ya usa
+/// esos índices— y no por ningún campo de texto: el `repository_id` entra como filtro porque dos
+/// repositorios pueden guardar la misma instantánea —el identificador es el resumen de su
+/// contenido, no un nombre único—, y sin él una restauración pedida sobre un repositorio podría
+/// resolverse contra la copia de otro.
+///
+/// `ORDER BY ... LIMIT 1` y no un `SELECT` a secas: una instantánea puede haberse copiado varias
+/// veces y la pregunta es por **una** —la más reciente es la que el panel pinta primero—, así que
+/// el orden decide cuál y lo decide de forma estable, con el identificador de la fila como
+/// desempate. Ordenar `e.started_at DESC` es lo mismo que hace el histórico: lo último primero.
+const SQL_OBJETIVO_DE_LA_INSTANTANEA: &str = "SELECT e.job_id, t.id, t.target_type, t.host_path, \
+     t.name FROM job_executions e \
+     JOIN backup_jobs j ON j.id = e.job_id \
+     JOIN backup_targets t ON t.id = j.target_id \
+     WHERE e.snapshot_id = ?1 AND j.repository_id = ?2 \
+     ORDER BY e.started_at DESC, e.id DESC LIMIT 1";
+
+/// Los objetivos de **varias** instantáneas, resueltos en **una sola** lectura.
+///
+/// Es la hermana por lotes de [`SQL_OBJETIVO_DE_LA_INSTANTANEA`] y conserva su semántica entera: las
+/// mismas tres tablas unidas por sus claves foráneas, el `repository_id` como filtro y el mismo
+/// orden —`e.started_at DESC, e.id DESC`—, del que depende que la **primera** fila de cada
+/// instantánea sea la suya más reciente, que es lo que allí decide el `LIMIT 1`. Lo único que cambia
+/// es que esta trae las filas de **todas** las instantáneas del lote a la vez: el explorador del
+/// panel resuelve así el target de las 200 de su ventana en una lectura y no en 200.
+///
+/// # Por qué la lista de instantáneas viaja enlazada y no como marcadores del `IN`
+///
+/// Un `IN` ortodoxo —un marcador por identificador— obligaría a **armar la sentencia en piezas**,
+/// porque el número de instantáneas lo pone quien llama, y esta casa tiene escrito lo contrario: la
+/// sentencia que se ejecuta y la que viaja al registro tienen que ser **la misma constante** —ver el
+/// comentario de las `SQL_*`—, y eso es lo que hace estructuralmente imposible que un valor acabe
+/// dentro de una consulta. Aquí la lista **es un valor enlazado**: viaja como un array JSON en `?1`
+/// y `json_each` lo abre en filas dentro del propio SQLite, así que la consulta es una constante,
+/// ningún identificador entra en su texto y no hay piezas que armar.
+///
+/// `json_each` es parte de SQLite (JSON1) y no una extensión: el binario la trae compilada. Y de ahí
+/// sale una consecuencia que conviene tener dicha: el límite de 999 parámetros enlazados de SQLite
+/// **no se roza**, porque esta consulta enlaza dos —el array y el repositorio— y no uno por
+/// instantánea, así que no hay lote que trocear mientras las instantáneas quepan en un solo array.
+const SQL_OBJETIVOS_DE_LAS_INSTANTANEAS: &str = "SELECT e.snapshot_id, e.job_id, t.id, \
+     t.target_type, t.host_path, t.name FROM job_executions e \
+     JOIN backup_jobs j ON j.id = e.job_id \
+     JOIN backup_targets t ON t.id = j.target_id \
+     WHERE e.snapshot_id IN (SELECT value FROM json_each(?1)) AND j.repository_id = ?2 \
+     ORDER BY e.started_at DESC, e.id DESC";
+
+/// Texto del error cuando lo que falla es **armar la lista** de instantáneas que viaja enlazada.
+///
+/// No es una sentencia ejecutada —la lista se arma antes de consultar— y por eso no se confunde con
+/// las `SQL_*`: dice dónde falló, que es codificar el array que `json_each` abre en filas.
+const CONSULTA_LISTA_DE_INSTANTANEAS: &str = "lista JSON de instantáneas del lote";
 
 /// Texto del error cuando falla el **mapeo** de una fila ya traída.
 ///
@@ -322,6 +413,99 @@ impl Ejecuciones {
             .map_err(error_de_consulta(SQL_LISTAR_FILTRADO))?;
 
         filas.iter().map(desde_fila).collect()
+    }
+
+    /// Resuelve el target sobre el que restaurar una instantánea, o `None` si no hay vínculo.
+    ///
+    /// «No hay vínculo» y «no se pudo leer» son cosas distintas, como en [`Ejecuciones::leer`]: lo
+    /// primero es `Ok(None)` —una instantánea que está en el repositorio y no en el histórico, que
+    /// es el caso de una copia hecha por otra herramienta— y lo segundo un error. Confundirlos
+    /// convertiría una base caída en «esa instantánea no tiene target», que es un rechazo con el
+    /// código equivocado y un diagnóstico que manda a buscar el fallo donde no está.
+    ///
+    /// El `repository_id` acota el vínculo al repositorio por el que se pregunta: la misma
+    /// instantánea puede estar en dos, y la restauración se pide contra uno.
+    pub async fn objetivo_de_la_instantanea(
+        &self,
+        snapshot_id: &str,
+        repository_id: &Uuid,
+    ) -> Result<Option<ObjetivoDeRestauracion>, DbError> {
+        let fila = sqlx::query(SQL_OBJETIVO_DE_LA_INSTANTANEA)
+            .bind(snapshot_id)
+            .bind(repository_id.hyphenated().to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(error_de_consulta(SQL_OBJETIVO_DE_LA_INSTANTANEA))?;
+
+        fila.as_ref().map(objetivo_desde_fila).transpose()
+    }
+
+    /// Resuelve el objetivo de **varias** instantáneas de una vez: las que tienen vínculo, con él.
+    ///
+    /// Es la hermana por lotes de [`Ejecuciones::objetivo_de_la_instantanea`] y comparte su semántica
+    /// entera —el mismo camino `job_executions.snapshot_id` → la tarea → su `target_id`, el mismo
+    /// «gana la ejecución más reciente» y el mismo acotado por `repository_id`, que hace falta porque
+    /// la misma instantánea puede estar en dos repositorios—, pero resuelve el lote completo en una
+    /// lectura en vez de una por instantánea.
+    ///
+    /// **Una instantánea sin vínculo no sale en el mapa**, y eso es contrato y no olvido: una copia
+    /// que hizo otra herramienta —o cuya fila de `job_executions` se borró en cascada con su tarea—
+    /// está en el repositorio y no tiene target. Quien pregunta tiene que poder distinguir eso de un
+    /// fallo de base, y la distinción es la misma que el `Ok(None)` de la hermana: la ausencia de
+    /// entrada es lo primero y el `Err` es lo segundo. Por eso el mapa no se rellena con
+    /// `None`s —«sin vínculo» y «vínculo sin datos» serían la misma cosa— ni con entradas de
+    /// relleno.
+    ///
+    /// Las **claves** son los identificadores tal y como llegaron —el de la columna `snapshot_id`,
+    /// que es el que publica el listado—, para que quien pregunte pueda casarlos sin normalizar nada.
+    ///
+    /// # Errors
+    ///
+    /// Un [`DbError::Consulta`] si la lista no se puede codificar o la sentencia falla.
+    pub async fn objetivos_de_las_instantaneas(
+        &self,
+        snapshot_ids: &[String],
+        repository_id: &Uuid,
+    ) -> Result<HashMap<String, ObjetivoDeRestauracion>, DbError> {
+        // Sin identificadores no hay nada que resolver: la consulta sobra, y un listado vacío no
+        // tiene por qué costar una ida y vuelta a la base.
+        if snapshot_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // El array lo arma `serde_json`, que es quien sabe escapar: ningún identificador se pega al
+        // texto de la consulta. El fallo viaja como `sqlx::Error::Encode` —y no estrena una
+        // variante— porque es exactamente lo que significa: un valor que no se pudo codificar para
+        // viajar a la base.
+        let lista = serde_json::to_string(snapshot_ids).map_err(|causa| DbError::Consulta {
+            consulta: CONSULTA_LISTA_DE_INSTANTANEAS,
+            causa: sqlx::Error::Encode(Box::new(causa)),
+        })?;
+
+        let filas = sqlx::query(SQL_OBJETIVOS_DE_LAS_INSTANTANEAS)
+            .bind(lista)
+            .bind(repository_id.hyphenated().to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(error_de_consulta(SQL_OBJETIVOS_DE_LAS_INSTANTANEAS))?;
+
+        let mut objetivos = HashMap::with_capacity(snapshot_ids.len());
+
+        for fila in &filas {
+            // El `IN` no casa nunca con `NULL`, así que una fila que ha llegado hasta aquí tiene su
+            // `snapshot_id` escrito: leerlo no puede degenerar en una clave vacía.
+            let instantanea = columna::<String>(fila, "snapshot_id")?;
+
+            // La primera fila de cada instantánea es la más reciente —el `ORDER BY` las trae así—,
+            // así que la instantánea que ya ocupa un hueco no se toca: es el mismo desenlace que
+            // resuelve el `LIMIT 1` de la hermana, y aquí hace falta porque el lote trae las filas de
+            // todas.
+            if let Entry::Vacant(hueco) = objetivos.entry(instantanea) {
+                hueco.insert(objetivo_desde_fila(fila)?);
+            }
+        }
+
+        Ok(objetivos)
     }
 
     /// Actualiza la fila **entera** y devuelve si existía.
@@ -449,6 +633,33 @@ where
         })
 }
 
+/// Mapea la fila del vínculo a [`ObjetivoDeRestauracion`].
+///
+/// `host_path` es la única columna anulable: un target de base de datos no tiene ruta de host y
+/// sale como `None`, nunca como cadena vacía —el §3 distingue `NULL` de `''` y el mapeo no lo
+/// confunde—.
+fn objetivo_desde_fila(fila: &SqliteRow) -> Result<ObjetivoDeRestauracion, DbError> {
+    let job_id = columna::<String>(fila, "job_id")?;
+    let job_id = Uuid::parse_str(&job_id).map_err(|causa| DbError::Consulta {
+        consulta: CONSULTA_MAPEO,
+        causa: sqlx::Error::Decode(Box::new(causa)),
+    })?;
+
+    let target_id = columna::<String>(fila, "id")?;
+    let target_id = Uuid::parse_str(&target_id).map_err(|causa| DbError::Consulta {
+        consulta: CONSULTA_MAPEO,
+        causa: sqlx::Error::Decode(Box::new(causa)),
+    })?;
+
+    Ok(ObjetivoDeRestauracion {
+        job_id,
+        target_id,
+        target_type: columna(fila, "target_type")?,
+        host_path: columna(fila, "host_path")?,
+        target_name: columna(fila, "name")?,
+    })
+}
+
 /// Mapea una fila de `job_executions` a la entidad.
 ///
 /// No descifra nada: esta tabla no tiene secretos. `finished_at` es anulable y sale como
@@ -502,6 +713,10 @@ mod tests {
     /// Identificador del `snapshot` de las pruebas: distinguible y largo.
     const SNAPSHOT: &str = "snapshot-distinguible-000000000000000000000001";
 
+    /// Un segundo `snapshot`, distinguible del primero: el lote resuelve **varias** instantáneas y
+    /// con una sola no se vería si cada una trae la suya.
+    const OTRA_INSTANTANEA: &str = "snapshot-distinguible-000000000000000000000002";
+
     /// Un `SecretString` con el valor dado.
     fn secreto(valor: &str) -> SecretString {
         SecretString::new(valor.to_owned())
@@ -542,6 +757,25 @@ mod tests {
             job_id: *job_id,
             status: Estado::Success,
             snapshot_id: Some(SNAPSHOT.to_owned()),
+            bytes_processed: 1024,
+            bytes_uploaded: 512,
+            error_message: None,
+            started_at,
+            finished_at: Some(started_at + Duration::seconds(30)),
+        }
+    }
+
+    /// Un alta de ejecución con la instantánea, la tarea y el instante dados.
+    ///
+    /// El desempate del contrato es la fecha —lo último primero—, así que las pruebas del lote
+    /// necesitan fechas **elegidas** y no las de `now_utc` que trae [`alta_ejecucion`]: dos altas
+    /// seguidas podrían caer en el mismo instante y el orden quedaría en manos del desempate por
+    /// `id`, que es lo que aquí no se quiere medir.
+    fn alta_con(instantanea: &str, job_id: &Uuid, started_at: OffsetDateTime) -> AltaDeEjecucion {
+        AltaDeEjecucion {
+            job_id: *job_id,
+            status: Estado::Success,
+            snapshot_id: Some(instantanea.to_owned()),
             bytes_processed: 1024,
             bytes_uploaded: 512,
             error_message: None,
@@ -1292,6 +1526,212 @@ mod tests {
             filas_de_la_tarea(&pool, &inexistente).await,
             0,
             "una ejecución huérfana no puede llegar a existir"
+        );
+    }
+
+    /// **El objetivo de una instantánea sale del vínculo de su ejecución, y sin él no hay nada.**
+    ///
+    /// Es la consulta que sostiene la restauración entera: el único camino de una instantánea a su
+    /// target es la ejecución que la anotó. Se afirma el objetivo **entero** —tarea, target, tipo,
+    /// ruta y nombre—, porque cada campo viaja a la respuesta o decide si se puede restaurar, y uno
+    /// que faltara dejaría la restauración sin destino.
+    ///
+    /// Y se afirma el `None` en los dos casos en que **no** hay vínculo: sin ninguna ejecución que
+    /// anote esa instantánea —una copia hecha con otra herramienta— y con la ejecución anotando
+    /// otra. Y el tercero, que es el que la firma lleva por el `repository_id`: la misma
+    /// instantánea anotada por una tarea de **otro** repositorio no resuelve, porque la pregunta es
+    /// por un repositorio concreto. `None` en los tres y no un error: «no hay vínculo» es un
+    /// rechazo con su código, y un error aquí lo convertiría en un fallo del servidor.
+    #[tokio::test]
+    async fn el_objetivo_de_una_instantanea_sale_del_vinculo_de_su_ejecucion() {
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+        let tarea = Tareas::nuevo(pool.clone())
+            .leer(&job_id)
+            .await
+            .expect("la lectura de la tarea no puede fallar")
+            .expect("la tarea de la base de prueba tiene que estar");
+
+        // Sin ninguna ejecución todavía: la instantánea existe para quien la mire en el
+        // repositorio, pero aquí no hay a qué target apuntarla.
+        assert!(
+            ejecuciones
+                .objetivo_de_la_instantanea(SNAPSHOT, &tarea.repository_id)
+                .await
+                .expect("la consulta no puede fallar")
+                .is_none(),
+            "sin ninguna ejecución que anote la instantánea no hay vínculo que resolver"
+        );
+
+        ejecuciones
+            .alta(alta_ejecucion(&job_id))
+            .await
+            .expect("el alta de la ejecución no puede fallar");
+
+        let objetivo = ejecuciones
+            .objetivo_de_la_instantanea(SNAPSHOT, &tarea.repository_id)
+            .await
+            .expect("la consulta no puede fallar")
+            .expect("la ejecución anotó la instantánea, así que el vínculo existe");
+
+        assert_eq!(objetivo.job_id, job_id, "la tarea no es la de la ejecución");
+        assert_eq!(
+            objetivo.target_id, tarea.target_id,
+            "el target no es el de la tarea de la ejecución"
+        );
+        assert_eq!(objetivo.target_type, TipoDeTarget::Directory);
+        assert_eq!(
+            objetivo.host_path.as_deref(),
+            Some("/srv/target-de-ejecucion")
+        );
+        assert_eq!(objetivo.target_name, "target-de-ejecucion");
+
+        assert!(
+            ejecuciones
+                .objetivo_de_la_instantanea("otra-instantanea", &tarea.repository_id)
+                .await
+                .expect("la consulta no puede fallar")
+                .is_none(),
+            "una instantánea que ninguna ejecución anotó no tiene vínculo"
+        );
+
+        assert!(
+            ejecuciones
+                .objetivo_de_la_instantanea(SNAPSHOT, &Uuid::new_v4())
+                .await
+                .expect("la consulta no puede fallar")
+                .is_none(),
+            "el vínculo se acota al repositorio por el que se pregunta: la copia de otro \
+             repositorio no resuelve aquí"
+        );
+    }
+
+    /// **El lote resuelve el target de cada instantánea, y la que no tiene vínculo no es un fallo.**
+    ///
+    /// Es la hermana por lotes de la consulta anterior, y mide lo que aquélla no puede: que varias
+    /// instantáneas se resuelvan de **una** vez y cada una con **su** target —un lote no puede
+    /// devolver el de la primera para todas—, que lo que no tiene vínculo **falte** del mapa sin
+    /// arrastrar al resto, y que el «gana la más reciente» siga decidiendo dentro del lote.
+    ///
+    /// El «más reciente» se discrimina por el `job_id` del objetivo y no por el target: las dos
+    /// ejecuciones de la misma instantánea son de tareas **hermanas**, que apuntan al mismo target,
+    /// así que el target no distingue nada; la tarea que anotó cada copia, sí.
+    ///
+    /// Y se afirman los dos casos extremos del contrato: un lote de un identificador que no casa con
+    /// ninguna fila —el mapa sale vacío, igual que el `Ok(None)` de la hermana— y un lote **vacío**,
+    /// que no consulta y devuelve un mapa vacío en vez de fallar.
+    #[tokio::test]
+    async fn los_objetivos_de_un_lote_salen_del_vinculo_de_cada_ejecucion() {
+        /// La instantánea que **no** casa con ninguna ejecución.
+        const SIN_VINCULO: &str = "instantanea-que-nadie-anoto";
+
+        let (_directorio, pool, ejecuciones, job_id) = base_con_ejecucion_posible().await;
+        let hermana = tarea_hermana(&pool, &job_id).await;
+        let tarea = Tareas::nuevo(pool.clone())
+            .leer(&job_id)
+            .await
+            .expect("la lectura de la tarea no puede fallar")
+            .expect("la tarea de la base de prueba tiene que estar");
+
+        // La misma instantánea anotada por **dos** ejecuciones de tareas distintas, y una segunda
+        // instantánea anotada por una sola: el lote tiene que resolver las dos primeras y quedarse,
+        // para la repetida, con la de la ejecución más reciente.
+        ejecuciones
+            .alta(alta_con(
+                SNAPSHOT,
+                &job_id,
+                datetime!(2026-01-01 10:00:00 UTC),
+            ))
+            .await
+            .expect("el alta de la ejecución no puede fallar");
+        ejecuciones
+            .alta(alta_con(
+                SNAPSHOT,
+                &hermana,
+                datetime!(2026-01-02 10:00:00 UTC),
+            ))
+            .await
+            .expect("el alta de la ejecución hermana no puede fallar");
+        ejecuciones
+            .alta(alta_con(
+                OTRA_INSTANTANEA,
+                &job_id,
+                datetime!(2026-01-03 10:00:00 UTC),
+            ))
+            .await
+            .expect("el alta de la ejecución de la otra instantánea no puede fallar");
+
+        let objetivos = ejecuciones
+            .objetivos_de_las_instantaneas(
+                &[
+                    SNAPSHOT.to_owned(),
+                    OTRA_INSTANTANEA.to_owned(),
+                    SIN_VINCULO.to_owned(),
+                ],
+                &tarea.repository_id,
+            )
+            .await
+            .expect("la consulta del lote no puede fallar");
+
+        assert_eq!(
+            objetivos.len(),
+            2,
+            "el lote tiene que traer las dos instantáneas con vínculo y ninguna más: {objetivos:?}"
+        );
+
+        let con_vinculo = objetivos
+            .get(SNAPSHOT)
+            .expect("la instantánea anotada por dos ejecuciones tiene que salir en el lote");
+
+        assert_eq!(
+            con_vinculo.job_id, hermana,
+            "de dos ejecuciones de la misma instantánea gana la más reciente, y ganó la primera"
+        );
+        assert_eq!(
+            con_vinculo.target_id, tarea.target_id,
+            "el target no es el de la tarea de la ejecución"
+        );
+        assert_eq!(con_vinculo.target_type, TipoDeTarget::Directory);
+        assert_eq!(
+            con_vinculo.host_path.as_deref(),
+            Some("/srv/target-de-ejecucion")
+        );
+        assert_eq!(con_vinculo.target_name, "target-de-ejecucion");
+
+        let la_otra = objetivos
+            .get(OTRA_INSTANTANEA)
+            .expect("la otra instantánea con vínculo tiene que salir con **su** objetivo");
+
+        assert_eq!(
+            la_otra.job_id, job_id,
+            "el lote tiene que casar cada instantánea con su propia ejecución, y no devolver el \
+             objetivo de la primera para todas"
+        );
+
+        assert!(
+            !objetivos.contains_key(SIN_VINCULO),
+            "una instantánea que ninguna ejecución anotó no tiene vínculo y no puede salir en el \
+             mapa: {objetivos:?}"
+        );
+
+        let de_otro_repositorio = ejecuciones
+            .objetivos_de_las_instantaneas(&[SNAPSHOT.to_owned()], &Uuid::new_v4())
+            .await
+            .expect("la consulta del lote no puede fallar");
+
+        assert!(
+            de_otro_repositorio.is_empty(),
+            "el lote se acota al repositorio por el que se pregunta: la copia de otro repositorio \
+             no resuelve aquí"
+        );
+
+        let vacio = ejecuciones
+            .objetivos_de_las_instantaneas(&[], &tarea.repository_id)
+            .await
+            .expect("un lote vacío no puede fallar");
+
+        assert!(
+            vacio.is_empty(),
+            "un lote sin identificadores no tiene nada que resolver y tiene que salir vacío"
         );
     }
 }

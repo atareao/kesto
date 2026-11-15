@@ -3,7 +3,7 @@ import {
   EventSourceFalso,
   eventoDePrueba,
   instalarEventSourceFalso,
-} from '../../services/eventosDePrueba'
+} from '../../../tests/eventosDePrueba'
 import { ProveedorDeEventos } from '../../services/events'
 import { LIMITE_DE_LINEAS, NOMBRE_DEL_EVENTO } from '../../services/useEventStream'
 import { ConsolaDeEjecucion } from './ConsolaDeEjecucion'

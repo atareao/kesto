@@ -1,13 +1,15 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { BrowserRouter } from 'react-router-dom'
-import { QueryClientProvider } from '@tanstack/react-query'
-import App from './App'
-import { crearClienteDeConsultas } from './services/clienteDeConsultas'
-import { ProveedorDeEventos } from './services/events'
+import { PanelConTema } from './components/PanelConTema/PanelConTema'
+import { ProveedorDeTema } from './services/tema'
 import './estilos.css'
 
-const queryClient = crearClienteDeConsultas()
+/**
+ * Arranque del panel: busca el `#root`, envuelve el árbol en `ProveedorDeTema`
+ * (el modo activo, oscuro por defecto) y monta la raíz de providers. Sin
+ * componentes definidos aquí: el rule de Fast Refresh pide que un módulo sin
+ * exports de componentes no declare componentes.
+ */
 
 const rootElement = document.getElementById('root')
 if (!rootElement) {
@@ -16,12 +18,8 @@ if (!rootElement) {
 
 createRoot(rootElement).render(
   <StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <ProveedorDeEventos>
-        <BrowserRouter>
-          <App />
-        </BrowserRouter>
-      </ProveedorDeEventos>
-    </QueryClientProvider>
+    <ProveedorDeTema>
+      <PanelConTema />
+    </ProveedorDeTema>
   </StrictMode>,
 )

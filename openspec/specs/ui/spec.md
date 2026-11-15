@@ -328,3 +328,144 @@ El porqué: el formulario es el espejo del contrato de la API y del `CHECK` de l
 - **WHEN** se envía el alta
 - **THEN** SHALL llamarse a la API con `target_type = 'sqlite'` y el `db_path`
 - **AND** la fuente SHALL aparecer en el listado
+
+### Requirement: El panel declara su identidad de marca
+
+El panel SHALL servir los assets de marca de Kesto y SHALL declararlos en el documento. En concreto SHALL servirse el favicon (`favicon.ico`, `favicon-16x16.png`, `favicon-32x32.png`, `favicon-48x48.png`, `favicon-64x64.png`), el icono para dispositivos Apple (`apple-touch-icon.png`), los iconos de Android (`android-chrome-192x192.png`, `android-chrome-512x512.png`), el icono enmascarable (`maskable-icon-512x512.png`), el icono de Windows (`mstile-150x150.png`) y el manifiesto (`site.webmanifest`). El documento SHALL declarar los `<link>` de iconos, el `<link rel="manifest">`, la meta `theme-color` con el azul de marca y las meta de Open Graph, y el menú lateral SHALL mostrar el logo de Kesto además del nombre.
+
+El porqué: hoy la pestaña del navegador no identifica a Kesto —no hay favicon ni manifest— y la marca del panel es solo texto. Una aplicación que el operador deja abierta todo el día debe poder reconocerse en una pestaña y en un marcador.
+
+#### Scenario: La pestaña identifica a Kesto
+- **GIVEN** el panel cargado en el navegador
+- **WHEN** se lee el documento servido
+- **THEN** SHALL declararse un `<link rel="icon">` y un `<link rel="manifest">`
+- **AND** el favicon y el manifest SHALL servirse desde la raíz del panel
+
+#### Scenario: El menú lateral muestra el logo
+- **GIVEN** el panel con el layout desplegado
+- **WHEN** se pinta el menú lateral
+- **THEN** SHALL verse el logo de Kesto
+- **AND** el logo SHALL ser legible en el tema activo
+
+### Requirement: El panel ofrece tema claro y oscuro, con oscuro por defecto y elección persistida
+
+El panel SHALL arrancar en **tema oscuro** siempre que no exista una elección guardada. Un control en el layout SHALL permitir alternar entre tema claro y oscuro; al activarlo, el tema SHALL cambiar de inmediato en todo el panel y la elección SHALL persistir en el almacenamiento del navegador, de modo que una recarga la respete. El arranque NO SHALL seguir la preferencia del sistema por sí solo: sin elección guardada, el resultado SHALL ser el oscuro.
+
+El control SHALL ser accesible: SHALL tener nombre accesible, SHALL ser alcanzable y activable solo con teclado, y SHALL anunciar el tema hacia el que cambia, no solo su color. Ningún color del panel SHALL quedar fijado a un tema: los colores SHALL proceder del tema activo, de modo que ambos sean legibles.
+
+El porqué: el panel se usa en sesiones largas y la identidad visual pide el modo oscuro por defecto, pero el operador debe poder pasar a claro y que su elección se recuerde. Que el color esté fijado a mano es justo lo que hoy hace ilegible una mitad del producto.
+
+#### Scenario: Por defecto, oscuro
+- **GIVEN** un navegador sin ninguna elección de tema guardada
+- **WHEN** se carga el panel
+- **THEN** el tema activo SHALL ser el oscuro
+
+#### Scenario: La elección persiste tras recargar
+- **GIVEN** el panel en tema oscuro
+- **WHEN** se activa el control de tema y se recarga el panel
+- **THEN** el tema activo SHALL ser el claro
+- **AND** NO SHALL volver al oscuro por defecto
+
+#### Scenario: Un control accesible
+- **GIVEN** el foco en el control de tema
+- **WHEN** se activa con el teclado
+- **THEN** el tema SHALL cambiar
+- **AND** el control SHALL anunciar su estado al usuario
+
+#### Scenario: Ambos temas son legibles
+- **GIVEN** el panel en cualquiera de los dos temas
+- **WHEN** se recorre la cabecera, el menú lateral y el contenido
+- **THEN** NO SHALL haber texto sobre un fondo del mismo color
+- **AND** los colores SHALL proceder del tema activo
+
+### Requirement: El código de aplicación no depende de tipos de Node
+
+El proyecto de UI SHALL separar la configuración de TypeScript por fronteras: aplicación, tooling y tests. El `tsconfig.json` de la **aplicación** (`ui/src`) NO SHALL declarar tipos de Node ni globales de Vitest. Los tipos de Node SHALL acotarse a los dos proyectos que sí los necesitan y SHALL declararse en el tsconfig de cada uno, no en el de la aplicación: el proyecto de **tooling** (`ui/tsconfig.node.json`, que typechequea `vite.config.ts`, ejecutado en Node) y el de **tests** (`ui/tsconfig.test.json`, que extiende del de aplicación y declara `"types": ["vitest/globals", "node"]`). El código de aplicación NO SHALL importar ni referenciar APIs o tipos de Node, y el andamiaje de pruebas (setup y dobles) SHALL vivir fuera de `ui/src`. El typecheck de la aplicación SHALL usar el tsconfig de aplicación y el de tests SHALL usar el tsconfig de tests.
+
+El porqué: el panel es código de navegador; permitir tipos de Node en toda la app invita a dependencias accidentales del entorno y oculta errores que solo aparecerían en el bundle. Acotarlos al tooling y a los tests mantiene la frontera explícita: el tooling los necesita para `vite.config.ts` (que corre en Node) y los tests para leer el sistema de ficheros.
+
+#### Scenario: La aplicación compila sin tipos de Node
+- **GIVEN** el código de aplicación de `ui/src`
+- **WHEN** se ejecuta el typecheck con el tsconfig de aplicación
+- **THEN** la compilación SHALL completarse sin resolver tipos de Node
+- **AND** el tsconfig de aplicación NO SHALL contener `"types": ["node"]` ni `"types": ["vitest/globals"]`
+
+#### Scenario: El proyecto de tooling conserva sus tipos de Node
+- **GIVEN** `ui/vite.config.ts`, que se ejecuta en Node
+- **WHEN** se resuelve el tsconfig de ese proyecto de tooling (`ui/tsconfig.node.json`)
+- **THEN** los tipos de Node SHALL estar disponibles para él
+- **AND** esos tipos SHALL declararse en el tsconfig de tooling, no en el de aplicación
+
+#### Scenario: Los tests conservan los tipos de Node y de Vitest
+- **GIVEN** los tests de UI
+- **WHEN** se ejecutan con el tsconfig de tests
+- **THEN** los tipos de Node y los globales de Vitest SHALL estar disponibles
+- **AND** el tsconfig de tests SHALL extender del tsconfig de aplicación
+
+### Requirement: El tema conserva su comportamiento tras el refactor de memoización
+
+El provider y el hook de tema SHALL mantener su API pública y su comportamiento observable: tema oscuro por defecto sin elección guardada, persistencia de la elección en `localStorage` bajo la clave `kesto-tema`, y conmutación inmediata y accesible. La eliminación de `useCallback`/`useMemo` redundantes NO SHALL alterar el tema aplicado, la persistencia ni la accesibilidad del control.
+
+El porqué: la memoización sobrante añade complejidad sin beneficio; retirarla no debe cambiar lo que el operador ve ni cómo se guarda su elección.
+
+#### Scenario: El tema por defecto sigue siendo oscuro
+- **GIVEN** un navegador sin elección guardada
+- **WHEN** se carga el panel
+- **THEN** el tema activo SHALL ser el oscuro
+
+#### Scenario: La elección persiste tras el refactor
+- **GIVEN** el panel en tema claro
+- **WHEN** se recarga el panel
+- **THEN** el tema activo SHALL seguir siendo el claro
+- **AND** `localStorage` SHALL conservar la clave `kesto-tema`
+
+#### Scenario: El conmutador sigue siendo accesible
+- **GIVEN** el panel cargado
+- **WHEN** se navega con teclado hasta el control de tema y se activa
+- **THEN** el tema SHALL cambiar
+- **AND** el control SHALL anunciar el tema hacia el que cambia
+
+### Requirement: El panel ofrece restaurar un snapshot con confirmación y progreso
+
+La pantalla de snapshots SHALL ofrecer, por cada fila, una acción de restaurar. Antes de lanzarla SHALL mostrarse una confirmación que indique el target sobre el que se va a restaurar —nombre y tipo, tomados de `target_name` y `target_type`, que el listado publica por fila—. Durante la operación, el panel SHALL reflejar la **fase** a partir del evento `restore_progress` sin recargar, y SHALL informar del resultado (éxito o error) con el mensaje de la API.
+
+La acción NO SHALL ejecutarse para snapshots de targets no restaurables en esta versión; en su lugar SHALL explicarse la limitación. El panel SHALL deshabilitar la acción y explicarla cuando `target_type` sea `null` —la fila no tiene target conocido, así que no hay destino sobre el que restaurar— o sea distinto de `directory` —los targets de base de datos quedan para la fase 2—.
+
+El progreso que el panel SHALL mostrar es el de la fase, no el de un avance incremental: los contadores del evento van a `0` en esta versión porque `rustic_core` 0.13 no ofrece callback de progreso, así que el panel NO SHALL pintar un porcentaje ni una barra determinada a partir de ellos, y SHALL limitarse a decir que la restauración está **en curso**, **terminada** o **fallida**.
+
+El porqué: una restauración escribe sobre datos del operador; pedir confirmación con el target a la vista es lo que evita una restauración en el sitio equivocado, y el aviso de fase evita que una operación larga parezca colgada. Ofrecer la acción para una fila sin target conocido —o para un target que esta versión no sabe restaurar— llevaría al operador a confirmar algo que la API va a rechazar, así que la limitación se declara en la propia fila y no después del error.
+
+#### Scenario: Confirmar antes de restaurar
+- **GIVEN** una fila de snapshot de un target de directorio
+- **WHEN** se pulsa «Restaurar»
+- **THEN** SHALL mostrarse una confirmación con el nombre y el tipo del target
+- **AND** la restauración NO SHALL empezar hasta confirmarla
+
+#### Scenario: Progreso en vivo
+- **GIVEN** una restauración en curso
+- **WHEN** llega un evento `restore_progress` con fase `restaurando`
+- **THEN** el panel SHALL reflejar sin recargar que la restauración está **en curso**
+- **AND** NO SHALL mostrar un porcentaje ni una barra determinada a partir de los contadores
+
+#### Scenario: Cierre de fase en vivo
+- **GIVEN** una restauración en curso
+- **WHEN** llega un evento `restore_progress` con fase `terminada` o `fallida`
+- **THEN** el panel SHALL reflejar sin recargar ese desenlace de fase
+- **AND** SHALL mostrar el mensaje con el que la API informa del resultado
+
+#### Scenario: Fila sin target conocido
+- **GIVEN** una fila de snapshot cuyo `target_type` es `null`
+- **WHEN** el operador mira la fila
+- **THEN** la acción de restaurar SHALL quedar deshabilitada
+- **AND** SHALL explicarse que no se puede restaurar porque no se conoce el target
+
+#### Scenario: Fila de un target no restaurable
+- **GIVEN** una fila de snapshot cuyo `target_type` es `mariadb`
+- **WHEN** el operador mira la fila
+- **THEN** la acción de restaurar SHALL quedar deshabilitada
+- **AND** SHALL explicarse que ese tipo de target no se restaura todavía en esta versión
+
+#### Scenario: Resultado
+- **GIVEN** una restauración que termina
+- **WHEN** el backend publica el resultado
+- **THEN** el panel SHALL mostrarlo con el mensaje de la API

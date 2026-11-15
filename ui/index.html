@@ -4,6 +4,51 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Kesto</title>
+
+    <!-- Identidad de marca: favicons, manifiesto e iconos de plataforma. -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png" />
+    <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64x64.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="msapplication-TileColor" content="#123048" />
+    <meta name="msapplication-TileImage" content="/mstile-150x150.png" />
+    <meta name="theme-color" content="#0D1B2A" />
+
+    <!-- Open Graph / redes sociales. -->
+    <meta property="og:title" content="Kesto — Backups &amp; Data Security" />
+    <meta
+      property="og:description"
+      content="Kesto: panel de copias de seguridad y snapshots incrementales sobre S3."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/og-image-dark.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="/og-image-dark.png" />
+
+    <!--
+      Tema antes de pintar: oscuro por defecto, o la elección guardada. Ajusta ya
+      el fondo del documento y el `theme-color` para que no haya destello ni
+      barra del navegador desalineada. No sigue la preferencia del sistema.
+    -->
+    <script>
+      ;(function () {
+        var tema = 'oscuro'
+        try {
+          if (window.localStorage.getItem('kesto-tema') === 'claro') tema = 'claro'
+        } catch (error) {
+          // Sin almacenamiento, el defecto oscuro.
+        }
+        document.documentElement.dataset.tema = tema
+        var colorDelTema = tema === 'claro' ? '#F8FAFC' : '#0D1B2A'
+        var meta = document.querySelector('meta[name="theme-color"]')
+        if (meta) meta.setAttribute('content', colorDelTema)
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -6,7 +6,7 @@ Aquí tienes la especificación técnica completa y actualizada para **Kesto**, 
 
 ## 1. Visión General del Sistema
 
-**Kesto** ("caja" o "contenedor" en esperanto) es una solución ligera en contenedor Docker para la automatización, orquestación y monitorización de copias de seguridad de bases de datos (MariaDB y PostgreSQL) y volúmenes de datos hacia almacenamiento S3 (RusticFS/MinIO/AWS S3).
+**Kesto** —en esperanto, *arca*, *caja*, *cesto* o *cajón*— es una solución ligera en contenedor Docker para la automatización, orquestación y monitorización de copias de seguridad de bases de datos (MariaDB y PostgreSQL) y volúmenes de datos hacia almacenamiento S3 (RusticFS/MinIO/AWS S3).
 
 El sistema utiliza `rustic_core` embebido en un motor escrito en Rust, interactúa directamente con el demonio de Docker del host mediante la API POSIX/socket, y expone un panel de control web reactivo desarrollado en **React** con la librería de componentes **Ant Design (Antd)**, alimentado en tiempo real mediante Server-Sent Events (SSE).
 
