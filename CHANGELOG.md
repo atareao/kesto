@@ -1,4 +1,26 @@
 # Changelog
+## [0.9.0] - 2026-11-15
+
+### Bug Fixes
+
+- *(ci)* Descargar vampus fuera del árbol y acotar el commit de release
+
+### Documentation
+
+- *(plan)* Spec SDD y PLAN-022 del filtro por target en Restauraciones
+- Relevo tras el cierre de #67 y v0.8.0 (issue #79 en curso)
+- *(restauracion)* FEATURE-022, archivo del change y cierre del plan 022
+- Relevo tras la entrega de #79 (PR #80 abierto)
+- Relevo tras la entrega de #79 (release v0.9.0 pendiente)
+
+### Features
+
+- *(restauracion)* Selector de target en la pantalla de Restauraciones
+
+### Testing
+
+- *(restauracion)* Fijar el filtro por target en la pantalla de Restauraciones
+- *(restauracion)* Reforzar el reinicio de paginación por estado
 ## [0.8.0] - 2026-11-15
 
 ### Documentation
@@ -22,6 +44,7 @@
 ### Miscellaneous Tasks
 
 - *(ci)* Descargar vampus precompilado en lugar de compilarlo
+- Release v0.8.0
 
 ### Styling
 
