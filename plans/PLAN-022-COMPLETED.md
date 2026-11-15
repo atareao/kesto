@@ -33,33 +33,33 @@ Añadir un selector de **target** a la pantalla de Restauraciones para acotar el
 ## Tareas (TDD: RED → GREEN → REFACTOR)
 
 ### 1. Preparación
-- [ ] 1.1 `just check-all` en verde (EXIT=0) antes de tocar código.
-- [ ] 1.2 Confirmar el punto de partida: el parámetro `target_id` ya viaja en la consulta y el catálogo de targets ya es consumible.
+- [x] 1.1 `just check-all` en verde (EXIT=0) antes de tocar código.
+- [x] 1.2 Confirmar el punto de partida: el parámetro `target_id` ya viaja en la consulta y el catálogo de targets ya es consumible.
 
 ### 2. RED — tests que fallan
-- [ ] 2.1 Test UI: el selector de target existe, sus opciones salen del catálogo, y elegir una acota la petición y la tabla. Verificación: `pnpm test` en `ui/` → el caso nuevo falla y el resto sigue verde.
-- [ ] 2.2 Test UI: cambiar el filtro reinicia la paginación y el total refleja el resultado acotado. Verificación: `pn. test` en `ui/` → falla.
-- [ ] 2.3 Test UI: limpiar el selector pide el listado sin `target_id`; elegir target y estado envía ambos parámetros. Verificación: `pnpm test` en `ui/` → falla.
-- [ ] 2.4 Test UI: un `target_id` sin opción en el catálogo no rompe la pantalla (vacío, no error ni carga infinita). Verificación: `pnpm test` en `ui/` → falla.
-- [ ] 2.5 Registrar el estado RED: casos nuevos fallando, resto en verde, `npx tsc --noEmit` sin errores de tipos en el test.
+- [x] 2.1 Test UI: el selector de target existe, sus opciones salen del catálogo, y elegir una acota la petición y la tabla. Verificación: `pnpm test` en `ui/` → el caso nuevo falla y el resto sigue verde.
+- [x] 2.2 Test UI: cambiar el filtro reinicia la paginación y el total refleja el resultado acotado. Verificación: `pn. test` en `ui/` → falla.
+- [x] 2.3 Test UI: limpiar el selector pide el listado sin `target_id`; elegir target y estado envía ambos parámetros. Verificación: `pnpm test` en `ui/` → falla.
+- [x] 2.4 Test UI: un `target_id` sin opción en el catálogo no rompe la pantalla (vacío, no error ni carga infinita). Verificación: `pnpm test` en `ui/` → falla.
+- [x] 2.5 Registrar el estado RED: casos nuevos fallando, resto en verde, `npx tsc --noEmit` sin errores de tipos en el test.
 
 ### 3. GREEN — el selector, mínimo
-- [ ] 3.1 Añadir el estado y el `Select` de target con `allowClear` en `ui/src/pages/restauraciones.tsx` (etiqueta = nombre del target, valor = su `id`), junto al filtro de estado. Verificación: `pnpm test` en `ui/` → 2.1 y 2.3 pasan.
-- [ ] 3.2 Pasar `target_id` a `useRestauraciones` y reiniciar `offset` al cambiar el filtro, por el mismo camino que el estado. Verificación: `pnpm test` en `ui/` → 2.2 pasa.
-- [ ] 3.3 Sostener el comportamiento ante un target ausente del catálogo (D4). Verificación: `pnpm test` en `ui/` → 2.4 pasa.
-- [ ] 3.4 Comprobar que la `queryKey` cambia con el filtro y que el refresco periódico no sirve la consulta cacheada anterior. Verificación: `pnpm test` en `ui/` → el caso de refresco del histórico sigue verde.
+- [x] 3.1 Añadir el estado y el `Select` de target con `allowClear` en `ui/src/pages/restauraciones.tsx` (etiqueta = nombre del target, valor = su `id`), junto al filtro de estado. Verificación: `pnpm test` en `ui/` → 2.1 y 2.3 pasan.
+- [x] 3.2 Pasar `target_id` a `useRestauraciones` y reiniciar `offset` al cambiar el filtro, por el mismo camino que el estado. Verificación: `pnpm test` en `ui/` → 2.2 pasa.
+- [x] 3.3 Sostener el comportamiento ante un target ausente del catálogo (D4). Verificación: `pnpm test` en `ui/` → 2.4 pasa.
+- [x] 3.4 Comprobar que la `queryKey` cambia con el filtro y que el refresco periódico no sirve la consulta cacheada anterior. Verificación: `pnpm test` en `ui/` → el caso de refresco del histórico sigue verde.
 
 ### 4. REFACTOR y cierre del panel
-- [ ] 4.1 Evitar duplicar el patrón del Histórico o justificar en el PR por qué difiere. Verificación: revisión del diff y `pnpm run lint` sin avisos.
-- [ ] 4.2 Panel completo en verde: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test` → `pnpm run build`.
-- [ ] 4.3 Auditoría `@react-reviewer` sobre el diff, sin bloqueantes.
-- [ ] 4.4 `docs/FEATURE-022-filtro-por-target-en-restauraciones.md` (qué es, ficheros, cómo funciona, cómo probarlo, decisiones D1–D4, follow-ups).
+- [x] 4.1 Evitar duplicar el patrón del Histórico o justificar en el PR por qué difiere. Verificación: revisión del diff y `pnpm run lint` sin avisos.
+- [x] 4.2 Panel completo en verde: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test` → `pnpm run build`.
+- [x] 4.3 Auditoría `@react-reviewer` sobre el diff, sin bloqueantes.
+- [x] 4.4 `docs/FEATURE-022-filtro-por-target-en-restauraciones.md` (qué es, ficheros, cómo funciona, cómo probarlo, decisiones D1–D4, follow-ups).
 
 ### 5. Verificación final (integración)
-- [ ] 5.1 `just check-all` con EXIT=0 (backend `fmt`+`clippy -D warnings`+`test`; panel `lint`+`typecheck`+`typecheck:test`+`test`+`build`).
-- [ ] 5.2 Recorrer uno a uno los escenarios de `openspec/changes/filtro-por-target-en-restauraciones/specs/ui/spec.md` y comprobar que cada uno tiene test que lo fija.
-- [ ] 5.3 `openspec validate filtro-por-target-en-restauraciones --strict` sin hallazgos.
-- [ ] 5.4 Marcar casillas, renombrar a `plans/PLAN-022-COMPLETED.md` y `openspec archive filtro-por-target-en-restauraciones`.
+- [x] 5.1 `just check-all` con EXIT=0 (backend `fmt`+`clippy -D warnings`+`test`; panel `lint`+`typecheck`+`typecheck:test`+`test`+`build`).
+- [x] 5.2 Recorrer uno a uno los escenarios de `openspec/changes/filtro-por-target-en-restauraciones/specs/ui/spec.md` y comprobar que cada uno tiene test que lo fija.
+- [x] 5.3 `openspec validate filtro-por-target-en-restauraciones --strict` sin hallazgos.
+- [x] 5.4 Marcar casillas, renombrar a `plans/PLAN-022-COMPLETED.md` y `openspec archive filtro-por-target-en-restauraciones`.
 
 ## Decisiones de diseño
 
