@@ -1,4 +1,39 @@
 # Changelog
+## [0.7.0] - 2026-11-15
+
+### Documentation
+
+- *(handoff)* Relevo de la FEATURE-015 y release v0.6.1
+- *(handoff)* Relevo para la FEATURE-016 (identidad visual y tema)
+- Glosar el nombre Kesto (en esperanto: arca, caja, cesto o cajón)
+- *(sdd)* Change identidad-visual-y-tema y PLAN-016 (issue #60)
+- FEATURE-016, archivo del change y cierre del PLAN-016
+- *(handoff)* Relevo con la FEATURE-016 entregada y el lab con el panel nuevo
+- Cerrar PLAN-017 y follow-ups de FEATURE-016
+- FEATURE-018, cierre del plan y del change SDD
+- Reflejar el PR #68 abierto en el plan y el relevo
+- Actualizar el relevo tras el merge del PR #68
+
+### Features
+
+- *(ui)* Identidad de marca y tema claro/oscuro (oscuro por defecto)
+- *(engine)* Restaurar instantáneas sobre el target de origen
+- *(api)* Endpoint de restauración y listado con el target
+- *(ui)* Restaurar desde el panel con confirmación y fase
+
+### Miscellaneous Tasks
+
+- *(ui)* Separar tsconfig de aplicación, tests y tooling
+- Type-checkear los tests del panel
+- *(db)* Índice sobre job_executions.snapshot_id
+
+### Refactor
+
+- *(ui)* Eliminar memoización redundante del tema
+
+### Testing
+
+- *(ui)* Añadir test de frontera de TypeScript
 ## [0.6.1] - 2026-11-14
 
 ### Bug Fixes
@@ -14,6 +49,7 @@
 ### Miscellaneous Tasks
 
 - *(sdd)* Archivar higiene-de-la-copia y cerrar PLAN-015 (#52, #53)
+- Release v0.6.1
 ## [0.6.0] - 2026-11-14
 
 ### Bug Fixes
