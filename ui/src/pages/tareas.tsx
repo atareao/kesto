@@ -95,7 +95,7 @@ export default function Tareas() {
       render: (_valor, tarea) => tarea.name ?? '',
     },
     {
-      title: 'Tarea',
+      title: 'Target',
       key: 'target',
       render: (_valor, tarea) =>
         nombresDeTarget.get(tarea.target_id) ?? formatearUuid(tarea.target_id),
