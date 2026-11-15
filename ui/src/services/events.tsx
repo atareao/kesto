@@ -15,13 +15,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { Estado, EventoDeEjecucion } from './api/types'
+import type { Estado, EventoDeEjecucion, EventoDeRestauracion } from './api/types'
 import {
   ContextoDelStream,
   ESPERA_BASE_MS,
   ESPERA_MAXIMA_MS,
   LIMITE_DE_LINEAS,
+  LIMITE_DE_RESTAURACIONES,
   NOMBRE_DEL_EVENTO,
+  NOMBRE_DEL_EVENTO_DE_RESTAURACION,
   RUTA_DE_EVENTOS,
 } from './useEventStream'
 import type { EstadoDeLaConexion, ValorDelStream } from './useEventStream'
@@ -66,6 +68,43 @@ function interpretarEvento(datos: string): EventoDeEjecucion | null {
 }
 
 /**
+ * Valida el JSON de `restore_progress` y lo convierte en el DTO. Igual que con
+ * `execution_progress`, un evento incompleto se descarta: un avance con campos
+ * a `undefined` rompería la barra de la restauración.
+ */
+function interpretarRestauracion(datos: string): EventoDeRestauracion | null {
+  let crudo: unknown
+  try {
+    crudo = JSON.parse(datos) as unknown
+  } catch {
+    return null
+  }
+
+  if (typeof crudo !== 'object' || crudo === null) return null
+  const campos = crudo as Record<string, unknown>
+
+  if (typeof campos.execution_id !== 'string' || typeof campos.snapshot_id !== 'string') return null
+  if (typeof campos.phase !== 'string') return null
+  if (typeof campos.files_done !== 'number' || typeof campos.bytes_done !== 'number') return null
+  if (campos.files_total !== null && typeof campos.files_total !== 'number') return null
+  if (campos.bytes_total !== null && typeof campos.bytes_total !== 'number') return null
+
+  return {
+    execution_id: campos.execution_id,
+    snapshot_id: campos.snapshot_id,
+    phase: campos.phase,
+    files_done: campos.files_done,
+    files_total: campos.files_total,
+    bytes_done: campos.bytes_done,
+    bytes_total: campos.bytes_total,
+    // El `motivo` solo lo trae una restauración `fallida`; el resto lo deja en
+    // `null` para que el DTO sea uniforme y la pantalla no tenga que distinguir
+    // «ausente» de «sin explicación».
+    motivo: typeof campos.motivo === 'string' ? campos.motivo : null,
+  }
+}
+
+/**
  * Abre (y cierra) la conexión SSE según haya consumidores. Va por encima de las
  * pantallas que muestren progreso.
  */
@@ -83,6 +122,9 @@ export function ProveedorDeEventos({
   )
   const [historial, setHistorial] = useState<
     ReadonlyMap<string, readonly EventoDeEjecucion[]>
+  >(() => new Map())
+  const [restauraciones, setRestauraciones] = useState<
+    ReadonlyMap<string, EventoDeRestauracion>
   >(() => new Map())
   const [hayConsumidores, setHayConsumidores] = useState(false)
   const consumidores = useRef(0)
@@ -140,6 +182,30 @@ export function ProveedorDeEventos({
         })
       })
 
+      fuente.addEventListener(NOMBRE_DEL_EVENTO_DE_RESTAURACION, (evento) => {
+        const avance = interpretarRestauracion((evento as MessageEvent<string>).data)
+        if (avance === null) return
+
+        setRestauraciones((previas) => {
+          const siguientes = new Map(previas)
+          // Se borra antes de volver a insertar para que la entrada recién
+          // actualizada quede al final del orden de inserción: así el recorte
+          // por antigüedad expulsa la que lleva más tiempo sin moverse. Es un
+          // criterio **distinto** del de `historial` —que guarda las últimas N
+          // líneas y no reordena nada— y es deliberado: aquí lo que hay que
+          // retener es la entrada de cada restauración, y la última que se movió
+          // es la que alguien está mirando. Ver `LIMITE_DE_RESTAURACIONES`.
+          siguientes.delete(avance.execution_id)
+          siguientes.set(avance.execution_id, avance)
+          while (siguientes.size > LIMITE_DE_RESTAURACIONES) {
+            const masAntigua = siguientes.keys().next().value
+            if (masAntigua === undefined) break
+            siguientes.delete(masAntigua)
+          }
+          return siguientes
+        })
+      })
+
       fuente.addEventListener('error', () => {
         fuente?.close()
         if (desmontado) return
@@ -161,8 +227,8 @@ export function ProveedorDeEventos({
   }, [hayConsumidores, url])
 
   const valor = useMemo<ValorDelStream>(
-    () => ({ estado, ejecuciones, historial, suscribir, desuscribir }),
-    [estado, ejecuciones, historial, suscribir, desuscribir],
+    () => ({ estado, ejecuciones, historial, restauraciones, suscribir, desuscribir }),
+    [estado, ejecuciones, historial, restauraciones, suscribir, desuscribir],
   )
 
   return <ContextoDelStream.Provider value={valor}>{children}</ContextoDelStream.Provider>

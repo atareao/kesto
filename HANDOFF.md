@@ -1,23 +1,25 @@
-# Relevo — PLAN-017: memoización del tema y frontera de tipos (issue #62)
+# Relevo — FEATURE-018: restauración de snapshots (PLAN-018 · issue #64)
 
-`development` y `main` en **v0.6.1** (tag `v0.6.1`). Esta sesión entregó el refactor de memoización del tema en una rama `feature/refactor-tema-memoization` → **PR a `development`** (cierra el issue #62). Sin issues abiertos tras el merge del PR.
+Rama `feature/restauracion-de-snapshots`. `development` y `main` en **v0.6.1** (tag `v0.6.1`). Todo el trabajo de esta feature está **commiteado** (5 commits) y empujado: el **PR #68** (https://github.com/atareao/kesto/pull/68) está abierto contra `development` con `Closes #64`, pendiente de revisión y merge. El cambio está archivado en `openspec/changes/archive/2026-11-15-restauracion-de-snapshots/` y el plan ya está renombrado a `plans/PLAN-018-COMPLETED.md`.
 
-## Hecho en esta sesión — `refactor-tema-memoization` (issue #62)
+## Hecho en esta sesión — `feature/restauracion-de-snapshots` (issue #64)
 
-Ciclo **SDD + TDD** cerrado. Change archivado en `openspec/changes/archive/2026-11-14-refactor-tema-memoization/` (delta fusionada en `openspec/specs/ui/spec.md`; `openspec validate --all --strict` en verde, 12/12). Plan cerrado en `plans/PLAN-017-COMPLETED.md`; dos follow-ups de FEATURE-016 (**BAJO 8** y **BAJO 9**) dados por cerrados.
+Feature nueva y completa, con el ciclo SDD+TDD cerrado de punta a punta. El endpoint `POST /api/v1/snapshots/{id}/restore` con cuerpo `{repository_id}` resuelve el vínculo `snapshot → job_executions → backup_jobs → backup_targets` (`Ejecuciones::objetivo_de_la_instantanea` en `src/db/entities/execution.rs`) y responde `200` con `execution_id` (efímero, no persistido), `snapshot_id`, `target_id` y `target_name`; los errores son `400` UUID mal formado, `404` repositorio ausente **o instantánea que no está en el repositorio** (comprobado contra el almacenamiento antes de responder, no optimista), `409` sin vínculo o destino ya ocupado, y `422` para targets de BD (v1 solo restaura `directory`). La restauración real vive en `Repositorio::restaurar_snapshot` (`src/rustic/repositorio.rs`: `prepare_restore` + `restore`, `delete: false`, `verify_existing: true`), corre en `spawn_blocking` (`fuera_del_runtime`) y se lanza en segundo plano para que el `200` vuelva antes que el trabajo.
 
-- **Memoización**: retirados los `useCallback`/`useMemo` redundantes de `ui/src/services/tema.tsx`. API pública del provider/hook intacta (defecto oscuro, persistencia en `kesto-tema`, conmutador accesible).
-- **Frontera de tipos app/tests/tooling**: `ui/tsconfig.json` de aplicación con `"types": []`; nuevo `ui/tsconfig.test.json` (`"types": ["vitest/globals", "node"]`, extiende del de app); el tooling (`ui/tsconfig.node.json`) conserva los suyos. El andamiaje de pruebas salió de `ui/src/` a `ui/tests/` (`setupTests.ts`, `fixtures.ts`, `fetchDePrueba.ts`, `selectDeAntd.ts`, `eventosDePrueba.ts`).
-- **Scripts y CI**: `ui/package.json` con `typecheck` (app) y `typecheck:test` (tests); `.justfile` añade `ui-typecheck-tests` y `ui-check` encadena los cinco pasos; `.github/workflows/ci.yml` typechequea app y tests por separado usando esos scripts (no `tsc` a mano).
-- **Docs / checklists**: `docs/FEATURE-016-identidad-visual-y-tema.md` marca BAJO 8 y BAJO 9 como cerrados; `tasks.md` del change y `plans/PLAN-017-COMPLETED.md` marcados.
-- **Verificación**: `just check` (backend) verde; en `ui/`: `pnpm run lint`, `npx tsc --noEmit`, `npx tsc -p tsconfig.test.json --noEmit` y `pnpm test` (**169** tests) verdes.
+El progreso viaja por el stream SSE global con `event: restore_progress` (`NOMBRE_DEL_EVENTO_DE_RESTAURACION` en `src/api/events.rs`) y las fases `restaurando`/`terminada`/`fallida`: el primer aviso se publica **antes** de restaurar, y el cierre se publica en el cuerpo asíncrono para cubrir también el pánico del hilo de bloqueo. Los cuatro contadores (`files_done`, `files_total`, `bytes_done`, `bytes_total`) van **siempre a 0** porque `rustic_core` 0.13 no ofrece progreso incremental por su API pública: queda declarado como limitación en el plan, la spec y el doc de la feature. La guarda de exclusión por destino es `Motor::reservar_el_destino` + `ReservaDeRestauracion` (con `Drop`, clave normalizada con `canonicalize` cuando existe), en `src/engine/mod.rs`.
+
+El listado `GET /api/v1/snapshots?repository_id=` se amplió con `target_id`/`target_name`/`target_type` nullable por fila, con consulta por lotes vía `json_each` y el vínculo fusionado por el manejador (el motor no lee la base). El panel (`ui/src/pages/snapshots.tsx`, `useSnapshots.ts`, `ui/src/api/snapshots.ts`, `ui/src/services/useEventStream.ts`, `events.tsx`) trae la acción «Restaurar», una confirmación que **nombra el target**, acción deshabilitada y explicada si el target es desconocido o no es `directory`, resultado **al cerrar fase** (no al `202`), progreso por **fase** (sin barra), aviso cerrable con plazo de confirmación de 30 min, suscripción al SSE mientras la operación está en vuelo, `loading`/`disabled`, a11y por fila y **una sola restauración a la vez** en el panel. La migración `migrations/0004_snapshot_id.sql` añade el índice sobre `job_executions.snapshot_id` (medido con `EXPLAIN QUERY PLAN`: lo usa la consulta de una instantánea; la del lote `json_each` no lo usa).
+
+Proceso: dos auditorías y dos re-auditorías sin bloqueantes; los cuatro bloqueantes originales quedaron corregidos. **Verificación:** `just check-all` verde — backend `fmt`, `clippy -D warnings` y `cargo test` con **464 passed, 0 failed, 22 ignored**; UI `pnpm run lint` limpio, `tsc` app y tests OK, `pnpm test` con **188 passed** y build OK (con el aviso preexistente del chunk de ~1,3 MB por Antd). `openspec validate --all --strict` → **12/12**.
 
 ## Pendiente / siguiente
 
-- **Backlog funcional:** vacío salvo heredados.
-- **Heredados vivos:** copia binaria `.backup` de SQLite (API `sqlite3_backup`) y Litestream; reintento/purga del «olvido fallido» de FEATURE-015.
-- Follow-up de FEATURE-016 aún abierto: bundle del panel en un único chunk (~1.3 MB / 403 kB gzip) por Antd; `manualChunks`/code-splitting futuro.
-- Al abrir feature nueva: empezar por su **GitHub Issue**, luego `plans/PLAN-018.md` y el change SDD.
+- **(a) Revisar y fusionar el PR #68 a `development` — lo único que falta.** El commit con gitmoji y el PR ya están hechos (5 commits, `Closes #64`); solo queda la revisión y el merge. Un merge a `main` sería después una release, con el bump que decida `release-prepare`. Nada más de esta feature está pendiente: el plan está marcado y renombrado, el change archivado y las deltas fusionadas en `openspec/specs/api-resources/spec.md` y `openspec/specs/ui/spec.md`.
+- **(b) Fase 2 de la restauración (issue #67).** Persistir la ejecución de restauración —hoy es efímera— y restaurar targets de BD dentro de su contenedor; más adelante, restauración parcial por rutas y purga de snapshots.
+- **(c) Heredados vivos.** Copia binaria `.backup` de SQLite (API `sqlite3_backup`) y Litestream; y el reintento/purga del «olvido fallido» de FEATURE-015.
+- **(d) Follow-up de FEATURE-016.** El bundle del panel sigue en un único chunk (~1,3 MB / ~405 kB gzip) por Antd; `manualChunks`/code-splitting futuro.
+- **(e) Nota de CI.** El test `dos_restauraciones_simultaneas_sobre_el_mismo_destino_no_caben` (`src/api/snapshots.rs`) tarda ~25 s en CI: cada restauración abre el repositorio dos veces y cada apertura cuesta varios segundos en la compilación de pruebas.
+- Al abrir feature nueva: empezar por su **GitHub Issue**, luego `plans/PLAN-NNN.md` y el change SDD.
 
 ## Lab (levantado; heredado de la sesión anterior)
 

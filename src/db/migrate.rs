@@ -138,7 +138,7 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::migrate::Migrator;
 
-    use crate::db::{preparar, preparar_con};
+    use crate::db::{abrir, preparar, preparar_con};
     use crate::test_support::{DirectorioDePrueba, config_con_dsn, directorio_de_prueba};
 
     /// Una base con el esquema ya aplicado, y su directorio temporal vivo.
@@ -961,5 +961,240 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    /// 1.54 — La `0004` añade el índice de `job_executions.snapshot_id`, y se usa.
+    ///
+    /// `snapshot_id` no es clave foránea de nada —es el identificador de la instantánea que la
+    /// ejecución anotó—, así que se quedó fuera de los cuatro índices de la `0002`, y las dos
+    /// consultas que resuelven sobre qué target cae una instantánea
+    /// (`SQL_OBJETIVO_DE_LA_INSTANTANEA` y `SQL_OBJETIVOS_DE_LAS_INSTANTANEAS`, en
+    /// `src/db/entities/execution.rs`) entran justo por esa columna y **además** ordenan por
+    /// `started_at DESC, id DESC`, sobre la tabla que más crece: una fila por cada ejecución de
+    /// cada copia.
+    ///
+    /// Lo que se mide, sin adornos:
+    ///
+    /// * **Sin estadísticas** —el estado de la base, que solo tiene `sqlite_stat1` si alguien
+    ///   corre `ANALYZE`, y este árbol no lo corre— la consulta de **una** instantánea cambia de
+    ///   plan y para bien: ya no tiene que entrar por el camino de las claves foráneas
+    ///   (`idx_backup_jobs_repository_id` → `idx_job_executions_job_id`) y busca directamente las
+    ///   ejecuciones de esa instantánea. La del **lote** no lo usa todavía: su `IN` sobre
+    ///   `json_each` no le da un valor por el que buscar, y sin estadísticas nadie le ha dicho que
+    ///   la clave sea única.
+    /// * **Con estadísticas** —`ANALYZE` sobre un histórico con la forma de verdad, casi todas
+    ///   las ejecuciones con su instantánea— las **dos** entran por el índice. Y la forma de la
+    ///   columna importa: con una columna casi toda a `NULL`, `ANALYZE` mide muchos registros por
+    ///   clave y el planificador prefiere el camino viejo. Por eso el histórico que se siembra
+    ///   abajo deja la instantánea también en las ejecuciones que no la tienen, que son la
+    ///   excepción —una copia que falló antes de anotarla—, y no al revés.
+    ///
+    /// El plan medido va anotado junto a cada aserción, como en 1.15, 1.16 y 1.17, y los
+    /// literales de `EXPLAIN QUERY PLAN` no son API estable: si un salto de SQLite los cambia, lo
+    /// que hay que rehacer es la medición, no la migración.
+    #[tokio::test]
+    async fn la_migracion_0004_indexa_el_snapshot_id() {
+        // El texto literal de `SQL_OBJETIVO_DE_LA_INSTANTANEA` y de
+        // `SQL_OBJETIVOS_DE_LAS_INSTANTANEAS`, la de una instantánea y la del lote: son
+        // constantes privadas de `job_executions` y aquí se repiten igual que el 1.17 repite su
+        // `JOIN`.
+        const DE_UNA: &str = "SELECT e.job_id, t.id, t.target_type, t.host_path, t.name \
+             FROM job_executions e \
+             JOIN backup_jobs j ON j.id = e.job_id \
+             JOIN backup_targets t ON t.id = j.target_id \
+             WHERE e.snapshot_id = ?1 AND j.repository_id = ?2 \
+             ORDER BY e.started_at DESC, e.id DESC LIMIT 1";
+
+        const DE_LOTE: &str = "SELECT e.snapshot_id, e.job_id, t.id, t.target_type, t.host_path, \
+             t.name FROM job_executions e \
+             JOIN backup_jobs j ON j.id = e.job_id \
+             JOIN backup_targets t ON t.id = j.target_id \
+             WHERE e.snapshot_id IN (SELECT value FROM json_each(?1)) AND j.repository_id = ?2 \
+             ORDER BY e.started_at DESC, e.id DESC";
+
+        // El filtro **suelto** por la columna del índice: deja ver si el índice está donde tiene
+        // que estar sin que el resto de la consulta lo estorbe.
+        const SOLO_EL_FILTRO: &str = "SELECT e.id FROM job_executions e WHERE e.snapshot_id = ?1";
+
+        // El estado de partida: una base con las migraciones hasta la `0003`, que es la que tiene
+        // una instalación anterior a esta migración, y con histórico dentro.
+        let (directorio, pool) = base_hasta(3).await;
+        poblar_para_el_plan(&pool).await;
+
+        let antes = indices_de_tabla(&pool, "job_executions").await;
+        assert!(
+            !antes
+                .iter()
+                .any(|indice| indice == "idx_job_executions_snapshot_id"),
+            "el índice de la 0004 no puede existir en una base en la 0003: {antes:?}"
+        );
+
+        // Los planes del «antes», con las mismas filas que el «después». Medido:
+        //   DE_UNA  SEARCH j USING INDEX idx_backup_jobs_repository_id (repository_id=?)
+        //           SEARCH t USING INDEX sqlite_autoindex_backup_targets_1 (id=?)
+        //           SEARCH e USING INDEX idx_job_executions_job_id (job_id=?)
+        //   Soltó   SCAN e
+        for (nombre, consulta) in [("la de una instantánea", DE_UNA), ("la del lote", DE_LOTE)] {
+            let plan = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {consulta}")).await;
+            assert!(
+                !plan.contains("idx_job_executions_snapshot_id"),
+                "el plan de {nombre} usa un índice que la migración no ha creado: {plan}"
+            );
+            assert!(
+                !plan.contains("SCAN job_executions"),
+                "el plan de {nombre} recorre `job_executions` entera cuando debería entrar por la \
+                 clave foránea de la tarea: {plan}"
+            );
+        }
+
+        let suelto_sin_indice =
+            plan_de(&pool, &format!("EXPLAIN QUERY PLAN {SOLO_EL_FILTRO}")).await;
+        assert!(
+            suelto_sin_indice.contains("SCAN e"),
+            "sin índice, el filtro por `snapshot_id` debería recorrer la tabla: {suelto_sin_indice}"
+        );
+
+        // La migración, sobre esa misma base: el migrador entero continúa desde la versión 3 y
+        // aplica la 0004 sin tocar nada más. Es lo que se comprueba de verdad —que el fichero
+        // entra y deja el índice declarado—, y no que el directorio tenga uno más.
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0004 debe aplicarse sobre una base llevada hasta la 0003");
+
+        let declarados = indices_de_tabla(&pool, "job_executions").await;
+        assert!(
+            declarados
+                .iter()
+                .any(|indice| indice == "idx_job_executions_snapshot_id"),
+            "la 0004 se aplicó pero el índice no está declarado: {declarados:?}"
+        );
+
+        // El «después» se mide sobre un pool **recién abierto**, y no es un detalle de estilo:
+        // SQLite decide el plan al preparar la sentencia y una conexión que ya tenía preparado
+        // ese mismo texto sigue sirviendo el plan viejo hasta que el esquema cambie a **sus**
+        // ojos —medido: midiendo el «después» sobre el pool que ya midió el «antes» sale otra vez
+        // el plan del «antes»—. Prepararlo de cero es, además, lo que hace un proceso que arranca
+        // contra una base ya migrada.
+        let dsn = directorio.dsn();
+        pool.close().await;
+        let pool = abrir(&dsn)
+            .await
+            .expect("la base migrada debe poder reabrirse");
+
+        // Sin estadísticas: la consulta de una instantánea entra por el índice nuevo —medido:
+        // SEARCH e USING INDEX idx_job_executions_snapshot_id (snapshot_id=?), y después SEARCH j
+        // y SEARCH t por sus claves primarias—, y el del lote sigue yendo por las claves
+        // foráneas, porque sin `ANALYZE` nadie le ha dicho que la clave sea única.
+        let de_una = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {DE_UNA}")).await;
+        assert!(
+            de_una.contains("idx_job_executions_snapshot_id"),
+            "el plan de la consulta de una instantánea no usa el índice de su columna: {de_una}"
+        );
+
+        let de_lote = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {DE_LOTE}")).await;
+        assert!(
+            !de_lote.contains("idx_job_executions_snapshot_id"),
+            "sin estadísticas, la consulta del lote no tiene por qué usar el índice: {de_lote}"
+        );
+
+        // Y el filtro suelto, que es el que no tenía otra puerta: de `SCAN e` a
+        // `SEARCH e USING INDEX idx_job_executions_snapshot_id (snapshot_id=?)`.
+        let suelto = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {SOLO_EL_FILTRO}")).await;
+        assert!(
+            suelto.contains("idx_job_executions_snapshot_id"),
+            "el filtro por `snapshot_id` no usa el índice de su columna: {suelto}"
+        );
+        assert!(
+            !suelto.contains("SCAN e"),
+            "el filtro por `snapshot_id` sigue recorriendo la tabla entera: {suelto}"
+        );
+
+        // Con estadísticas, las dos entran por el índice. Medido: DE_UNA queda en `SCAN t`,
+        // `SEARCH e USING INDEX idx_job_executions_snapshot_id (snapshot_id=?)` y `SEARCH j` por su
+        // clave primaria; DE_LOTE añade el `LIST SUBQUERY` del `json_each` con el mismo `SEARCH e`
+        // por el índice. La `ANALYZE` cambia el esquema —crea `sqlite_stat1`—, así que la medición
+        // vuelve a ir sobre un pool nuevo, por lo mismo de antes.
+        sqlx::query("ANALYZE")
+            .execute(&pool)
+            .await
+            .expect("`ANALYZE` sobre la base de prueba no puede fallar");
+
+        pool.close().await;
+        let pool = abrir(&dsn)
+            .await
+            .expect("la base con estadísticas debe poder reabrirse");
+
+        for (nombre, consulta) in [("la de una instantánea", DE_UNA), ("la del lote", DE_LOTE)] {
+            let plan = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {consulta}")).await;
+            assert!(
+                plan.contains("idx_job_executions_snapshot_id"),
+                "con estadísticas, el plan de {nombre} debería entrar por el índice nuevo: {plan}"
+            );
+        }
+
+        // Una migración que solo crea un índice es idempotente por el `IF NOT EXISTS`, y volver a
+        // aplicarla no puede fallar ni dejar el esquema distinto.
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("reaplicar el migrador sobre una base ya migrada no puede fallar");
+
+        assert_eq!(
+            indices_de_tabla(&pool, "job_executions").await,
+            declarados,
+            "reaplicar la migración cambió los índices de la tabla"
+        );
+
+        pool.close().await;
+    }
+
+    /// Siembra la base de la prueba 1.54 con un histórico con la forma de la de verdad.
+    ///
+    /// Las cifras no son un adorno: el planificador decide con lo que **cree** saber de los
+    /// tamaños de cada tabla, y sin estadísticas eso no son los datos. Con estadísticas sí, y de
+    /// ahí salen las dos mitades que la prueba mide: `backup_jobs` con doscientas tareas,
+    /// `job_executions` con dos mil ejecuciones y `backup_targets` con un solo target.
+    ///
+    /// La instantánea la lleva **casi** toda ejecución y el `NULL` es la excepción —una copia que
+    /// falló antes de anotarla—, que es la forma de un histórico real. No es un detalle: con la
+    /// columna al revés —casi toda a `NULL`— `ANALYZE` mide cientos de registros por clave,
+    /// el índice parece inútil y el planificador se queda con el camino viejo; medido, y por eso
+    /// la siembra va así.
+    async fn poblar_para_el_plan(pool: &SqlitePool) {
+        for sentencia in [
+            "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+             secret_access_key, passphrase) \
+             VALUES ('r-1', 'repo', 'e', 'b', 'r', 'a', 's', 'p')",
+            "INSERT INTO backup_targets (id, name, target_type, host_path) \
+             VALUES ('t-1', 'carpeta', 'directory', '/srv/datos')",
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+             SELECT 'j-'||x, 't-1', 'r-1', '0 3 * * *' FROM (WITH RECURSIVE c(x) AS \
+             (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200) SELECT x FROM c)",
+            "INSERT INTO job_executions (id, job_id, status, snapshot_id, started_at) \
+             SELECT 'e-'||x, 'j-'||((x % 200)+1), 'success', \
+             CASE WHEN x % 50 = 0 THEN NULL ELSE 'snap-'||x END, \
+             datetime('now', '-'||x||' seconds') FROM (WITH RECURSIVE c(x) AS \
+             (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000) SELECT x FROM c)",
+        ] {
+            sqlx::query(sentencia)
+                .execute(pool)
+                .await
+                .expect("la siembra de la prueba 1.54 no puede fallar");
+        }
+    }
+
+    /// Los índices declarados sobre una tabla, por nombre y ordenados.
+    ///
+    /// Hermana de la consulta suelta del 1.53: lo que se repite es el predicado
+    /// —`type = 'index'`, `tbl_name`, `LIKE 'idx_%'` y el orden—, que es lo que hace comparables
+    /// dos listados de tablas distintas.
+    async fn indices_de_tabla(pool: &SqlitePool, tabla: &str) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 \
+             AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .bind(tabla)
+        .fetch_all(pool)
+        .await
+        .expect("los índices deben poder consultarse")
     }
 }

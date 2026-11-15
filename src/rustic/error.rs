@@ -190,4 +190,58 @@ pub enum Error {
     /// lo que dijo la biblioteca, que nunca incluye material de clave.
     #[error("no se ha podido retirar la instantánea de `{destino}`: {motivo}")]
     OlvidoFallido { destino: String, motivo: String },
+
+    /// No se ha podido restaurar una instantánea sobre su destino.
+    ///
+    /// Es el fallo de una restauración entera —abrir el índice completo, resolver la instantánea,
+    /// preparar el plan y escribir los datos—, y no se parte en variantes por cada paso porque
+    /// ninguno de ellos se puede **arreglar** de otra manera desde fuera: la instantánea que no
+    /// está, el destino que no se deja escribir y el fichero que no se puede leer son el mismo
+    /// desenlace para quien pidió la restauración —no se restauró—, y distinguirlos sería publicar
+    /// un desglose que nadie puede usar.
+    ///
+    /// Lo que **sí** se puede elegir va aquí: el `destino` es el nombre del repositorio y no la
+    /// ruta local del target. El `motivo` no se elige —lo escribe la biblioteca—, y por eso tiene
+    /// su propia nota debajo.
+    ///
+    /// # Qué lleva el `motivo`, que no es lo que uno supondría
+    ///
+    /// El `motivo` es lo que devuelve `display_log()` de la biblioteca, y eso **interpola el
+    /// contexto del error**: sustituye los `{placeholders}` de su mensaje por los valores que la
+    /// biblioteca le fue colgando —la ruta del destino en el host, en un «The directory `/srv/x`
+    /// could not be created»— y arrastra detrás la cadena de causas del `source`, con lo que
+    /// dijera el backend por el que se leyó el índice. No hay, pues, ninguna promesa de que quepa
+    /// en una línea ni de que no nombre una ruta del host: lo que hay es un texto de diagnóstico,
+    /// útil precisamente por eso.
+    ///
+    /// De material de clave no lleva nada **por el mismo motivo** que el de una copia: las
+    /// credenciales viajan en las opciones del backend, no en los mensajes con los que falla. Pero
+    /// eso es una propiedad del texto de la biblioteca y no un filtro de esta casa: quien quiera
+    /// una garantía tiene el paso por la red de secretos de la extracción —ver
+    /// `motivo_de_la_biblioteca` en `src/engine/ejecucion.rs`—, que es el que recorta los valores
+    /// de las credenciales. Y aun con él, una ruta del host pasa.
+    ///
+    /// # Dónde acaba hoy
+    ///
+    /// **Solo en el registro.** El motor envuelve este fallo en [`ErrorDelMotor::Repositorio`]
+    /// pasando su `Display` —el `motivo` incluido— por esa red de secretos, y el manejador de la
+    /// restauración hace con él lo único que se puede hacer cuando el `200` ya volvió: contarlo con
+    /// `tracing::error!`. No se persiste en ninguna fila, así que hoy el daño de que nombre una
+    /// ruta del host es nulo.
+    ///
+    /// Si algún día se persistiera —la fase 2 de la restauración apunta a dejar su fila de
+    /// ejecución, como deja la copia—, ese texto sería el que iría a la base, y la ruta del host
+    /// con él. El sitio donde decidir si eso vale o si hay que recortarlo, como se recorta el
+    /// motivo de una copia, es ése, y está escrito aquí para que la decisión no se tome a ciegas.
+    ///
+    /// [`ErrorDelMotor::Repositorio`]: crate::engine::ErrorDelMotor::Repositorio
+    #[error("no se ha podido restaurar `{instantanea}` desde `{destino}`: {motivo}")]
+    RestauracionFallida {
+        /// El nombre del repositorio del que se restauraba.
+        destino: String,
+        /// La instantánea que se intentaba restaurar, en hex completo.
+        instantanea: String,
+        /// Lo que dijo la biblioteca, con su contexto ya interpolado: ver la nota de la variante.
+        motivo: String,
+    },
 }

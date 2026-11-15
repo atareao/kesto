@@ -17,10 +17,16 @@
  * - `execution_id` y `job_id` vienen con guiones, igual que en `/executions`, y
  *   se comparan tal cual: no se normalizan.
  * - `percentage` es `null` cuando no se conoce el total (barra indeterminada).
+ *
+ * El mismo stream publica un segundo tipo de evento, `restore_progress`, con
+ * **otro** payload (siete campos distintos, en `EventoDeRestauracion`). Se
+ * mantiene aparte y no se funde con `execution_progress`: son dos protocolos
+ * con dos formas de medir el avance, y mezclarlos obligaría a cada consumidor a
+ * distinguir de dónde viene lo que lee.
  */
 
 import { createContext, useContext, useEffect } from 'react'
-import type { EventoDeEjecucion } from './api/types'
+import type { EventoDeEjecucion, EventoDeRestauracion } from './api/types'
 
 /** Lo que se espera antes del primer reintento; cada uno dobla al anterior. */
 export const ESPERA_BASE_MS = 1000
@@ -31,8 +37,11 @@ export const ESPERA_MAXIMA_MS = 30_000
 /** Única ruta del stream de eventos. */
 export const RUTA_DE_EVENTOS = '/api/v1/events'
 
-/** Nombre del evento. Es un literal de protocolo, no una etiqueta cualquiera. */
+/** Nombre del evento de progreso de una copia. Literal de protocolo. */
 export const NOMBRE_DEL_EVENTO = 'execution_progress'
+
+/** Nombre del evento de progreso de una restauración. Literal de protocolo. */
+export const NOMBRE_DEL_EVENTO_DE_RESTAURACION = 'restore_progress'
 
 /** Estado de la conexión, para pintar un aviso si el stream no está vivo. */
 export type EstadoDeLaConexion = 'conectando' | 'abierto' | 'reconectando' | 'detenido'
@@ -44,6 +53,23 @@ export type EstadoDeLaConexion = 'conectando' | 'abierto' | 'reconectando' | 'de
  */
 export const LIMITE_DE_LINEAS = 200
 
+/**
+ * Restauraciones que se recuerdan en el mapa. Igual que con la consola, es un
+ * tope y no una promesa: el stream no guarda replay y una sesión larga puede
+ * ver muchas restauraciones.
+ *
+ * El recorte no es el mismo que el de `historial` y no es un descuido: aquí
+ * **reinserta** cada evento y expulsa la entrada que lleva más tiempo sin
+ * moverse —LRU por recencia—, mientras que `historial` conserva **las últimas
+ * N líneas** de cada ejecución y no reordena nada. Da igual cuál de las dos se
+ * lea como «las últimas»: cada restauración publica su empezó y su terminó, así
+ * que el aviso terminal reinserta su entrada y la mantiene viva hasta que
+ * lleguen `LIMITE_DE_RESTAURACIONES` restauraciones más nuevas. Lo que importa
+ * aquí es que la entrada del desenlace no se vaya por antigüedad antes de que la
+ * pantalla lo correlacione.
+ */
+export const LIMITE_DE_RESTAURACIONES = 50
+
 /** Lo que ve un consumidor: la conexión y el último progreso de cada ejecución. */
 export interface ContextoDeEventos {
   estado: EstadoDeLaConexion
@@ -54,6 +80,13 @@ export interface ContextoDeEventos {
    * máximo de `LIMITE_DE_LINEAS` y en orden de llegada. Alimenta la consola.
    */
   historial: ReadonlyMap<string, readonly EventoDeEjecucion[]>
+  /**
+   * Último evento `restore_progress` conocido de cada restauración, indexado
+   * por `execution_id`. Es un mapa aparte del de `ejecuciones`: el payload de
+   * una restauración es otro, y un consumidor que espera un `EventoDeEjecucion`
+   * no debe encontrarse uno de restauración.
+   */
+  restauraciones: ReadonlyMap<string, EventoDeRestauracion>
 }
 
 /** El contexto y las dos operaciones con las que el proveedor cuenta consumidores. */
@@ -85,8 +118,8 @@ function useContextoDelStream(): ValorDelStream {
  * ejecución, indexado por `execution_id`.
  */
 export function useEventStream(): ContextoDeEventos {
-  const { estado, ejecuciones, historial } = useContextoDelStream()
-  return { estado, ejecuciones, historial }
+  const { estado, ejecuciones, historial, restauraciones } = useContextoDelStream()
+  return { estado, ejecuciones, historial, restauraciones }
 }
 
 /**
@@ -111,4 +144,43 @@ export function useEjecucion(executionId: string): {
 } {
   const { estado, ejecuciones } = useContextoDelStream()
   return { estado, evento: ejecuciones.get(executionId) ?? null }
+}
+
+/**
+ * El progreso de **una** restauración. A diferencia de `useEjecucion`, tolera
+ * que no haya proveedor por encima: una pantalla puede montarse aislada —las
+ * pruebas de la pantalla lo hacen— y no por eso debe romperse. Sin proveedor
+ * devuelve `null` y no se suscribe.
+ *
+ * Con proveedor se suscribe **mientras el hook vive**, aunque todavía no haya
+ * `executionId`: el identificador de la ejecución lo reparte el `POST` y el
+ * primer `restaurando` se publica nada más lanzar el trabajo, así que si el
+ * consumidor esperase a la respuesta para suscribirse, ese primer aviso se
+ * perdería —el stream no guarda replay—. Suscribirse una vez y no soltarlo
+ * evita además el ciclo cerrar/abrir por operación: el `EventSource` se abre
+ * con el primer consumidor y se cierra con el último.
+ *
+ * El evento se localiza por `executionId`: dentro de la misma pantalla es
+ * inequívoco, porque cada restauración reparte uno nuevo. El mapa del proveedor
+ * retiene los eventos aunque todavía no haya `executionId` con el que buscarlos,
+ * de modo que el desenlace no se pierde si llega antes que el `POST`.
+ */
+export function useRestauracion(executionId: string | null): {
+  evento: EventoDeRestauracion | null
+  estado: EstadoDeLaConexion | null
+} {
+  const contexto = useContext(ContextoDelStream)
+  const suscribir = contexto?.suscribir
+  const desuscribir = contexto?.desuscribir
+
+  useEffect(() => {
+    if (suscribir === undefined || desuscribir === undefined) return
+    suscribir()
+    return desuscribir
+  }, [suscribir, desuscribir])
+
+  if (contexto === null) return { evento: null, estado: null }
+
+  const evento = executionId === null ? null : contexto.restauraciones.get(executionId) ?? null
+  return { evento, estado: contexto.estado }
 }

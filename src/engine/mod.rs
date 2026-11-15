@@ -56,7 +56,8 @@ mod ejecucion;
 pub mod extraccion;
 mod hub;
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -72,7 +73,7 @@ use crate::docker::Cliente;
 use crate::rustic::{Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
 
 use cola::Cola;
-pub use hub::{CAPACIDAD_DEL_HUB, EventoDeEjecucion, Hub};
+pub use hub::{CAPACIDAD_DEL_HUB, EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor, Hub};
 
 pub use extraccion::{
     CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, Objetivo, Resultado, Ruta, ruta,
@@ -243,6 +244,25 @@ pub enum ErrorDelMotor {
         job_id: Uuid,
     },
 
+    /// Ese destino ya tiene una restauración **en vuelo**. **Corresponde a un `409`**.
+    ///
+    /// Es el desenlace de la guarda de exclusión de [`Motor::reservar_el_destino`]: dos
+    /// restauraciones sobre el mismo `host_path` escribirían a la vez en el mismo directorio del
+    /// host, así que la segunda se rechaza en vez de lanzarse.
+    ///
+    /// El sujeto es el **destino** y no la instantánea a propósito: dos instantáneas distintas del
+    /// mismo repositorio que se restauran sobre el mismo target chocan exactamente igual —el disco
+    /// es el mismo—, y por eso la reserva se lleva por ruta.
+    ///
+    /// El `destino` viaja para el **registro** —es una ruta de la fila del target, no un dato que
+    /// mandara la petición— y no se publica: el mensaje del `409` lo compone el mapeo de la capa
+    /// HTTP, que es quien decide qué se cuenta y qué no.
+    #[error("el destino `{destino}` ya tiene una restauración en curso: no se lanza una segunda")]
+    RestauracionEnCurso {
+        /// El destino —el `host_path` del target— que ya estaba reservado.
+        destino: String,
+    },
+
     /// El motor ha dejado de aceptar trabajo. **Corresponde a un `503`**.
     ///
     /// Es el desenlace de un disparo que llega después de que el proceso haya empezado a apagarse.
@@ -312,9 +332,12 @@ pub enum ErrorDelMotor {
 
     /// La biblioteca de copia no ha podido hacer su trabajo contra el repositorio.
     ///
-    /// Lo devuelven las dos operaciones que el motor presta sin ser una copia
-    /// ([`Motor::abrir_repositorio`] y [`Motor::listar_snapshots`]): ahí no hay ejecución que
-    /// apuntar, así que el fallo se cuenta a quien preguntó y no queda escrito en ninguna fila.
+    /// Lo devuelven las **cuatro** operaciones que el motor presta sin ser una copia:
+    /// [`Motor::abrir_repositorio`], [`Motor::listar_snapshots`], [`Motor::tiene_la_instantanea`] y
+    /// [`Motor::restaurar`]. En ninguna hay una fila de ejecución que apuntar —la de la
+    /// restauración es **efímera** y no se persiste—, así que el fallo se cuenta a quien preguntó y
+    /// no queda escrito en ninguna fila; y cuando no hay nadie a quien contárselo, se queda en el
+    /// registro (ver más abajo el caso de la restauración).
     ///
     /// # La correspondencia con los códigos HTTP la elige quien llama
     ///
@@ -328,12 +351,20 @@ pub enum ErrorDelMotor {
     /// [`motivo`](Self::Repositorio::motivo), que va ya pasado por la red de secretos de la
     /// extracción —un error de un backend puede llevar dentro la URL del destino con su
     /// credencial, y esto se guarda y se muestra—.
+    ///
+    /// Y en la **restauración** ese `502` no llega a nadie: el trabajo va en segundo plano con el
+    /// `200` ya entregado, así que la correspondencia la consume el **registro** —el motivo viaja
+    /// con su `tracing::error!`— y el cliente se quedó con el `404`, el `409` o el `422` de la
+    /// ruta, o con el `200` si la petición llegó a lanzarse. El `502` que sí contesta es el de un
+    /// fallo del motor **antes** de lanzarla: el [`Motor::tiene_la_instantanea`] con el que el
+    /// manejador comprueba que la copia sigue en el repositorio.
     #[error("el repositorio no ha respondido: {motivo}")]
     Repositorio {
         /// El fallo de la biblioteca, para quien tenga que **decidir** con él.
         #[source]
         causa: crate::rustic::Error,
-        /// El mismo fallo, ya recortado y sin credenciales, para contarlo.
+        /// El mismo fallo, ya recortado y sin credenciales, para contarlo: la red de secretos
+        /// quita los **valores** de las claves, no lo que el texto diga de una ruta del host.
         motivo: String,
     },
 
@@ -406,7 +437,38 @@ struct Interior {
     contexto: Contexto,
     /// La cola: los buzones y la parada.
     cola: Cola,
+    /// Los destinos con una restauración **en vuelo**, para que dos no escriban a la vez.
+    ///
+    /// Vive aquí y no en [`Contexto`] porque los trabajadores de la cola no la necesitan: quien la
+    /// consulta y la escribe son las peticiones de la capa HTTP y los trabajos de restauración que
+    /// ellas lanzan, y todos pasan por el mismo `Motor`. Es un `Arc` porque cada reserva que se
+    /// entrega —una por restauración— tiene que poder soltarse sola cuando su trabajo acabe, aunque
+    /// para entonces el `Motor` de la petición ya no exista.
+    ///
+    /// El candado es de `std` y no de Tokio, como el del hub: lo que protege son dos operaciones
+    /// instantáneas —mirar y anotar, o tachar— y **nunca se mantiene a lo largo de un `await`**;
+    /// [`Motor::reservar_el_destino`] es síncrona justo por eso.
+    ///
+    /// Lo que guarda dentro son claves ya **normalizadas** ([`normalizar_el_destino`]) y no el texto
+    /// crudo del `host_path`: es lo que hace que dos formas de escribir el mismo directorio sean el
+    /// mismo destino y no dos.
+    destinos_reservados: Arc<Mutex<HashSet<String>>>,
 }
+
+/// Las tres fases del aviso de restauración, que son **contrato** del §5.
+///
+/// No son literales sueltos porque no son texto de este módulo: el contrato del change fija tres
+/// palabras —`restaurando` al arrancar y `terminada` o `fallida` al cerrar— y el panel decide qué
+/// pintar con ellas. Vivir en constantes con nombre es lo que hace que el vocabulario se lea de una
+/// vez y que el día que se añada una fase no haya que buscarla por el fichero.
+///
+/// Son constantes **privadas**: lo que la capa HTTP publica es el evento, y quien decide el nombre
+/// `restore_progress` es ella. Aquí solo se decide qué fase lleva dentro.
+const FASE_RESTAURANDO: &str = "restaurando";
+/// La fase del cierre cuando la restauración llegó a término.
+const FASE_TERMINADA: &str = "terminada";
+/// La fase del cierre cuando la restauración **no** llegó a término, por la razón que sea.
+const FASE_FALLIDA: &str = "fallida";
 
 impl Motor {
     /// Monta el motor.
@@ -430,6 +492,7 @@ impl Motor {
                 hub: Hub::nuevo(),
             },
             cola: Cola::nueva(),
+            destinos_reservados: Arc::new(Mutex::new(HashSet::new())),
         })))
     }
 
@@ -661,6 +724,219 @@ impl Motor {
         .await
     }
 
+    /// Reserva un destino para una restauración, o dice que ya hay una en vuelo.
+    ///
+    /// Es la guarda de exclusión por **destino**: dos `POST` de restauración sobre el mismo
+    /// snapshot —o sobre dos instantáneas distintas del mismo target— escribirían a la vez en el
+    /// mismo `host_path`, y lo que quedaría en el disco sería la mezcla de las dos. La reserva se
+    /// toma **antes de contestar**, que es lo que hace que la segunda petición reciba un `409` en
+    /// vez de un `200` que promete un trabajo condenado a pelearse con el primero.
+    ///
+    /// # La reserva se suelta al soltarse
+    ///
+    /// Lo que devuelve es una guarda —[`ReservaDeRestauracion`]— que tacha el destino **al soltarse**
+    /// y no cuando alguien se acuerde de hacerlo: quien la recibe la lleva consigo mientras dure el
+    /// trabajo, así que el destino vuelve a estar libre tanto si la restauración acaba bien como si
+    /// acaba mal, y también si el trabajo se desmonta por un camino que nadie escribió —un pánico
+    /// dentro del futuro que la lleva, o una cancelación—, porque Rust suelta los locales de un
+    /// futuro al desmontarlo. Sin la guarda, un desenlace inesperado dejaría el destino reservado
+    /// **para siempre** y ese target no volvería a restaurarse hasta reiniciar el proceso.
+    ///
+    /// Es **síncrona** a propósito: mira y anota bajo un candado de `std`, y mantenerlo a lo largo
+    /// de un `await` sería el camino de un interbloqueo. No habla con el repositorio ni con la base
+    /// —de ahí que no sea `async`—: lo único que decide es quién tiene el destino.
+    ///
+    /// Lo que se mira y se anota no es el texto que llega, sino su forma normalizada
+    /// ([`normalizar_el_destino`]): dos maneras de escribir el mismo directorio —`/data` y
+    /// `/data/`— son **una sola clave**, y una segunda restauración sobre él no entra.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`ErrorDelMotor::RestauracionEnCurso`] —un `409`— si ese destino ya está reservado.
+    pub fn reservar_el_destino(
+        &self,
+        destino: &str,
+    ) -> Result<ReservaDeRestauracion, ErrorDelMotor> {
+        // La clave con la que se mira y se anota es la **normalizada**, no lo que llegue escrito:
+        // `"/data"` y `"/data/"` son el mismo directorio y tienen que ser la misma clave, o dos
+        // restauraciones escribirían a la vez en el mismo sitio. El `Drop` de la guarda tacha con
+        // esta misma forma —la lleva dentro—, así que lo que se libera es lo que se reservó.
+        let clave = normalizar_el_destino(destino);
+        let mut reservados = candado(&self.0.destinos_reservados);
+
+        if !reservados.insert(clave.clone()) {
+            return Err(ErrorDelMotor::RestauracionEnCurso {
+                destino: destino.to_owned(),
+            });
+        }
+
+        Ok(ReservaDeRestauracion {
+            destino: clave,
+            reservados: Arc::clone(&self.0.destinos_reservados),
+        })
+    }
+
+    /// Dice si el repositorio tiene esa instantánea, **sin restaurarla**, fuera del runtime.
+    ///
+    /// Es la lectura que hace que el `404` de la restauración sea de verdad: el manejador resuelve
+    /// la fila del repositorio y el vínculo de la instantánea con su target sin abrir el
+    /// almacenamiento, así que sin esta pregunta el `200` prometería un trabajo contra una copia que
+    /// puede no estar —una que purgó la retención, un repositorio recreado en el mismo destino— y el
+    /// fallo solo aparecería en el registro.
+    ///
+    /// # Por qué es una segunda apertura, y por qué se acepta
+    ///
+    /// Abre y suelta el repositorio en la misma llamada —igual que [`Motor::listar_snapshots`]—, y
+    /// eso significa que una restauración abre el almacenamiento **dos veces**: una para preguntar
+    /// si la copia está y otra para restaurarla. Es el precio de que el `404` exista: saber si la
+    /// instantánea está exige preguntárselo al repositorio, y no hay forma de saberlo por la fila
+    /// —`job_executions.snapshot_id` dice cuál se copió, no si sigue ahí—. Una sola apertura
+    /// obligaría a decidir el código de la respuesta **después** de contestar, que es exactamente el
+    /// `200` optimista que el contrato prohíbe.
+    ///
+    /// Quien llame dos veces seguidas —la comprobación y la restauración— paga dos derivaciones de
+    /// clave. Medido: `init` y `open` tardan 6,4 s cada uno en la compilación de pruebas, así que en
+    /// el peor caso el `200` de una restauración llega unos segundos más tarde. Lo que compra es que
+    /// ese `200` hable de una copia que existe.
+    ///
+    /// # Errors
+    ///
+    /// Las mismas dos que [`Motor::abrir_repositorio`], más el fallo de la lectura en sí —que el
+    /// repositorio no se deje listar—, que llega también como [`ErrorDelMotor::Repositorio`].
+    pub async fn tiene_la_instantanea(
+        &self,
+        acceso: Acceso,
+        instantanea: &str,
+    ) -> Result<bool, ErrorDelMotor> {
+        let abridor = self.0.contexto.ajustes.abridor;
+        // El trabajo viaja a un hilo propio y tiene que ser `'static`: se lleva una copia del
+        // identificador en vez de prestar el de quien pregunta.
+        let instantanea = instantanea.to_owned();
+
+        fuera_del_runtime(move || {
+            let (repositorio, _puesta) =
+                abridor(&acceso, BarrasDelMotor::mudas()).map_err(|causa| {
+                    ErrorDelMotor::Repositorio {
+                        motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                        causa,
+                    }
+                })?;
+
+            repositorio
+                .tiene_la_instantanea(&instantanea)
+                .map_err(|causa| ErrorDelMotor::Repositorio {
+                    motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                    causa,
+                })
+        })
+        .await
+    }
+
+    /// Restaura `instantanea` en `destino_local`, **fuera del runtime de Tokio**.
+    ///
+    /// Es la operación que cierra las tres que la capa HTTP necesita y la única que **escribe**:
+    /// abre el repositorio con el abridor inyectado y le pide que restaure la instantánea en el
+    /// destino. El [`Repositorio`] se **consume** en la llamada —restaurar lo deja en un estado
+    /// intermedio, no reutilizable—, así que no se suelta a mano ni se guarda para nada más.
+    ///
+    /// # Por qué el primer aviso se publica **antes** de tocar el repositorio
+    ///
+    /// El stream SSE del §5 es **uno solo y global**, y `restore_progress` tiene que ser el
+    /// **primer** evento que ve un cliente que acaba de suscribirse: si el aviso de arranque se
+    /// publicara al terminar, el primer fotograma llegaría cuando ya no hay nada que pintar y el
+    /// panel no tendría forma de saber que la restauración empezó. Por eso ese aviso sale aquí, en
+    /// el **cuerpo asíncrono**, antes de programar el trabajo de disco: así no depende de cuándo el
+    /// conjunto de bloqueo decida despachar el cierre y llega en cuanto el manejador cede el
+    /// control, que es lo antes que se puede.
+    ///
+    /// # Por qué el aviso de cierre también vive aquí, y no dentro del trabajo
+    ///
+    /// El de cierre se publica en el cuerpo asíncrono, **sobre el desenlace del `.await`**: `Ok` es
+    /// `terminada` y `Err` es `fallida`. Y no dentro del cierre que corre en el hilo de bloqueo
+    /// porque ahí se perdería justo el desenlace que más importa: un pánico de la biblioteca —que
+    /// llama a código que este crate no controla— convierte el trabajo en un [`JoinError`], y el
+    /// cierre que se le pasó a [`fuera_del_runtime`] **no llega a ejecutarse siquiera**. El cierre
+    /// no se publicaría, el panel se quedaría en «restaurando» para siempre y nadie sabría que
+    /// aquello terminó. Aquí, en cambio, un solo camino cubre los tres desenlaces que existen:
+    /// éxito, error y desmontaje del hilo de trabajo.
+    ///
+    /// Los contadores del primer aviso van a `0` —los totales no se conocen hasta que la
+    /// biblioteca recorre el árbol, y el contrato del evento no admite un «aún no lo sé» más que
+    /// como un cero— y los dos avisos llevan las fases de [`FASE_RESTAURANDO`] y del cierre, que son
+    /// frases **constantes** del motor, no cifras.
+    ///
+    /// [`JoinError`]: tokio::task::JoinError
+    ///
+    /// # Errors
+    ///
+    /// Las mismas que [`Motor::abrir_repositorio`], más el fallo de la restauración en sí, que
+    /// llega también como [`ErrorDelMotor::Repositorio`]. El aviso de cierre se publica tanto si
+    /// la restauración termina bien (`terminada`) como si falla (`fallida`), y quien pregunta por
+    /// el desenlace lo tiene igualmente en el `Result`.
+    pub async fn restaurar(
+        &self,
+        acceso: Acceso,
+        instantanea: String,
+        destino_local: String,
+        execution_id: Uuid,
+    ) -> Result<(), ErrorDelMotor> {
+        let abridor = self.0.contexto.ajustes.abridor;
+        let hub = self.0.contexto.hub.clone();
+
+        hub.publicar_restauracion(EventoDeRestauracion {
+            execution_id,
+            snapshot_id: instantanea.clone(),
+            phase: FASE_RESTAURANDO.to_owned(),
+            files_done: 0,
+            files_total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+        });
+
+        // El trabajo se lleva su copia del identificador porque el original lo necesita el aviso de
+        // cierre, que se publica después.
+        let instantanea_del_trabajo = instantanea.clone();
+
+        let desenlace = fuera_del_runtime(move || {
+            let (repositorio, _puesta) =
+                abridor(&acceso, BarrasDelMotor::mudas()).map_err(|causa| {
+                    ErrorDelMotor::Repositorio {
+                        motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                        causa,
+                    }
+                })?;
+
+            repositorio
+                .restaurar_snapshot(&instantanea_del_trabajo, &destino_local)
+                .map_err(|causa| ErrorDelMotor::Repositorio {
+                    motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                    causa,
+                })
+        })
+        .await;
+
+        // Confirmación de cierre: un cliente que se suscribiera tarde todavía ve el desenlace de la
+        // restauración, tanto si llegó a término como si no —y el `Err` cubre también el pánico del
+        // hilo de trabajo, que es el desenlace que se perdería publicando desde dentro—.
+        let fase = if desenlace.is_ok() {
+            FASE_TERMINADA
+        } else {
+            FASE_FALLIDA
+        };
+
+        hub.publicar_restauracion(EventoDeRestauracion {
+            execution_id,
+            snapshot_id: instantanea,
+            phase: fase.to_owned(),
+            files_done: 0,
+            files_total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+        });
+
+        desenlace
+    }
+
     /// Deja de aceptar trabajo, espera lo acotado y une los hilos.
     ///
     /// Es **idempotente** y hay que llamarla desde el cierre ordenado del proceso, **después** de
@@ -684,6 +960,93 @@ impl std::fmt::Debug for Motor {
             .field("parado", &self.0.cola.esta_parada())
             .field("capacidad_del_hub", &self.0.contexto.hub.capacidad())
             .finish_non_exhaustive()
+    }
+}
+
+/// La reserva de un destino para una restauración: mientras viva, ese destino está ocupado.
+///
+/// La entrega [`Motor::reservar_el_destino`] y **no se puede construir a mano** —sus campos son
+/// privados—, que es lo que hace que una reserva solo pueda venir de haber mirado el mapa: quien
+/// tiene una guarda tiene el destino.
+///
+/// # Por qué se suelta con un `Drop`
+///
+/// Porque el trabajo que la retiene puede terminar por caminos que nadie escribe. Quien la recibe
+/// es el trabajo —el manejador se la pasa al task que restaura—, y ese futuro puede desmontarse por
+/// un pánico dentro de él o por una cancelación; con una liberación explícita, esos dos caminos
+/// dejarían el destino reservado para siempre y el target no volvería a restaurarse hasta reiniciar
+/// el proceso. Con el `Drop`, lo suelta el propio desmontaje del futuro, que es lo último que Rust
+/// garantiza antes de dar el trabajo por terminado.
+///
+/// Y la liberación **no entra en pánico** si otro hilo se cayó con el candado tomado: lo que hay
+/// dentro es un conjunto de rutas, tan válido como era, y un pánico aquí —durante el desmontaje de
+/// otro— abortaría el proceso.
+pub struct ReservaDeRestauracion {
+    /// El destino reservado, en la forma **normalizada** con la que se anotó: es exactamente lo que
+    /// el `Drop` tacha, y tiene que serlo o la reserva no se soltaría nunca.
+    destino: String,
+    /// El mapa del motor, compartido: tachar aquí es lo que libera el destino.
+    reservados: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ReservaDeRestauracion {
+    fn drop(&mut self) {
+        candado(&self.reservados).remove(&self.destino);
+    }
+}
+
+/// Reduce a **una sola forma** las maneras de escribir un mismo destino, para que dos
+/// restauraciones no puedan escribir a la vez sobre el mismo directorio por escribirlo distinto.
+///
+/// La guarda es un conjunto de claves de texto, así que sin esto `"/data"` y `"/data/"` —el mismo
+/// directorio— serían dos claves y la segunda restauración entraría. Quien fija ese texto es el
+/// alta de targets, que **no** lo normaliza: guarda el `host_path` tal cual lo escribió el usuario
+/// (`src/db/entities/target.rs`), y de ahí que la normalización tenga que estar aquí.
+///
+/// Hay dos ramas porque [`std::fs::canonicalize`] —la forma buena: resuelve `.`, `..`, las barras
+/// de más y los enlaces simbólicos— **solo habla de lo que existe**:
+///
+/// 1. **El directorio existe:** se devuelve su ruta canónica. Es el caso de una restauración sobre
+///    un destino ya usado, y el único que se puede resolver de verdad.
+/// 2. **Todavía no existe** —lo corriente, porque es la restauración quien lo crea—:
+///    `canonicalize` falla y se cae a una normalización **textual mínima**, que recorta las barras
+///    finales sobrantes y deja en pie la raíz. No se puede ser más estricto: `.`, `..` y los
+///    enlaces simbólicos dependen del sistema de ficheros, no del texto, así que resolverlos a mano
+///    daría una clave **distinta** de la canónica que se usará cuando el directorio ya exista, y
+///    eso es peor que no normalizar. Lo que la rama compra es el caso corriente —una barra de más
+///    al final— sin inventar nada.
+///
+/// Las dos ramas tienen que salir **igual** en los dos momentos de la guarda, al reservar y al
+/// soltar: el `Drop` tacha exactamente lo que se anotó, así que ambos pasan por aquí.
+///
+/// La ruta canónica se pasa a texto con `to_string_lossy`: una ruta que no sea UTF-8 en Linux solo
+/// puede venir de un nombre de fichero que no lo es, y quedarse con la pérdida es preferible a que
+/// la reserva no se pueda hacer.
+fn normalizar_el_destino(ruta: &str) -> String {
+    if let Ok(canonica) = std::fs::canonicalize(ruta) {
+        return canonica.to_string_lossy().into_owned();
+    }
+
+    let recortada = ruta.trim_end_matches('/');
+
+    // `"/"` recortado queda vacío, y la raíz no es lo mismo que la cadena vacía: se conserva.
+    if recortada.is_empty() && ruta.starts_with('/') {
+        "/".to_owned()
+    } else {
+        recortada.to_owned()
+    }
+}
+
+/// Toma un candado **sin entrar en pánico** si otro hilo se cayó teniéndolo tomado.
+///
+/// Es la misma decisión que la del candado del hub y la de `src/engine/ejecucion.rs`: el dato de
+/// dentro sigue siendo tan válido como era —un conjunto de rutas—, y un motor no se cae por el
+/// pánico de otro. Importa además en el `Drop` de [`ReservaDeRestauracion`]: un pánico durante el
+/// desmontaje de otro trabajo **abortaría el proceso**.
+fn candado<T>(candado: &Mutex<T>) -> MutexGuard<'_, T> {
+    match candado.lock() {
+        Ok(guardado) => guardado,
+        Err(veneno) => veneno.into_inner(),
     }
 }
 
@@ -753,8 +1116,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::cola::CAPACIDAD_DE_LA_COLA;
-    use super::hub::EventoDeEjecucion;
-    use super::{Ajustes, Dependencias, ErrorDelMotor, Motor, ejecucion};
+    use super::hub::{EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor};
+    use super::{
+        Ajustes, Dependencias, ErrorDelMotor, FASE_FALLIDA, FASE_RESTAURANDO, FASE_TERMINADA,
+        Motor, ejecucion, normalizar_el_destino,
+    };
     use crate::db::entities::{
         AltaDeRepositorio, AltaDeTarea, AltaDeTarget, Ejecucion, Ejecuciones, Estado, Repositorios,
         Tareas, Targets, TipoDeTarget,
@@ -2144,15 +2510,20 @@ mod tests {
 
     // ── El progreso ──────────────────────────────────────────────────────────
 
-    /// Vacía el receptor y devuelve los eventos que había.
+    /// Vacía el receptor y devuelve los eventos de ejecución que había.
+    ///
+    /// El receptor transporta [`EventoDelMotor`], y estas pruebas solo miden el progreso de una
+    /// copia: los avisos de restauración se saltan, que es lo que haría cualquier lector que
+    /// estuviera mirando esta mitad del contrato.
     fn recoger(
-        receptor: &mut tokio::sync::broadcast::Receiver<EventoDeEjecucion>,
+        receptor: &mut tokio::sync::broadcast::Receiver<EventoDelMotor>,
     ) -> Vec<EventoDeEjecucion> {
         let mut eventos = Vec::new();
 
         loop {
             match receptor.try_recv() {
-                Ok(evento) => eventos.push(evento),
+                Ok(EventoDelMotor::Ejecucion(evento)) => eventos.push(evento),
+                Ok(EventoDelMotor::Restauracion(_)) => continue,
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                 // Un cliente que se pierde eventos no se corta: sigue leyendo. Aquí no puede
                 // pasar —se lee enseguida y son pocos—, pero el camino se escribe igual.
@@ -2161,6 +2532,28 @@ mod tests {
         }
 
         eventos
+    }
+
+    /// Vacía el receptor y devuelve los avisos de **restauración** que había.
+    ///
+    /// Es el hermano de [`recoger`] para la otra mitad del contrato, con las mismas reglas: se lee
+    /// lo que haya, el receptor que se hubiera perdido algún evento sigue leyendo, y los avisos de
+    /// una copia se saltan —aquí lo que se mide es la restauración—.
+    fn recoger_restauraciones(
+        receptor: &mut tokio::sync::broadcast::Receiver<EventoDelMotor>,
+    ) -> Vec<EventoDeRestauracion> {
+        let mut avisos = Vec::new();
+
+        loop {
+            match receptor.try_recv() {
+                Ok(EventoDelMotor::Restauracion(aviso)) => avisos.push(aviso),
+                Ok(EventoDelMotor::Ejecucion(_)) => continue,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+
+        avisos
     }
 
     /// **14.** `percentage` es **nulo** con un origen sin total y **numérico** con uno que lo
@@ -2728,6 +3121,379 @@ mod tests {
                 .iter()
                 .map(|resumen| resumen.fecha)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// **`tiene_la_instantanea` resuelve el identificador contra el repositorio de verdad.**
+    ///
+    /// Es la lectura que hace que el `404` de la restauración sea de verdad, y lo que se mide aquí
+    /// es la mitad que solo se puede medir con un repositorio abierto: que la comprobación mire
+    /// **dónde debe** —el almacenamiento del repositorio de la fila, con el abridor del motor y
+    /// fuera del runtime—, y no en la fila ni en el histórico de ejecuciones.
+    ///
+    /// El vínculo está sembrado en la base y la instantánea en el repositorio, así que los dos
+    /// desenlaces se afirman sobre el mismo motor: la que está dice que sí y una bien formada que no
+    /// existe dice que no. Con la lista de identificadores en la mano y la fila apuntando al
+    /// repositorio, lo que se descarta es un «sí» por haber visto cualquier cosa.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tiene_la_instantanea_resuelve_contra_el_repositorio() {
+        let aparato = Aparato::nuevo().await;
+        let siembra = sembrar_snapshots(
+            &aparato.destino,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let sembrada = siembra.identificadores[0].clone();
+        let motor = aparato.motor_con(abridor_local);
+
+        let acceso = aparato.acceso_de(&aparato.repositorio).await;
+
+        assert!(
+            motor
+                .tiene_la_instantanea(acceso, &sembrada)
+                .await
+                .expect("el repositorio sembrado se deja preguntar"),
+            "la instantánea `{sembrada}` está en el repositorio de la fila y la comprobación dijo \
+             que no: el `404` de la restauración se lo llevaría una copia que sí está"
+        );
+
+        assert!(
+            !motor
+                .tiene_la_instantanea(
+                    aparato.acceso_de(&aparato.repositorio).await,
+                    &"f".repeat(64)
+                )
+                .await
+                .expect("preguntar por una que no está no es un fallo del repositorio"),
+            "una instantánea bien formada que no está en el repositorio tiene que dar `false`, y \
+             dio `true`: la restauración prometería un trabajo contra una copia ausente"
+        );
+    }
+
+    /// **Un repositorio que no se puede abrir no se confunde con una instantánea que no está.**
+    ///
+    /// La distinción es la del código HTTP: el repositorio que no responde es un `502` y la copia
+    /// ausente un `404`, así que un «no está» inventado por un destino caído mandaría al operador a
+    /// buscar una copia que quizá esté. Se mide con el abridor que falla siempre: el desenlace tiene
+    /// que ser un error del motor con la causa de dentro, no un `Ok(false)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolver_una_instantanea_con_un_repositorio_que_no_abre_es_un_error() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let desenlace = motor
+            .tiene_la_instantanea(
+                aparato.acceso_de(&aparato.repositorio).await,
+                &"f".repeat(64),
+            )
+            .await;
+
+        assert!(
+            matches!(desenlace, Err(ErrorDelMotor::Repositorio { .. })),
+            "un repositorio que no se puede abrir no puede leerse como «esa instantánea no está»: \
+             {desenlace:?}"
+        );
+    }
+
+    /// **La restauración que no llega a término publica su aviso de cierre como `fallida`.**
+    ///
+    /// Es el hallazgo de auditoría que se perdía: publicando el cierre **dentro** del trabajo —en el
+    /// hilo de bloqueo—, un pánico de la biblioteca se convierte en un `JoinError` y el cierre no
+    /// llega a ejecutarse, así que no se publicaba nada y el panel se quedaba en «restaurando» para
+    /// siempre. El instrumento es el abridor que entra en pánico a propósito: no abre nada de verdad
+    /// y el hilo se cae, que es exactamente el desenlace que el cierre tiene que contar.
+    ///
+    /// Se afirman las **dos** fases y en orden: `restaurando` sale antes de tocar el repositorio
+    /// —contrato del primer fotograma— y `fallida` sale al final, que es lo que esta corrección
+    /// añade. Y los cuatro contadores siguen a cero en los dos: el aviso describe el empezó/terminó,
+    /// no un avance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_restauracion_que_se_cae_publica_el_cierre_como_fallida() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_panica);
+        let mut receptor = motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        let execution_id = Uuid::new_v4();
+        let instantanea = "f".repeat(64);
+
+        let desenlace = motor
+            .restaurar(
+                aparato.acceso_de(&aparato.repositorio).await,
+                instantanea.clone(),
+                aparato.destino.to_string_lossy().into_owned(),
+                execution_id,
+            )
+            .await;
+
+        assert!(
+            matches!(desenlace, Err(ErrorDelMotor::TrabajoInterrumpido { .. })),
+            "el pánico del hilo de trabajo tiene que llegar con nombre propio y no como un fallo \
+             del repositorio: {desenlace:?}"
+        );
+
+        let avisos = recoger_restauraciones(&mut receptor);
+
+        assert_eq!(
+            avisos
+                .iter()
+                .map(|aviso| aviso.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec![FASE_RESTAURANDO, FASE_FALLIDA],
+            "el aviso de cierre tiene que publicarse aunque el trabajo se caiga, y con la fase \
+             `fallida`: {avisos:?}"
+        );
+
+        for aviso in &avisos {
+            assert_eq!(
+                aviso.execution_id, execution_id,
+                "el aviso no lleva la ejecución de la restauración: {aviso:?}"
+            );
+            assert_eq!(
+                aviso.snapshot_id, instantanea,
+                "el aviso no lleva la instantánea que se restauraba: {aviso:?}"
+            );
+            assert!(
+                [
+                    aviso.files_done,
+                    aviso.files_total,
+                    aviso.bytes_done,
+                    aviso.bytes_total
+                ]
+                .iter()
+                .all(|contador| *contador == 0),
+                "en esta versión los cuatro contadores van a cero: {aviso:?}"
+            );
+        }
+    }
+
+    /// **La restauración que llega a término publica `terminada`, y el `Result` dice lo mismo.**
+    ///
+    /// Es la otra mitad del escenario de cierre, y la que ata el aviso al desenlace: lo que el
+    /// stream publica y lo que devuelve la llamada tienen que contar lo mismo. Se hace contra un
+    /// repositorio **de verdad** —el abridor local del arnés y una instantánea sembrada con la
+    /// biblioteca—, porque restaurar de verdad es lo único que produce un `Ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_restauracion_que_llega_a_termino_publica_terminada() {
+        let aparato = Aparato::nuevo().await;
+        let siembra = sembrar_snapshots(
+            &aparato.destino,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let instantanea = siembra.identificadores[0].clone();
+
+        // El destino de la restauración, retenido: al soltarse se borra, y la restauración sigue
+        // corriendo cuando la prueba ya está leyendo el aviso.
+        let host = directorio_de_prueba();
+        let motor = aparato.motor_con(abridor_local);
+        let mut receptor = motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        let execution_id = Uuid::new_v4();
+
+        let desenlace = motor
+            .restaurar(
+                aparato.acceso_de(&aparato.repositorio).await,
+                instantanea,
+                host.ruta().to_string_lossy().into_owned(),
+                execution_id,
+            )
+            .await;
+
+        assert!(
+            desenlace.is_ok(),
+            "restaurar una instantánea que está en el repositorio no puede fallar: {desenlace:?}"
+        );
+
+        let avisos = recoger_restauraciones(&mut receptor);
+
+        assert_eq!(
+            avisos
+                .iter()
+                .map(|aviso| aviso.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec![FASE_RESTAURANDO, FASE_TERMINADA],
+            "una restauración que llega a término tiene que cerrar con `terminada`: {avisos:?}"
+        );
+    }
+
+    /// **La reserva de un destino es exclusiva por destino, y se suelta al soltarse.**
+    ///
+    /// Es la guarda de la tercera corrección: dos restauraciones sobre el mismo `host_path` no caben
+    /// —escribirían a la vez en el mismo directorio—, y la guarda es **por destino** y no global, así
+    /// que dos targets distintos siguen restaurándose a la vez. Lo segundo se mide en la misma prueba
+    /// porque es lo que descarta una guarda que excluyera de más.
+    ///
+    /// Y lo que se libera al soltar la guarda es lo que hace que un `409` hable de una restauración
+    /// que está corriendo **ahora**: si no se soltara, el destino quedaría reservado para siempre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_reserva_de_un_destino_excluye_la_segunda_y_se_suelta_al_soltarse() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let destino = "/destino/de/la/restauracion";
+        let otro_destino = "/destino/de/otra/restauracion";
+
+        let reserva = motor
+            .reservar_el_destino(destino)
+            .expect("el primer destino está libre");
+
+        assert!(
+            matches!(
+                motor.reservar_el_destino(destino),
+                Err(ErrorDelMotor::RestauracionEnCurso { .. })
+            ),
+            "dos restauraciones sobre el mismo destino no pueden caber a la vez"
+        );
+
+        let otra_reserva = motor
+            .reservar_el_destino(otro_destino)
+            .expect("la guarda es por destino, y otro destino tiene que entrar");
+
+        drop(reserva);
+
+        assert!(
+            motor.reservar_el_destino(destino).is_ok(),
+            "soltar la reserva tiene que dejar el destino libre"
+        );
+
+        drop(otra_reserva);
+    }
+
+    /// **Dos formas de escribir el mismo destino colisionan, y el `Drop` libera la forma anotada.**
+    ///
+    /// Es el menor que encontró la re-auditoría: la guarda es un conjunto de claves de texto, así
+    /// que `"/data"` y `"/data/"` —el mismo directorio— **no** coincidían y dos restauraciones podían
+    /// escribir a la vez sobre el mismo sitio. Se mide con un directorio **real** y no con una ruta
+    /// inventada porque la rama buena de la normalización es `canonicalize`, que solo habla de lo
+    /// que existe.
+    ///
+    /// Lo segundo que se afirma es la mitad que no se puede olvidar: el `Drop` tacha la forma
+    /// **normalizada**, que es la que se anotó, y por eso hay que volver a poder reservar el mismo
+    /// directorio escrito **de la otra manera**. Un `Drop` que tachara el texto crudo dejaría la
+    /// clave normalizada dentro para siempre y ese target no volvería a restaurarse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_reserva_normaliza_el_destino_y_dos_formas_del_mismo_directorio_colisionan() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let directorio = directorio_de_prueba();
+        let sin_barra = directorio.ruta().to_string_lossy().into_owned();
+        let con_barra = format!("{sin_barra}/");
+
+        assert_ne!(
+            sin_barra, con_barra,
+            "la prueba necesita dos textos distintos del mismo directorio"
+        );
+
+        let reserva = motor
+            .reservar_el_destino(&sin_barra)
+            .expect("el primer destino está libre");
+
+        assert!(
+            matches!(
+                motor.reservar_el_destino(&con_barra),
+                Err(ErrorDelMotor::RestauracionEnCurso { .. })
+            ),
+            "`{sin_barra}` y `{con_barra}` son el mismo directorio: la segunda reserva no puede \
+             entrar, porque dos restauraciones escribirían a la vez en el mismo sitio"
+        );
+
+        drop(reserva);
+
+        assert!(
+            motor.reservar_el_destino(&con_barra).is_ok(),
+            "soltar la reserva tachó otra clave que la que se anotó: el destino normalizado se \
+             quedó reservado para siempre"
+        );
+    }
+
+    /// **La normalización textual cubre el destino que todavía no existe.**
+    ///
+    /// Es la otra rama de [`normalizar_el_destino`], y la de este caso: la restauración es quien
+    /// crea el directorio, así que en el momento de reservar `canonicalize` falla y lo único que
+    /// queda es recortar las barras finales. Lo que se afirma es que la clave sale de todos modos
+    /// normalizada —las dos formas colisionan— y que la raíz no se confunde con la cadena vacía.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_reserva_normaliza_tambien_un_destino_que_no_existe() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let directorio = directorio_de_prueba();
+        let destino = directorio.ruta().join("todavia-no-existe");
+        let sin_barra = destino.to_string_lossy().into_owned();
+        let con_barra = format!("{sin_barra}/");
+
+        assert!(
+            !destino.exists(),
+            "esta prueba mide la rama de la normalización textual: {sin_barra} no puede existir"
+        );
+
+        let reserva = motor
+            .reservar_el_destino(&sin_barra)
+            .expect("el destino que no existe todavía está libre");
+
+        assert!(
+            matches!(
+                motor.reservar_el_destino(&con_barra),
+                Err(ErrorDelMotor::RestauracionEnCurso { .. })
+            ),
+            "la barra de más tiene que colisionar también cuando el directorio no existe todavía"
+        );
+
+        drop(reserva);
+
+        assert_eq!(
+            normalizar_el_destino("/"),
+            "/",
+            "la raíz recortada no es la cadena vacía: no se puede perder"
+        );
+        assert_eq!(
+            normalizar_el_destino(&format!("{sin_barra}//")),
+            sin_barra,
+            "la rama textual recorta las barras finales sobrantes"
+        );
+    }
+
+    /// **La reserva se suelta aunque el trabajo que la retiene entre en pánico.**
+    ///
+    /// Es la mitad que no se puede dejar al cuidado de nadie: una liberación explícita no se ejecuta
+    /// cuando el futuro que lleva la reserva se desmonta por un pánico —ni por una cancelación—, y
+    /// el destino se quedaría reservado **para siempre**, así que ese target no volvería a
+    /// restaurarse hasta reiniciar el proceso. Se reproduce el reparto que hace el manejador: la
+    /// reserva viaja **dentro** del trabajo y el trabajo entra en pánico a propósito.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_reserva_se_suelta_aunque_el_trabajo_entre_en_panico() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let destino = "/destino/que/se/cae";
+        let reserva = motor
+            .reservar_el_destino(destino)
+            .expect("el destino está libre");
+
+        let del_trabajo = motor.clone();
+        let caido = tokio::spawn(async move {
+            let _reserva = reserva;
+
+            panic!("el trabajo de esta prueba se cae a propósito: la reserva no puede quedarse");
+        })
+        .await;
+
+        assert!(
+            caido.is_err(),
+            "el pánico del trabajo tiene que llegar como un pánico del task"
+        );
+
+        assert!(
+            del_trabajo.reservar_el_destino(destino).is_ok(),
+            "el destino se quedó reservado después de un pánico en el trabajo: ese target no \
+             volvería a restaurarse hasta reiniciar el proceso"
         );
     }
 

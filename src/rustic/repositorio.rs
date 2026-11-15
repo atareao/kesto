@@ -118,8 +118,9 @@ use rustic_backend::opendal::OpenDALBackend;
 use rustic_core::repofile::{SnapshotFile, SnapshotId};
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, Excludes, FileType, IndexedIdsStatus, KeyOptions,
-    LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions, ParentOptions, ReadBackend,
-    Repository, RepositoryBackends, RepositoryOptions, SnapshotOptions, WriteBackend,
+    LocalDestination, LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions, LsOptions,
+    ParentOptions, ReadBackend, Repository, RepositoryBackends, RepositoryOptions, RestoreOptions,
+    SnapshotOptions, WriteBackend,
 };
 use time::OffsetDateTime;
 
@@ -715,6 +716,60 @@ impl Repositorio {
             .collect()
     }
 
+    /// Dice si el repositorio tiene una instantánea con ese identificador, **sin restaurarla**.
+    ///
+    /// Es la lectura que la capa HTTP necesita para contestar `404` de verdad: el manejador puede
+    /// resolver la fila del repositorio y el vínculo de la instantánea con su target sin abrir el
+    /// almacenamiento, así que sin esta pregunta una instantánea que ya no está —una copia que la
+    /// retención purgó, un repositorio recreado en el mismo destino— daría un `200` que promete un
+    /// trabajo que no puede ocurrir, y el fallo solo saldría en el registro.
+    ///
+    /// Resuelve el identificador **igual que la restauración**: lo parsea a [`SnapshotId`] y lo
+    /// busca en el índice de identificadores del repositorio, **en hex completo** —el de
+    /// [`CopiaHecha::id`] y el del listado—, nunca en la forma corta del `Display`, que son ocho
+    /// caracteres y es un prefijo ambiguo.
+    ///
+    /// # Por qué se pregunta al índice y no por la instantánea suelta
+    ///
+    /// Está medido: `get_snapshots` con un identificador que no está **no** devuelve una lista
+    /// vacía, falla —la biblioteca intenta leer el fichero de esa instantánea y el backend contesta
+    /// «no such file or directory»—, así que por ahí un «no está» y un repositorio roto se ven
+    /// igual. El índice de identificadores, en cambio, es la lectura que el listado ya hace
+    /// ([`Repositorio::listar_snapshots`]) y contesta sin tocar ninguno de los ficheros: enumera, y
+    /// estar o no estar es una comparación.
+    ///
+    /// Un identificador que no llega a ser un hex completo es un `false` y **no** un error: lo que
+    /// se pregunta es si esa instantánea está, y una cadena que no puede ser el identificador de
+    /// ninguna no está. Así el rechazo que ve el operador es el mismo en los dos casos —«esa copia no
+    /// está»— en vez de un error de servidor por una errata en la ruta.
+    ///
+    /// No se lee el índice **completo** —el que trae los tamaños, que es lo que exige
+    /// `prepare_restore`— ni se toca el destino ni el árbol: es una lectura de metadatos. No se puede
+    /// llamar desde dentro de un runtime de Tokio por lo mismo que las demás —la biblioteca
+    /// construye su propio runtime—, y quien la llama es
+    /// [`Motor::tiene_la_instantanea`](crate::engine::Motor::tiene_la_instantanea), que saca el
+    /// trabajo del runtime antes de llegar aquí.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::ListadoFallido`] si el repositorio no se deja leer —el mismo desenlace que
+    /// el listado, porque es la misma lectura de índice—.
+    pub fn tiene_la_instantanea(&self, id: &str) -> Result<bool, Error> {
+        let fallo = |motivo: String| Error::ListadoFallido {
+            destino: self.destino.clone(),
+            motivo,
+        };
+
+        let Ok(buscada) = id.parse::<SnapshotId>() else {
+            return Ok(false);
+        };
+
+        self.repo
+            .list::<SnapshotId>()
+            .map_err(|error| fallo(error.display_log()))
+            .map(|mut presentes| presentes.any(|candidata| candidata == buscada))
+    }
+
     /// Olvida una instantánea: la retira del repositorio por su identificador.
     ///
     /// Es para una copia que **no se ha dado por buena** después de que el archivado ya escribiera
@@ -755,6 +810,120 @@ impl Repositorio {
 
         self.repo
             .delete_snapshots(&[instantanea])
+            .map_err(|error| fallo(error.display_log()))
+    }
+
+    /// Restaura una instantánea completa sobre un directorio del sistema de ficheros.
+    ///
+    /// Es la operación que hace útil una copia: leer del repositorio y dejar los datos otra vez
+    /// donde estaban. Se restaura **la instantánea entera** y no una ruta suya —el panel restaura
+    /// una copia, no un fichero suelto—, así que el nodo de partida es el raíz del árbol de la
+    /// instantánea y el recorrido baja por todo él.
+    ///
+    /// # El índice tiene que ser el completo, y eso es lo que decide la firma
+    ///
+    /// Medido en la biblioteca: preparar un plan de restauración exige saber **cuánto ocupa cada
+    /// trozo** —el plan agrupa los ficheros por el trozo que los contiene para leerlos una vez—, y
+    /// ese tamaño no está en el índice reducido con el que este tipo se abre
+    /// ([`IndexedIdsStatus`]: solo los identificadores, que es lo que basta para archivar y para
+    /// purgar). De ahí que la restauración **consuma** el repositorio: pasar al índice completo es
+    /// una conversión que se lleva el valor, y el repositorio es de un solo uso práctico de todas
+    /// formas —ver el encabezado del módulo—.
+    ///
+    /// El precio está medido y se paga entero: leer el índice completo cuesta una pasada más sobre
+    /// el índice —el reducido ya se leyó al poner en marcha— y retiene en memoria el tamaño y la
+    /// situación de cada trozo. Es lo que la biblioteca exige para restaurar, y hacerlo de otra
+    /// forma sería deducir los tamaños de otra fuente.
+    ///
+    /// # El destino se crea, y no se borra nada
+    ///
+    /// El destino es la ruta del `host_path` del target: se **crea** si no está y la restauración
+    /// escribe dentro. Y se restaura con la poda **desactivada** (`delete: false`): lo que hay en el
+    /// destino y no estaba en la instantánea se queda donde está. Es la decisión conservadora, y es
+    /// la única defendible por defecto: `delete: true` borra del host todo lo que la instantánea no
+    /// contenga, y una restauración lanzada por error sobre el directorio equivocado se lleva por
+    /// delante datos que no tienen copia.
+    ///
+    /// En cambio `verify_existing` va **activado**: un fichero que ya está y coincide se compara por
+    /// contenido y no por fecha y tamaño. Lo que cuesta es relectura, y lo que compra es no dar por
+    /// bueno un fichero que cambió sin que la fecha lo delate.
+    ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// Restaurar bloquea el hilo y, con el backend de S3, la biblioteca construye su **propio**
+    /// runtime para hablar con el destino: llamar a esto desde dentro de otro runtime entra en
+    /// **pánico** —medido, literal: «Cannot start a runtime from within a runtime.»—. Quien la llama
+    /// es [`Motor::restaurar`](crate::engine::Motor::restaurar), que saca el trabajo del runtime
+    /// antes de llegar aquí.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::RestauracionFallida`] si el identificador no es un hex completo, si la
+    /// instantánea no está en el repositorio, si el destino no se deja preparar o si la
+    /// restauración no termina.
+    pub fn restaurar_snapshot(self, instantanea: &str, destino_local: &str) -> Result<(), Error> {
+        let Repositorio { repo, destino } = self;
+
+        let fallo = |motivo: String| Error::RestauracionFallida {
+            destino: destino.clone(),
+            instantanea: instantanea.to_owned(),
+            motivo,
+        };
+
+        // El identificador se pasa en **hex completo** —el del listado y el de la respuesta de la
+        // API—, no en la forma corta del `Display` de `SnapshotId`, que son ocho caracteres y es un
+        // prefijo ambiguo.
+        let identificador: SnapshotId = instantanea
+            .parse()
+            .map_err(|error: Box<rustic_core::RusticError>| fallo(error.display_log()))?;
+
+        // El índice completo **lo antes posible**: es el requisito de `prepare_restore` y el único
+        // sitio del recorrido donde se puede pagar, antes de tocar el destino.
+        let repo = repo
+            .to_indexed()
+            .map_err(|error| fallo(error.display_log()))?;
+
+        // La instantánea, por su identificador: es lo que trae el árbol que se va a recorrer.
+        let hex = identificador.to_hex().as_str().to_owned();
+        let mut copias = repo
+            .get_snapshots(&[hex.as_str()])
+            .map_err(|error| fallo(error.display_log()))?;
+
+        let Some(copia) = copias.pop() else {
+            return Err(fallo(format!(
+                "el repositorio no tiene ninguna instantánea con el identificador `{hex}`"
+            )));
+        };
+
+        // El nodo del que cuelga todo el árbol. La ruta vacía no es un atajo: el recorrido de la
+        // biblioteca empieza en un nodo raíz **sintético** —sin nombre y con el árbol de la
+        // instantánea por debajo—, que es justo lo que se pide al restaurar la copia entera.
+        let raiz = repo
+            .node_from_snapshot_and_path(&copia, "")
+            .map_err(|error| fallo(error.display_log()))?;
+
+        // El recorrido, clonable: se consume una vez para preparar el plan y otra para restaurar,
+        // y las dos tienen que ver **los mismos** nodos.
+        let nodos = repo
+            .ls(&raiz, &LsOptions::default())
+            .map_err(|error| fallo(error.display_log()))?;
+
+        // El destino se crea si no está y **no** se espera un fichero suelto: lo que se restaura es
+        // un árbol dentro de un directorio.
+        let destino_local = LocalDestination::new(destino_local, true, false)
+            .map_err(|error| fallo(error.display_log()))?;
+
+        // Las opciones, por sus mutadores y no por literal: el tipo es `#[non_exhaustive]`, así que
+        // desde fuera del crate no se puede construir con una expresión de struct —ni con la
+        // actualización funcional—, y los dos valores por defecto que se cambian son los dos que
+        // están medidos arriba.
+        let opciones = RestoreOptions::default().verify_existing(true);
+
+        let plan = repo
+            .prepare_restore(&opciones, nodos.clone(), &destino_local, false)
+            .map_err(|error| fallo(error.display_log()))?;
+
+        repo.restore(plan, &opciones, nodos, &destino_local)
             .map_err(|error| fallo(error.display_log()))
     }
 }
@@ -2842,6 +3011,73 @@ mod tests {
                 "el fallo de olvidar un identificador inválido no es `OlvidoFallido`: {fallo:?}"
             );
         }
+
+        drop(repositorio);
+    }
+
+    /// **26.** `tiene_la_instantanea` distingue la que está de la que no, **sin restaurar nada**.
+    ///
+    /// Es la lectura que sostiene el `404` de la restauración, y lo que se mide son sus tres
+    /// desenlaces: la instantánea sembrada está, un identificador bien formado que no corresponde a
+    /// ninguna no está, y una cadena que no llega a ser un hex completo tampoco —y **sin** error—,
+    /// porque lo que se pregunta es si esa copia está y una cadena que no puede ser el identificador
+    /// de ninguna no está.
+    ///
+    /// El identificador sembrado se toma en **hex completo** —64 caracteres— y se usa tal cual: es
+    /// el mismo valor que viaja en la URL y en la fila de la ejecución, así que si la comprobación
+    /// exigiera la forma corta del `Display` de `SnapshotId` —ocho caracteres, prefijo ambiguo—
+    /// esta prueba lo diría.
+    ///
+    /// Se pregunta **una sola vez** por cada desenlace sobre el mismo repositorio ya abierto: abrir
+    /// un repositorio cuesta segundos en la compilación de pruebas —derivar su clave— y este tipo es
+    /// de un solo uso práctico, así que no se reabre para volver a mirar.
+    #[test]
+    fn tiene_la_instantanea_distingue_la_que_esta_de_la_que_no() {
+        let destino = Destino::nuevo();
+        let siembra = sembrar_snapshots(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let sembrada = siembra.identificadores[0].clone();
+
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino sembrado se abre");
+
+        // Bien formado y ausente: 64 caracteres hexadecimales que no son el resumen de nada. Se
+        // afirma antes su forma para que el `false` de abajo no lo pueda dar un identificador mal
+        // formado, que es el otro caso y tiene su propia comprobación.
+        let ausente = "f".repeat(64);
+
+        assert_eq!(
+            sembrada.len(),
+            ausente.len(),
+            "los dos identificadores tienen que tener la misma forma, y el sembrado mide {}",
+            sembrada.len()
+        );
+
+        assert!(
+            repositorio
+                .tiene_la_instantanea(&sembrada)
+                .expect("preguntar por una instantánea con el repositorio abierto no puede fallar"),
+            "la instantánea sembrada está en el repositorio y la comprobación dijo que no: `{sembrada}`"
+        );
+
+        assert!(
+            !repositorio
+                .tiene_la_instantanea(&ausente)
+                .expect("preguntar por una instantánea que no está no es un fallo"),
+            "un identificador bien formado que no es el resumen de ninguna instantánea dice estar: \
+             `{ausente}`"
+        );
+
+        assert!(
+            !repositorio
+                .tiene_la_instantanea("no-es-un-hexadecimal")
+                .expect("una cadena que no puede ser un identificador no es un fallo: no está"),
+            "una cadena que no llega a ser un hex completo no puede ser la de ninguna instantánea"
+        );
 
         drop(repositorio);
     }

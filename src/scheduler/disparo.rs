@@ -194,7 +194,7 @@ mod tests {
     use super::{Decision, decidir};
     use crate::db::DbError;
     use crate::db::entities::{Ejecucion, Estado};
-    use crate::engine::{ErrorDelMotor, EventoDeEjecucion};
+    use crate::engine::{ErrorDelMotor, EventoDeEjecucion, EventoDelMotor};
     use crate::scheduler::pruebas::{Aparato, CRON_DE_CINCO};
 
     /// El plazo, acotado y con nombre, con el que una prueba espera a que una ejecución acabe.
@@ -226,15 +226,19 @@ mod tests {
         }
     }
 
-    /// Vacía el receptor del hub y devuelve los eventos que había.
+    /// Vacía el receptor del hub y devuelve los eventos de ejecución que había.
+    ///
+    /// El receptor transporta [`EventoDelMotor`], y estas pruebas solo miden el progreso de una
+    /// copia: los avisos de restauración se saltan.
     fn recoger(
-        receptor: &mut tokio::sync::broadcast::Receiver<EventoDeEjecucion>,
+        receptor: &mut tokio::sync::broadcast::Receiver<EventoDelMotor>,
     ) -> Vec<EventoDeEjecucion> {
         let mut eventos = Vec::new();
 
         loop {
             match receptor.try_recv() {
-                Ok(evento) => eventos.push(evento),
+                Ok(EventoDelMotor::Ejecucion(evento)) => eventos.push(evento),
+                Ok(EventoDelMotor::Restauracion(_)) => continue,
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
                 // Un cliente que se pierde eventos no se corta: sigue leyendo. Aquí no puede pasar
                 // —se lee enseguida y son pocos—, pero el camino se escribe igual.
