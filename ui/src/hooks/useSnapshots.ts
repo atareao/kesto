@@ -26,6 +26,11 @@ export function useSnapshots(repositoryId: string | null | undefined) {
 export interface RestauracionPedida {
   repositoryId: string
   snapshotId: string
+  /**
+   * Confirma la sobrescritura de un target de base de datos; se omite para un
+   * `directory`. Lo decide la confirmación de la pantalla, no el hook.
+   */
+  sobrescribir?: boolean
   /** Permite cancelar la petición si la pantalla se desmonta. */
   signal?: AbortSignal
 }
@@ -40,7 +45,7 @@ export interface RestauracionPedida {
  */
 export function useRestaurarSnapshot() {
   return useMutation({
-    mutationFn: ({ repositoryId, snapshotId, signal }: RestauracionPedida) =>
-      restaurarSnapshot({ repositoryId, snapshotId, signal }),
+    mutationFn: ({ repositoryId, snapshotId, sobrescribir, signal }: RestauracionPedida) =>
+      restaurarSnapshot({ repositoryId, snapshotId, sobrescribir, signal }),
   })
 }

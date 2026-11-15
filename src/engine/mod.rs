@@ -55,8 +55,10 @@ mod cola;
 mod ejecucion;
 pub mod extraccion;
 mod hub;
+pub mod restauracion;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -67,18 +69,22 @@ use uuid::Uuid;
 
 use crate::db::DbError;
 use crate::db::entities::{
-    AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, Repositorios, Tareas, Targets,
+    AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, ObjetivoDeRestauracion, Repositorios,
+    Restauraciones, Tareas, Targets,
 };
-use crate::docker::Cliente;
+use crate::docker::{Cliente, Orden};
 use crate::rustic::{Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
 
 use cola::Cola;
 pub use hub::{CAPACIDAD_DEL_HUB, EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor, Hub};
 
+use extraccion::recortar;
 pub use extraccion::{
     CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, Objetivo, Resultado, Ruta, ruta,
     volcar,
 };
+pub use restauracion::{CaminoDeRestauracion, ErrorDeRestauracion, comando};
+use restauracion::{EscritorDelVolcado, TunelDeRestauracion, tunel_de_restauracion};
 
 // Las dos constantes del puente, que el motor pasa a las dos esperas del volcado. Son las
 // **mismas** para el transporte y para el lector del canal —es la misma pregunta vista desde dos
@@ -175,11 +181,11 @@ impl std::fmt::Debug for Ajustes {
     }
 }
 
-/// Las cuatro capas de acceso que el motor usa.
+/// Las cinco capas de acceso que el motor usa.
 ///
 /// Existe para que el motor **no** tenga que nombrar [`crate::state::EstadoDeBase`]: `src/engine`
 /// no importa `src/state`, y así el día que el `AppState` lleve el motor no hay un ciclo de
-/// módulos. Quien lo construye es el arranque, con las cuatro capas del estado, y eso son cuatro
+/// módulos. Quien lo construye es el arranque, con las capas del estado, y eso son unas pocas
 /// líneas.
 ///
 /// Van tras un [`Arc`] por lo mismo que en el resto del programa: el motor se clona y las capas no
@@ -194,11 +200,17 @@ pub struct Dependencias {
     pub tareas: Arc<Tareas>,
     /// La capa de acceso de `job_executions`.
     pub ejecuciones: Arc<Ejecuciones>,
+    /// La capa de acceso de `restore_executions`.
+    ///
+    /// Es la quinta y no la cuarta que había: la restauración de una base necesita anotar su ciclo
+    /// de vida —de `running` a `success` o `failed`— en la fila que el manejador dejó en `pending`,
+    /// y esa fila es de esta capa y de ninguna otra.
+    pub restauraciones: Arc<Restauraciones>,
 }
 
 impl std::fmt::Debug for Dependencias {
-    /// No publica nada de dentro: las cuatro capas llevan el pool y la clave de cifrado, y lo que
-    /// un diagnóstico necesita saber es que están, no cómo son por dentro.
+    /// No publica nada de dentro: las capas llevan el pool y la clave de cifrado, y lo que un
+    /// diagnóstico necesita saber es que están, no cómo son por dentro.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dependencias").finish_non_exhaustive()
     }
@@ -365,6 +377,26 @@ pub enum ErrorDelMotor {
         causa: crate::rustic::Error,
         /// El mismo fallo, ya recortado y sin credenciales, para contarlo: la red de secretos
         /// quita los **valores** de las claves, no lo que el texto diga de una ruta del host.
+        motivo: String,
+    },
+
+    /// La restauración **del contenedor** falló: la orden del cliente de la base salió con un
+    /// código distinto de cero, o el transporte no llegó a darla. **Corresponde a un `500`**.
+    ///
+    /// Es el desenlace que se guarda en `restore_executions.error_message` y no llega a ninguna
+    /// respuesta: la restauración corre en segundo plano, así que quien lee este error es el
+    /// registro y la fila del §3. El [`motivo`](Self::Restauracion::motivo) viene de
+    /// [`crate::engine::restauracion::ejecutar_las_ordenes`], que ya lo pasó por la red de
+    /// credenciales —el `stderr` del cliente de la base— y lo recortó.
+    ///
+    /// Lo que lo separa de [`Repositorio`](Self::Repositorio) es de qué lado falló: aquí el
+    /// repositorio entregó el volcado y el que no lo aceptó fue el contenedor, y por eso el motivo
+    /// nombra la orden y el contenedor. Cuando el que falla es el repositorio, el motivo del
+    /// transporte llega con el suyo dentro —ver [`crate::docker::Error::EntradaNoEntregada`]— y el
+    /// desenlace sigue siendo éste, porque el trabajo que lo pidió es el de la restauración.
+    #[error("{motivo}")]
+    Restauracion {
+        /// Qué dijo el contenedor o el transporte, ya depurado y recortado.
         motivo: String,
     },
 
@@ -832,12 +864,40 @@ impl Motor {
         .await
     }
 
-    /// Restaura `instantanea` en `destino_local`, **fuera del runtime de Tokio**.
+    /// Restaura `instantanea` sobre el `objetivo`, eligiendo el camino por su **tipo**.
     ///
     /// Es la operación que cierra las tres que la capa HTTP necesita y la única que **escribe**:
-    /// abre el repositorio con el abridor inyectado y le pide que restaure la instantánea en el
-    /// destino. El [`Repositorio`] se **consume** en la llamada —restaurar lo deja en un estado
-    /// intermedio, no reutilizable—, así que no se suelta a mano ni se guarda para nada más.
+    /// abre el repositorio con el abridor inyectado y lleva el volcado a su sitio —al
+    /// `host_path` de un directorio, con el origen local de la biblioteca, o al contenedor de una
+    /// base, por el `stdin` del `exec`—. El [`Repositorio`] se **consume** en la llamada
+    /// —restaurar lo deja en un estado intermedio, no reutilizable—, así que no se suelta a mano ni
+    /// se guarda para nada más.
+    ///
+    /// # La rama la decide el tipo, y solo por el tipo
+    ///
+    /// [`restauracion::comando`] traduce el objetivo a un [`CaminoDeRestauracion`] y es la **única**
+    /// boca que decide: un `directory` sale por [`CaminoDeRestauracion::PorDirectorio`] y una base
+    /// —`mariadb`, `postgresql` o `sqlite`— por [`CaminoDeRestauracion::PorContenedor`]. Aquí no
+    /// hay ninguna segunda comprobación del tipo, y no por descuido: dos decisiones sobre lo mismo
+    /// son dos sitios que pueden separarse, y el día que se añada un tipo el `match` del módulo de
+    /// la restauración avisa mientras que una comprobación suelta no.
+    ///
+    /// # El ciclo de vida de la fila lo escribe este método
+    ///
+    /// Al empezar, la fila —que dejó en `pending` quien lanzó la restauración— pasa a `running`; al
+    /// terminar pasa a `success` con `finished_at`, o a `failed` con `error_message` y
+    /// `finished_at`. La escritura final se **intenta también** cuando el trabajo falla: es lo que
+    /// hace que un fallo no se quede en `running` mintiendo en el histórico **mientras la escritura
+    /// llegue**. El límite está escrito donde toca, en
+    /// [`cerrar_la_restauracion`](Self::cerrar_la_restauracion): lo que estas dos funciones ignoran
+    /// —con su aviso, y sin detener el trabajo— es una fila que no está y una lectura que falle;
+    /// una **escritura** que falle se registra igual y deja la fila como estaba, así que la garantía
+    /// es que el desenlace se intenta, no que llega.
+    ///
+    /// Si no hay fila con ese identificador, el trabajo **sigue igual** y solo se registra el aviso:
+    /// quien lanza una restauración la crea antes de contestar, así que su ausencia es un fallo de
+    /// otro, y dejar la restauración a medias por una contabilidad que no existe sería peor que el
+    /// aviso.
     ///
     /// # Por qué el primer aviso se publica **antes** de tocar el repositorio
     ///
@@ -845,9 +905,9 @@ impl Motor {
     /// **primer** evento que ve un cliente que acaba de suscribirse: si el aviso de arranque se
     /// publicara al terminar, el primer fotograma llegaría cuando ya no hay nada que pintar y el
     /// panel no tendría forma de saber que la restauración empezó. Por eso ese aviso sale aquí, en
-    /// el **cuerpo asíncrono**, antes de programar el trabajo de disco: así no depende de cuándo el
-    /// conjunto de bloqueo decida despachar el cierre y llega en cuanto el manejador cede el
-    /// control, que es lo antes que se puede.
+    /// el **cuerpo asíncrono**, antes de programar el trabajo: así no depende de cuándo el conjunto
+    /// de bloqueo decida despachar el cierre y llega en cuanto el manejador cede el control, que es
+    /// lo antes que se puede.
     ///
     /// # Por qué el aviso de cierre también vive aquí, y no dentro del trabajo
     ///
@@ -860,6 +920,16 @@ impl Motor {
     /// aquello terminó. Aquí, en cambio, un solo camino cubre los tres desenlaces que existen:
     /// éxito, error y desmontaje del hilo de trabajo.
     ///
+    /// # Hasta dónde llega ese «un solo camino»
+    ///
+    /// Cubre el pánico del **hilo de trabajo**, que llega como [`JoinError`] por el `.await` y es un
+    /// desenlace más. **No** cubre un pánico del propio cuerpo asíncrono de este método —ni el de la
+    /// espera del `.await`—: ahí el cuerpo se deshace antes de llegar a publicar, y no hay desde
+    /// dónde hacerlo. El límite no se puede cerrar sin perder algo: publicar el cierre desde el hilo
+    /// de bloqueo cubriría ese caso y perdería el del pánico del hilo —y con él el de la biblioteca
+    /// entera, que llama a código que este crate no controla y es la que más falla—, así que se
+    /// elige el que más importa y el límite se deja escrito.
+    ///
     /// Los contadores del primer aviso van a `0` —los totales no se conocen hasta que la
     /// biblioteca recorre el árbol, y el contrato del evento no admite un «aún no lo sé» más que
     /// como un cero— y los dos avisos llevan las fases de [`FASE_RESTAURANDO`] y del cierre, que son
@@ -870,34 +940,108 @@ impl Motor {
     /// # Errors
     ///
     /// Las mismas que [`Motor::abrir_repositorio`], más el fallo de la restauración en sí, que
-    /// llega también como [`ErrorDelMotor::Repositorio`]. El aviso de cierre se publica tanto si
-    /// la restauración termina bien (`terminada`) como si falla (`fallida`), y quien pregunta por
-    /// el desenlace lo tiene igualmente en el `Result`.
+    /// llega como [`ErrorDelMotor::Repositorio`] cuando el que no responde es el repositorio y como
+    /// [`ErrorDelMotor::Restauracion`] cuando el que falla es el contenedor. Un objetivo
+    /// incoherente —al que le falta un campo de su tipo— llega también como
+    /// [`ErrorDelMotor::Restauracion`]. El aviso de cierre se publica tanto si la restauración
+    /// termina bien (`terminada`) como si falla (`fallida`), y quien pregunta por el desenlace lo
+    /// tiene igualmente en el `Result`.
     pub async fn restaurar(
         &self,
         acceso: Acceso,
         instantanea: String,
-        destino_local: String,
+        objetivo: ObjetivoDeRestauracion,
         execution_id: Uuid,
     ) -> Result<(), ErrorDelMotor> {
-        let abridor = self.0.contexto.ajustes.abridor;
+        // El camino, **antes** de tocar nada: un objetivo incoherente no llega al punto de anunciar
+        // un arranque que no va a ocurrir. La fila sí se cierra —a `failed`—, porque el trabajo se
+        // tomó y esa es la verdad.
+        let camino = match restauracion::comando(&objetivo) {
+            Ok(camino) => camino,
+            Err(causa) => {
+                let motivo = recortar(&causa.to_string());
+                self.cerrar_la_restauracion(execution_id, Some(&motivo))
+                    .await;
+                return Err(ErrorDelMotor::Restauracion { motivo });
+            }
+        };
+
         let hub = self.0.contexto.hub.clone();
 
-        hub.publicar_restauracion(EventoDeRestauracion {
+        // El aviso de arranque, con los cuatro contadores a cero.
+        hub.publicar_restauracion(evento_de_restauracion(
             execution_id,
-            snapshot_id: instantanea.clone(),
-            phase: FASE_RESTAURANDO.to_owned(),
-            files_done: 0,
-            files_total: 0,
-            bytes_done: 0,
-            bytes_total: 0,
-        });
+            &instantanea,
+            FASE_RESTAURANDO,
+        ));
 
-        // El trabajo se lleva su copia del identificador porque el original lo necesita el aviso de
-        // cierre, que se publica después.
-        let instantanea_del_trabajo = instantanea.clone();
+        // La fila, de `pending` a `running`: a partir de aquí una restauración en curso se ve en el
+        // histórico.
+        self.marcar_en_curso(execution_id).await;
 
-        let desenlace = fuera_del_runtime(move || {
+        let desenlace = match camino {
+            CaminoDeRestauracion::PorDirectorio { ruta } => {
+                self.restaurar_en_el_directorio(acceso, &instantanea, ruta)
+                    .await
+            }
+            CaminoDeRestauracion::PorContenedor {
+                contenedor,
+                ordenes,
+            } => {
+                self.restaurar_en_el_contenedor(acceso, &instantanea, contenedor, ordenes)
+                    .await
+            }
+        };
+
+        // Confirmación de cierre: un cliente que se suscribiera tarde todavía ve el desenlace de la
+        // restauración, tanto si llegó a término como si no —y el `Err` cubre también el pánico del
+        // hilo de trabajo, que llega como `JoinError` por el `.await` y es el desenlace que se
+        // perdería publicando desde dentro—. Lo que este camino **no** cubre es un pánico de este
+        // propio cuerpo asíncrono: se desharía antes de llegar aquí. El límite, entero, en el
+        // rustdoc de arriba.
+        let fase = if desenlace.is_ok() {
+            FASE_TERMINADA
+        } else {
+            FASE_FALLIDA
+        };
+
+        hub.publicar_restauracion(evento_de_restauracion(execution_id, &instantanea, fase));
+
+        // El desenlace, a la fila: `success` con su final, o `failed` con el motivo y su final.
+        self.cerrar_la_restauracion(
+            execution_id,
+            desenlace
+                .as_ref()
+                .err()
+                .map(|causa| recortar(&causa.to_string()))
+                .as_deref(),
+        )
+        .await;
+
+        desenlace
+    }
+
+    /// Restaura la instantánea en un directorio del sistema de ficheros, **fuera del runtime**.
+    ///
+    /// Es la rama de un target `directory`: abre el repositorio con el abridor inyectado y le pide
+    /// que restaure la instantánea en la ruta del host. El trabajo va a un hilo de bloqueo por la
+    /// misma razón de siempre —la biblioteca bloquea y construye su propio runtime— y por eso
+    /// delega en [`fuera_del_runtime`].
+    async fn restaurar_en_el_directorio(
+        &self,
+        acceso: Acceso,
+        instantanea: &str,
+        ruta: PathBuf,
+    ) -> Result<(), ErrorDelMotor> {
+        let abridor = self.0.contexto.ajustes.abridor;
+        let instantanea = instantanea.to_owned();
+
+        // La ruta canónica puede no ser UTF-8 —un nombre de fichero de Linux no tiene por qué
+        // serlo—, y la biblioteca quiere un `&str`: quedarse con la pérdida es preferible a no
+        // poder restaurar. El camino se compone con el mismo `PathBuf` que ya validó `comando`.
+        let destino_local = ruta.to_string_lossy().into_owned();
+
+        fuera_del_runtime(move || {
             let (repositorio, _puesta) =
                 abridor(&acceso, BarrasDelMotor::mudas()).map_err(|causa| {
                     ErrorDelMotor::Repositorio {
@@ -907,34 +1051,199 @@ impl Motor {
                 })?;
 
             repositorio
-                .restaurar_snapshot(&instantanea_del_trabajo, &destino_local)
+                .restaurar_snapshot(&instantanea, &destino_local)
                 .map_err(|causa| ErrorDelMotor::Repositorio {
                     motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
                     causa,
                 })
         })
-        .await;
+        .await
+    }
 
-        // Confirmación de cierre: un cliente que se suscribiera tarde todavía ve el desenlace de la
-        // restauración, tanto si llegó a término como si no —y el `Err` cubre también el pánico del
-        // hilo de trabajo, que es el desenlace que se perdería publicando desde dentro—.
-        let fase = if desenlace.is_ok() {
-            FASE_TERMINADA
-        } else {
-            FASE_FALLIDA
-        };
+    /// Restaura la instantánea en el contenedor del objetivo, por el `stdin` de sus `exec`.
+    ///
+    /// Es la rama de un target de base: el volcado sale del repositorio en un hilo de bloqueo
+    /// —la biblioteca **escribe** con un `Write` bloqueante— y llega al `stdin` del `exec` por el
+    /// puente acotado de [`tunel_de_restauracion`], sin pasar por el disco. Las dos mitades corren a
+    /// la vez: parar el volcado mientras nadie lee llenaría el canal y bloquearía el hilo; parar el
+    /// `exec` mientras nadie escribe lo dejaría esperando un volcado que no llega.
+    ///
+    /// El orden de los dos desenlaces a la hora de decidir el fallo no es indiferente: manda el del
+    /// **contenedor**, porque el `exec` es quien traduce el fallo de la biblioteca cuando el volcado
+    /// no llegó entero —[`crate::docker::Error::EntradaNoEntregada`] lleva dentro el motivo del
+    /// repositorio—, así que dejar ganar al del hilo sería perder el que trae el detalle. Solo si el
+    /// contenedor no falló se mira lo que dijo el hilo, y ese caso es el de un `exec` que salió bien
+    /// sobre un volcado que el repositorio no pudo producir entero.
+    async fn restaurar_en_el_contenedor(
+        &self,
+        acceso: Acceso,
+        instantanea: &str,
+        contenedor: String,
+        ordenes: Vec<Orden>,
+    ) -> Result<(), ErrorDelMotor> {
+        let abridor = self.0.contexto.ajustes.abridor;
+        let socket = self.0.contexto.ajustes.socket_del_motor.clone();
+        let espera = self.0.contexto.ajustes.espera_del_motor;
 
-        hub.publicar_restauracion(EventoDeRestauracion {
-            execution_id,
-            snapshot_id: instantanea,
-            phase: fase.to_owned(),
-            files_done: 0,
-            files_total: 0,
-            bytes_done: 0,
-            bytes_total: 0,
+        // El puente, antes de lanzar nada: es lo que da el `stdin` al `exec` y el `Write` a la
+        // biblioteca. El nombre del volcado es el de la instantánea, que es su única identidad
+        // —dentro del árbol no tiene un nombre conocido—.
+        let TunelDeRestauracion { escritor, lector } =
+            tunel_de_restauracion(instantanea.to_owned(), CAPACIDAD_DEL_CANAL);
+
+        // El volcado, a un hilo de bloqueo: la biblioteca escribe con un `Write` bloqueante y
+        // construye su propio runtime, así que **no** puede correr dentro del de Tokio.
+        let instantanea_del_volcado = instantanea.to_owned();
+        let volcado = tokio::task::spawn_blocking(move || {
+            volcar_el_repositorio(&abridor, &acceso, &instantanea_del_volcado, escritor)
         });
 
-        desenlace
+        // Y el `exec`, aquí, consumiendo ese `stdin`. El cliente se construye por restauración,
+        // como en la extracción: no hay agrupador de conexiones compartido, y a cambio una
+        // restauración no puede dejar al runtime de la aplicación esperando a nada.
+        let desenlace = match Cliente::conectar(&socket, espera) {
+            Ok(cliente) => {
+                restauracion::ejecutar_las_ordenes(
+                    &cliente,
+                    &contenedor,
+                    &ordenes,
+                    lector,
+                    INACTIVIDAD_MAXIMA,
+                )
+                .await
+            }
+            Err(causa) => Err(ErrorDelMotor::Restauracion {
+                motivo: recortar(&causa.to_string()),
+            }),
+        };
+
+        // La unión **después** de decidir: el `lector` ya se consumió —y se soltó— con la llamada
+        // de arriba, así que el hilo no puede quedarse bloqueado escribiendo en un canal sin
+        // lector.
+        let vuelta = match volcado.await {
+            Ok(vuelta) => vuelta,
+            Err(caida) => Err(ErrorDelMotor::TrabajoInterrumpido {
+                motivo: format!("el hilo que volcaba el repositorio no llegó a término: {caida}"),
+            }),
+        };
+
+        // El del contenedor primero; el del repositorio, si el contenedor no falló.
+        desenlace.and(vuelta)
+    }
+
+    /// Pasa la fila de la restauración a `running`.
+    ///
+    /// Si la fila no está o no se pudo leer, el trabajo sigue igual y solo se registra el aviso,
+    /// porque quien lanza una restauración crea la fila antes de contestar y su ausencia es un fallo
+    /// de otro. El `running` que no se pudo **escribir** también se registra y no detiene nada: el
+    /// desenlace se intentará escribir igual, que es lo que el operador necesita. Lo que este método
+    /// **no** promete es que la fila acabe en `running`: si la escritura falla, se queda en
+    /// `pending` y solo el registro lo dice.
+    async fn marcar_en_curso(&self, execution_id: Uuid) {
+        let mut fila = match self
+            .0
+            .contexto
+            .dependencias
+            .restauraciones
+            .leer(&execution_id)
+            .await
+        {
+            Ok(Some(fila)) => fila,
+            Ok(None) => {
+                tracing::warn!(
+                    %execution_id,
+                    "no hay fila de restauración para esta ejecución: no se anota su ciclo de vida"
+                );
+                return;
+            }
+            Err(causa) => {
+                tracing::error!(
+                    %causa, %execution_id,
+                    "no se ha podido leer la fila de la restauración"
+                );
+                return;
+            }
+        };
+
+        fila.status = Estado::Running;
+
+        if let Err(causa) = self
+            .0
+            .contexto
+            .dependencias
+            .restauraciones
+            .actualizar(&fila)
+            .await
+        {
+            tracing::error!(
+                %causa, %execution_id,
+                "no se ha podido pasar la restauración a `running`"
+            );
+        }
+    }
+
+    /// Escribe el desenlace de la restauración en la fila: `success`, o `failed` con su motivo.
+    ///
+    /// `motivo` es `None` cuando la restauración llegó a término y `Some` cuando falló, y es el
+    /// mismo texto que viaja en el error del motor —ya depurado y recortado—, que es lo que el
+    /// operador necesita para saber si fue la contraseña, el binario o el contenedor.
+    ///
+    /// Se lee la fila **otra vez** en vez de escribirla por el identificador: la capa de acceso
+    /// escribe el estado, el motivo y el final, y las columnas que no toca —la instantánea, el
+    /// target, el `started_at`— tienen que seguir ahí. Un `UPDATE` que las reescribiera con lo que
+    /// esta función cree saber sería una segunda fuente de verdad. Si la fila no está —o no se pudo
+    /// leer—, el fallo se registra y se sigue: el trabajo ya terminó y no hay nada que deshacer. Y
+    /// lo mismo vale para la **escritura** del desenlace: si falla, se registra y se sigue —no hay a
+    /// quién devolvérselo, el trabajo ya terminó—, con lo que la fila se queda como estaba, en
+    /// `running`. Ese es el límite de la garantía del ciclo de vida: se cubre que el desenlace se
+    /// **intente** escribir, no que llegue.
+    async fn cerrar_la_restauracion(&self, execution_id: Uuid, motivo: Option<&str>) {
+        let mut fila = match self
+            .0
+            .contexto
+            .dependencias
+            .restauraciones
+            .leer(&execution_id)
+            .await
+        {
+            Ok(Some(fila)) => fila,
+            Ok(None) => {
+                tracing::warn!(
+                    %execution_id,
+                    "no hay fila de restauración que cerrar para esta ejecución"
+                );
+                return;
+            }
+            Err(causa) => {
+                tracing::error!(
+                    %causa, %execution_id,
+                    "no se ha podido leer la fila de la restauración para cerrarla"
+                );
+                return;
+            }
+        };
+
+        fila.status = if motivo.is_some() {
+            Estado::Failed
+        } else {
+            Estado::Success
+        };
+        fila.error_message = motivo.map(str::to_owned);
+        fila.finished_at = Some(OffsetDateTime::now_utc());
+
+        if let Err(causa) = self
+            .0
+            .contexto
+            .dependencias
+            .restauraciones
+            .actualizar(&fila)
+            .await
+        {
+            tracing::error!(
+                %causa, %execution_id,
+                "no se ha podido escribir el desenlace de la restauración"
+            );
+        }
     }
 
     /// Deja de aceptar trabajo, espera lo acotado y une los hilos.
@@ -1102,6 +1411,68 @@ where
     }
 }
 
+/// El aviso de restauración para una fase, con los cuatro contadores a **cero**.
+///
+/// Los contadores van a cero y no se calculan: los totales no se conocen hasta que la biblioteca
+/// recorre el árbol, y el contrato del evento del §5 no admite un «aún no lo sé» más que como un
+/// cero. La fase entra como [`&str`] porque las tres son constantes con nombre —[`FASE_RESTAURANDO`]
+/// y las de cierre— y quien las elige es el cuerpo de [`Motor::restaurar`].
+fn evento_de_restauracion(
+    execution_id: Uuid,
+    instantanea: &str,
+    fase: &str,
+) -> EventoDeRestauracion {
+    EventoDeRestauracion {
+        execution_id,
+        snapshot_id: instantanea.to_owned(),
+        phase: fase.to_owned(),
+        files_done: 0,
+        files_total: 0,
+        bytes_done: 0,
+        bytes_total: 0,
+    }
+}
+
+/// Vuelca la instantánea del repositorio en el puente, **en un hilo de bloqueo**.
+///
+/// Es la mitad productora de la restauración de una base, y la que traduce el desenlace de la
+/// biblioteca al del motor: la apertura del repositorio y el volcado en sí fallan los dos como
+/// [`ErrorDelMotor::Repositorio`], con el motivo de la biblioteca ya depurado.
+///
+/// Lo que **no** se puede olvidar: declarar el final del volcado en el puente. El camino bueno es
+/// [`EscritorDelVolcado::terminar_bien`], que es la señal que distingue un fin legítimo de un canal
+/// cerrado por la muerte del escritor; y el camino malo es [`EscritorDelVolcado::fallar`], que deja
+/// el motivo en la ranura que el lector consulta —sin ella, un volcado a medias llegaría al `stdin`
+/// como un fin de fichero limpio y la restauración parecería buena—.
+fn volcar_el_repositorio(
+    abridor: &AbridorDeRepositorios,
+    acceso: &Acceso,
+    instantanea: &str,
+    mut escritor: EscritorDelVolcado,
+) -> Result<(), ErrorDelMotor> {
+    let (repositorio, _puesta) =
+        abridor(acceso, BarrasDelMotor::mudas()).map_err(|causa| ErrorDelMotor::Repositorio {
+            motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), acceso),
+            causa,
+        })?;
+
+    match repositorio.volcar_a(instantanea, &mut escritor) {
+        Ok(()) => {
+            escritor.terminar_bien();
+            Ok(())
+        }
+        Err(causa) => {
+            let motivo = ejecucion::motivo_de_la_biblioteca(&causa.to_string(), acceso);
+
+            // La ranura **antes** de devolver: el `exec` puede estar leyendo el `stdin` ahora
+            // mismo, y el motivo tiene que estar puesto cuando vea el canal cerrado.
+            escritor.fallar(motivo.clone());
+
+            Err(ErrorDelMotor::Repositorio { motivo, causa })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1112,18 +1483,21 @@ mod tests {
 
     use rustic_core::repofile::SnapshotId;
     use sqlx::SqlitePool;
+    use time::OffsetDateTime;
     use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     use uuid::Uuid;
 
     use super::cola::CAPACIDAD_DE_LA_COLA;
     use super::hub::{EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor};
+    use super::restauracion::destino_del_objetivo;
     use super::{
         Ajustes, Dependencias, ErrorDelMotor, FASE_FALLIDA, FASE_RESTAURANDO, FASE_TERMINADA,
         Motor, ejecucion, normalizar_el_destino,
     };
     use crate::db::entities::{
-        AltaDeRepositorio, AltaDeTarea, AltaDeTarget, Ejecucion, Ejecuciones, Estado, Repositorios,
-        Tareas, Targets, TipoDeTarget,
+        AltaDeRepositorio, AltaDeRestauracion, AltaDeTarea, AltaDeTarget, Ejecucion, Ejecuciones,
+        Estado, ObjetivoDeRestauracion, Repositorios, Restauracion, Restauraciones, Tareas,
+        Targets, TipoDeTarget,
     };
     use crate::rustic::{Acceso, BarrasDelMotor, Error, PuestaEnMarcha, Repositorio};
     use crate::secret::SecretString;
@@ -1473,7 +1847,8 @@ mod tests {
                 repositorios: Arc::new(Repositorios::nuevo(pool.clone(), clave.clone())),
                 targets: Arc::new(Targets::nuevo(pool.clone(), clave.clone())),
                 tareas: Arc::new(Tareas::nuevo(pool.clone())),
-                ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone())),
+                ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
+                restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
             };
 
             let mut aparato = Self {
@@ -1764,6 +2139,34 @@ mod tests {
         async fn fila(&self, id: &Uuid) -> Ejecucion {
             self.dependencias
                 .ejecuciones
+                .leer(id)
+                .await
+                .expect("la lectura no puede fallar")
+                .expect("la fila tiene que seguir ahí")
+        }
+
+        /// Da de alta una fila de `restore_executions` en `pending`, como la deja quien lanza la
+        /// restauración.
+        ///
+        /// Es lo que mide el ciclo de vida: el motor **no** la crea —eso es del manejador, que la
+        /// necesita antes de contestar—, así que las pruebas de la persistencia la crean aquí y
+        /// comprueban que el motor la lleva a `running` y de ahí a su desenlace.
+        async fn alta_de_restauracion(&self, instantanea: &str) -> Restauracion {
+            self.dependencias
+                .restauraciones
+                .alta(AltaDeRestauracion {
+                    snapshot_id: instantanea.to_owned(),
+                    target_id: None,
+                    started_at: OffsetDateTime::now_utc(),
+                })
+                .await
+                .expect("el alta de la restauración no puede fallar")
+        }
+
+        /// La fila de una restauración, leída por la capa de acceso.
+        async fn fila_de_restauracion(&self, id: &Uuid) -> Restauracion {
+            self.dependencias
+                .restauraciones
                 .leer(id)
                 .await
                 .expect("la lectura no puede fallar")
@@ -2557,6 +2960,57 @@ mod tests {
         avisos
     }
 
+    /// Un objetivo de restauración **de directorio**: el más barato de los cuatro tipos.
+    ///
+    /// Lo usan las pruebas que miden el ciclo de vida, la rama y los dos avisos, y existe para no
+    /// repetir los diez campos del tipo en cada una. Los dos identificadores van a `nil`: el motor
+    /// no los usa —el `target_id` y el `job_id` los resuelve quien restaura, no el motor—, y un
+    /// valor inventado sugeriría que hacen falta.
+    fn objetivo_de_directorio(destino: &str) -> ObjetivoDeRestauracion {
+        ObjetivoDeRestauracion {
+            job_id: Uuid::nil(),
+            target_id: Uuid::nil(),
+            target_type: TipoDeTarget::Directory,
+            container_name: None,
+            db_user: None,
+            db_password: None,
+            db_name: None,
+            host_path: Some(destino.to_owned()),
+            db_path: None,
+            target_name: "objetivo-de-prueba".to_owned(),
+        }
+    }
+
+    /// Un objetivo de restauración **de base**: el contenedor y la base que se le digan.
+    ///
+    /// Es el que elige la rama de contenedor —`mariadb`, el más simple, con una sola orden—, y el
+    /// que usan las pruebas de la reserva por destino y de la rama por tipo.
+    fn objetivo_mariadb(contenedor: &str, db_name: Option<&str>) -> ObjetivoDeRestauracion {
+        ObjetivoDeRestauracion {
+            job_id: Uuid::nil(),
+            target_id: Uuid::nil(),
+            target_type: TipoDeTarget::Mariadb,
+            container_name: Some(contenedor.to_owned()),
+            db_user: Some("operador".to_owned()),
+            db_password: None,
+            db_name: db_name.map(str::to_owned),
+            host_path: None,
+            db_path: None,
+            target_name: "objetivo-de-base-de-prueba".to_owned(),
+        }
+    }
+
+    /// Un objetivo de `postgresql` con el contenedor y la base que se le digan.
+    ///
+    /// Sirve para comprobar que la clave de un destino de base **distingue el tipo**: el mismo
+    /// contenedor con la misma base, pero otro servidor, es otro destino.
+    fn objetivo_postgresql(contenedor: &str, db_name: Option<&str>) -> ObjetivoDeRestauracion {
+        ObjetivoDeRestauracion {
+            target_type: TipoDeTarget::Postgresql,
+            ..objetivo_mariadb(contenedor, db_name)
+        }
+    }
+
     /// **14.** `percentage` es **nulo** con un origen sin total y **numérico** con uno que lo
     /// declara, y el evento lleva los siete campos con el `status` de la fila.
     ///
@@ -3224,7 +3678,7 @@ mod tests {
             .restaurar(
                 aparato.acceso_de(&aparato.repositorio).await,
                 instantanea.clone(),
-                aparato.destino.to_string_lossy().into_owned(),
+                objetivo_de_directorio(&aparato.destino.to_string_lossy()),
                 execution_id,
             )
             .await;
@@ -3301,7 +3755,7 @@ mod tests {
             .restaurar(
                 aparato.acceso_de(&aparato.repositorio).await,
                 instantanea,
-                host.ruta().to_string_lossy().into_owned(),
+                objetivo_de_directorio(&host.ruta().to_string_lossy()),
                 execution_id,
             )
             .await;
@@ -3320,6 +3774,244 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![FASE_RESTAURANDO, FASE_TERMINADA],
             "una restauración que llega a término tiene que cerrar con `terminada`: {avisos:?}"
+        );
+    }
+
+    /// **La restauración que llega a término deja su fila en `success` con su `finished_at`.**
+    ///
+    /// Es la mitad buena del ciclo de vida, y la única que se puede medir sin contenedor: un target
+    /// de directorio restaura contra un repositorio **de verdad** —el abridor local del arnés y una
+    /// instantánea sembrada—, así que el `Ok` es real y lo que se lee después es lo que el motor
+    /// escribió en la base. La fila nace en `pending`, como la deja quien lanza la restauración, y lo
+    /// que se afirma es que al final está en `success`, sin motivo de fallo y con su `finished_at`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_restauracion_que_llega_a_termino_deja_la_fila_en_success() {
+        let aparato = Aparato::nuevo().await;
+        let siembra = sembrar_snapshots(
+            &aparato.destino,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let instantanea = siembra.identificadores[0].clone();
+
+        let host = directorio_de_prueba();
+        let motor = aparato.motor_con(abridor_local);
+
+        let fila = aparato.alta_de_restauracion(&instantanea).await;
+        assert_eq!(
+            fila.status,
+            Estado::Pending,
+            "la fila tiene que nacer en `pending`, como la crea quien lanza la restauración"
+        );
+
+        let desenlace = motor
+            .restaurar(
+                aparato.acceso_de(&aparato.repositorio).await,
+                instantanea,
+                objetivo_de_directorio(&host.ruta().to_string_lossy()),
+                fila.id,
+            )
+            .await;
+
+        assert!(
+            desenlace.is_ok(),
+            "una restauración de directorio contra una instantánea sembrada no puede fallar: \
+             {desenlace:?}"
+        );
+
+        let guardada = aparato.fila_de_restauracion(&fila.id).await;
+
+        assert_eq!(
+            guardada.status,
+            Estado::Success,
+            "la restauración llegó a término y su fila no quedó en `success`"
+        );
+        assert!(
+            guardada.error_message.is_none(),
+            "una restauración que llega a término no deja motivo de fallo: {guardada:?}"
+        );
+        assert!(
+            guardada.finished_at.is_some(),
+            "la fila de una restauración terminada tiene que llevar su `finished_at`: {guardada:?}"
+        );
+    }
+
+    /// **La restauración que falla deja su fila en `failed` con el motivo, nunca en `running`.**
+    ///
+    /// Es la mitad que no se puede dejar al cuidado de nadie: una escritura final que solo ocurriera
+    /// por el camino bueno dejaría la fila en `running` **para siempre** y el operador creería que su
+    /// restauración sigue en curso. El instrumento es un abridor que no abre —el repositorio no
+    /// responde—, que es un fallo del camino de directorio y no necesita contenedor; lo que se afirma
+    /// es el estado final, que lleva motivo y que no es `running`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_restauracion_que_falla_deja_la_fila_en_failed_con_su_motivo() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let instantanea = "a".repeat(64);
+        let host = directorio_de_prueba();
+
+        let fila = aparato.alta_de_restauracion(&instantanea).await;
+
+        let desenlace = motor
+            .restaurar(
+                aparato.acceso_de(&aparato.repositorio).await,
+                instantanea,
+                objetivo_de_directorio(&host.ruta().to_string_lossy()),
+                fila.id,
+            )
+            .await;
+
+        assert!(
+            desenlace.is_err(),
+            "un repositorio que no se puede abrir no puede dar una restauración buena"
+        );
+
+        let guardada = aparato.fila_de_restauracion(&fila.id).await;
+
+        assert_eq!(
+            guardada.status,
+            Estado::Failed,
+            "la restauración falló y su fila no quedó en `failed`: quedó en `{:?}`, y una fila en \
+             `running` miente —dice que sigue en curso— para siempre",
+            guardada.status
+        );
+        assert!(
+            guardada.error_message.is_some(),
+            "la fila de una restauración fallida tiene que llevar el motivo: {guardada:?}"
+        );
+        assert!(
+            guardada.finished_at.is_some(),
+            "la fila de una restauración fallida tiene que llevar su `finished_at`: {guardada:?}"
+        );
+    }
+
+    /// **La rama de la restauración la decide el tipo del objetivo, y solo el tipo.**
+    ///
+    /// Las dos mitades, y cada una descarta el error de la otra: un objetivo de **directorio** se
+    /// restaura en el `host_path` —el fichero sembrado aparece ahí— sin pasar por ningún contenedor,
+    /// y un objetivo de **base** no escribe **nada** en el `host_path` —aunque se le ponga uno—,
+    /// porque sale por el contenedor. El primero usa el abridor local y una instantánea sembrada, así
+    /// que su éxito es real; el segundo falla por el contenedor, que es lo que se espera de un socket
+    /// que no existe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_rama_de_la_restauracion_la_decide_el_tipo_del_objetivo() {
+        let aparato = Aparato::nuevo().await;
+        let siembra = sembrar_snapshots(
+            &aparato.destino,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let instantanea = siembra.identificadores[0].clone();
+        let camino_del_volcado = siembra.nodo.clone();
+
+        let motor = aparato.motor_con(abridor_local);
+
+        // 1. Un directorio: el volcado acaba en el host, y no se habla con ningún contenedor.
+        let host = directorio_de_prueba();
+
+        let desenlace = motor
+            .restaurar(
+                aparato.acceso_de(&aparato.repositorio).await,
+                instantanea.clone(),
+                objetivo_de_directorio(&host.ruta().to_string_lossy()),
+                Uuid::new_v4(),
+            )
+            .await;
+
+        assert!(
+            desenlace.is_ok(),
+            "un target de directorio se restaura en el host y no necesita contenedor: {desenlace:?}"
+        );
+        assert!(
+            host.ruta().join(&camino_del_volcado).exists(),
+            "un target de directorio tiene que escribir en su `host_path`, y el fichero sembrado no \
+             está en `{}`",
+            host.ruta().display()
+        );
+
+        // 2. Una base: **no** toca el host, y falla por el contenedor.
+        let host_de_la_base = directorio_de_prueba();
+        let mut objetivo = objetivo_mariadb("contenedor-que-no-existe", None);
+        objetivo.host_path = Some(host_de_la_base.ruta().to_string_lossy().into_owned());
+
+        let desenlace = motor
+            .restaurar(
+                aparato.acceso_de(&aparato.repositorio).await,
+                instantanea,
+                objetivo,
+                Uuid::new_v4(),
+            )
+            .await;
+
+        assert!(
+            matches!(desenlace, Err(ErrorDelMotor::Restauracion { .. })),
+            "un target de base sale por el contenedor: sin uno que exista tiene que fallar como tal \
+             y no como la rama de directorio: {desenlace:?}"
+        );
+        assert!(
+            std::fs::read_dir(host_de_la_base.ruta())
+                .expect("el host de la base tiene que poder listarse")
+                .next()
+                .is_none(),
+            "un target de base no escribe en el sistema de ficheros de Kesto, y `{}` tiene ficheros",
+            host_de_la_base.ruta().display()
+        );
+    }
+
+    /// **Dos restauraciones sobre el mismo destino de base no caben, y destinos distintos sí.**
+    ///
+    /// Es la guarda del §3 extendida a la base: el sujeto de la reserva es el destino —el contenedor
+    /// junto con la base, o el `db_path` de un `sqlite`—, y no la instantánea. Lo que se afirma, en
+    /// una sola prueba, es que la clave que separa dos destinos de base nombra lo que tiene que
+    /// nombrar: el mismo contenedor y la misma base colisionan, un contenedor distinto no, una base
+    /// distinta del mismo contenedor tampoco, y dos tipos de servidor en el mismo contenedor **no**
+    /// son el mismo destino —son dos servidores—.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_reserva_de_un_destino_de_base_excluye_la_segunda_y_admite_otro_destino() {
+        let aparato = Aparato::nuevo().await;
+        let motor = aparato.motor_con(abridor_que_no_abre);
+
+        let mismo_destino = objetivo_mariadb("contenedor-de-prueba", Some("tienda"));
+        let otro_contenedor = objetivo_mariadb("otro-contenedor", Some("tienda"));
+        let otra_base = objetivo_mariadb("contenedor-de-prueba", Some("otra"));
+        let otro_servidor = objetivo_postgresql("contenedor-de-prueba", Some("tienda"));
+
+        let clave = destino_del_objetivo(&mismo_destino)
+            .expect("el objetivo de una base nombra su destino");
+
+        let reserva = motor
+            .reservar_el_destino(&clave)
+            .expect("el primer destino de base está libre");
+
+        assert!(
+            matches!(
+                motor.reservar_el_destino(
+                    &destino_del_objetivo(&mismo_destino).expect("el objetivo nombra su destino")
+                ),
+                Err(ErrorDelMotor::RestauracionEnCurso { .. })
+            ),
+            "dos restauraciones sobre el mismo contenedor y la misma base no pueden caber a la vez"
+        );
+
+        for (nombre, objetivo) in [
+            ("un contenedor distinto", &otro_contenedor),
+            ("otra base del mismo contenedor", &otra_base),
+            ("otro servidor en el mismo contenedor", &otro_servidor),
+        ] {
+            let clave = destino_del_objetivo(objetivo).expect("el objetivo nombra su destino");
+
+            assert!(
+                motor.reservar_el_destino(&clave).is_ok(),
+                "{nombre} tiene que ser un destino distinto y entrar"
+            );
+        }
+
+        drop(reserva);
+
+        assert!(
+            motor.reservar_el_destino(&clave).is_ok(),
+            "soltar la reserva tiene que dejar el destino de base libre"
         );
     }
 

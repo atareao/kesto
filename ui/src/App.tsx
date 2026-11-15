@@ -5,6 +5,7 @@ import Dashboard from './pages/dashboard'
 import Tareas from './pages/tareas'
 import Historico from './pages/historico'
 import Snapshots from './pages/snapshots'
+import Restauraciones from './pages/restauraciones'
 import Ajustes from './pages/ajustes'
 import Sesion from './pages/sesion'
 import NoEncontrada from './pages/noEncontrada'
@@ -27,6 +28,7 @@ export default function App() {
           <Route path="tareas" element={<Tareas />} />
           <Route path="historico" element={<Historico />} />
           <Route path="snapshots" element={<Snapshots />} />
+          <Route path="restauraciones" element={<Restauraciones />} />
           <Route path="ajustes" element={<Ajustes />} />
           <Route path="*" element={<NoEncontrada />} />
         </Route>

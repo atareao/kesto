@@ -65,6 +65,7 @@ const ENTRADAS: ReadonlyArray<{ etiqueta: string; ruta: string }> = [
   { etiqueta: 'Tareas', ruta: '/tareas' },
   { etiqueta: 'Histórico', ruta: '/historico' },
   { etiqueta: 'Snapshots', ruta: '/snapshots' },
+  { etiqueta: 'Restauraciones', ruta: '/restauraciones' },
   { etiqueta: 'Ajustes', ruta: '/ajustes' },
 ]
 
@@ -106,7 +107,7 @@ describe('rutas del panel', () => {
 
     const nav = screen.getByRole('navigation', { name: 'Principal' })
     expect(nav).toBeInTheDocument()
-    // Las cinco pantallas más la de sesión siguen alcanzables.
-    expect(within(nav).getAllByRole('link')).toHaveLength(6)
+    // Las seis pantallas más la de sesión siguen alcanzables.
+    expect(within(nav).getAllByRole('link')).toHaveLength(7)
   })
 })

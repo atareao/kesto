@@ -517,6 +517,7 @@ fn dependencias_del_motor(db: &EstadoDeBase) -> Dependencias {
         targets: db.targets.clone(),
         tareas: db.tareas.clone(),
         ejecuciones: db.ejecuciones.clone(),
+        restauraciones: db.restauraciones.clone(),
     }
 }
 

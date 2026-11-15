@@ -81,7 +81,8 @@ use crate::api::extract::{Json, Query};
 use crate::api::response::ApiResponse;
 use crate::api::targets::texto_del_tipo;
 use crate::api::{contenido, del_motor};
-use crate::db::entities::{ObjetivoDeRestauracion, Repositorio, TipoDeTarget};
+use crate::db::entities::{AltaDeRestauracion, ObjetivoDeRestauracion, Repositorio, TipoDeTarget};
+use crate::engine::restauracion::destino_del_objetivo;
 use crate::error::AppError;
 use crate::rustic::{Acceso, ResumenDeSnapshot};
 use crate::state::AppState;
@@ -152,6 +153,16 @@ pub struct ConsultaDelCable {
 pub struct CuerpoDeLaRestauracion {
     /// El repositorio del que se lee la instantánea.
     pub repository_id: String,
+    /// La confirmación de sobrescritura: obligatoria para un target de base de datos.
+    ///
+    /// Nace en `false` y **no** en `true`: un cuerpo que no la traiga —el de un target de
+    /// directorio, o el de una petición a la que le falta la confirmación— no autoriza a pisar datos
+    /// vivos. Por eso lleva `#[serde(default)]` y no un campo obligatorio: la falta de la
+    /// confirmación no es «un campo mal escrito» sino «una condición previa sin cumplir», y quien la
+    /// decide es la puerta del manejador —que contesta `428`—, no el extractor —que contestaría
+    /// `400`—. `deny_unknown_fields` sigue rechazando cualquier otro campo.
+    #[serde(default)]
+    pub sobrescribir: bool,
 }
 
 /// `GET /api/v1/snapshots?repository_id=<id>` — el explorador de instantáneas del §5.
@@ -293,43 +304,53 @@ pub async fn listado(
 ///   repositorio —si no, el `409` no tendría sentido—, lo que falta es el vínculo con un target, y
 ///   eso no es un recurso ausente sino un conflicto con el estado del sistema: por eso no se
 ///   contesta `404`, que el panel leería como «esa copia no está» cuando sí está.
-/// * **`422` si el target no es un directorio**: aquí el vínculo **sí** existe y la petición es
-///   correcta; lo que no se puede cumplir es la operación para ese tipo de target en esta versión.
-///   Eso no es un conflicto con el estado —`409`— sino una entidad que no se puede procesar por su
-///   tipo, así que el panel distingue «todavía no» de «no se encuentra». El `host_path` es `Option`
-///   porque el §3 solo lo pide en un comentario de columna —«Requerido para tipo `directory`»— y
-///   **ningún `CHECK` de la base lo garantiza**: sus columnas son anulables y su único `CHECK`
-///   restringe el tipo, así que un `directory` sin ruta es una fila que la tabla guarda tan
-///   contenta —lo dice el alta de targets— y que aquí no se puede dar por hecha. Quien la exige es
-///   el borde HTTP: el alta la pide al crear el target y este manejador no la asume al restaurar,
-///   donde un `directory` sin ruta es también un `422` con su propio motivo.
-/// * **`404` si la instantánea no está en el repositorio**: es el otro `404`, y el único que exige
-///   abrir el almacenamiento. El vínculo de la fila dice cuál se copió, no si sigue ahí —una copia
-///   purgada o un repositorio recreado dejan el vínculo intacto y la instantánea ausente—, así que
-///   el `200` no puede ser optimista: sin esta comprobación prometería un trabajo que no puede
-///   ocurrir y el fallo solo se vería en el registro. Se distingue del `404` del repositorio ausente
-///   por el mensaje, para que el operador sepa si lo que falta es el repositorio o la copia.
+/// * **`404` si la instantánea no está en el repositorio**: el único `404` que exige abrir el
+///   almacenamiento. El vínculo de la fila dice cuál se copió, no si sigue ahí —una copia purgada o
+///   un repositorio recreado dejan el vínculo intacto y la instantánea ausente—, así que el `200` no
+///   puede ser optimista: sin esta comprobación prometería un trabajo que no puede ocurrir y el
+///   fallo solo se vería en el registro. Se distingue del `404` del repositorio ausente por el
+///   mensaje, para que el operador sepa si lo que falta es el repositorio o la copia.
+/// * **`422` si un target `directory` no declara su ruta**: aquí el vínculo **sí** existe y la
+///   petición es correcta; lo que no se puede cumplir es la operación por la forma del target. Eso
+///   no es un conflicto con el estado —`409`— sino una entidad que no se puede procesar, y el motivo
+///   **nombra el campo** que falta. El `host_path` es `Option` porque el §3 solo lo pide en un
+///   comentario de columna —«Requerido para tipo `directory`»— y **ningún `CHECK` de la base lo
+///   garantiza**: sus columnas son anulables y su único `CHECK` restringe el tipo, así que un
+///   `directory` sin ruta es una fila que la tabla guarda tan contenta —lo dice el alta de targets—
+///   y que aquí no se puede dar por hecha.
+/// * **`428` si un target de base de datos no trae la confirmación de sobrescritura**: la operación
+///   pisa datos vivos, así que sin `sobrescribir: true` no se lanza nada. El `428 Precondition
+///   Required` y **no** un `400` —la petición está bien formada— ni un `409` —no choca con lo que ya
+///   está pasando— ni un `422` —la operación sí se puede cumplir—: lo que falta es un acto explícito
+///   de quien pregunta, y ése es justo el sentido de la condición previa.
 /// * **`409` si ese destino ya tiene una restauración en vuelo**: dos restauraciones sobre el mismo
-///   `host_path` escribirían a la vez en el mismo directorio del host, así que la segunda se
-///   rechaza antes de lanzarse. El sujeto es el **destino** y no la instantánea: dos instantáneas
-///   distintas del mismo target chocan igual, porque el disco es el mismo. La reserva se suelta
-///   cuando el trabajo acaba —ver [`ReservaDeRestauracion`](crate::engine::ReservaDeRestauracion)—,
-///   de modo que un `409` solo habla de una restauración que está corriendo **ahora**.
+///   destino escribirían a la vez en el mismo sitio, así que la segunda se rechaza antes de lanzarse.
+///   El sujeto es el **destino** y no la instantánea: dos instantáneas distintas del mismo target
+///   chocan igual, porque el disco —o el contenedor— es el mismo. La reserva se suelta cuando el
+///   trabajo acaba —ver [`ReservaDeRestauracion`](crate::engine::ReservaDeRestauracion)—, de modo que
+///   un `409` solo habla de una restauración que está corriendo **ahora**.
 ///
-/// El orden de los rechazos no es gratuito: los tres primeros se deciden sin abrir el
-/// almacenamiento —la fila, el vínculo y el tipo— y solo el cuarto lo abre, así que una petición que
-/// se puede rechazar gratis no paga una apertura. Y la comprobación de la instantánea va antes de
-/// generar el `execution_id`: un `404` **no publica** ningún `restore_progress` ni lanza ninguna
-/// ejecución, y eso es contrato.
+/// # El **orden** de los rechazos es contrato
 ///
-/// # Por qué la restauración va **en segundo plano**
+/// La fila y el vínculo se resuelven sin abrir el almacenamiento, así que los dos primeros rechazos
+/// —`404` del repositorio y `409` del vínculo— se deciden sin pagar una apertura. Después va la
+/// existencia **real** de la copia, que es la que sí la paga, y solo entonces la puerta por tipo
+/// —`422` o `428`—, la reserva del destino y la fila. La comprobación de la instantánea va **antes**
+/// de la puerta de la confirmación a propósito: al revés, el panel pediría confirmar una
+/// sobrescritura sobre una copia que no existe. Y todo lo anterior va **antes** de crear la fila y
+/// lanzar el trabajo: un `404`, un `422` o un `428` **no publican** ningún `restore_progress` ni
+/// lanzan ninguna ejecución, y eso es contrato.
+///
+/// # Por qué la restauración va **en segundo plano**, y por qué la fila va **antes**
 ///
 /// El contrato del §5 es que este endpoint devuelve la **ejecución**, no su resultado: restaurar
 /// abre el repositorio y recorre el árbol escribiendo en el host, y eso puede tardar minutos. Si el
-/// manejador esperara a que terminara, el cliente tendría la respuesta bloqueada todo ese tiempo.
-/// Se lanza en un task propio y el `200` vuelve ya, con el `execution_id` **efímero** que identifica
-/// el trabajo en curso: no se persiste porque no hay tabla de restauraciones ni migración nueva, y
-/// el progreso viaja por el stream SSE, no por la base.
+/// manejador esperara a que terminara, el cliente tendría la respuesta bloqueada todo ese tiempo. Se
+/// lanza en un task propio y el `200` vuelve ya. Pero la fila de `restore_executions` se crea
+/// **antes** del `200` y es la que da el `execution_id`: una restauración existe en el histórico en
+/// `pending` desde antes de contestar, y el motor la pasa a `running` y la cierra con su desenlace
+/// —`success` o `failed` con su motivo—. Un `execution_id` efímero no diría nada después del `200`,
+/// que es lo que la auditoría marcó.
 ///
 /// # Errors
 ///
@@ -337,7 +358,8 @@ pub async fn listado(
 /// [`AppError::NotFound`] para la fila que no está **o** para la instantánea que el repositorio no
 /// tiene, un `409` de [`AppError::Conflict`] si la instantánea no tiene vínculo **o** si ese destino
 /// ya tiene una restauración en vuelo, un `422` de [`AppError::UnprocessableEntity`] si el target no
-/// se puede restaurar en esta versión, y un `500` de [`AppError::Database`] si el vínculo no se
+/// declara lo que su tipo necesita, un `428` de [`AppError::PreconditionRequired`] si un target de
+/// base de datos llega sin la confirmación, y un `500` de [`AppError::Database`] si el vínculo no se
 /// puede resolver. Un fallo al abrir el repositorio para comprobar la instantánea llega como
 /// [`AppError::BadGateway`], que es lo que la traducción del motor da a un destino que no responde.
 pub async fn restaurar(
@@ -372,46 +394,22 @@ pub async fn restaurar(
         ));
     };
 
-    // El vínculo existe y la petición es correcta: lo que no se puede cumplir es la operación para
-    // este tipo de target en esta versión, y esa es la distinción que hace que el panel diga
-    // «todavía no» en vez de «no se encuentra».
-    if objetivo.target_type != TipoDeTarget::Directory {
-        return Err(AppError::UnprocessableEntity(
-            "restaurar targets de base de datos todavía no está soportado en esta versión: solo se \
-             restauran targets de directorio"
-                .to_owned(),
-        ));
-    }
-
-    // El §3 pide la ruta del host para un target de directorio, pero **la base no la garantiza**:
-    // su único `CHECK` restringe `target_type` y `host_path` es anulable, así que un `directory`
-    // sin ruta es una fila que la tabla guarda —lo dice el alta de targets— y aquí no se da por
-    // hecha: sin destino no hay dónde restaurar, y el motivo lo dice. El `Option` se **mueve** y
-    // no se clona porque el tipo ya se comprobó arriba: del objetivo solo quedan los dos campos de
-    // la respuesta.
-    let destino = objetivo.host_path.ok_or_else(|| {
-        AppError::UnprocessableEntity(
-            "el target de la instantánea es de directorio pero no declara su ruta en el host: no \
-             hay dónde restaurarla"
-                .to_owned(),
-        )
-    })?;
-
     // Dos accesos y no uno: el tipo no es `Clone` —lleva los secretos ya descifrados, y clonarlos
     // por comodidad sería repartirlos—, así que la comprobación y el trabajo se llevan cada uno el
     // suyo. Construirlo cuesta leer seis campos de una fila que ya está en memoria.
     let acceso_de_la_comprobacion = acceso_del_repositorio(&fila);
 
-    // El `404` **de verdad**, y el último de los rechazos: la fila y el vínculo se resuelven sin
-    // abrir el almacenamiento, así que hasta aquí no se sabe si la copia sigue existiendo. Una
-    // instantánea que ya no está —una que purgó la retención, un repositorio recreado en el mismo
-    // destino— no se puede restaurar, y decirlo exige preguntárselo al repositorio.
-    // `job_executions.snapshot_id` dice **cuál** se copió, no si sigue ahí: sin esta comprobación el
-    // `200` prometería un trabajo contra una copia ausente y el fallo solo saldría en el registro,
-    // que es lo que la auditoría marcó. Va aquí y no antes para que los rechazos que no cuestan una
-    // apertura se decidan sin pagarla, y **antes** de generar el `execution_id` y lanzar el trabajo:
-    // el escenario del contrato dice que este `404` no publica ningún `restore_progress` ni lanza
-    // ninguna ejecución de restauración.
+    // El `404` **de verdad**: la fila y el vínculo se resuelven sin abrir el almacenamiento, así que
+    // hasta aquí no se sabe si la copia sigue existiendo. Una instantánea que ya no está —una que
+    // purgó la retención, un repositorio recreado en el mismo destino— no se puede restaurar, y
+    // decirlo exige preguntárselo al repositorio. `job_executions.snapshot_id` dice **cuál** se
+    // copió, no si sigue ahí: sin esta comprobación el `200` prometería un trabajo contra una copia
+    // ausente y el fallo solo saldría en el registro, que es lo que la auditoría marcó.
+    //
+    // Va **antes** de la puerta de la confirmación, y el **orden es contrato**: al revés, el panel
+    // pediría confirmar una sobrescritura sobre una copia que no existe y el operador confirmaría
+    // una operación imposible. Y va antes de crear la fila y lanzar el trabajo: el escenario del
+    // contrato dice que este `404` no publica ningún `restore_progress` ni lanza ninguna ejecución.
     if !estado
         .motor
         .tiene_la_instantanea(acceso_de_la_comprobacion, &instantanea)
@@ -425,17 +423,77 @@ pub async fn restaurar(
         ));
     }
 
+    // La puerta por **tipo**, ya con la copia confirmada en el almacenamiento y antes de reservar
+    // nada: las dos ramas son rechazos de la petición y ninguna lanza trabajo ni publica aviso.
+    if objetivo.target_type == TipoDeTarget::Directory {
+        // El §3 pide la ruta del host para un target de directorio, pero **la base no la
+        // garantiza**: su único `CHECK` restringe `target_type` y `host_path` es anulable, así que
+        // un `directory` sin ruta es una fila que la tabla guarda —lo dice el alta de targets— y
+        // aquí no se da por hecha: sin destino no hay dónde restaurar. El motivo **nombra el campo**
+        // que falta, que es lo único que permite arreglarlo sin leer el código, y el blanco cuenta
+        // como falta —una ruta de espacios no nombra ningún sitio—.
+        if objetivo
+            .host_path
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            return Err(AppError::UnprocessableEntity(
+                "el target de la instantánea es de directorio pero le falta `host_path`: sin la \
+                 ruta del host no hay dónde restaurarla"
+                    .to_owned(),
+            ));
+        }
+    } else if !cuerpo.sobrescribir {
+        // Un target de base de datos pisa datos vivos: sin la confirmación explícita no se lanza el
+        // trabajo. El `428` y **no** un `400` —la petición está bien formada— ni un `422` —la
+        // operación sí se puede cumplir—: lo que falta es que quien pregunta confirme, y el panel
+        // tiene que poder distinguir «confirma esto» de «ese target está mal».
+        return Err(AppError::PreconditionRequired(
+            "restaurar un target de base de datos sobrescribe datos vivos: confirma la \
+             sobrescritura con `sobrescribir: true`"
+                .to_owned(),
+        ));
+    }
+
+    // El **destino** de la guarda de exclusión, que depende del tipo: la ruta del host en un
+    // directorio y la clave del contenedor y la base en un target de base. Se resuelve aquí —y no
+    // con un `host_path` suelto— porque una base se protege por su contenedor: el mismo contenedor
+    // puede alojar dos servidores distintos, y los dos no pueden escribir a la vez. Su incoherencia
+    // —un campo que el tipo necesita y no está— se rechaza con el mismo `422` que el resto de lo que
+    // no se puede procesar por su forma.
+    let destino = destino_del_objetivo(&objetivo)
+        .map_err(|causa| AppError::UnprocessableEntity(causa.to_string()))?;
+
     // La guarda de exclusión por **destino**, antes de responder: dos restauraciones sobre el mismo
-    // `host_path` escribirían a la vez en el mismo directorio del host. La reserva viaja con el
-    // trabajo —ver `ReservaDeRestauracion`— y se suelta cuando el trabajo acabe, sea como sea.
+    // destino escribirían a la vez en el mismo sitio. La reserva viaja con el trabajo —ver
+    // `ReservaDeRestauracion`— y se suelta cuando el trabajo acabe, sea como sea.
     let reserva = estado
         .motor
         .reservar_el_destino(&destino)
         .map_err(del_motor)?;
 
-    // Efímero: identifica el trabajo en curso para el stream SSE y no se persiste —no hay tabla de
-    // restauraciones ni migración nueva—.
-    let execution_id = Uuid::new_v4();
+    // Los dos campos que la respuesta publica, antes de mover el objetivo a la tarea.
+    let target_id = objetivo.target_id;
+    let target_name = objetivo.target_name.clone();
+
+    // La fila **antes** del `200`, y su identificador es el `execution_id`: una restauración existe
+    // en el histórico **en `pending`** desde antes de contestar, y el ciclo de vida —`running` y su
+    // desenlace— lo escribe el motor sobre esta misma fila. Un `execution_id` efímero no diría nada
+    // después del `200` —ni si acabó, ni cuándo, ni sobre qué—, que es lo que la auditoría marcó. La
+    // fecha la pone aquí el manejador porque la columna es `NOT NULL` y sin valor por defecto.
+    let restauracion = estado
+        .db
+        .restauraciones
+        .alta(AltaDeRestauracion {
+            snapshot_id: instantanea.clone(),
+            target_id: Some(target_id),
+            started_at: OffsetDateTime::now_utc(),
+        })
+        .await?;
+
+    let execution_id = restauracion.id;
 
     // La restauración va **en segundo plano** para que el `200` vuelva ya: el contrato devuelve la
     // ejecución, no su resultado. El fallo no puede viajar al cliente —ya tiene su respuesta—, así
@@ -452,7 +510,7 @@ pub async fn restaurar(
         let _reserva = reserva;
 
         if let Err(error) = motor
-            .restaurar(acceso, instantanea_tarea, destino, execution_id)
+            .restaurar(acceso, instantanea_tarea, objetivo, execution_id)
             .await
         {
             tracing::error!(%error, "la restauración en segundo plano falló");
@@ -462,8 +520,8 @@ pub async fn restaurar(
     let vista = RestauracionDelCable {
         execution_id: execution_id.to_string(),
         snapshot_id: instantanea,
-        target_id: objetivo.target_id.to_string(),
-        target_name: objetivo.target_name,
+        target_id: target_id.to_string(),
+        target_name,
     };
 
     Ok(ApiResponse::new(
@@ -483,7 +541,7 @@ pub async fn restaurar(
 /// estilo.
 #[derive(Debug, Serialize)]
 struct RestauracionDelCable {
-    /// La ejecución **efímera** en la que corre la restauración; no se persiste.
+    /// La ejecución de la restauración, que **es** la fila persistida en `restore_executions`.
     execution_id: String,
     /// La instantánea que se está restaurando.
     snapshot_id: String,
@@ -1633,10 +1691,11 @@ mod tests {
         tipo: TipoDeTarget,
         host_path: Option<String>,
     ) -> (Uuid, Uuid) {
-        let target = estado
-            .db
-            .targets
-            .alta(AltaDeTarget {
+        sembrar_cadena_con_target(
+            estado,
+            repositorio,
+            instantanea,
+            AltaDeTarget {
                 name: "target-de-la-restauracion".to_owned(),
                 target_type: tipo,
                 container_name: None,
@@ -1645,7 +1704,29 @@ mod tests {
                 db_name: None,
                 host_path,
                 db_path: None,
-            })
+            },
+        )
+        .await
+    }
+
+    /// Lo mismo que [`sembrar_cadena`], pero con la fila del target **entera** a cargo de quien
+    /// llama.
+    ///
+    /// Existe porque un target de base no se siembra con los cuatro campos del de directorio: su
+    /// restauración necesita el contenedor, el usuario y la base, y el comando inverso los exige.
+    /// Se pasa un [`AltaDeTarget`] y no nueve parámetros sueltos para que el llamante declare
+    /// exactamente lo que la tabla guarda, sin que este ayudante tenga que tener una opinión sobre
+    /// cuáles son los campos de cada tipo.
+    async fn sembrar_cadena_con_target(
+        estado: &AppState,
+        repositorio: Uuid,
+        instantanea: &str,
+        target: AltaDeTarget,
+    ) -> (Uuid, Uuid) {
+        let target = estado
+            .db
+            .targets
+            .alta(target)
             .await
             .expect("el target de la restauración se da de alta");
 
@@ -1704,6 +1785,19 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
             }
         }
+    }
+
+    /// Cuántas filas tiene `restore_executions`, con **SQL directo**.
+    ///
+    /// Se cuenta contra la tabla y no con la capa de acceso: lo que estas pruebas afirman cuando
+    /// dicen «no se creó nada» es qué quedó **escrito**, y un recuento que pasara por la misma capa
+    /// que se está probando podría contar otra cosa. Es el mismo patrón que el recuento del módulo
+    /// de la entidad.
+    async fn restauraciones_persistidas(estado: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM restore_executions")
+            .fetch_one(&estado.db.pool)
+            .await
+            .expect("el recuento de `restore_executions` debe poder leerse")
     }
 
     /// Busca, recursivamente bajo `raiz`, un fichero cuyo contenido sea **exactamente** `contenido`.
@@ -1899,14 +1993,24 @@ mod tests {
         );
     }
 
-    /// 1.41 — Una instantánea de un target de base de datos contesta `422`.
+    /// 1.41 — Un target de base **sin** la confirmación contesta `428`, y no lanza nada.
     ///
-    /// Cubre `api-resources`, escenario «Target no restaurable». El `422` y no un `409`: el
-    /// vínculo **existe** y la petición es correcta, lo que no se puede cumplir es la operación
-    /// para ese tipo de target en esta versión, y esa es exactamente la distinción que el código
-    /// tiene que hacer para que el panel pueda decir «todavía no» en vez de «no se encuentra».
+    /// Cubre `api-resources`, escenario «Restaurar un target de base sin confirmación». El `428` y
+    /// no un `422`: el vínculo existe, la petición está bien formada y lo que falta es una
+    /// **condición previa** —que quien pide confirme que se pueden pisar los datos vivos—, que es
+    /// exactamente lo que un `Precondition Required` significa. El `422` queda para lo que no se
+    /// puede procesar por su forma —un `directory` sin `host_path`—, y el panel tiene que poder
+    /// distinguir «confirma esto» de «ese target está mal».
+    ///
+    /// La instantánea se siembra **de verdad** —la escribe la biblioteca— para que la puerta se
+    /// decida en su sitio del orden: la comprobación del almacenamiento va antes, así que con una
+    /// copia ausente el desenlace sería el `404` de la prueba siguiente y no este `428`.
+    ///
+    /// Y se afirma que **no se lanzó nada** por partida doble: `restore_executions` sigue vacía y
+    /// por el hub no ha salido ningún `restore_progress`. Un `428` que dejara la fila creada sería
+    /// un trabajo que nadie pidió, y el panel lo pintaría como una restauración en curso.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn una_instantanea_de_un_target_de_base_de_datos_contesta_422() {
+    async fn un_target_de_base_sin_confirmacion_contesta_428_sin_lanzar_nada() {
         let (estado, _base) = estado_con_base().await;
         let router = api_router(estado.clone());
 
@@ -1924,14 +2028,28 @@ mod tests {
 
         let instantanea = siembra.identificadores[0].clone();
 
-        sembrar_cadena(
+        sembrar_cadena_con_target(
             &estado,
             repositorio_id,
             &instantanea,
-            TipoDeTarget::Mariadb,
-            None,
+            AltaDeTarget {
+                name: "target-de-base-sin-confirmacion".to_owned(),
+                target_type: TipoDeTarget::Postgresql,
+                container_name: Some("contenedor-de-la-base-de-la-prueba".to_owned()),
+                db_user: Some("kesto".to_owned()),
+                db_password: None,
+                db_name: None,
+                host_path: None,
+                db_path: None,
+            },
         )
         .await;
+
+        let mut receptor = estado
+            .motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
 
         let respuesta = post_json(
             router,
@@ -1946,7 +2064,8 @@ mod tests {
         assert_ne!(
             status,
             StatusCode::NOT_FOUND,
-            "la ruta de la restauración tiene que estar montada: contestó {status} con {cuerpo}"
+            "la ruta de la restauración tiene que estar montada y la instantánea está: contestó \
+             {status} con {cuerpo}"
         );
 
         assert_ne!(
@@ -1956,18 +2075,38 @@ mod tests {
              sistema: contestó {status} con {cuerpo}"
         );
 
-        assert_eq!(
+        assert_ne!(
             status,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "restaurar un target de base de datos no está soportado en esta versión y la API tiene \
-             que contestar 422 explicándolo; contestó {status} con {cuerpo}"
+            "lo que falta es la confirmación, no un campo del target: contestó {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::PRECONDITION_REQUIRED,
+            "un target de base sin `sobrescribir` no se puede restaurar y la API tiene que contestar \
+             428 —y no lanzar nada—: contestó {status} con {cuerpo}"
         );
 
         assert!(
             cuerpo["message"]
                 .as_str()
                 .is_some_and(|motivo| !motivo.is_empty()),
-            "el 422 tiene que explicar la limitación: {cuerpo}"
+            "el 428 tiene que explicar que hace falta confirmar: {cuerpo}"
+        );
+
+        let restauraciones = restauraciones_persistidas(&estado).await;
+
+        assert_eq!(
+            restauraciones, 0,
+            "un 428 no puede dejar la fila de `restore_executions` creada: el trabajo nunca se \
+             lanzó y la fila quedaría en `pending` para siempre"
+        );
+
+        assert!(
+            no_hay_restauraciones_pendientes(&mut receptor),
+            "un 428 no puede publicar ningún `restore_progress`: el panel daría por lanzada una \
+             restauración que no existe"
         );
     }
 
@@ -2134,6 +2273,289 @@ mod tests {
             [StatusCode::OK, StatusCode::CONFLICT],
             "dos restauraciones simultáneas sobre el mismo destino tienen que dejar una lanzada \
              (200) y la otra rechazada (409): contestaron {codigos:?}"
+        );
+    }
+
+    /// 1.42 — Un `directory` sin ruta contesta `422`, y no lanza nada.
+    ///
+    /// Cubre `api-resources`, escenario «Target no restaurable», que es el `422` que **queda** en la
+    /// API después de este change: la limitación por tipo se levanta para las bases, pero un target
+    /// de directorio sin destino sigue siendo una petición que no se puede procesar. El motivo
+    /// **nombra el campo** que falta, que es lo único que permite arreglarlo sin leer el código.
+    ///
+    /// La fila se siembra por la capa de acceso con `host_path: None` y **no** por el alta: el alta
+    /// un `directory` sin ruta lo rechaza con un `400` —lo exige el borde HTTP y tiene su prueba—,
+    /// así que la única forma de tener una fila así es una importación o un `UPDATE` a mano, que es
+    /// justo el caso que el contrato manda cubrir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_target_de_directorio_sin_ruta_contesta_422_nombrando_el_campo() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-42", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let instantanea = siembra.identificadores[0].clone();
+
+        sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &instantanea,
+            TipoDeTarget::Directory,
+            None,
+        )
+        .await;
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{instantanea}/restore"),
+            &serde_json::json!({ "repository_id": repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "un target de directorio sin ruta no se puede restaurar —no hay dónde escribir— y la API \
+             tiene que contestar 422; contestó {status} con {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|motivo| motivo.contains("host_path")),
+            "el 422 tiene que nombrar el campo que falta: {cuerpo}"
+        );
+
+        assert_eq!(
+            restauraciones_persistidas(&estado).await,
+            0,
+            "un 422 no puede dejar fila en `restore_executions`"
+        );
+    }
+
+    /// 1.45 — Una instantánea ausente contesta `404` **aunque** le falte la confirmación.
+    ///
+    /// Es el **orden** de las comprobaciones, y el orden es contrato: la existencia real de la
+    /// copia en el almacenamiento se decide **antes** de la puerta de la confirmación, así que un
+    /// target de base sin `sobrescribir` cuya instantánea ya no está contesta `404` y no `428`. Al
+    /// revés, el panel pediría confirmar una sobrescritura sobre una copia que no existe, y el
+    /// operador confirmaría una operación imposible.
+    ///
+    /// El vínculo se siembra con un identificador **inventado** —bien formado y ausente— para que
+    /// el `409` del vínculo no tape el caso, y el target es de base para que la puerta esté armada:
+    /// si el orden estuviera invertido, esta petición contestaría `428`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_instantanea_ausente_de_un_target_de_base_sin_confirmacion_contesta_404() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-45", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        // Bien formada —64 caracteres hexadecimales— y ausente.
+        let inventada = "e".repeat(64);
+
+        sembrar_cadena_con_target(
+            &estado,
+            repositorio_id,
+            &inventada,
+            AltaDeTarget {
+                name: "target-de-base-sin-instantanea".to_owned(),
+                target_type: TipoDeTarget::Postgresql,
+                container_name: Some("contenedor-de-la-base-de-la-prueba".to_owned()),
+                db_user: Some("kesto".to_owned()),
+                db_password: None,
+                db_name: None,
+                host_path: None,
+                db_path: None,
+            },
+        )
+        .await;
+
+        let mut receptor = estado
+            .motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{inventada}/restore"),
+            &serde_json::json!({ "repository_id": repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_ne!(
+            status,
+            StatusCode::PRECONDITION_REQUIRED,
+            "la existencia de la copia se comprueba antes de la puerta de la confirmación: la API \
+             no puede pedir confirmar una sobrescritura sobre una copia que no está; contestó \
+             {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "una instantánea que el repositorio no tiene contesta 404, con o sin confirmación: \
+             contestó {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            restauraciones_persistidas(&estado).await,
+            0,
+            "un 404 no puede dejar fila en `restore_executions`"
+        );
+
+        assert!(
+            no_hay_restauraciones_pendientes(&mut receptor),
+            "un 404 no puede publicar ningún `restore_progress`"
+        );
+    }
+
+    /// 1.46 — Con la confirmación, el `200` devuelve una ejecución **persistida** en `pending`.
+    ///
+    /// Cubre `api-resources`, escenario «Restaurar un snapshot de un target de base con
+    /// confirmación», y la mitad que la fase anterior dejaba sin cerrar: el `execution_id` ya no es
+    /// efímero —no hay forma de seguir el desenlace de un identificador que nadie guardó—, así que
+    /// lo que se afirma es que **es** una fila de `restore_executions`, con la instantánea y el
+    /// target de la petición.
+    ///
+    /// El estado de la fila se mira con holgura a propósito: el ciclo de vida lo escribe el motor
+    /// en segundo plano —pasa a `running` y la cierra con su desenlace—, así que entre el `200` y
+    /// esta lectura puede haber avanzado. Lo que nace en `pending` lo fija la capa de acceso, que
+    /// tiene su propia prueba; aquí se mide que la fila **existe** y que es la que la respuesta
+    /// anunció. Y no se puede cerrar en `success`: el contenedor del target no existe, así que esta
+    /// restauración está condenada —y eso es lo que hace la prueba barata: no toca ninguna base
+    /// real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restaurar_un_target_de_base_con_confirmacion_persiste_la_ejecucion() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-46", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let instantanea = siembra.identificadores[0].clone();
+
+        let (target, _ejecucion) = sembrar_cadena_con_target(
+            &estado,
+            repositorio_id,
+            &instantanea,
+            AltaDeTarget {
+                name: "target-de-base-con-confirmacion".to_owned(),
+                target_type: TipoDeTarget::Mariadb,
+                container_name: Some("contenedor-de-la-base-de-la-prueba".to_owned()),
+                db_user: Some("kesto".to_owned()),
+                db_password: None,
+                db_name: Some("kesto".to_owned()),
+                host_path: None,
+                db_path: None,
+            },
+        )
+        .await;
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{instantanea}/restore"),
+            &serde_json::json!({ "repository_id": repositorio, "sobrescribir": true }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "con la confirmación, restaurar un target de base tiene que contestar 200; contestó \
+             {status} con {cuerpo}"
+        );
+
+        let execution_id = cuerpo["data"]["execution_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("la respuesta tiene que traer la ejecución: {cuerpo}"));
+
+        let execution_id = Uuid::parse_str(execution_id).unwrap_or_else(|error| {
+            panic!("el `execution_id` tiene que ser un UUID en su forma canónica: {error}")
+        });
+
+        assert_eq!(
+            cuerpo["data"]["snapshot_id"].as_str(),
+            Some(instantanea.as_str()),
+            "la respuesta tiene que identificar la instantánea que se restauró: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["target_id"].as_str(),
+            Some(target.to_string().as_str()),
+            "la respuesta tiene que identificar el target sobre el que se restauró: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["target_name"].as_str(),
+            Some("target-de-base-con-confirmacion"),
+            "la respuesta tiene que poder anunciar el target por su nombre: {cuerpo}"
+        );
+
+        let fila = estado
+            .db
+            .restauraciones
+            .leer(&execution_id)
+            .await
+            .expect("la lectura de la restauración no puede fallar")
+            .unwrap_or_else(|| {
+                panic!(
+                    "el `execution_id` de la respuesta tiene que ser la fila de \
+                     `restore_executions` que se acaba de crear: {cuerpo}"
+                )
+            });
+
+        assert_eq!(
+            fila.snapshot_id, instantanea,
+            "la fila persistida tiene que apuntar a la instantánea de la petición"
+        );
+        assert_eq!(
+            fila.target_id,
+            Some(target),
+            "la fila persistida tiene que apuntar al target de la petición"
+        );
+        assert_ne!(
+            fila.status,
+            Estado::Success,
+            "una restauración contra un contenedor que no existe no puede darse por buena: la fila \
+             quedaría mintiendo en el histórico"
         );
     }
 }

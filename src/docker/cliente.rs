@@ -1,5 +1,6 @@
 //! El cliente del motor de contenedores: la conexión y el `exec` con su salida.
 
+use std::future::Future;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -10,6 +11,7 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 // compila.
 use bollard::models::ExecInspectResponse;
 use futures_util::StreamExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::{Canal, Error, Orden, Trozo};
 
@@ -276,6 +278,319 @@ impl Cliente {
             contenedor: contenedor.to_owned(),
         })
     }
+
+    /// Ejecuta `orden` dentro de `contenedor` alimentando su `stdin` con `lector`, entrega cada
+    /// trozo de su salida a `al_llegar` y devuelve el código de salida del proceso.
+    ///
+    /// Es el camino de la **restauración**: la orden del cliente de la base lee el volcado por su
+    /// entrada estándar (ver [`crate::engine::restauracion`]), y lo que aquí se hace es llevarle
+    /// esos bytes desde un [`AsyncRead`] —que en producción es el puente del repositorio— hasta el
+    /// `stdin` del `exec`. No hay ningún fichero por medio: ni temporal ni compartido.
+    ///
+    /// # Lo que cambia respecto de [`ejecutar`](Self::ejecutar)
+    ///
+    /// Tres cosas, y las tres importan:
+    ///
+    /// 1. el `exec` pide `attach_stdin`, que es lo que hace que la orden tenga entrada estándar
+    ///    conectada a este proceso —[`opciones_con_entrada`] es donde está, y [`Orden`] no cambia—;
+    /// 2. el `stdin` se **cierra** con un `shutdown` **después** del último byte: cerrarlo antes
+    ///    truncaría la restauración —el cliente recibiría un fin de entrada con la orden a medias—
+    ///    y el archivo quedaría incompleto sin que el código de salida lo delate;
+    /// 3. la escritura y el drenaje van **a la vez**, no uno tras otro: serializarlos se bloquea, y
+    ///    no de forma sutil —el proceso espera stdin mientras nadie lee su salida, y el `stdin` no
+    ///    avanza mientras nadie drena su salida—.
+    ///
+    /// # Cuida el cierre: cerrar el `stdin` a destiempo degrada el cierre
+    ///
+    /// Es la trampa medida que ya avisa [`ejecutar`](Self::ejecutar) por el otro lado: escribir en
+    /// un `exec` que no ha pedido `attach_stdin` —o cerrar su entrada antes de tiempo— degrada el
+    /// cierre limpio a un `Connection reset by peer`. Aquí el `stdin` **sí** se pide y **sí** se
+    /// cierra, y solo `shutdown` tras el último byte: es lo que la orden necesita para saber que el
+    /// volcado se acabó.
+    ///
+    /// # El `LogOutput::StdIn` se ignora, y **no** dispara el `debug_assert`
+    ///
+    /// En el camino sin entrada, un `StdIn` significa que alguien pidió `attach_stdin` por error, y
+    /// por eso allí se canda. Aquí se pidió a propósito, así que lo que la biblioteca entregue por
+    /// ese canal —si entrega algo— no es ni una cosa ni la otra: se ignora. Lo que **sí** se
+    /// conserva es el candado del `Console`: el tty sigue sin pedirse, y con tty la separación
+    /// `stdout`/`stderr` se perdería.
+    ///
+    /// # El drenaje acota la inactividad, y el error de la entrada manda
+    ///
+    /// El drenaje lleva el **mismo** plazo de inactividad que el camino sin entrada: se mide entre
+    /// trozos, así que un cliente lento pero que avanza no falla nunca, y uno que se calla sale con
+    /// [`Error::RestauracionEstancada`]. Si las dos mitades fallan, se propaga **el error de la
+    /// entrada**: un volcado que no llegó entero es la causa, y la salida del contenedor es lo que
+    /// pasó después de recibir un fin de entrada a medias.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::EntradaNoEntregada`] si el `lector` falló —el volcado quedó a medias— o si
+    /// el `stdin` rechazó la escritura, [`Error::RestauracionEstancada`] si la salida dejó de
+    /// llegar, y las mismas que [`ejecutar`](Self::ejecutar) para el resto del transporte.
+    pub async fn ejecutar_con_entrada(
+        &self,
+        contenedor: &str,
+        orden: &Orden,
+        inactividad_maxima: Duration,
+        lector: impl AsyncRead + Unpin,
+        mut al_llegar: impl FnMut(Trozo),
+    ) -> Result<i32, Error> {
+        let creado = self
+            .docker
+            .create_exec(contenedor, opciones_con_entrada(orden))
+            .await
+            .map_err(|causa| Error::del_contenedor(contenedor, causa))?;
+
+        let iniciado = self
+            .docker
+            .start_exec(
+                &creado.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    tty: false,
+                    output_capacity: None,
+                }),
+            )
+            .await
+            .map_err(|causa| Error::del_contenedor(contenedor, causa))?;
+
+        let StartExecResults::Attached { input, mut output } = iniciado else {
+            return Err(Error::SinSalida {
+                contenedor: contenedor.to_owned(),
+            });
+        };
+
+        // La entrega: leer del `lector` —el volcado del repositorio— y escribirlo en el `stdin`
+        // del `exec`. Se hace en su propio futuro para poder correr **a la vez** que el drenaje.
+        let entrega = async {
+            let mut entrada = input;
+            let mut lector = lector;
+            let mut buffer = vec![0_u8; TROZO_DE_ENTRADA];
+
+            let desenlace = loop {
+                match lector.read(&mut buffer).await {
+                    // El fin del volcado: el `lector` contesta `Ok(0)` solo cuando el escritor
+                    // declaró el final bueno, así que aquí es donde toca cerrar el `stdin`.
+                    Ok(0) => break Ok(()),
+                    Ok(leidos) => {
+                        if let Err(causa) = entrada.write_all(&buffer[..leidos]).await {
+                            break Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                format!("el `stdin` de la orden rechazó el volcado: {causa}"),
+                            ));
+                        }
+                    }
+                    Err(causa) => break Err(causa),
+                }
+            };
+
+            // El cierre, **después** del último byte. Y si el volcado se rompió a medias se cierra
+            // igual —de mejor esfuerzo—: dejarlo abierto tendría al cliente de la base esperando
+            // para siempre una entrada que ya no va a llegar, y el fallo que importa es el de
+            // arriba.
+            let cierre = entrada.shutdown().await;
+
+            match (desenlace, cierre) {
+                (Err(causa), _) => Err(causa),
+                (Ok(()), Err(causa)) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("no se pudo cerrar el `stdin` de la orden: {causa}"),
+                )),
+                (Ok(()), Ok(())) => Ok(()),
+            }
+        };
+
+        // El drenaje de la salida, con el mismo plazo de inactividad que el camino sin entrada: es
+        // lo único que acota a un cliente colgado, porque el `timeout` del cliente se resolvió
+        // cuando llegaron las cabeceras.
+        let drenaje = async {
+            loop {
+                let trozo = match tokio::time::timeout(inactividad_maxima, output.next()).await {
+                    Ok(Some(trozo)) => {
+                        trozo.map_err(|causa| Error::del_contenedor(contenedor, causa))?
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(Error::RestauracionEstancada {
+                            contenedor: contenedor.to_owned(),
+                            inactividad: inactividad_maxima,
+                        });
+                    }
+                };
+
+                let (canal, bytes) = match trozo {
+                    LogOutput::StdOut { message } => (Canal::Salida, message),
+                    LogOutput::StdErr { message } => (Canal::Error, message),
+                    // Aquí `attach_stdin` se pidió a propósito, así que un `StdIn` —si la
+                    // biblioteca entrega alguno— se ignora: no es salida del proceso ni un fallo.
+                    LogOutput::StdIn { .. } => continue,
+                    // Y el `Console` sigue candado: el tty no se pide.
+                    LogOutput::Console { message } => {
+                        debug_assert!(
+                            false,
+                            "la biblioteca entregó un `Console`: alguien encendió el tty, y con \
+                             tty el motivo de un fallo viaja como bytes de salida"
+                        );
+                        (Canal::Salida, message)
+                    }
+                };
+
+                al_llegar(Trozo {
+                    canal,
+                    bytes: bytes.to_vec(),
+                });
+            }
+
+            Ok(())
+        };
+
+        // Las dos mitades, a la vez, con el **drenaje mandando**: ver [`conducir_la_orden`], que es
+        // donde está escrito el porqué de la regla y qué desenlace sale de cada cruce.
+        conducir_la_orden(contenedor, entrega, drenaje).await?;
+
+        // El código de salida, como en el camino sin entrada: después de que el flujo cierre, que
+        // es cuando el proceso terminó.
+        let estado = self
+            .docker
+            .inspect_exec(&creado.id)
+            .await
+            .map_err(|causa| Error::del_contenedor(contenedor, causa))?;
+
+        codigo_de_salida(&estado).ok_or_else(|| Error::SinCodigoDeSalida {
+            contenedor: contenedor.to_owned(),
+        })
+    }
+}
+
+/// El tamaño del búfer con el que se entrega el volcado al `stdin` de un `exec`.
+///
+/// Es el mismo tamaño que el motor usa del otro lado —los trozos de la extracción—, y aquí hace de
+/// tope del mensaje que viaja por el flujo del `exec`: ni un volcado de un giga se trocea en un
+/// mensaje que no quepa, ni cada byte paga el coste de una escritura.
+const TROZO_DE_ENTRADA: usize = 8 * 1024;
+
+/// Conduce las dos mitades de una orden —la entrega del volcado y el drenaje de la salida— a la
+/// vez, con el **drenaje mandando**.
+///
+/// Las dos tienen que correr a la vez, y no una tras otra: serializarlas se bloquea, y no de forma
+/// sutil —el proceso espera su entrada mientras nadie lee su salida, y la entrada no avanza mientras
+/// nadie drena su salida—. Pero «a la vez» no basta: las dos mitades tienen plazos distintos, y
+/// esperar a las dos sin más deja un cuelgue por el que no pasa el tiempo.
+///
+/// # El cuelgue que esto evita: la mitad que no tiene plazo
+///
+/// La entrega **no tiene plazo propio y no puede tenerlo**: lo que lee es el volcado del
+/// repositorio, que puede tardar lo que tarde, y un plazo suyo mataría una restauración legítima
+/// por lenta que fuera. El drenaje sí lo tiene —el plazo de inactividad, que se mide entre trozos—,
+/// y por eso es el único que puede vencer. Con un `join!` de las dos, un contenedor que dejó de
+/// producir salida **y** dejó de drenar su `stdin` —el cliente de la base colgado, o muerto sin
+/// cerrar la tubería— hace vencer el plazo del drenaje y deja la entrega bloqueada en su escritura
+/// **para siempre**: la orden no termina, la fila de `restore_executions` se queda en `running` y la
+/// reserva del destino no se suelta, así que el target no vuelve a restaurarse hasta reiniciar el
+/// proceso. Y el hilo que volcaba se queda atascado con su canal.
+///
+/// # La regla: cuando el drenaje termina, la entrega no sobrevive
+///
+/// Así que el desenlace de la unión es el del **drenaje** en cuanto el drenaje termina, y la
+/// entrega se suelta si aún estaba pendiente: cerrar su futuro cierra el `stdin` del `exec` y suelta
+/// el lector, que es lo que despierta —con un error de canal cerrado— al hilo que estuviera
+/// bloqueado escribiendo en él. Tres cruces, y ninguno es el de antes:
+///
+/// | entrega | drenaje | desenlace |
+/// |---|---|---|
+/// | terminó con error | cualquiera, ya agotado | el error de la **entrada** —un volcado a medias es la causa, y lo que el contenedor dijo después es su consecuencia— |
+/// | terminó bien | su desenlace | el del **drenaje** |
+/// | seguía pendiente | su desenlace | el del **drenaje**, y si ese desenlace es **bueno** el de la orden **no** es un cero: ver abajo |
+///
+/// El drenaje **no se cancela** cuando falla la entrega, y eso no es un descuido: lo que el
+/// contenedor escriba por su canal de error es el motivo que acaba en `error_message`, así que
+/// cortarlo al primer fallo de la entrada dejaría al operador sin la única pista de por qué falló su
+/// base. Lo que sí se hace es dejar de esperar a una entrega que ya falló —no se vuelve a sondear un
+/// futuro agotado—.
+///
+/// # Por qué un drenaje bueno con la entrega pendiente no es un bien
+///
+/// Porque significa que el proceso acabó **antes** de que el volcado llegara entero: el fin de su
+/// entrada lo manda esta mitad —`shutdown`, y solo tras el último byte—, así que un cliente que sale
+/// sin haberlo visto no leyó el volcado. Ese caso **no lo delata el código de salida**, y devolver
+/// aquí un bien convertiría un volcado truncado en una restauración dada por buena —el desenlace que
+/// el requisito prohíbe—. De ahí [`Error::EntradaNoEntregada`] también en ese cruce: la orden
+/// terminó, pero no con el volcado dentro.
+///
+/// # Errors
+///
+/// Devuelve el error del **drenaje** cuando el drenaje terminó primero —el plazo de inactividad
+/// vencido ([`Error::RestauracionEstancada`]) o un fallo del flujo— y [`Error::EntradaNoEntregada`]
+/// cuando el fallo está en la entrega, sea porque su futuro devolvió un error —el repositorio no
+/// pudo volcar, o el `stdin` rechazó la escritura— o porque la orden terminó antes de recibirlo
+/// entero.
+async fn conducir_la_orden(
+    contenedor: &str,
+    entrega: impl Future<Output = Result<(), std::io::Error>>,
+    drenaje: impl Future<Output = Result<(), Error>>,
+) -> Result<(), Error> {
+    // Los dos futuros se anclan **en esta pila**: `select` exige `Unpin`, y anclarlos aquí evita
+    // reservar en el montón para algo que vive lo que vive esta llamada.
+    let entrega = std::pin::pin!(entrega);
+    let drenaje = std::pin::pin!(drenaje);
+
+    match futures_util::future::select(entrega, drenaje).await {
+        // La entrega terminó primero, así que su desenlace ya está. El drenaje **no se cancela**:
+        // hay que agotarlo —lo que el contenedor dijo por su canal de error es el motivo de un
+        // fallo— y, cuando termine, manda el error de la entrada si lo hubo.
+        futures_util::future::Either::Left((desenlace_de_la_entrada, drenaje)) => {
+            let del_drenaje = drenaje.await;
+
+            match desenlace_de_la_entrada {
+                Ok(()) => del_drenaje,
+                Err(causa) => Err(Error::EntradaNoEntregada {
+                    contenedor: contenedor.to_owned(),
+                    causa,
+                }),
+            }
+        }
+        // El drenaje terminó primero: **manda**. La entrega se queda sin esperar, y su futuro —con
+        // el `stdin` y el lector dentro— se suelta al salir de aquí, que es lo que impide que un
+        // cliente que dejó de leer su entrada cuelgue la orden para siempre.
+        futures_util::future::Either::Right((del_drenaje, _entrega)) => match del_drenaje {
+            Err(causa) => Err(causa),
+            // El drenaje cerró bien con la entrega aún pendiente: la orden terminó antes de recibir
+            // el volcado entero, y eso no es un bien. El porqué, entero, en el rustdoc de arriba.
+            Ok(()) => Err(Error::EntradaNoEntregada {
+                contenedor: contenedor.to_owned(),
+                causa: std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "la orden terminó antes de que el volcado llegara entero a su `stdin`: lo que \
+                     recibió no es el volcado completo, y darla por buena restauraría una copia a \
+                     medias",
+                ),
+            }),
+        },
+    }
+}
+
+/// Las opciones de un `exec` que **recibe** el volcado por su `stdin`.
+///
+/// Es la diferencia con [`Cliente::ejecutar`] puesta en un solo sitio: allí el `stdin` no se pide
+/// —escribir en un `exec` que no lo ha pedido degrada el cierre limpio a un `Connection reset by
+/// peer`—, y aquí sí, porque la restauración depende de él. `attach_stdout`, `attach_stderr` y
+/// `tty: false` se piden igual que en el camino sin entrada, y por las mismas razones: sin ningún
+/// `attach` el arranque falla, y con tty todo llega como `Console` y se pierde la separación.
+///
+/// Se separa de la llamada para poder fijarla sin un motor de contenedores: las opciones son un
+/// valor, y eso se puede comprobar en una prueba.
+fn opciones_con_entrada(orden: &Orden) -> CreateExecOptions<&str> {
+    CreateExecOptions {
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(false),
+        env: Some(orden.env.iter().map(String::as_str).collect()),
+        cmd: Some(orden.cmd.iter().map(String::as_str).collect()),
+        ..Default::default()
+    }
 }
 
 /// El código de salida de un `exec` ya inspeccionado, o `None` si no se puede decir cómo acabó.
@@ -324,6 +639,11 @@ impl std::fmt::Debug for Cliente {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use bollard::models::ExecInspectResponse;
@@ -1051,5 +1371,363 @@ mod tests {
             .comprobar()
             .await
             .expect("un motor vivo contesta al `ping`");
+    }
+
+    // ── La entrada del `exec` ────────────────────────────────────────────────
+
+    /// **La orden de restauración pide el `stdin`, junto a los dos canales de salida.**
+    ///
+    /// Sin motor de contenedores no se puede ejecutar nada, pero las opciones del `exec` son un
+    /// valor, y eso se fija aquí: `attach_stdin` en `true` —lo que la restauración necesita—,
+    /// `attach_stdout` y `attach_stderr` también, y `tty` en `false` para no perder la separación
+    /// entre los dos canales. Es la mitad del contrato de [`Cliente::ejecutar_con_entrada`] que se
+    /// puede comprobar sin levantar un contenedor.
+    #[test]
+    fn la_orden_de_restauracion_pide_el_stdin_y_los_dos_canales_de_salida() {
+        let orden = Orden {
+            cmd: vec!["psql".to_owned(), "-U".to_owned(), "operador".to_owned()],
+            env: vec!["PGPASSWORD=secreta".to_owned()],
+        };
+
+        let opciones = super::opciones_con_entrada(&orden);
+
+        assert_eq!(
+            opciones.attach_stdin,
+            Some(true),
+            "la restauración sin `attach_stdin` no tiene por dónde recibir el volcado"
+        );
+        assert_eq!(
+            opciones.attach_stdout,
+            Some(true),
+            "sin `attach_stdout` no hay a qué contestar el motor"
+        );
+        assert_eq!(
+            opciones.attach_stderr,
+            Some(true),
+            "sin `attach_stderr` se pierde el motivo de un fallo del cliente"
+        );
+        assert_eq!(
+            opciones.tty,
+            Some(false),
+            "con tty la separación entre `stdout` y `stderr` se pierde"
+        );
+        assert_eq!(
+            opciones.cmd,
+            Some(vec!["psql", "-U", "operador"]),
+            "el comando no es el de la orden"
+        );
+        assert_eq!(
+            opciones.env,
+            Some(vec!["PGPASSWORD=secreta"]),
+            "el entorno no es el de la orden"
+        );
+    }
+
+    // ── La unión de la entrega y el drenaje ──────────────────────────────────
+
+    /// Lo que se le concede a la unión en las pruebas sin motor.
+    ///
+    /// Es un tope de seguridad, no una medida: lo que estas pruebas afirman es que la unión
+    /// **concluye**, así que un cuelgue tiene que leerse como un fallo y no como una suite parada.
+    const ESPERA_DE_LA_UNION: Duration = Duration::from_secs(5);
+
+    /// La unión, con plazo: si no concluye, la prueba falla **por el plazo** y no se queda colgada.
+    async fn la_union_con_plazo<F: Future>(union: F) -> F::Output {
+        tokio::time::timeout(ESPERA_DE_LA_UNION, union)
+            .await
+            .expect(
+                "la unión no concluyó dentro del plazo: una de las dos mitades sobrevivió a la otra",
+            )
+    }
+
+    /// Una entrega que **nunca** termina: se queda pendiente para siempre, sin apuntar ni el
+    /// despertador.
+    ///
+    /// Es el hilo del repositorio atascado —el canal lleno y el `stdin` sin drenar—, y lo que se
+    /// mide con ella es que la unión **no** se queda esperándola. El `Drop` deja constancia de si el
+    /// futuro llegó a soltarse, que es la otra mitad de lo mismo: no basta con que la unión
+    /// concluya; la entrega no puede quedarse viva por detrás.
+    struct EntregaQueNuncaTermina {
+        /// `true` cuando el futuro se suelta: lo que prueba que la entrega no sobrevivió.
+        soltada: Arc<AtomicBool>,
+    }
+
+    impl Future for EntregaQueNuncaTermina {
+        type Output = Result<(), std::io::Error>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for EntregaQueNuncaTermina {
+        fn drop(&mut self) {
+            self.soltada.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// **Un drenaje que termina no deja la entrega colgada para siempre.**
+    ///
+    /// Es el cuelgue que la unión tiene que no cometer: el contenedor dejó de producir salida **y**
+    /// dejó de drenar su `stdin` —el cliente de la base colgado, o muerto sin cerrar la tubería—, así
+    /// que la entrega se queda bloqueada en la escritura mientras el drenaje vence su plazo de
+    /// inactividad. Si la unión esperara a las dos mitades, el trabajo no terminaría **nunca**: la
+    /// fila de `restore_executions` se quedaría en `running`, la reserva del destino no se soltaría
+    /// —el target no volvería a restaurarse hasta reiniciar el proceso— y se filtraría el hilo que
+    /// volcaba, con su canal. Por eso manda el drenaje: cuando termina, la entrega se suelta.
+    #[tokio::test]
+    async fn el_drenaje_que_termina_no_deja_colgada_una_entrega_que_nunca_avanza() {
+        /// El plazo del drenaje que se vence en esta prueba.
+        const INACTIVIDAD: Duration = Duration::from_millis(500);
+
+        let soltada = Arc::new(AtomicBool::new(false));
+        let entrega = EntregaQueNuncaTermina {
+            soltada: Arc::clone(&soltada),
+        };
+
+        let desenlace = la_union_con_plazo(super::conducir_la_orden(
+            "contenedor-de-la-base",
+            entrega,
+            async move {
+                Err(Error::RestauracionEstancada {
+                    contenedor: "contenedor-de-la-base".to_owned(),
+                    inactividad: INACTIVIDAD,
+                })
+            },
+        ))
+        .await;
+
+        assert!(
+            matches!(desenlace, Err(Error::RestauracionEstancada { .. })),
+            "el drenaje venció su plazo y la unión no devolvió su desenlace: {desenlace:?}"
+        );
+        assert!(
+            soltada.load(Ordering::SeqCst),
+            "la entrega siguió viva después de terminar el drenaje: el `stdin` y el volcado se \
+             quedan retenidos, y el hilo que volcaba, bloqueado"
+        );
+    }
+
+    /// **Una orden que termina antes de recibir el volcado entero no se da por buena.**
+    ///
+    /// Es el otro lado de la misma regla, y el que impide que «manda el drenaje» se convierta en un
+    /// falso éxito: si el drenaje cierra con bien mientras la entrega sigue pendiente, el proceso
+    /// acabó **sin** haber visto el fin de su entrada —ese fin lo manda esta mitad, unas líneas más
+    /// arriba—, así que el volcado quedó a medias. Devolver un cero aquí daría por buena una
+    /// restauración incompleta, que es justo lo que el código de salida **no** delata.
+    #[tokio::test]
+    async fn una_orden_que_termina_antes_de_recibir_el_volcado_no_se_da_por_buena() {
+        let soltada = Arc::new(AtomicBool::new(false));
+        let entrega = EntregaQueNuncaTermina {
+            soltada: Arc::clone(&soltada),
+        };
+
+        let desenlace = la_union_con_plazo(super::conducir_la_orden(
+            "contenedor-de-la-base",
+            entrega,
+            async { Ok(()) },
+        ))
+        .await;
+
+        assert!(
+            matches!(desenlace, Err(Error::EntradaNoEntregada { .. })),
+            "el drenaje cerró limpio con el volcado a medias y la unión lo dio por bueno: \
+             {desenlace:?}"
+        );
+        assert!(
+            soltada.load(Ordering::SeqCst),
+            "la entrega siguió viva después de terminar el drenaje"
+        );
+    }
+
+    /// **El error de la entrada manda, y el drenaje no se cancela para averiguarlo.**
+    ///
+    /// Las dos mitades terminan: la entrega falló —el repositorio no pudo volcar— y el drenaje
+    /// cerró bien. El desenlace es el de la entrada, porque un volcado que no llegó entero es la
+    /// causa y lo que el contenedor dijo después es su consecuencia. Y el drenaje **llega a
+    /// correr**: lo que el contenedor escriba por su canal de error es el motivo de un fallo, así
+    /// que cortarlo al primer fallo de la entrada dejaría al operador sin la única pista.
+    #[tokio::test]
+    async fn el_fallo_de_la_entrada_manda_sobre_el_cierre_bueno_del_drenaje() {
+        /// El motivo que dice el repositorio: tiene que viajar dentro del error.
+        const MOTIVO: &str = "la instantánea no está en el repositorio";
+
+        let drenada = Arc::new(AtomicBool::new(false));
+        let marca = Arc::clone(&drenada);
+
+        let desenlace = la_union_con_plazo(super::conducir_la_orden(
+            "contenedor-de-la-base",
+            async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    MOTIVO,
+                ))
+            },
+            async move {
+                // Cede el turno: así la unión **tiene** que esperar a esta mitad en vez de
+                // encontrarla lista.
+                tokio::task::yield_now().await;
+                marca.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ))
+        .await;
+
+        match desenlace {
+            Err(Error::EntradaNoEntregada { causa, .. }) => assert!(
+                causa.to_string().contains(MOTIVO),
+                "el error de la entrada no lleva el motivo del repositorio: {causa}"
+            ),
+            otro => panic!(
+                "con el volcado a medias, el desenlace tiene que ser el de la entrada: {otro:?}"
+            ),
+        }
+        assert!(
+            drenada.load(Ordering::SeqCst),
+            "el drenaje se canceló al fallar la entrada: el motivo del contenedor se pierde"
+        );
+    }
+
+    /// **Sin fallo, el desenlace de la unión es el del drenaje, y la entrega no se espera de más.**
+    ///
+    /// Es el camino bueno: la entrega termina —el volcado llegó entero— y el drenaje cierra con
+    /// bien. Lo que se fija aquí es la otra mitad de la regla: mientras la entrega **sí** termina,
+    /// la unión la respeta y no deja de escuchar al drenaje.
+    #[tokio::test]
+    async fn sin_fallo_la_union_devuelve_el_desenlace_del_drenaje() {
+        let desenlace = la_union_con_plazo(super::conducir_la_orden(
+            "contenedor-de-la-base",
+            async { Ok(()) },
+            async {
+                tokio::task::yield_now().await;
+                Ok(())
+            },
+        ))
+        .await;
+
+        assert!(
+            desenlace.is_ok(),
+            "con las dos mitades en bien, la unión no devolvió un bien: {desenlace:?}"
+        );
+    }
+
+    /// **El volcado llega entero por el `stdin` y se cierra después del último byte.**
+    ///
+    /// Es la prueba de punta a punta del transporte de la restauración: un contenedor de verdad, el
+    /// `stdin` alimentado con un `AsyncRead` de bytes conocidos y la salida recogida. El comando es
+    /// `wc -c`, que **lee su entrada hasta el fin de fichero** y cuenta los bytes: si el `stdin` no
+    /// se cerrara tras el último byte, `wc` esperaría para siempre y el plazo de inactividad
+    /// vencería; y si el cierre se adelantara, el número contado sería menor que el entregado. Los
+    /// dos desenlaces fallan esta prueba.
+    ///
+    /// El `AsyncRead` es un `&[u8]` —lo que implementa el contrato es un `impl AsyncRead + Unpin`—
+    /// y no un fichero: aquí lo que se prueba es el transporte, y meter el puente del repositorio
+    /// dentro haría que un fallo de la prueba pudiera ser de cualquiera de las dos capas. El puente
+    /// tiene sus propias pruebas en `crate::engine::restauracion`.
+    ///
+    /// No hay ningún fichero temporal por medio: la entrada es memoria, así que el escenario «el
+    /// volcado no toca el disco de Kesto» se cumple por construcción en este camino.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn el_volcado_llega_entero_por_el_stdin_y_se_cierra_al_terminar() {
+        /// Bytes que se entregan al `stdin` del contenedor.
+        const BYTES: usize = 300_000;
+
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::nuevo(
+            "el_volcado_llega_entero_por_el_stdin_y_se_cierra_al_terminar",
+        )
+        .await;
+
+        let orden = orden_de_shell("wc -c");
+        let contenido = vec![b'k'; BYTES];
+
+        let mut salida = Vec::new();
+        let codigo = cliente
+            .ejecutar_con_entrada(
+                contenedor.nombre(),
+                &orden,
+                INACTIVIDAD_DE_PRUEBA,
+                &contenido[..],
+                |trozo: Trozo| {
+                    if trozo.canal == Canal::Salida {
+                        salida.extend_from_slice(&trozo.bytes);
+                    }
+                },
+            )
+            .await
+            .expect("una orden que lee su entrada no puede fallar por el transporte");
+
+        assert_eq!(
+            codigo, 0,
+            "el cliente de la prueba tiene que salir con cero"
+        );
+
+        let contados: usize = String::from_utf8_lossy(&salida)
+            .trim()
+            .parse()
+            .expect("`wc -c` tiene que contestar un número");
+
+        assert_eq!(
+            contados, BYTES,
+            "el contenedor recibió {contados} bytes de los {BYTES} entregados: el volcado llegó \
+             truncado o se cerró el `stdin` antes de tiempo"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// **Un cliente que no lee su `stdin` no deja la orden colgada: el plazo la acaba.**
+    ///
+    /// Es el cuelgue del que la unión se defiende, con un contenedor de verdad y por el camino de
+    /// producción: la orden —`sleep`, que ni lee su entrada ni escribe nada— deja la entrega
+    /// bloqueada en la escritura en cuanto se llena la tubería, y el drenaje vence su plazo de
+    /// inactividad. Sin la regla de que **manda el drenaje**, esta llamada no volvería **nunca**: es
+    /// el desenlace que la prueba mide con su plazo, que es lo que hace que un cuelgue se lea como
+    /// un fallo y no como una suite parada.
+    ///
+    /// El volcado es de cuatro mebibytes a propósito: una tubería no los traga, así que la entrega
+    /// **llega** a bloquearse en vez de terminar por casualidad y dejar la prueba midiendo otra cosa.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn un_cliente_que_no_lee_su_stdin_acaba_en_el_plazo_y_no_cuelga_la_orden() {
+        /// Bytes que se entregan al `stdin`: más de lo que traga una tubería.
+        const BYTES: usize = 4 * 1024 * 1024;
+
+        /// El plazo que se le concede a la llamada entera, contenedor incluido.
+        const ESPERA_DE_LA_PRUEBA: Duration = Duration::from_secs(30);
+
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::nuevo(
+            "un_cliente_que_no_lee_su_stdin_acaba_en_el_plazo_y_no_cuelga_la_orden",
+        )
+        .await;
+
+        let orden = orden_de_shell("sleep 60");
+        let contenido = vec![b'k'; BYTES];
+
+        let desenlace = tokio::time::timeout(
+            ESPERA_DE_LA_PRUEBA,
+            cliente.ejecutar_con_entrada(
+                contenedor.nombre(),
+                &orden,
+                INACTIVIDAD_CORTA,
+                &contenido[..],
+                |_trozo: Trozo| {},
+            ),
+        )
+        .await
+        .expect(
+            "la orden no concluyó dentro del plazo: la entrega sobrevivió al drenaje, y con ella \
+             se quedan el hilo que volcaba y el destino sin liberar",
+        );
+
+        assert!(
+            matches!(desenlace, Err(Error::RestauracionEstancada { .. })),
+            "con el cliente callado y su `stdin` sin drenar, el desenlace tiene que ser el del \
+             drenaje: {desenlace:?}"
+        );
+
+        contenedor.retirar().await;
     }
 }

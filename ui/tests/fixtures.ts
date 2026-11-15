@@ -8,6 +8,7 @@ import type {
   Execution,
   Job,
   Repository,
+  RestauracionRegistrada,
   Snapshot,
   Target,
 } from '../src/services/api/types'
@@ -88,6 +89,26 @@ export function snapshot(campos: Partial<Snapshot> & { id: string }): Snapshot {
     target_id: 't1',
     target_name: 'web',
     target_type: 'directory',
+    ...campos,
+  }
+}
+
+export function restauracionRegistrada(
+  campos: Partial<RestauracionRegistrada> & { id: string },
+): RestauracionRegistrada {
+  return {
+    snapshot_id: 'a'.repeat(64),
+    // El target de origen del histórico: su nombre y su tipo los resuelve el
+    // backend; quien pruebe un target borrado los pone a `null` con `target_id`.
+    target_id: 't1',
+    target_name: 'web',
+    target_type: 'directory',
+    // El histórico enseña el desenlace real: por defecto, una restauración
+    // terminada sin motivo de error.
+    status: 'success',
+    error_message: null,
+    started_at: '2026-01-02T03:00:00Z',
+    finished_at: '2026-01-02T03:05:00Z',
     ...campos,
   }
 }
