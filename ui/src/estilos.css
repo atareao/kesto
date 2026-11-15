@@ -61,6 +61,7 @@ main:focus {
   outline: none;
 }
 
+/* Con la barra plegada solo queda el logo: el nombre no llega a renderizarse. */
 .marca-del-panel {
   display: flex;
   align-items: center;
@@ -76,18 +77,31 @@ main:focus {
   flex: none;
 }
 
-/* La cabecera toma su color del tema activo (tokens en `Layout.tsx`); aquí solo
- * se coloca su contenido. */
-.cabecera-del-panel {
+/*
+ * El pie cierra la barra lateral: los mandos del chasis quedan pegados al fondo.
+ * Antd mide la `Sider` a `100vh`, así que basta con que sus hijos sean una
+ * columna y el pie reclame el hueco que sobra (`margin-top: auto`).
+ */
+.ant-layout-sider-children {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 16px;
+  flex-direction: column;
 }
 
-/* El conmutador se separa del resto y queda a la derecha de la cabecera. */
-.conmutador-de-tema {
-  margin-inline-start: auto;
+/* El conmutador a la izquierda y el plegado a la derecha. */
+.pie-del-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  margin-top: auto;
+}
+
+/* Plegada, la barra mide 80 px: los dos mandos pasan a una columna centrada. */
+.ant-layout-sider-collapsed .pie-del-panel {
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 8px;
 }
 
 .contenido-del-panel {
