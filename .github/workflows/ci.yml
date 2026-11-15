@@ -128,3 +128,65 @@ jobs:
 
       - name: Build
         run: ${{ needs.preflight.outputs.ui_pm == 'pnpm' && 'pnpm run build' || 'npm run build' }}
+
+  # Job aislado del job `backend`: sin `needs:` y con Docker propio, para que un
+  # fallo del runner de contenedores no arrastre al pipeline principal.
+  e2e:
+    name: E2E (docker)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      MARIA_IMAGE: docker.io/library/mariadb:11
+      POSTGRES_IMAGE: docker.io/library/postgres:18-alpine
+      ALPINE_IMAGE: docker.io/library/alpine:3.23
+      # Fijada por versión, igual que la de por defecto del arnés (`tests/e2e/arnes.rs`,
+      # `IMAGEN_S3`): al subirla hay que cambiar las dos y volver a comprobar que se descarga.
+      S3_IMAGE: docker.io/chrislusf/seaweedfs:4.53
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # Clave de relleno solo para los tests: nunca un secret real.
+      KESTO_MASTER_KEY: kesto-e2e-test-master-key-000000000000
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Docker daemon
+        run: docker info
+
+      - name: Pre-pull test images
+        run: |
+          docker pull "$MARIA_IMAGE"
+          docker pull "$POSTGRES_IMAGE"
+          docker pull "$ALPINE_IMAGE"
+          docker pull "$S3_IMAGE"
+
+      # Los dos pasos que ejecutan la batería van por un tubo —para que el registro quede en el
+      # artefacto—, y el desenlace de un tubo es el del **último** comando: sin `pipefail`, un
+      # fallo de la batería saldría con el cero del `tee` y el job quedaría en verde. Lo exige
+      # el escenario «un fallo de la batería deja el job en rojo».
+      - name: Integration tests (ignored)
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -- --ignored --test-threads=1 2>&1 | tee e2e-ignored.log
+
+      - name: E2E tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --features e2e --test e2e -- --test-threads=1 2>&1 | tee e2e-tests.log
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: |
+            e2e-ignored.log
+            e2e-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
