@@ -104,7 +104,7 @@ WAL SHALL convivir con ficheros `-wal` y `-shm` **junto a la base**, así que **
 
 ### Requirement: Las cuatro tablas del §3 se reproducen exactas, con sus `CHECK`, sus cascadas y los índices añadidos
 
-Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`.
+Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`. `backup_jobs` SHALL incluir además la columna `name` (`TEXT`, anulable), declarada aquí **como un añadido al SRS** —el §3 no la tiene en su versión original—: un UUID no identifica la tarea al operador, y el nombre es lo que hace legible el histórico y los snapshots.
 
 Las restricciones SHALL estar **en la base** y no solo en Rust: un `INSERT` hecho con `sqlite3` a mano tiene que chocar con el mismo `CHECK` que choca la aplicación. Es la única forma de que el enumerado sea una garantía y no una convención.
 
@@ -156,6 +156,12 @@ Los índices SHALL nombrarse `idx_{tabla}_{columna}`.
 - **WHEN** se planifica el `JOIN` de `job_executions` con `backup_jobs` filtrando por `repository_id`
 - **THEN** el plan SHALL apoyarse en los índices de clave foránea
 - **AND** `job_executions` NO SHALL tener columna `repository_id`
+
+#### Scenario: La columna `name` de `backup_jobs` existe y es anulable
+- **GIVEN** una base con las migraciones aplicadas
+- **WHEN** se consulta la tabla `backup_jobs`
+- **THEN** SHALL existir la columna `name` de tipo `TEXT`
+- **AND** SHALL admitir `NULL` en una fila insertada con SQL directo `INSERT ... (id, target_id, repository_id, cron_expression) VALUES (...)` sin especificarla
 
 ### Requirement: Los identificadores son UUIDv4 en `TEXT` y las fechas son UTC
 

@@ -4,7 +4,7 @@
 **Base:** `development` tras el merge de #72 (release v0.7.0 publicada)
 **Rama:** `feature/tarea-en-historico-y-snapshots` (desde `development`)
 **Change SDD:** `openspec/changes/nombre-de-la-tarea/`
-**Estado:** En curso — plan y change SDD redactados, pendientes de aprobación
+**Estado:** Completado — implementado y verificado (TDD RED→GREEN; `just check-all` y `openspec validate --all --strict` en verde), auditoría de backend y UI sin bloqueantes; PR a `development`
 
 ## 1. Objetivo
 
@@ -65,10 +65,10 @@ Ver `openspec/changes/nombre-de-la-tarea/tasks.md`. Resumen:
 
 ## 7. Criterios de aceptación
 
-- [ ] El Histórico y los Snapshots muestran la tarea de forma legible (nombre si lo tiene; si no, el identificador).
-- [ ] El contrato se actualiza en las specs `db`, `api-resources` y `ui`, y en `docs/DEFINITION.md` §3.
-- [ ] Tests de API y de UI actualizados y en verde.
-- [ ] `just check`, `just ui-check` y `openspec validate --all --strict` en verde.
+- [x] El Histórico y los Snapshots muestran la tarea de forma legible (nombre si lo tiene; si no, el identificador).
+- [x] El contrato se actualiza en las specs `db`, `api-resources` y `ui`, y en `docs/DEFINITION.md` §3.
+- [x] Tests de API y de UI actualizados y en verde.
+- [x] `just check`, `just ui-check` y `openspec validate --all --strict` en verde.
 
 ## 8. Referencias
 
