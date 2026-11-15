@@ -145,14 +145,37 @@ describe('pantalla de Restauraciones', () => {
   it('El filtro por estado acota el listado y vuelve a la primera página', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(
-      manejadorCon(() => pagina([restauracionRegistrada({ id: 'x1', status: 'failed' })], 1)),
+      manejadorCon(({ url }) => {
+        // El listado completo tiene dos páginas; acotado a `failed`, una sola fila.
+        const parametros = new URL(url, 'http://localhost').searchParams
+        return parametros.get('status') === 'failed'
+          ? pagina([restauracionRegistrada({ id: 'x1', status: 'failed' })], 1)
+          : pagina(lote(TAMANO_DE_PAGINA), TAMANO_DE_PAGINA * 2)
+      }),
     )
 
     const { unmount } = montar()
     await esperarLaTabla()
 
+    // Primero se sale de la primera página: sin ese `offset` heredado, exigir
+    // `offset=0` después no demostraría que el filtro reinicia la paginación.
+    await usuario.click(screen.getByRole('button', { name: 'Siguiente' }))
+    await waitFor(() => {
+      expect(
+        fetch
+          .a('/api/v1/restorations')
+          .some((llamada) => llamada.url.includes(`offset=${TAMANO_DE_PAGINA}`)),
+      ).toBe(true)
+    })
+
     await elegirEnSelect(usuario, 'Estado', 'Fallida')
 
+    // El listado queda acotado: fuera las correctas de las páginas anteriores.
+    await waitFor(() => {
+      const tabla = screen.getByRole('table', { name: 'Restauraciones' })
+      expect(within(tabla).getByText('Fallida')).toBeInTheDocument()
+      expect(within(tabla).queryByText('Correcta')).not.toBeInTheDocument()
+    })
     await waitFor(() => {
       const ultima = fetch.a('/api/v1/restorations').at(-1)
       expect(ultima?.url).toContain('status=failed')
