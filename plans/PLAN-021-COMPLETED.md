@@ -78,7 +78,7 @@ Cerrar el ciclo de la copia para los targets de base de datos: restaurar dentro 
 ### 4. Cierre
 - [x] 4.1 `openspec archive restauracion-de-bases-de-datos`.
 - [x] 4.2 Renombrar este plan a `plans/PLAN-021-COMPLETED.md`.
-- [ ] 4.3 PR a `development` con gitmoji y `Closes #67`.
+- [x] 4.3 PR a `development` con gitmoji y `Closes #67`.
 
 ## Verificación
 
