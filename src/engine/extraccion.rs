@@ -2452,27 +2452,46 @@ mod tests {
         );
     }
 
-    /// **Un fallo sin una gota en la salida no es una base vacía.**
+    /// **Un fallo sin una gota de volcado no es una base vacía.**
     ///
     /// Es el caso «no hay cliente de volcado en la imagen», que es justo el que hay que
-    /// distinguir de una base sin datos: los dos dejan el `stdout` en cero bytes, y lo único
-    /// que los separa es el código de salida y el motivo. El contenedor de prueba es un
-    /// `alpine`, que no trae `mariadb-dump`, así que el comando de verdad de un volcado global
-    /// sale con un código distinto de cero, no escribe nada por su salida y sí deja un motivo
-    /// por su canal de error. La señal de la entrega tiene que quedarse **en falso**: darla por
-    /// buena sería dar por buena una copia vacía, que existe, ocupa sitio y no se puede
-    /// restaurar.
+    /// distinguir de una base sin datos. Los dos dejan el volcado en cero bytes, así que la
+    /// salida **no** los separa: lo que los separa es el desenlace del proceso —una base vacía
+    /// sale con `0` y declara el final de su volcado; este fallo sale con un código distinto de
+    /// cero y **no** lo declara—. El contenedor de prueba es un `alpine`, que no trae
+    /// `mariadb-dump`, así que el comando de verdad de un volcado global no llega ni a arrancar:
+    /// el proceso no escribe un volcado, el motor dice por qué, y la señal de la entrega tiene
+    /// que quedarse **en falso**. Darla por buena sería dar por buena una copia vacía, que
+    /// existe, ocupa sitio y no se puede restaurar.
     ///
     /// La prueba que ya había escribe bytes antes de fallar; ésta no escribe ninguno, que es la
     /// forma en que un fallo de extracción se parece a una base vacía y la razón de que el
-    /// código de salida y el canal de error sean lo único que los distingue.
+    /// código de salida y el cierre sin final sean lo único que los distingue.
+    ///
+    /// # Ni la cuenta de bytes ni el canal son contrato de este módulo: son del motor
+    ///
+    /// Y hay dos medidos. Con **Podman** el `exec` no arranca, la salida queda **vacía**
+    /// (`bytes_leidos` en cero) y el motivo —que nombra el binario— llega por el canal de
+    /// **error**. Con **Docker** —el motor del job `e2e` del CI, que es el mismo que el de
+    /// producción— el error del runtime OCI (`OCI runtime exec failed: … exec: "mariadb-dump":
+    /// executable file not found in $PATH`, **131 bytes** contados en el runner) viaja por el
+    /// canal de **salida**: suma en `bytes_leidos` y el motivo del contenedor se queda vacío.
+    /// Afirmar cualquiera de las dos cosas sería afirmar el troceado del motor, así que esta
+    /// prueba no las afirma; lo que afirma es lo que sí es de este módulo: que el aviso del
+    /// motor está —en el motivo o en los bytes que llegaron, que es donde cada motor lo pone— y
+    /// que **nombra el binario ausente**, que el lector **falla** en vez de devolver un fin de
+    /// fichero limpio, y que la entrega no se declara. Un código distinto de cero ya impide que
+    /// nada de lo que llegue por la salida se archive como una copia buena; lo que el motor
+    /// escriba ahí no puede convertirse en un volcado entregado.
     #[tokio::test]
     #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
-    async fn un_proceso_que_falla_sin_escribir_en_la_salida_no_es_una_base_vacia() {
-        let contenedor = ContenedorDePrueba::nuevo(
-            "un_proceso_que_falla_sin_escribir_en_la_salida_no_es_una_base_vacia",
-        )
-        .await;
+    async fn un_proceso_que_falla_sin_volcado_no_es_una_base_vacia() {
+        /// El binario que el `alpine` de prueba no trae, y que el aviso tiene que nombrar.
+        const AUSENTE: &str = "mariadb-dump";
+
+        let contenedor =
+            ContenedorDePrueba::nuevo("un_proceso_que_falla_sin_volcado_no_es_una_base_vacia")
+                .await;
         let TunelDelVolcado {
             origen,
             productor,
@@ -2484,7 +2503,7 @@ mod tests {
         // ese binario no está, que es exactamente lo que pasa cuando la imagen de la base no
         // trae el cliente de volcado.
         let orden = Orden {
-            cmd: argv(&["mariadb-dump", "--single-transaction", "--all-databases"]),
+            cmd: argv(&[AUSENTE, "--single-transaction", "--all-databases"]),
             env: Vec::new(),
         };
         let hilo = volcar_en_su_hilo(contenedor.nombre(), orden, productor);
@@ -2502,20 +2521,21 @@ mod tests {
             resultado.codigo, 0,
             "el binario no está en la imagen, así que el proceso no puede salir con cero"
         );
-        assert_eq!(
-            resultado.bytes_leidos, 0,
-            "un binario ausente no escribe nada por su salida: la cuenta de bytes sería el \
-             volcado y aquí no hay ninguno"
+
+        // El aviso del motor, donde cada motor lo ponga: el motivo del contenedor (Podman) o
+        // los bytes que llegaron al lector (Docker). En los dos casos tiene que nombrar el
+        // binario que falta: es la mitad que distingue este fallo de una base vacía.
+        let aviso_del_motor = format!(
+            "{}{}",
+            resultado.motivo_del_contenedor,
+            String::from_utf8_lossy(&leido)
         );
         assert!(
-            leido.is_empty(),
-            "al lector no puede llegarle nada: {} bytes",
+            aviso_del_motor.contains(AUSENTE),
+            "el aviso del motor no nombra el binario ausente ({AUSENTE}): el motivo es {:?} y al \
+             lector le llegaron {} bytes",
+            resultado.motivo_del_contenedor,
             leido.len()
-        );
-        assert!(
-            !resultado.motivo_del_contenedor.is_empty(),
-            "el motivo del contenedor se perdió, y es la única mitad que distingue este fallo de \
-             una base vacía"
         );
         assert!(
             lectura.is_err(),
@@ -2524,7 +2544,7 @@ mod tests {
         );
         assert!(
             !entrega.completa(),
-            "una extracción que falló sin escribir nada no puede darse por entregada"
+            "una extracción que falló sin escribir un volcado no puede darse por entregada"
         );
 
         contenedor.retirar().await;

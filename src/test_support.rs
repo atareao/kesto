@@ -1502,12 +1502,13 @@ pub(crate) fn lector_del_volcado(
 // ── Motor de contenedores ────────────────────────────────────────────────────
 //
 // Las pruebas que necesitan un motor de contenedores van marcadas `#[ignore]`, y hoy son
-// **veinte**: once en `src/docker` (todas en `cliente.rs`) y nueve en `src/engine` (siete
-// en `extraccion.rs` y dos en `mod.rs`). El motivo de que estén marcadas y no se
-// ejecuten es el CI: el job `backend` de `.github/workflows/ci.yml` no declara
-// servicios, así que `cargo test` tiene que quedar verde sin motor. Lo de abajo es el
-// arnés de toda esa capa, y quien las lance con `cargo test -- --ignored` necesita un
-// motor de verdad en la máquina.
+// **veintisiete**: trece en `src/docker` (todas en `cliente.rs`) y catorce en `src/engine`
+// (siete en `extraccion.rs`, cuatro en `mod.rs` y tres en `restauracion.rs`). El motivo de
+// que estén marcadas es el job `backend` de `.github/workflows/ci.yml`: no declara
+// servicios, así que `cargo test` tiene que quedar verde sin motor. Quien las lance con
+// `cargo test -- --ignored` necesita un motor de verdad en la máquina —y el runner del job
+// `e2e` lo tiene—: las pruebas se escriben contra el **contrato** de esta capa, no contra
+// el troceado ni los canales de un motor concreto, que cambian de uno a otro.
 //
 // El motivo completo va escrito **en cada** `#[ignore]` y no solo aquí: quien lee una
 // prueba ignorada lee su atributo, y una nota que vive en otro fichero es una nota que
