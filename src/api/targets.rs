@@ -148,7 +148,12 @@ impl TargetDelCable {
 /// enum de la capa de acceso no implementa `serde` y no viaja. Las pruebas fijan los literales,
 /// así que un cambio de vocabulario en la base no puede pasar inadvertido en el cable. El texto
 /// es `sqlite` y no `sqlite3`: el segundo es el binario que hace la copia.
-fn texto_del_tipo(tipo: TipoDeTarget) -> &'static str {
+///
+/// Es `pub(crate)` porque **no es el texto de este recurso**: el listado del explorador publica el
+/// tipo de cada target y tiene que decirlo con estas mismas cuatro palabras. Una segunda tabla de
+/// literales en `snapshots.rs` sería una segunda boca del vocabulario del cable, y el día que se
+/// añada un tipo las dos se separarían sin que nada lo delatara.
+pub(crate) fn texto_del_tipo(tipo: TipoDeTarget) -> &'static str {
     match tipo {
         TipoDeTarget::Mariadb => "mariadb",
         TipoDeTarget::Postgresql => "postgresql",

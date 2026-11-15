@@ -307,6 +307,15 @@ pub(crate) fn del_motor(error: ErrorDelMotor) -> AppError {
             "la tarea ya tiene una ejecución en curso: no se encola una segunda".to_owned(),
         ),
 
+        // 409 — la guarda de exclusión por destino de la restauración. El mensaje no repite la ruta
+        // —es un dato de la fila del target, no de la petición— y nombra lo que el operador necesita
+        // saber: que ese destino está ocupado **ahora** y que la reserva se suelta sola al acabar.
+        ErrorDelMotor::RestauracionEnCurso { .. } => AppError::Conflict(
+            "ese destino ya tiene una restauración en curso: no se lanza una segunda sobre el \
+             mismo target"
+                .to_owned(),
+        ),
+
         // 503 — el motor no acepta trabajo ahora mismo: o ha empezado a apagarse, o la cola de ese
         // repositorio está llena, o su trabajador no está. El motivo —que incluye los
         // identificadores y, en el último caso, la causa de base— se queda en el registro.

@@ -9,6 +9,18 @@
 //! **biblioteca** y piden el listado por HTTP: si la respuesta estuviera deducida del histórico, no
 //! habría forma de que saliera una instantánea ajena.
 //!
+//! # El listado sale del repositorio, y el target de cada elemento de la base
+//!
+//! Cada elemento del listado lleva tres campos más —`target_id`, `target_name` y `target_type`— que
+//! **no** salen del repositorio: son del target sobre el que esa copia se restauraría, y el único
+//! camino que el §3 deja escrito de una instantánea a su target es el vínculo que dejó su ejecución
+//! (`job_executions.snapshot_id` → la tarea → su `target_id`). Los resuelve este módulo —el
+//! manejador, con la capa de datos— y **no** el motor, que no lee la base: el motor lista lo que hay
+//! en el almacenamiento y el manejador completa cada elemento con lo que la base sabe de él. Los tres
+//! son anulables porque una instantánea puede no casar con ninguna ejecución —una copia que hizo otra
+//! herramienta, o cuya fila de `job_executions` se borró en cascada con su tarea— y el panel necesita
+//! saber **antes** de ofrecer la restauración si esa copia tiene destino, y cuál es.
+//!
 //! # De dónde sale el listado, y por dónde **no** se abre el repositorio
 //!
 //! La lista la resuelve [`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots) y **no**
@@ -50,18 +62,20 @@
 //! abrirlo.
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use crate::api::extract::Query;
+use crate::api::extract::{Json, Query};
 use crate::api::response::ApiResponse;
+use crate::api::targets::texto_del_tipo;
 use crate::api::{contenido, del_motor};
-use crate::db::entities::Repositorio;
+use crate::db::entities::{ObjetivoDeRestauracion, Repositorio, TipoDeTarget};
 use crate::error::AppError;
 use crate::rustic::{Acceso, ResumenDeSnapshot};
 use crate::state::AppState;
@@ -81,15 +95,18 @@ use crate::state::AppState;
 /// la medición.
 pub const LA_VENTANA: usize = 200;
 
-/// Las rutas del explorador: el listado de un repositorio, y solo él.
+/// Las rutas del explorador: el listado de un repositorio y la restauración de una instantánea.
 ///
 /// Se declara como las rutas de los otros recursos —un `router()` que
 /// [`api_router`](crate::api::api_router) mezcla— para que dónde se cuelga lo decida quien lo llama
 /// y este módulo no tenga que conocer la partición del router. Lo que sí se decide aquí es lo que
-/// **no** se hace: la ruta no entra en la lista blanca de rutas públicas, porque es superficie de
-/// negocio —publica qué hay en el almacenamiento— y le toca el *gate* de sesión como al resto.
+/// **no** se hace: ninguna de las dos rutas entra en la lista blanca de rutas públicas, porque son
+/// superficie de negocio —una publica qué hay en el almacenamiento y la otra **escribe** en el
+/// host— y les toca el *gate* de sesión como al resto.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/api/v1/snapshots", get(listado))
+    Router::new()
+        .route("/api/v1/snapshots", get(listado))
+        .route("/api/v1/snapshots/{id}/restore", post(restaurar))
 }
 
 /// Los parámetros de la consulta, tal y como llegan por el cable.
@@ -110,6 +127,25 @@ pub fn router() -> Router<AppState> {
 pub struct ConsultaDelCable {
     /// El repositorio cuyas instantáneas se listan.
     pub repository_id: Option<String>,
+}
+
+/// El cuerpo de la petición de restauración, tal y como llega por el cable.
+///
+/// La instantánea viaja en el **camino** —`/api/v1/snapshots/{id}/restore`— porque es el recurso
+/// sobre el que se actúa, y el repositorio en el **cuerpo** porque es el contexto desde el que se
+/// lee: la misma instantánea puede estar en dos repositorios, así que sin decir cuál, la operación
+/// no está determinada. Es la partición inversa a la del listado, y no por capricho: allí no hay
+/// recurso al que colgar la instantánea y solo se pregunta por un repositorio.
+///
+/// `deny_unknown_fields` por la misma razón que en la consulta del listado: un campo de más
+/// ignorado en silencio haría creer a quien llamó que ha elegido lo que no ha elegido. El rechazo
+/// sale por la envoltura como cualquier otro cuerpo que no se puede interpretar, y ni el nombre ni
+/// el valor del campo que sobra viajan al cliente.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CuerpoDeLaRestauracion {
+    /// El repositorio del que se lee la instantánea.
+    pub repository_id: String,
 }
 
 /// `GET /api/v1/snapshots?repository_id=<id>` — el explorador de instantáneas del §5.
@@ -161,11 +197,21 @@ pub struct ConsultaDelCable {
 /// garantiza es el orden de lo que devuelve. El campo lo dice palabra por palabra en la vista del
 /// cable, que es donde lo lee quien construye el panel.
 ///
+/// # El target de cada elemento lo resuelve este manejador
+///
+/// Los tres campos del target —`target_id`, `target_name` y `target_type`— no los puede resolver el
+/// motor, que no lee la base, así que el listado se completa aquí: primero se le piden al motor las
+/// instantáneas del almacenamiento, y **después** —con sus identificadores— se le piden a la capa de
+/// datos los objetivos, en una sola lectura para todo el lote. La fusión es por el identificador de
+/// la instantánea y el resultado de no encontrarlo es `null`, no un elemento menos: una copia sin
+/// vínculo sigue siendo una copia del repositorio y tiene que poder listarse.
+///
 /// # Errors
 ///
 /// Un `400` de [`AppError::InvalidInput`] para el parámetro que falta o que no es un UUID, un `404`
 /// de [`AppError::NotFound`] para la fila que no está, lo que devuelva la traducción del motor si el
-/// repositorio no se puede listar, y un `500` de [`AppError::Database`] si la fila no se puede leer.
+/// repositorio no se puede listar, y un `500` de [`AppError::Database`] si la fila del repositorio no
+/// se puede leer o si los objetivos de sus instantáneas no se pueden resolver.
 pub async fn listado(
     State(estado): State<AppState>,
     Query(consulta): Query<ConsultaDelCable>,
@@ -185,15 +231,265 @@ pub async fn listado(
     // llena y el silencio serían indistinguibles de «esto es todo». Ver el rustdoc del campo.
     let truncated = instantaneas.len() >= LA_VENTANA;
 
+    // El target de cada instantánea lo resuelve **este** manejador y no el motor: el motor lista lo
+    // que hay en el almacenamiento y no lee la base —no sabe de ella—, y el vínculo
+    // `instantánea → ejecución → tarea → target` solo existe ahí. Va después de listar y no antes
+    // porque los identificadores que hay que resolver son los que ha devuelto el listado.
+    //
+    // Una sola lectura para todo el lote: resolver los 200 identificadores de la ventana de uno en
+    // uno serían 200 consultas para pintar una pantalla.
+    let identificadores: Vec<String> = instantaneas
+        .iter()
+        .map(|resumen| resumen.id.clone())
+        .collect();
+
+    let objetivos = estado
+        .db
+        .ejecuciones
+        .objetivos_de_las_instantaneas(&identificadores, &fila.id)
+        .await?;
+
     // La vista se compone antes de envolverla porque formatear una fecha puede fallar: ese fallo es
     // un `500` con la causa al registro, y no una respuesta a la que le falte un elemento.
-    let vista = ListadoDelCable::desde(&instantaneas, truncated)?;
+    let vista = ListadoDelCable::desde(&instantaneas, &objetivos, truncated)?;
 
     Ok(ApiResponse::new(
         StatusCode::OK,
         "instantáneas listadas",
         contenido(&vista)?,
     ))
+}
+
+/// `POST /api/v1/snapshots/{id}/restore` — restaurar una instantánea sobre el target que la copió.
+///
+/// El vínculo entre una instantánea y su target no lo guarda la instantánea —la biblioteca la
+/// escribe sin nombre de tarea—, así que se resuelve por el único camino que el §3 sí deja escrito:
+/// `job_executions.snapshot_id` → la tarea → su `target_id`. Ese camino lo recorre la capa de
+/// acceso —[`Ejecuciones::objetivo_de_la_instantanea`](crate::db::entities::Ejecuciones::objetivo_de_la_instantanea)—
+/// y el manejador solo decide qué hacer con su desenlace.
+///
+/// # Los rechazos, y por qué son ésos
+///
+/// * **`400` si el `repository_id` del cuerpo no es un UUID**: es el mismo reparto que en el
+///   listado —una errata de teclado no es un recurso ausente—, y el rechazo nombra el campo.
+/// * **`404` si el repositorio no existe**: sin fila no hay destino que abrir, y se contesta antes
+///   de tocar el almacenamiento.
+/// * **`409` si la instantánea no casa con ninguna ejecución**: la instantánea **existe** en el
+///   repositorio —si no, el `409` no tendría sentido—, lo que falta es el vínculo con un target, y
+///   eso no es un recurso ausente sino un conflicto con el estado del sistema: por eso no se
+///   contesta `404`, que el panel leería como «esa copia no está» cuando sí está.
+/// * **`422` si el target no es un directorio**: aquí el vínculo **sí** existe y la petición es
+///   correcta; lo que no se puede cumplir es la operación para ese tipo de target en esta versión.
+///   Eso no es un conflicto con el estado —`409`— sino una entidad que no se puede procesar por su
+///   tipo, así que el panel distingue «todavía no» de «no se encuentra». El `host_path` es `Option`
+///   porque el §3 solo lo pide en un comentario de columna —«Requerido para tipo `directory`»— y
+///   **ningún `CHECK` de la base lo garantiza**: sus columnas son anulables y su único `CHECK`
+///   restringe el tipo, así que un `directory` sin ruta es una fila que la tabla guarda tan
+///   contenta —lo dice el alta de targets— y que aquí no se puede dar por hecha. Quien la exige es
+///   el borde HTTP: el alta la pide al crear el target y este manejador no la asume al restaurar,
+///   donde un `directory` sin ruta es también un `422` con su propio motivo.
+/// * **`404` si la instantánea no está en el repositorio**: es el otro `404`, y el único que exige
+///   abrir el almacenamiento. El vínculo de la fila dice cuál se copió, no si sigue ahí —una copia
+///   purgada o un repositorio recreado dejan el vínculo intacto y la instantánea ausente—, así que
+///   el `200` no puede ser optimista: sin esta comprobación prometería un trabajo que no puede
+///   ocurrir y el fallo solo se vería en el registro. Se distingue del `404` del repositorio ausente
+///   por el mensaje, para que el operador sepa si lo que falta es el repositorio o la copia.
+/// * **`409` si ese destino ya tiene una restauración en vuelo**: dos restauraciones sobre el mismo
+///   `host_path` escribirían a la vez en el mismo directorio del host, así que la segunda se
+///   rechaza antes de lanzarse. El sujeto es el **destino** y no la instantánea: dos instantáneas
+///   distintas del mismo target chocan igual, porque el disco es el mismo. La reserva se suelta
+///   cuando el trabajo acaba —ver [`ReservaDeRestauracion`](crate::engine::ReservaDeRestauracion)—,
+///   de modo que un `409` solo habla de una restauración que está corriendo **ahora**.
+///
+/// El orden de los rechazos no es gratuito: los tres primeros se deciden sin abrir el
+/// almacenamiento —la fila, el vínculo y el tipo— y solo el cuarto lo abre, así que una petición que
+/// se puede rechazar gratis no paga una apertura. Y la comprobación de la instantánea va antes de
+/// generar el `execution_id`: un `404` **no publica** ningún `restore_progress` ni lanza ninguna
+/// ejecución, y eso es contrato.
+///
+/// # Por qué la restauración va **en segundo plano**
+///
+/// El contrato del §5 es que este endpoint devuelve la **ejecución**, no su resultado: restaurar
+/// abre el repositorio y recorre el árbol escribiendo en el host, y eso puede tardar minutos. Si el
+/// manejador esperara a que terminara, el cliente tendría la respuesta bloqueada todo ese tiempo.
+/// Se lanza en un task propio y el `200` vuelve ya, con el `execution_id` **efímero** que identifica
+/// el trabajo en curso: no se persiste porque no hay tabla de restauraciones ni migración nueva, y
+/// el progreso viaja por el stream SSE, no por la base.
+///
+/// # Errors
+///
+/// Un `400` de [`AppError::InvalidInput`] para el identificador mal formado, un `404` de
+/// [`AppError::NotFound`] para la fila que no está **o** para la instantánea que el repositorio no
+/// tiene, un `409` de [`AppError::Conflict`] si la instantánea no tiene vínculo **o** si ese destino
+/// ya tiene una restauración en vuelo, un `422` de [`AppError::UnprocessableEntity`] si el target no
+/// se puede restaurar en esta versión, y un `500` de [`AppError::Database`] si el vínculo no se
+/// puede resolver. Un fallo al abrir el repositorio para comprobar la instantánea llega como
+/// [`AppError::BadGateway`], que es lo que la traducción del motor da a un destino que no responde.
+pub async fn restaurar(
+    State(estado): State<AppState>,
+    Path(instantanea): Path<String>,
+    Json(cuerpo): Json<CuerpoDeLaRestauracion>,
+) -> Result<ApiResponse, AppError> {
+    let id = identificador(&cuerpo.repository_id)?;
+
+    // La fila resuelve **qué** destino abrir, y su ausencia es un `404` antes de tocar el
+    // almacenamiento: el mismo texto que el `404` del explorador, para que el panel no tenga que
+    // distinguir por el mensaje de qué ruta viene.
+    let fila = estado.db.repositorios.leer(&id).await?.ok_or_else(|| {
+        AppError::NotFound("no existe ningún repositorio con ese identificador".to_owned())
+    })?;
+
+    // El vínculo lo resuelve la capa de acceso: la instantánea no guarda su tarea, así que el único
+    // camino es el que dejó escrito la ejecución. `None` es «esa instantánea no casa con ninguna
+    // ejecución de este repositorio» —un `409`, no un `404`: la copia existe, lo que falta es el
+    // vínculo—.
+    let objetivo = estado
+        .db
+        .ejecuciones
+        .objetivo_de_la_instantanea(&instantanea, &id)
+        .await?;
+
+    let Some(objetivo) = objetivo else {
+        return Err(AppError::Conflict(
+            "la instantánea no está asociada a ninguna ejecución ni target: no hay sobre qué \
+             restaurarla"
+                .to_owned(),
+        ));
+    };
+
+    // El vínculo existe y la petición es correcta: lo que no se puede cumplir es la operación para
+    // este tipo de target en esta versión, y esa es la distinción que hace que el panel diga
+    // «todavía no» en vez de «no se encuentra».
+    if objetivo.target_type != TipoDeTarget::Directory {
+        return Err(AppError::UnprocessableEntity(
+            "restaurar targets de base de datos todavía no está soportado en esta versión: solo se \
+             restauran targets de directorio"
+                .to_owned(),
+        ));
+    }
+
+    // El §3 pide la ruta del host para un target de directorio, pero **la base no la garantiza**:
+    // su único `CHECK` restringe `target_type` y `host_path` es anulable, así que un `directory`
+    // sin ruta es una fila que la tabla guarda —lo dice el alta de targets— y aquí no se da por
+    // hecha: sin destino no hay dónde restaurar, y el motivo lo dice. El `Option` se **mueve** y
+    // no se clona porque el tipo ya se comprobó arriba: del objetivo solo quedan los dos campos de
+    // la respuesta.
+    let destino = objetivo.host_path.ok_or_else(|| {
+        AppError::UnprocessableEntity(
+            "el target de la instantánea es de directorio pero no declara su ruta en el host: no \
+             hay dónde restaurarla"
+                .to_owned(),
+        )
+    })?;
+
+    // Dos accesos y no uno: el tipo no es `Clone` —lleva los secretos ya descifrados, y clonarlos
+    // por comodidad sería repartirlos—, así que la comprobación y el trabajo se llevan cada uno el
+    // suyo. Construirlo cuesta leer seis campos de una fila que ya está en memoria.
+    let acceso_de_la_comprobacion = acceso_del_repositorio(&fila);
+
+    // El `404` **de verdad**, y el último de los rechazos: la fila y el vínculo se resuelven sin
+    // abrir el almacenamiento, así que hasta aquí no se sabe si la copia sigue existiendo. Una
+    // instantánea que ya no está —una que purgó la retención, un repositorio recreado en el mismo
+    // destino— no se puede restaurar, y decirlo exige preguntárselo al repositorio.
+    // `job_executions.snapshot_id` dice **cuál** se copió, no si sigue ahí: sin esta comprobación el
+    // `200` prometería un trabajo contra una copia ausente y el fallo solo saldría en el registro,
+    // que es lo que la auditoría marcó. Va aquí y no antes para que los rechazos que no cuestan una
+    // apertura se decidan sin pagarla, y **antes** de generar el `execution_id` y lanzar el trabajo:
+    // el escenario del contrato dice que este `404` no publica ningún `restore_progress` ni lanza
+    // ninguna ejecución de restauración.
+    if !estado
+        .motor
+        .tiene_la_instantanea(acceso_de_la_comprobacion, &instantanea)
+        .await
+        .map_err(del_motor)?
+    {
+        return Err(AppError::NotFound(
+            "el repositorio indicado no tiene ninguna instantánea con ese identificador: no hay \
+             nada que restaurar"
+                .to_owned(),
+        ));
+    }
+
+    // La guarda de exclusión por **destino**, antes de responder: dos restauraciones sobre el mismo
+    // `host_path` escribirían a la vez en el mismo directorio del host. La reserva viaja con el
+    // trabajo —ver `ReservaDeRestauracion`— y se suelta cuando el trabajo acabe, sea como sea.
+    let reserva = estado
+        .motor
+        .reservar_el_destino(&destino)
+        .map_err(del_motor)?;
+
+    // Efímero: identifica el trabajo en curso para el stream SSE y no se persiste —no hay tabla de
+    // restauraciones ni migración nueva—.
+    let execution_id = Uuid::new_v4();
+
+    // La restauración va **en segundo plano** para que el `200` vuelva ya: el contrato devuelve la
+    // ejecución, no su resultado. El fallo no puede viajar al cliente —ya tiene su respuesta—, así
+    // que se registra, que es lo único que se puede hacer con él.
+    let motor = estado.motor.clone();
+    let acceso = acceso_del_repositorio(&fila);
+    let instantanea_tarea = instantanea.clone();
+
+    tokio::spawn(async move {
+        // La reserva vive lo que dure el trabajo: se suelta al terminar —y también si el futuro se
+        // desmonta por un pánico o por una cancelación, porque es un local suyo y su `Drop` corre
+        // igual—. Por eso no hay un `liberar` explícito aquí: el que se puede olvidar es el que
+        // deja el destino reservado para siempre.
+        let _reserva = reserva;
+
+        if let Err(error) = motor
+            .restaurar(acceso, instantanea_tarea, destino, execution_id)
+            .await
+        {
+            tracing::error!(%error, "la restauración en segundo plano falló");
+        }
+    });
+
+    let vista = RestauracionDelCable {
+        execution_id: execution_id.to_string(),
+        snapshot_id: instantanea,
+        target_id: objetivo.target_id.to_string(),
+        target_name: objetivo.target_name,
+    };
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "restauración lanzada",
+        contenido(&vista)?,
+    ))
+}
+
+/// El `data` de la respuesta de la restauración: en qué ejecución corre, qué se restaura y dónde.
+///
+/// # Estos nombres son un **añadido al SRS**
+///
+/// El §5 publica el `execution_id` del evento SSE de la restauración pero **no** el JSON de esta
+/// respuesta, así que los cuatro nombres los fija el RED de este change, igual que los seis campos
+/// del explorador. Van en snake_case porque el test los lee así y porque el resto del §5 usa ese
+/// estilo.
+#[derive(Debug, Serialize)]
+struct RestauracionDelCable {
+    /// La ejecución **efímera** en la que corre la restauración; no se persiste.
+    execution_id: String,
+    /// La instantánea que se está restaurando.
+    snapshot_id: String,
+    /// El target sobre el que se restaura.
+    target_id: String,
+    /// El nombre del target, para que el panel pueda anunciarlo sin otra consulta.
+    target_name: String,
+}
+
+/// Convierte el `repository_id` del cuerpo en un `Uuid`, o contesta `400` nombrando su campo.
+///
+/// El motivo **nombra el campo y no repite el valor** que llegó: la regla de la casa es que un
+/// rechazo diga qué campo está mal, nunca lo que traía. Es el mismo reparto que en los tres recursos
+/// con identificador en el camino —una errata de teclado no es un recurso ausente— y que en el
+/// listado de este mismo módulo.
+fn identificador(repository_id: &str) -> Result<Uuid, AppError> {
+    Uuid::parse_str(repository_id).map_err(|_| {
+        AppError::InvalidInput(
+            "el campo `repository_id` del cuerpo no tiene la forma de un UUID".to_owned(),
+        )
+    })
 }
 
 /// Resuelve la fila del repositorio que pide la consulta, o el rechazo que le corresponda.
@@ -291,13 +587,22 @@ struct ListadoDelCable {
 }
 
 impl ListadoDelCable {
-    /// Vuelca las instantáneas del motor en la vista del cable.
+    /// Vuelca las instantáneas del motor en la vista del cable, casando cada una con su objetivo.
     ///
     /// Puede fallar porque formatear una fecha es falible: ver [`SnapshotDelCable::desde`].
-    fn desde(instantaneas: &[ResumenDeSnapshot], truncated: bool) -> Result<Self, AppError> {
+    ///
+    /// El `objetivos` lo trae **quien llama** —el manejador, de la capa de datos— y no el motor, que
+    /// no lee la base: aquí solo se casa por el identificador de la instantánea, y la que no esté en
+    /// el mapa sale con los tres campos de su target a `null`, que es lo que significa «esta copia no
+    /// casó con ninguna ejecución» y **no** un hueco que rellenar.
+    fn desde(
+        instantaneas: &[ResumenDeSnapshot],
+        objetivos: &HashMap<String, ObjetivoDeRestauracion>,
+        truncated: bool,
+    ) -> Result<Self, AppError> {
         let snapshots = instantaneas
             .iter()
-            .map(SnapshotDelCable::desde)
+            .map(|resumen| SnapshotDelCable::desde(resumen, objetivos.get(&resumen.id)))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
@@ -327,6 +632,14 @@ impl ListadoDelCable {
 /// que se resuelve una instantánea sin ambigüedad—, `time` en RFC3339 —el formato del resto de la
 /// API—, `paths` con las rutas que la instantánea **declara** contener, `label` con la etiqueta de
 /// la tarea, y `files` y `bytes` como el resumen de lo que la copia procesó.
+///
+/// # Y por qué los tres del target van **aparte** de esos seis
+///
+/// Porque no salen del repositorio ni de la instantánea, sino del vínculo que dejó la ejecución que
+/// la copió: son la respuesta a «¿sobre qué se restauraría esto y se puede?», que es la pregunta que
+/// el panel hace **antes** de ofrecer el botón. Su `null` no es un dato que falte sino un dato: una
+/// copia sin vínculo —de otra herramienta, o cuya fila se borró en cascada con su tarea— no tiene
+/// destino conocido, y eso es justo lo que hay que poder leer.
 #[derive(Debug, Serialize)]
 struct SnapshotDelCable {
     /// El identificador de la instantánea, en hex completo.
@@ -346,10 +659,27 @@ struct SnapshotDelCable {
     files: u64,
     /// Los bytes que la copia procesó.
     bytes: u64,
+    /// El identificador del target sobre el que se restauraría, en su forma canónica; `null` si la
+    /// instantánea no casó con ninguna ejecución.
+    ///
+    /// Es anulable **por contrato** y no por descuido, y lo es junto a los dos de abajo: la
+    /// instantánea existe en el repositorio y puede que ninguna ejecución la haya anotado, y en ese
+    /// caso el panel tiene que poder decir «de ésta no se sabe el destino» en vez de esconderla del
+    /// listado o de inventarse un destino.
+    target_id: Option<String>,
+    /// El nombre del target, para que el panel lo anuncie sin otra consulta; `null` con el resto.
+    target_name: Option<String>,
+    /// El tipo del target, con **el mismo texto del cable** que publica `/api/v1/targets`; `null`
+    /// con el resto.
+    ///
+    /// Se publica aunque el target no sea restaurable en esta versión —solo un `directory` lo es—
+    /// porque es el dato con el que el panel decide si deshabilitar la acción: saberlo **antes** de
+    /// intentarlo es justo lo que evita un `422` que el operador no podía prever.
+    target_type: Option<String>,
 }
 
 impl SnapshotDelCable {
-    /// Convierte un resumen del repositorio en la vista del cable.
+    /// Convierte un resumen del repositorio y su objetivo —si lo tiene— en la vista del cable.
     ///
     /// La fecha se formatea aquí y **puede fallar** —el rango de fechas de `time` es más estrecho
     /// que el de la biblioteca—, y ese fallo es un `500` con la causa al registro y no una fecha
@@ -359,7 +689,16 @@ impl SnapshotDelCable {
     /// El resto son copias tal cual: el resumen del repositorio ya viene con los tipos del panel
     /// —los dos contadores como `u64` y las rutas como cadenas—, así que aquí no se reinterpreta
     /// ninguno.
-    fn desde(resumen: &ResumenDeSnapshot) -> Result<Self, AppError> {
+    ///
+    /// Los tres del target salen del objetivo que resolvió la capa de datos, y su ausencia se
+    /// publica como `null` en los tres: no hay un caso en que uno solo falte, porque o hay vínculo
+    /// —y entonces están los tres— o no lo hay. El tipo se traduce con
+    /// [`texto_del_tipo`], que es la **misma** función que usa el recurso de targets: el vocabulario
+    /// del cable es uno, no uno por ruta.
+    fn desde(
+        resumen: &ResumenDeSnapshot,
+        objetivo: Option<&ObjetivoDeRestauracion>,
+    ) -> Result<Self, AppError> {
         Ok(Self {
             id: resumen.id.clone(),
             time: fecha(resumen.fecha)?,
@@ -367,6 +706,9 @@ impl SnapshotDelCable {
             label: resumen.etiqueta.clone(),
             files: resumen.ficheros,
             bytes: resumen.bytes,
+            target_id: objetivo.map(|objetivo| objetivo.target_id.to_string()),
+            target_name: objetivo.map(|objetivo| objetivo.target_name.clone()),
+            target_type: objetivo.map(|objetivo| texto_del_tipo(objetivo.target_type).to_owned()),
         })
     }
 }
@@ -386,14 +728,25 @@ fn fecha(fecha: OffsetDateTime) -> Result<String, AppError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use axum::Router;
     use axum::http::StatusCode;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
+    use uuid::Uuid;
 
+    use crate::api::api_router;
+    use crate::db::entities::{AltaDeEjecucion, AltaDeTarea, AltaDeTarget, Estado, TipoDeTarget};
+    use crate::engine::EventoDelMotor;
+    use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
-        ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA, body_json, directorio_de_prueba,
-        get, post_json, router_desarrollo, sembrar_snapshot_ajeno, sembrar_snapshots,
+        DirectorioDePrueba, ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA,
+        SEMILLA_CONTENIDO, base_con_clave, body_json, config_con_dsn, directorio_de_prueba,
+        estado_de_prueba, get, post_json, router_desarrollo, sembrar_snapshot_ajeno,
+        sembrar_snapshots,
     };
 
     /// Un identificador bien formado cualquiera, que no corresponde a ninguna fila.
@@ -454,12 +807,18 @@ mod tests {
             .to_owned()
     }
 
-    /// Comprueba que un elemento del listado trae los seis datos del contrato, cada uno con su tipo.
+    /// Comprueba que un elemento del listado trae los seis datos del contrato, cada uno con su tipo,
+    /// y **las tres claves** del target.
     ///
     /// Los seis y no uno: el explorador es la única pantalla que enseña qué hay **dentro** del
     /// repositorio, y cada dato que falte deja una columna de la tabla sin poder pintarse. El tipo se
     /// comprueba además del valor porque un número serializado como cadena —o una fecha como número—
     /// pasa un `is_some` y rompe al panel.
+    ///
+    /// De los tres del target se comprueba aquí **la presencia** y no el valor: el contrato los
+    /// publica en todos los elementos —un elemento sin esas claves dejaría al panel sin poder
+    /// distinguir «esta copia no tiene target» de «el servidor no lo dice»—, y cuáles llegan a `null`
+    /// y cuáles poblados lo miden las pruebas que siembran el vínculo.
     fn comprobar_elemento(elemento: &serde_json::Value, donde: &str) {
         assert!(
             elemento["id"].as_str().is_some_and(|id| !id.is_empty()),
@@ -502,6 +861,41 @@ mod tests {
             "el resumen del elemento {donde} tiene que contar los bytes que la copia procesó: \
          {elemento}"
         );
+
+        for campo in CAMPOS_DEL_TARGET {
+            assert!(
+                elemento.get(campo).is_some(),
+                "el elemento {donde} no trae el campo `{campo}` del target, y el contrato lo publica \
+             en **todos** los elementos, aunque sea a `null`: {elemento}"
+            );
+        }
+    }
+
+    /// Los tres campos del target que el listado publica en **cada** elemento.
+    ///
+    /// Son los mismos que necesita el panel para saber si la copia es restaurable y sobre qué: el
+    /// identificador, el nombre y el tipo del target, y los tres a `null` cuando la instantánea no
+    /// casó con ninguna ejecución.
+    const CAMPOS_DEL_TARGET: [&str; 3] = ["target_id", "target_name", "target_type"];
+
+    /// Busca, por su identificador, el elemento del listado que corresponde a una instantánea.
+    ///
+    /// Se busca por identificador y no por posición porque el orden del listado es el de las fechas
+    /// —de la más reciente a la más antigua— y una prueba que se apoyara en la posición estaría
+    /// midiendo el orden para hablar del target. Y se falla en vez de devolver `None`: que la
+    /// instantánea sembrada no esté en el listado no es un caso a tolerar aquí —eso ya lo afirma la
+    /// prueba— sino el motivo por el que la aserción que viene después no significaría nada.
+    fn elemento_con_id<'a>(
+        listado: &'a [serde_json::Value],
+        instantanea: &str,
+        cuerpo: &serde_json::Value,
+    ) -> &'a serde_json::Value {
+        listado
+            .iter()
+            .find(|elemento| elemento["id"].as_str() == Some(instantanea))
+            .unwrap_or_else(|| {
+                panic!("la instantánea `{instantanea}` no está en el listado: {cuerpo}")
+            })
     }
 
     /// 1.29a — Sin `repository_id` el listado contesta `400` **nombrando el parámetro**.
@@ -665,6 +1059,11 @@ mod tests {
     /// único que el explorador garantiza del subconjunto que devuelve—, comprobado sobre la
     /// secuencia entera de fechas, y `truncated: false` con un listado que cabe entero, porque allí
     /// la ventana se llena y el campo es `true`.
+    ///
+    /// Y una tercera, que es la mitad **sin** vínculo del contrato ampliado: aquí el histórico está
+    /// vacío —el repositorio se siembra con la biblioteca y ninguna copia de Kesto ha corrido—, así
+    /// que ninguna de las tres instantáneas casa con una ejecución y los tres campos del target
+    /// tienen que salir a `null` **sin** que ninguna desaparezca del listado.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cada_elemento_trae_sus_seis_datos_y_el_listado_sale_del_repositorio() {
         let router = router_desarrollo().await;
@@ -712,6 +1111,20 @@ mod tests {
 
         for (indice, elemento) in listado.iter().enumerate() {
             comprobar_elemento(elemento, &format!("en la posición {indice}"));
+        }
+
+        // Y sin ejecuciones en el histórico, los tres campos del target llegan a `null`: es lo que
+        // significa «esta copia no casó con ninguna ejecución», y tiene que poder leerse sin que el
+        // elemento se caiga del listado. La mitad contraria —los tres poblados— la mide la prueba
+        // del vínculo, que sí siembra la cadena.
+        for (indice, elemento) in listado.iter().enumerate() {
+            for campo in CAMPOS_DEL_TARGET {
+                assert!(
+                    elemento[campo].is_null(),
+                    "sin ejecuciones que anoten la instantánea, el campo `{campo}` del elemento en \
+                     la posición {indice} tiene que llegar a `null` y llegó {elemento}"
+                );
+            }
         }
 
         // El orden, que es **lo único** que el explorador garantiza del listado: de la más
@@ -777,6 +1190,112 @@ mod tests {
             "las instantáneas del repositorio tienen que llegar con su etiqueta —`{ETIQUETA_SEMBRADA}` \
          y `{ETIQUETA_AJENA}`— y llegaron {etiquetas:?}"
         );
+    }
+
+    /// 1.29f — El listado publica el target de cada instantánea, y `null` si no tiene vínculo.
+    ///
+    /// Cubre `api-resources`, escenario «El listado trae el target de cada instantánea» (D1). Es la
+    /// mitad que la prueba anterior no puede medir: allí el histórico está vacío y todos los
+    /// elementos salen sin target; aquí se siembran las dos cosas y se comprueba que la respuesta las
+    /// trata **distinto sin perder ninguna**:
+    ///
+    /// * una instantánea **con** vínculo —target, tarea y ejecución sembrados por la capa de acceso,
+    ///   que es la única forma de tener una ejecución, porque las crea una copia que corre—, que sale
+    ///   con los tres campos poblados;
+    /// * y otra **sin** él, que es la copia que el histórico no anotó —una hecha con otra
+    ///   herramienta— y que sigue en el listado con los tres a `null`.
+    ///
+    /// Se afirma el **tipo del cable** del target y no el de la columna: `directory`, el mismo literal
+    /// que publica `/api/v1/targets`, porque es el dato con el que el panel decide si la restauración
+    /// es posible **antes** de ofrecerla.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_listado_publica_el_target_de_cada_instantanea_y_null_si_no_lo_tiene() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z", "2026-01-02T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "explorador-1-29f", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        // Una de las dos se queda sin vínculo: es la ajena al histórico, y tiene que seguir en el
+        // listado con su hueco a la vista.
+        let con_vinculo = siembra.identificadores[0].clone();
+        let sin_vinculo = siembra.identificadores[1].clone();
+
+        let (target, _ejecucion) = sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &con_vinculo,
+            TipoDeTarget::Directory,
+            Some("/srv/explorador-1-29f".to_owned()),
+        )
+        .await;
+
+        let respuesta = get(
+            router,
+            &format!("/api/v1/snapshots?repository_id={repositorio}"),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado de un repositorio con una instantánea con vínculo y otra sin él tiene que \
+             contestar 200, y contestó {status} con {cuerpo}"
+        );
+
+        let listado = cuerpo["data"]["snapshots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
+
+        assert_eq!(
+            listado.len(),
+            siembra.identificadores.len(),
+            "una instantánea sin vínculo sigue siendo una copia del repositorio y no puede \
+             desaparecer del listado: {cuerpo}"
+        );
+
+        let del_vinculo = elemento_con_id(listado, &con_vinculo, &cuerpo);
+
+        assert_eq!(
+            del_vinculo["target_id"].as_str(),
+            Some(target.to_string().as_str()),
+            "la instantánea con vínculo tiene que publicar el identificador de su target: {cuerpo}"
+        );
+        assert_eq!(
+            del_vinculo["target_name"].as_str(),
+            Some("target-de-la-restauracion"),
+            "el listado tiene que publicar el nombre del target, para que el panel lo anuncie sin \
+             otra consulta: {cuerpo}"
+        );
+        assert_eq!(
+            del_vinculo["target_type"].as_str(),
+            Some("directory"),
+            "el tipo del target viaja con el mismo texto del cable que publica `/api/v1/targets`: \
+             {cuerpo}"
+        );
+
+        let huerfana = elemento_con_id(listado, &sin_vinculo, &cuerpo);
+
+        for campo in CAMPOS_DEL_TARGET {
+            assert!(
+                huerfana[campo].is_null(),
+                "una instantánea sin ejecución que la anote no tiene target y su campo `{campo}` \
+                 tiene que llegar a `null`: {cuerpo}"
+            );
+        }
     }
 
     /// 1.29e — El listado va acotado a la ventana e indica que hay más.
@@ -847,6 +1366,553 @@ mod tests {
         assert_eq!(
             cuerpo["data"]["truncated"], true,
             "con más instantáneas que la ventana, la respuesta tiene que decir que hay más: {cuerpo}"
+        );
+    }
+
+    /// Cuánto se espera a que el fichero restaurado aparezca bajo el destino.
+    ///
+    /// La restauración es una operación **en curso** cuando la API contesta: el endpoint devuelve
+    /// la ejecución, no su resultado. Sin plazo, una restauración que no escribiera nada dejaría
+    /// la prueba esperando para siempre —y un cuelgue no dice qué faltaba—; con él, el desenlace
+    /// se lee en el mensaje del fallo.
+    const PLAZO_DE_LA_RESTAURACION: Duration = Duration::from_secs(30);
+
+    /// Monta el estado **con su pool y su clave**, para poder sembrar la cadena antes de pedir.
+    ///
+    /// Las pruebas del listado no lo necesitan —su cadena se siembra por la superficie del §5—,
+    /// pero la de la restauración sí: el vínculo `instantánea -> ejecución -> tarea -> target`
+    /// solo existe en la base, y **no hay ruta** que dé de alta una ejecución —la crea una copia
+    /// que corre—, así que hay que sembrarla por la capa de acceso. Es el mismo patrón que
+    /// `executions.rs::estado_con_base`.
+    ///
+    /// La guarda del directorio viaja en el retorno y tiene que seguir **viva** hasta el final de
+    /// la prueba: al soltarse se borra el directorio y la base desaparece bajo los pies del router.
+    async fn estado_con_base() -> (AppState, DirectorioDePrueba) {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool, Arc::clone(&clave)),
+        );
+
+        (estado, directorio)
+    }
+
+    /// Siembra un target, una tarea que lo apunta y una ejecución con la instantánea dada.
+    ///
+    /// Se siembra por la **capa de acceso** porque es la única forma de tener una ejecución: una
+    /// copia la crea cuando corre, y lo que estas pruebas necesitan es el **vínculo** con la
+    /// instantánea, no lanzar una copia y esperar a que acabe.
+    ///
+    /// Devuelve el identificador del target y el de la ejecución, que son dos de los datos que la
+    /// respuesta de la restauración tiene que publicar.
+    async fn sembrar_cadena(
+        estado: &AppState,
+        repositorio: Uuid,
+        instantanea: &str,
+        tipo: TipoDeTarget,
+        host_path: Option<String>,
+    ) -> (Uuid, Uuid) {
+        let target = estado
+            .db
+            .targets
+            .alta(AltaDeTarget {
+                name: "target-de-la-restauracion".to_owned(),
+                target_type: tipo,
+                container_name: None,
+                db_user: None,
+                db_password: None,
+                db_name: None,
+                host_path,
+                db_path: None,
+            })
+            .await
+            .expect("el target de la restauración se da de alta");
+
+        let tarea = estado
+            .db
+            .tareas
+            .alta(AltaDeTarea {
+                target_id: target.id,
+                repository_id: repositorio,
+                cron_expression: "0 3 * * *".to_owned(),
+                keep_daily: 7,
+                keep_weekly: 4,
+                keep_monthly: 6,
+                enabled: true,
+            })
+            .await
+            .expect("la tarea de la restauración se da de alta");
+
+        let ejecucion = estado
+            .db
+            .ejecuciones
+            .alta(AltaDeEjecucion {
+                job_id: tarea.id,
+                status: Estado::Success,
+                snapshot_id: Some(instantanea.to_owned()),
+                bytes_processed: 1024,
+                bytes_uploaded: 512,
+                error_message: None,
+                started_at: OffsetDateTime::now_utc(),
+                finished_at: Some(OffsetDateTime::now_utc()),
+            })
+            .await
+            .expect("la ejecución de la restauración se da de alta");
+
+        (target.id, ejecucion.id)
+    }
+
+    /// Comprueba que por el hub **no** ha salido ningún aviso de restauración.
+    ///
+    /// Se vacía el receptor entero y se mira si había alguno: el receptor se toma **antes** de la
+    /// petición que se mide, así que un aviso publicado por ella está dentro. Se lee con las mismas
+    /// reglas que la prueba del stream —los avisos de una copia se saltan, que aquí no hay ninguna
+    /// corriendo, y un receptor que se hubiera perdido eventos no corta la lectura—.
+    fn no_hay_restauraciones_pendientes(
+        receptor: &mut tokio::sync::broadcast::Receiver<EventoDelMotor>,
+    ) -> bool {
+        loop {
+            match receptor.try_recv() {
+                Ok(EventoDelMotor::Restauracion(_)) => return false,
+                Ok(EventoDelMotor::Ejecucion(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => return true,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+    }
+
+    /// Busca, recursivamente bajo `raiz`, un fichero cuyo contenido sea **exactamente** `contenido`.
+    ///
+    /// Se busca por contenido y **recursivamente** y no por una ruta construida a mano: rustic
+    /// conserva dentro del destino la ruta archivada —la absoluta de la fuente sin su barra
+    /// inicial—, así que adivinar dónde acaba el fichero sería medir la suposición de la prueba y
+    /// no lo que el motor restauró.
+    fn recoge_contenido(raiz: &Path, contenido: &[u8]) -> Option<PathBuf> {
+        for entrada in std::fs::read_dir(raiz).ok()?.flatten() {
+            let ruta = entrada.path();
+
+            if ruta.is_dir() {
+                if let Some(encontrado) = recoge_contenido(&ruta, contenido) {
+                    return Some(encontrado);
+                }
+            } else if std::fs::read(&ruta).is_ok_and(|leido| leido == contenido) {
+                return Some(ruta);
+            }
+        }
+
+        None
+    }
+
+    /// Espera, de forma **acotada**, a que el fichero restaurado aparezca bajo `raiz`.
+    ///
+    /// La restauración corre por detrás de la respuesta, así que el fichero no está en el
+    /// instante en que el endpoint contesta. Se sondea el sistema de ficheros —lo que se mide es
+    /// que los datos **vuelven**, no la fila que los anuncia— hasta agotar el plazo.
+    async fn espera_el_contenido(
+        raiz: &Path,
+        contenido: &[u8],
+        plazo: Duration,
+    ) -> Option<PathBuf> {
+        let limite = Instant::now() + plazo;
+
+        loop {
+            if let Some(encontrado) = recoge_contenido(raiz, contenido) {
+                return Some(encontrado);
+            }
+
+            if Instant::now() >= limite {
+                return None;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 1.39 — Restaurar una instantánea de un target de directorio devuelve su ejecución y su
+    /// target, y **el fichero vuelve a estar**.
+    ///
+    /// Cubre `api-resources`, escenario «Restaurar un snapshot de un target de directorio».
+    ///
+    /// La respuesta no basta como medida: un `200` con la ejecución y el target correctos lo
+    /// cumple un manejador que resuelva el mapeo y no restaure nada. El criterio de aceptación es
+    /// el otro —el fichero sembrado aparece bajo el `host_path` del target—, y por eso el destino
+    /// es un directorio **vacío**: con uno que ya tuviera la fuente no se podría distinguir «se
+    /// restauró» de «ya estaba».
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restaurar_una_instantanea_de_un_target_de_directorio_devuelve_su_ejecucion_y_su_target()
+     {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        // El destino del repositorio, con una instantánea **de verdad** escrita por la
+        // biblioteca: la restauración lee de ahí, así que una instantánea inventada no
+        // restauraría nada.
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-39", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let host = directorio_de_prueba();
+        let instantanea = siembra.identificadores[0].clone();
+
+        let (target, _ejecucion) = sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &instantanea,
+            TipoDeTarget::Directory,
+            Some(host.ruta().to_string_lossy().into_owned()),
+        )
+        .await;
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{instantanea}/restore"),
+            &serde_json::json!({ "repository_id": repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "restaurar una instantánea de un target de directorio tiene que contestar 200, y \
+             contestó {status} con {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["data"]["execution_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "la respuesta tiene que traer el identificador de la ejecución de restauración: {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["snapshot_id"].as_str(),
+            Some(instantanea.as_str()),
+            "la respuesta tiene que identificar la instantánea que se restauró: {cuerpo}"
+        );
+
+        let target_publicado = target.to_string();
+
+        assert_eq!(
+            cuerpo["data"]["target_id"].as_str(),
+            Some(target_publicado.as_str()),
+            "la respuesta tiene que identificar el target sobre el que se restauró: {cuerpo}"
+        );
+
+        let encontrado =
+            espera_el_contenido(host.ruta(), SEMILLA_CONTENIDO, PLAZO_DE_LA_RESTAURACION).await;
+
+        assert!(
+            encontrado.is_some(),
+            "el fichero sembrado no reapareció bajo `{}` en {PLAZO_DE_LA_RESTAURACION:?}: una \
+             restauración que contesta 200 y no devuelve los datos no ha restaurado nada",
+            host.ruta().display()
+        );
+    }
+
+    /// 1.40 — Una instantánea que no casa con ninguna ejecución contesta `409`.
+    ///
+    /// Cubre `api-resources`, escenario «Snapshot sin target». El `409` y no un `404`: la
+    /// instantánea **existe** en el repositorio —se sembró con la biblioteca—, lo que falta es el
+    /// vínculo con un target, y eso no es un recurso ausente sino un conflicto con el estado del
+    /// sistema. Se afirma antes el `assert_ne!` del `404` para que la prueba diga lo que mide y no
+    /// pase por el azar de una ruta sin montar.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_instantanea_sin_ejecucion_contesta_409() {
+        let router = router_desarrollo().await;
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-40", &ruta).await;
+        let instantanea = siembra.identificadores[0].clone();
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{instantanea}/restore"),
+            &serde_json::json!({ "repository_id": repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "la instantánea existe en el repositorio, así que lo que falla no es un recurso \
+             ausente: contestó {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "una instantánea sin ejecución ni target no se puede restaurar y la API tiene que \
+             contestar 409; contestó {status} con {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|motivo| !motivo.is_empty()),
+            "el 409 tiene que traer un motivo que explique que falta el vínculo: {cuerpo}"
+        );
+    }
+
+    /// 1.41 — Una instantánea de un target de base de datos contesta `422`.
+    ///
+    /// Cubre `api-resources`, escenario «Target no restaurable». El `422` y no un `409`: el
+    /// vínculo **existe** y la petición es correcta, lo que no se puede cumplir es la operación
+    /// para ese tipo de target en esta versión, y esa es exactamente la distinción que el código
+    /// tiene que hacer para que el panel pueda decir «todavía no» en vez de «no se encuentra».
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_instantanea_de_un_target_de_base_de_datos_contesta_422() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-41", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let instantanea = siembra.identificadores[0].clone();
+
+        sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &instantanea,
+            TipoDeTarget::Mariadb,
+            None,
+        )
+        .await;
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{instantanea}/restore"),
+            &serde_json::json!({ "repository_id": repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "la ruta de la restauración tiene que estar montada: contestó {status} con {cuerpo}"
+        );
+
+        assert_ne!(
+            status,
+            StatusCode::CONFLICT,
+            "el vínculo con el target existe, así que no es un conflicto con el estado del \
+             sistema: contestó {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "restaurar un target de base de datos no está soportado en esta versión y la API tiene \
+             que contestar 422 explicándolo; contestó {status} con {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|motivo| !motivo.is_empty()),
+            "el 422 tiene que explicar la limitación: {cuerpo}"
+        );
+    }
+
+    /// 1.43 — Una instantánea que no está en el repositorio contesta `404`, y no publica nada.
+    ///
+    /// Cubre `api-resources`, escenario «Snapshot que no está en el repositorio», y es el hallazgo
+    /// que la auditoría marcó como bloqueante: el manejador resolvía la fila y el vínculo sin abrir
+    /// nunca el almacenamiento, así que una instantánea ausente —una copia purgada, un repositorio
+    /// recreado— daba un `200` que prometía un trabajo imposible y el fallo solo salía en el
+    /// registro. El vínculo se siembra con un identificador **inventado** para que el `409` del
+    /// vínculo no tape el caso: aquí hay fila, hay vínculo y hay target de directorio, y lo que
+    /// falta es la copia.
+    ///
+    /// El escenario dice tres cosas, y se afirman las tres: el `404`, que **no** se publica ningún
+    /// `restore_progress` —el receptor del hub se toma antes de pedir y se mira después— y que no se
+    /// lanza ninguna restauración, que es lo mismo dicho de otra forma: el manejador contesta antes
+    /// de generar el `execution_id`, así que el `data` de la respuesta no existe y no hay trabajo
+    /// detrás.
+    ///
+    /// Y el mensaje se compara con el otro `404` —el del repositorio ausente— para dejar dicho que
+    /// son distinguibles: el operador tiene que poder saber si falta el repositorio o la copia.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn una_instantanea_que_no_esta_en_el_repositorio_contesta_404() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        // El repositorio tiene una instantánea de verdad; la que pide la restauración es otra.
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-43", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        // Bien formada —64 caracteres hexadecimales— y ausente: así el `404` lo decide el
+        // repositorio y no el rechazo de un identificador mal formado, que es otro caso.
+        let inventada = "f".repeat(64);
+
+        let host = directorio_de_prueba();
+        sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &inventada,
+            TipoDeTarget::Directory,
+            Some(host.ruta().to_string_lossy().into_owned()),
+        )
+        .await;
+
+        let mut receptor = estado
+            .motor
+            .hub()
+            .suscribir()
+            .expect("el hub no está cerrado en esta prueba");
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{inventada}/restore"),
+            &serde_json::json!({ "repository_id": repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_ne!(
+            status,
+            StatusCode::CONFLICT,
+            "el vínculo con el target existe, así que lo que falta no es el vínculo: contestó \
+             {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "una instantánea que el repositorio no tiene no se puede restaurar y la API tiene que \
+             contestar 404 —y no un 200 optimista—: contestó {status} con {cuerpo}"
+        );
+
+        let motivo = cuerpo["message"].as_str().unwrap_or_default();
+
+        assert!(
+            motivo.contains("instantánea"),
+            "el 404 de la instantánea ausente tiene que decir que lo que falta es la copia: {cuerpo}"
+        );
+
+        assert_ne!(
+            motivo, "no existe ningún repositorio con ese identificador",
+            "el 404 de la copia ausente y el del repositorio ausente tienen que ser distinguibles: \
+             el operador necesita saber cuál de los dos le falta"
+        );
+
+        assert!(
+            no_hay_restauraciones_pendientes(&mut receptor),
+            "un 404 no puede publicar ningún `restore_progress`: el panel daría por lanzada una \
+             restauración que no existe"
+        );
+    }
+
+    /// 1.44 — Dos restauraciones **simultáneas** sobre el mismo destino no caben: una entra.
+    ///
+    /// Es la guarda de la tercera corrección. Sin ella, dos `POST` sobre el mismo snapshot generan
+    /// cada uno su `execution_id` y escriben a la vez en el **mismo `host_path`**, y lo que queda en
+    /// el disco es la mezcla de las dos.
+    ///
+    /// El orden de los dos códigos es **indeterminado** —las dos peticiones se lanzan a la vez y
+    /// cuál reserva primero lo decide el planificador—, así que lo que se afirma es el reparto y no
+    /// quién llegó antes. Y no hay dos `409` posibles: la reserva la suelta quien la tomó, así que
+    /// una de las dos tiene que haber entrado.
+    ///
+    /// Por qué esto no es una carrera que pueda salir de otra forma: las dos peticiones empiezan a
+    /// la vez y cada una abre el repositorio **antes** de reservar —unos 6,4 s por apertura en la
+    /// compilación de pruebas—, así que las dos reservas caen en el mismo tramo de milisegundos,
+    /// mientras que la ganadora retiene el destino toda su restauración, que abre el repositorio
+    /// **otra vez** con el mismo coste. La ventana en la que la perdedora encontraría el destino
+    /// libre es, por tanto, varios segundos más corta que la que necesita para llegar hasta allí.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dos_restauraciones_simultaneas_sobre_el_mismo_destino_no_caben() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let instantanea = siembra.identificadores[0].clone();
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-44", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let host = directorio_de_prueba();
+        sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &instantanea,
+            TipoDeTarget::Directory,
+            Some(host.ruta().to_string_lossy().into_owned()),
+        )
+        .await;
+
+        let uri = format!("/api/v1/snapshots/{instantanea}/restore");
+        let cuerpo = serde_json::json!({ "repository_id": repositorio });
+
+        // Las dos a la vez: `join!` y no dos `await` seguidos, que sería medir el caso en el que una
+        // ya ha terminado —y entonces las dos entran, con razón—.
+        let (primera, segunda) = tokio::join!(
+            post_json(router.clone(), &uri, &cuerpo),
+            post_json(router.clone(), &uri, &cuerpo),
+        );
+
+        let mut codigos = [primera.status(), segunda.status()];
+        codigos.sort_by_key(|codigo| codigo.as_u16());
+
+        assert_eq!(
+            codigos,
+            [StatusCode::OK, StatusCode::CONFLICT],
+            "dos restauraciones simultáneas sobre el mismo destino tienen que dejar una lanzada \
+             (200) y la otra rechazada (409): contestaron {codigos:?}"
         );
     }
 }

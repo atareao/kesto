@@ -14,13 +14,13 @@
 //!
 //! # El cable vive aquí, no en el hub
 //!
-//! El nombre del evento —[`NOMBRE_DEL_EVENTO`]—, los siete nombres de campo y el texto del
-//! `status` se escriben en este fichero y en ningún otro. El motor entrega un
-//! [`EventoDeEjecucion`] con tipos —el `status` es un
-//! [`Estado`](crate::db::entities::Estado), no una cadena—, y traducirlo a las líneas del
-//! protocolo es cosa de la capa HTTP: si los nombres vivieran en el hub, el hub tendría que saber
-//! cómo se llama el cable, y el día que el motor cambie su tipo interno el panel se enteraría por
-//! un campo que deja de llegar.
+//! Los nombres de los eventos —[`NOMBRE_DEL_EVENTO`] y
+//! [`NOMBRE_DEL_EVENTO_DE_RESTAURACION`]—, los nombres de sus campos y el texto del `status` se
+//! escriben en este fichero y en ningún otro. El motor entrega un [`EventoDelMotor`] con tipos —el
+//! `status` es un [`Estado`](crate::db::entities::Estado), no una cadena—, y traducirlo a las
+//! líneas del protocolo es cosa de la capa HTTP: si los nombres vivieran en el hub, el hub tendría
+//! que saber cómo se llama el cable, y el día que el motor cambie su tipo interno el panel se
+//! enteraría por un campo que deja de llegar.
 //!
 //! # Sin latido, y por qué eso es una decisión y no un olvido
 //!
@@ -78,16 +78,22 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::engine::EventoDeEjecucion;
+use crate::engine::{EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor};
 use crate::state::AppState;
 
-/// El nombre del evento del §5: el único que este stream emite.
+/// El nombre del evento de una ejecución: el del §5.
 ///
 /// Es una constante, y una sola, porque el nombre es **contrato**: el panel se escribe contra él
 /// —`event: execution_progress`— y un cambio de literal aquí es un cambio de protocolo, no un
 /// detalle de implementación. Vive al lado del manejador que lo escribe y no en el hub, por lo
 /// dicho arriba: el hub reparte un tipo, el cable lo pone la capa HTTP.
 pub const NOMBRE_DEL_EVENTO: &str = "execution_progress";
+
+/// El nombre del evento de una restauración.
+///
+/// El mismo razonamiento que [`NOMBRE_DEL_EVENTO`]: es contrato —el panel se escribe contra
+/// `event: restore_progress`— y por eso es una constante con nombre y no un literal suelto.
+pub const NOMBRE_DEL_EVENTO_DE_RESTAURACION: &str = "restore_progress";
 
 /// El flujo de eventos de un cliente, ya en el formato del protocolo.
 ///
@@ -154,7 +160,7 @@ pub async fn stream(State(estado): State<AppState>) -> Sse<FlujoDelStream> {
 /// conexiones acaben, y este `Closed` es lo que hace que la de este cliente acabe. Sin él, el
 /// cierre del servidor esperaría para siempre a un cuerpo que no tiene final.
 fn flujo(
-    receptor: broadcast::Receiver<EventoDeEjecucion>,
+    receptor: broadcast::Receiver<EventoDelMotor>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(receptor, |mut receptor| async move {
         loop {
@@ -179,22 +185,45 @@ fn flujo(
 
 /// Traduce un aviso del motor a la línea de evento que viaja por el cable.
 ///
-/// Devuelve `None` —y lo registra— si el `data` no se puede serializar. No debería ocurrir: los
-/// siete campos son dos cadenas, tres números y un `Option<f64>`, y con eso `serde_json` no falla.
-/// Pero un manejador no aborta, y aquí además no hay ninguna respuesta donde poner un `500`: el
-/// stream ya está abierto, así que el desenlace honesto es perder ese aviso y seguir sirviendo los
+/// Es el `match` que separa las dos clases de aviso: cada variante tiene su nombre de evento y su
+/// vista. Devuelve `None` —y lo registra— si el `data` no se puede serializar. No debería ocurrir:
+/// los campos son cadenas, números y un `Option<f64>`, y con eso `serde_json` no falla. Pero un
+/// manejador no aborta, y aquí además no hay ninguna respuesta donde poner un `500`: el stream ya
+/// está abierto, así que el desenlace honesto es perder ese aviso y seguir sirviendo los
 /// siguientes, en vez de cerrar la conexión de todos los clientes por un evento que no se pudo
 /// escribir.
-fn linea(evento: &EventoDeEjecucion) -> Option<Event> {
-    match serde_json::to_string(&VistaDelEvento::desde(evento)) {
-        Ok(datos) => Some(Event::default().event(NOMBRE_DEL_EVENTO).data(datos)),
-        Err(error) => {
-            tracing::error!(
-                %error,
-                "un aviso de ejecución no se pudo serializar: se descarta y el stream sigue"
-            );
+fn linea(evento: &EventoDelMotor) -> Option<Event> {
+    match evento {
+        EventoDelMotor::Ejecucion(evento) => {
+            match serde_json::to_string(&VistaDelEvento::desde(evento)) {
+                Ok(datos) => Some(Event::default().event(NOMBRE_DEL_EVENTO).data(datos)),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "un aviso de ejecución no se pudo serializar: se descarta y el stream sigue"
+                    );
 
-            None
+                    None
+                }
+            }
+        }
+        EventoDelMotor::Restauracion(evento) => {
+            match serde_json::to_string(&VistaDelEventoDeRestauracion::desde(evento)) {
+                Ok(datos) => Some(
+                    Event::default()
+                        .event(NOMBRE_DEL_EVENTO_DE_RESTAURACION)
+                        .data(datos),
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "un aviso de restauración no se pudo serializar: se descarta y el stream \
+                         sigue"
+                    );
+
+                    None
+                }
+            }
         }
     }
 }
@@ -247,6 +276,44 @@ impl<'a> VistaDelEvento<'a> {
     }
 }
 
+/// El `data` del evento de restauración: sus siete campos, con sus nombres literales.
+///
+/// Es el hermano de [`VistaDelEvento`] y por el mismo motivo: los nombres de los campos son
+/// contrato y viven aquí, no en el tipo del motor. La diferencia es que una restauración no tiene
+/// `job_id` ni `status`, sino la instantánea que se restaura y la fase en la que va.
+#[derive(Debug, Serialize)]
+struct VistaDelEventoDeRestauracion<'a> {
+    /// La ejecución de restauración de la que habla el aviso, en su forma canónica con guiones.
+    execution_id: String,
+    /// La instantánea que se está restaurando.
+    snapshot_id: &'a str,
+    /// Qué está haciendo la restauración ahora mismo.
+    phase: &'a str,
+    /// Los ficheros restaurados hasta el momento.
+    files_done: u64,
+    /// Los ficheros que la restauración tiene que escribir.
+    files_total: u64,
+    /// Los bytes restaurados hasta el momento.
+    bytes_done: u64,
+    /// Los bytes que la restauración tiene que escribir.
+    bytes_total: u64,
+}
+
+impl<'a> VistaDelEventoDeRestauracion<'a> {
+    /// Convierte un aviso de restauración en la vista que viaja por el cable.
+    fn desde(evento: &'a EventoDeRestauracion) -> Self {
+        Self {
+            execution_id: evento.execution_id.hyphenated().to_string(),
+            snapshot_id: &evento.snapshot_id,
+            phase: &evento.phase,
+            files_done: evento.files_done,
+            files_total: evento.files_total,
+            bytes_done: evento.bytes_done,
+            bytes_total: evento.bytes_total,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Las pruebas del stream de eventos: `GET /api/v1/events`.
@@ -271,18 +338,23 @@ mod tests {
     //! repositorio y tarea, el disparo y el propio stream—: así lo que se mide es lo que el panel
     //! ve, y no una ruta montada a mano para la prueba.
     use std::path::Path;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use axum::Router;
     use axum::body::Body;
     use axum::http::StatusCode;
     use axum::http::header;
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     use crate::api::api_router;
+    use crate::db::entities::{AltaDeEjecucion, Estado};
+    use crate::state::EstadoDeBase;
     use crate::test_support::{
-        DirectorioDePrueba, datos_del_evento, directorio_de_prueba, estado_desarrollo, get,
-        header_text, post, post_json, router_oidc, siguiente_evento,
+        DirectorioDePrueba, base_con_clave, config_con_dsn, datos_del_evento, directorio_de_prueba,
+        estado_de_prueba, estado_desarrollo, get, header_text, post, post_json, router_oidc,
+        sembrar_snapshots, siguiente_evento,
     };
 
     /// Lo que se espera a que llegue un evento del stream, en cada espera.
@@ -762,5 +834,174 @@ mod tests {
                 .is_some_and(|mensaje| !mensaje.is_empty()),
             "el 401 tiene que traer un mensaje: {texto}"
         );
+    }
+
+    /// Los campos del progreso de una restauración, con sus nombres literales.
+    ///
+    /// Se declaran como lista y no se escriben uno a uno en la aserción porque el contrato los fija
+    /// **todos** y una lista es lo único que hace que perder uno se lea en el mensaje del fallo. No
+    /// se cuentan ni se exige un número exacto, a diferencia del evento del §5: aquí lo que se
+    /// afirma es que ninguno de los siete falta.
+    const LOS_CAMPOS_DE_LA_RESTAURACION: [&str; 7] = [
+        "execution_id",
+        "snapshot_id",
+        "phase",
+        "files_done",
+        "files_total",
+        "bytes_done",
+        "bytes_total",
+    ];
+
+    /// El aparato de la restauración: la cadena que mapea una instantánea con su target.
+    ///
+    /// Es hermano de [`AparatoDelStream`] y por el mismo motivo: el stream solo habla cuando el
+    /// motor publica, y el motor publica cuando una operación avanza. Aquí la operación es una
+    /// restauración, y lo único que no se puede sembrar por la superficie del §5 es la fila de
+    /// `job_executions` que da el vínculo —la crea una copia que corre, y no hay ruta que la
+    /// dé de alta—, así que esa pieza se siembra por la capa de acceso.
+    ///
+    /// Los tres directorios se retienen: el de la base porque el pool lo sobrevive, y los dos —el
+    /// destino del repositorio y el `host_path` del target— porque la restauración sigue corriendo
+    /// cuando la prueba ya ha leído su primer aviso.
+    struct AparatoDeLaRestauracion {
+        /// La base con la que se sembró la ejecución, retenida mientras viva el aparato.
+        _base: DirectorioDePrueba,
+        /// El destino local del repositorio, con su instantánea sembrada.
+        _destino: DirectorioDePrueba,
+        /// El `host_path` del target de directorio, que es donde la restauración escribe.
+        _host: DirectorioDePrueba,
+        /// El router de producción.
+        router: Router,
+        /// El identificador de la instantánea que se restaura.
+        snapshot: String,
+        /// El repositorio en cuyo destino vive la instantánea.
+        repositorio: String,
+    }
+
+    impl AparatoDeLaRestauracion {
+        /// Siembra la cadena entera y devuelve el aparato listo para lanzar la restauración.
+        async fn nuevo() -> Self {
+            let (directorio, pool, clave) = base_con_clave().await;
+
+            let estado = estado_de_prueba(
+                config_con_dsn(&directorio.dsn()),
+                EstadoDeBase::nuevo(pool, Arc::clone(&clave)),
+            );
+
+            let router = api_router(estado.clone());
+
+            // El destino llevará una instantánea **de verdad**, escrita por la biblioteca: la
+            // restauración lee de ahí, así que hay que sembrarla **antes** del alta —que abre el
+            // repositorio— y no después.
+            let destino = directorio_de_prueba();
+            let siembra = sembrar_snapshots(
+                destino.ruta(),
+                crate::test_support::PASSPHRASE_DE_PRUEBA,
+                &["2026-01-01T10:00:00Z"],
+            );
+            let instantanea = siembra.identificadores[0].clone();
+
+            let host = directorio_de_prueba();
+
+            let target = alta_de_target(&router, host.ruta()).await;
+            let repositorio = alta_de_repositorio(&router, destino.ruta()).await;
+            let tarea = alta_de_tarea(&router, &target, &repositorio).await;
+
+            // La única pieza sin ruta: el vínculo entre la instantánea y la tarea.
+            estado
+                .db
+                .ejecuciones
+                .alta(AltaDeEjecucion {
+                    job_id: tarea,
+                    status: Estado::Success,
+                    snapshot_id: Some(instantanea.clone()),
+                    bytes_processed: 1024,
+                    bytes_uploaded: 512,
+                    error_message: None,
+                    started_at: OffsetDateTime::now_utc(),
+                    finished_at: Some(OffsetDateTime::now_utc()),
+                })
+                .await
+                .expect("la ejecución que da el vínculo de la instantánea se da de alta");
+
+            Self {
+                _base: directorio,
+                _destino: destino,
+                _host: host,
+                router,
+                snapshot: instantanea,
+                repositorio,
+            }
+        }
+    }
+
+    /// 1.42 — La restauración publica `restore_progress` en el stream global.
+    ///
+    /// Cubre `api-resources`, escenario «Restaurar un snapshot de un target de directorio» en lo
+    /// que toca al stream: el progreso de una restauración se publica con **su** nombre de evento y
+    /// con sus campos, y no con los del §5 —una restauración no tiene `job_id` ni `status`—.
+    ///
+    /// El stream se pide **antes** de lanzar la restauración, que es lo que hace que el primer aviso
+    /// esté dentro del hub cuando la prueba se pone a leer. Y el lanzamiento se afirma con su código
+    /// **antes** de esperar el evento: sin eso, una ruta que no existiera dejaría la prueba
+    /// esperando en balde el `PLAZO_DEL_EVENTO` en vez de decir en el acto que contesta `404`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_restauracion_publica_su_progreso_en_el_stream() {
+        let aparato = AparatoDeLaRestauracion::nuevo().await;
+
+        let respuesta = get(aparato.router.clone(), "/api/v1/events").await;
+        let status = respuesta.status();
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el stream tiene que abrirse antes de que el motor publique nada, y contestó {status}"
+        );
+
+        let mut cuerpo = respuesta.into_body();
+
+        let respuesta = post_json(
+            aparato.router.clone(),
+            &format!("/api/v1/snapshots/{}/restore", aparato.snapshot),
+            &serde_json::json!({ "repository_id": aparato.repositorio }),
+        )
+        .await;
+
+        let status = respuesta.status();
+
+        assert!(
+            matches!(status, StatusCode::OK | StatusCode::ACCEPTED),
+            "lanzar la restauración tiene que aceptarse —200 o 202— para que haya un progreso que \
+             seguir por el stream; contestó {status}"
+        );
+
+        let evento = siguiente_evento(&mut cuerpo, PLAZO_DEL_EVENTO)
+            .await
+            .expect(
+                "el stream no publicó ningún evento después de lanzar una restauración: o el aviso \
+                 no llega al cliente o el cliente no estaba suscrito cuando el motor lo publicó",
+            );
+
+        let nombre = evento
+            .lines()
+            .find_map(|linea| linea.strip_prefix("event:"))
+            .map(str::trim);
+
+        assert_eq!(
+            nombre,
+            Some("restore_progress"),
+            "el progreso de una restauración se publica con su propio nombre de evento, \
+             `restore_progress`, y llegó {evento:?}"
+        );
+
+        let datos = datos_del_evento(&evento);
+
+        for campo in LOS_CAMPOS_DE_LA_RESTAURACION {
+            assert!(
+                datos.get(campo).is_some(),
+                "el `data` del evento no trae el campo `{campo}` del progreso de la restauración: \
+                 {evento:?}"
+            );
+        }
     }
 }
