@@ -444,9 +444,12 @@ fn instante(fecha: &str) -> Zoned {
 ///
 /// El camino del fichero dentro del árbol se devuelve porque **no se puede adivinar**: un
 /// origen local archiva las rutas tal y como se las da el sistema de ficheros, así que el
-/// árbol reproduce el camino de la fuente sin su barra inicial, y quien quiera restaurar el
-/// fichero necesita ese camino. Devolverlo aquí es lo que hace que las pruebas de retención
-/// comprueben que el contenido **sigue ahí** en vez de que la instantánea sigue listada.
+/// árbol reproduce el camino de la fuente sin su barra inicial, y quien quiera **volver a sacar
+/// ese nodo** —`dump`, que es lo que hacen las pruebas de retención— necesita ese camino.
+/// Restaurar no: una restauración descuenta la ruta con la que se montó la copia y deja el
+/// fichero en la raíz del destino, así que la restauración de una siembra no se busca por aquí.
+/// Devolverlo es lo que hace que las pruebas de retención comprueben que el contenido **sigue
+/// ahí** en vez de que la instantánea sigue listada.
 pub(crate) struct Siembra {
     /// Los identificadores, en hex completo, en el orden de las fechas que se pidieron.
     pub identificadores: Vec<String>,
