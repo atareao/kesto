@@ -75,6 +75,11 @@ export function snapshot(campos: Partial<Snapshot> & { id: string }): Snapshot {
     label: null,
     files: 10,
     bytes: 1024,
+    // El listado publica el target de origen de cada instantánea; el defecto es
+    // el caso que ofrece restaurar, y quien pruebe otra cosa lo pone a mano.
+    target_id: 't1',
+    target_name: 'web',
+    target_type: 'directory',
     ...campos,
   }
 }
