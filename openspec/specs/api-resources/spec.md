@@ -258,11 +258,13 @@ Cada fila SHALL llevar sus **métricas** —los dos contadores de bytes y sus do
 
 Las fechas de cada fila SHALL publicarse como cadena RFC3339, como en el resto de la superficie.
 
+Cada fila SHALL llevar además **`job_name`** (anulable): el nombre de la tarea de esa ejecución, resuelto por el vínculo con `backup_jobs`. SHALL publicarse como `null` cuando la tarea no tenga nombre o la ejecución no case con ninguna tarea, con la misma tolerancia que el resto del listado: un `job_name` a `null` es un nombre desconocido, no un error, y NO SHALL acortar el listado ni ocultar la fila.
+
 #### Scenario: El listado sin filtros devuelve las ejecuciones con sus métricas
 - **GIVEN** tres ejecuciones dadas de alta
 - **WHEN** se pide el listado sin filtros
 - **THEN** SHALL contestar `200` con las tres filas
-- **AND** cada fila SHALL traer `bytes_processed`, `bytes_uploaded`, `started_at` y `finished_at`
+- **AND** cada fila SHALL traer `bytes_processed`, `bytes_uploaded`, `started_at`, `finished_at` y `job_name`
 
 #### Scenario: Los filtros por job_id y por status acotan el listado
 - **GIVEN** ejecuciones de dos tareas distintas, con estados distintos
@@ -512,6 +514,8 @@ El listado SHALL ser tolerante a la ausencia del vínculo —una consulta por el
 
 El porqué: el panel necesita saber **sobre qué target** se va a restaurar antes de confirmarlo, y si ese target es restaurable, y hoy el listado no lo dice. Sin estos tres campos, la confirmación no puede nombrar el destino —que es justo lo que evita escribir en el sitio equivocado— y la acción no puede saber si debe ofrecerse o explicar su limitación; y como el vínculo con el target puede faltar por causas legítimas, el contrato tiene que decir qué significa su ausencia en vez de dejar que cada cliente la adivine.
 
+Cada elemento de `data` SHALL llevar además **`job_name`** (anulable): el nombre de la tarea de origen, resuelto por el vínculo `snapshot → job_executions → backup_jobs`, y publicado como `null` cuando la instantánea no case con ninguna tarea o la tarea no tenga nombre. La `label` de la instantánea NO SHALL tocarse: SHALL seguir siendo el identificador de la tarea, y los campos que el listado ya publicaba —`id`, `time`, `paths`, `label`, `files`, `bytes`, junto al target— SHALL seguir como están.
+
 #### Scenario: Una instantánea con ejecución trae el target
 
 - **GIVEN** una instantánea cuya fila en `job_executions` casa con una tarea y su target del repositorio que se pide
@@ -526,6 +530,14 @@ El porqué: el panel necesita saber **sobre qué target** se va a restaurar ante
 - **THEN** los campos `target_id`, `target_name` y `target_type` de ese elemento SHALL ser `null`
 - **AND** la instantánea SHALL seguir apareciendo en el listado
 - **AND** NO SHALL contestarse `404` ni `409` por esa instantánea
+
+#### Scenario: Cada instantánea declara el nombre de su tarea o null
+
+- **GIVEN** una instantánea cuya tarea tiene nombre, y otra del mismo repositorio cuya tarea no lo tiene
+- **WHEN** se pide `GET /api/v1/snapshots?repository_id=<id>`
+- **THEN** el elemento de la primera SHALL traer `job_name` con el nombre de su tarea
+- **AND** el de la segunda SHALL traer `job_name` a `null`
+- **AND** el campo `label` de ambas SHALL seguir siendo el identificador de la tarea, sin cambios
 
 ### Requirement: La restauración de un snapshot se pide por su recurso y usa el target de origen
 
@@ -568,3 +580,35 @@ El porqué: restaurar es la operación que hace útil una copia; sin endpoint no
 - **THEN** SHALL publicarse `restore_progress` con fase `terminada` o `fallida`, respectivamente
 - **AND** los cuatro contadores del aviso SHALL seguir a `0`
 - **AND** el `Result` del motor SHALL reflejar el mismo desenlace
+
+### Requirement: La tarea lleva un nombre legible
+
+`POST /api/v1/jobs` y `PUT /api/v1/jobs/:id` SHALL aceptar un campo opcional `name` (texto). El valor SHALL recortarse; si queda vacío o en blanco SHALL guardarse como `null`; si supera **120** caracteres SHALL rechazarse con `400` y la envoltura, **nombrando `name`**.
+
+`GET /api/v1/jobs` y `GET /api/v1/jobs/:id` SHALL publicar `name` (anulable) por tarea.
+
+El nombre NO SHALL ser único ni obligatorio. El porqué: sin nombre el panel cae al identificador de la tarea, y el nombre es lo que distingue dos tareas sobre el mismo target —hoy el Histórico usa el nombre del target como proxy y confunde las dos—. Exigir unicidad obligaría a inventar sufijos para lo que es una etiqueta para el operador, y hacerlo obligatorio rompería las tareas que ya existen sin nombre.
+
+#### Scenario: El alta guarda el nombre recortado
+- **GIVEN** un alta de tarea con `name` con espacios a ambos lados de `copia nocturna`
+- **WHEN** se guarda y se lee la tarea
+- **THEN** su `name` SHALL ser `copia nocturna`, sin los espacios de los extremos
+- **AND** SHALL conservarse el resto de campos de la tarea
+
+#### Scenario: Un nombre en blanco se guarda como null
+- **GIVEN** un alta de tarea con `name` a una cadena de solo espacios
+- **WHEN** se guarda y se lee la tarea
+- **THEN** su `name` SHALL ser `null`
+- **AND** NO SHALL guardarse una cadena vacía
+
+#### Scenario: Un nombre de más de 120 caracteres contesta 400 nombrando name
+- **GIVEN** un alta o una edición de tarea con un `name` de 121 caracteres
+- **WHEN** se envía
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el mensaje SHALL nombrar el campo `name`
+
+#### Scenario: El listado de tareas publica el nombre anulable
+- **GIVEN** una tarea con nombre y otra sin él
+- **WHEN** se pide `GET /api/v1/jobs`
+- **THEN** la primera fila SHALL traer su `name`
+- **AND** la segunda SHALL traer `name` a `null`

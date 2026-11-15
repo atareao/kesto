@@ -274,7 +274,8 @@ mod tests {
     /// Afirma los **cuatro** campos de cada columna —nombre, tipo, `NOT NULL` y
     /// valor por defecto— contra el §3, no solo el nombre: el escenario pide «las
     /// columnas, los tipos y los valores por defecto». Lo que se compara es el
-    /// esquema que dejan **todas** las migraciones: el §3 más lo que añade la `0003`.
+    /// esquema que dejan **todas** las migraciones: el §3 más lo que añaden la `0003`
+    /// (`db_path`) y la `0005` (`backup_jobs.name`).
     #[tokio::test]
     async fn las_cuatro_tablas_tienen_las_columnas_del_srs() {
         let (_directorio, pool) = base_migrada().await;
@@ -326,6 +327,12 @@ mod tests {
                     columna("keep_monthly", "INTEGER", true, Some("12")),
                     columna("enabled", "BOOLEAN", true, Some("1")),
                     columna("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP")),
+                    // La columna la añade la `0005` (issue #65), **sin** reconstruir la tabla: un
+                    // `ALTER TABLE ... ADD COLUMN` la deja al final del orden declarado, y por eso
+                    // va aquí y no junto al `name` de las otras dos tablas. Es anulable y sin valor
+                    // por defecto: una tarea sin nombre es un estado válido y anterior a este
+                    // change, así que las filas que ya había tienen que quedar con `NULL`.
+                    columna("name", "TEXT", false, None),
                 ],
             ),
             (
@@ -355,6 +362,88 @@ mod tests {
                  valor por defecto)"
             );
         }
+
+        pool.close().await;
+    }
+
+    /// 1.1 (db) — La `0005` añade `backup_jobs.name`, `TEXT` y anulable, **sin reconstruir** la
+    /// tabla.
+    ///
+    /// Se parte de una base llevada hasta la `0004` —el estado de una instalación anterior a este
+    /// change— y **con tareas dentro**, y se aplica el migrador entero. Lo que se mide es lo que
+    /// distingue un `ALTER TABLE ... ADD COLUMN` de una reconstrucción: que el fichero entre, que
+    /// deje la columna declarada con su tipo y su anulabilidad, y que las filas que ya había
+    /// **sigan ahí** con `name` a `NULL`. Una reconstrucción —`CREATE`/`INSERT SELECT`/`DROP`/
+    /// `RENAME`— que se equivocara se llevaría las tareas por delante, y eso no lo ve una prueba
+    /// que solo mire el directorio de migraciones.
+    #[tokio::test]
+    async fn la_0005_anade_el_nombre_sin_reconstruir_backup_jobs() {
+        let (_directorio, pool) = base_hasta(4).await;
+
+        // Una instalación anterior con **dos** tareas: son las filas que tienen que sobrevivir a la
+        // migración, y las dos sin nombre, que es el estado en el que quedan las tareas que ya
+        // existían.
+        for sentencia in [
+            "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+             secret_access_key, passphrase) VALUES ('r-1', 'repo', 'e', 'b', 'r', 'a', 's', 'p')",
+            "INSERT INTO backup_targets (id, name, target_type, host_path) \
+             VALUES ('t-1', 'carpeta', 'directory', '/srv/datos')",
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+             VALUES ('j-1', 't-1', 'r-1', '0 3 * * *')",
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+             VALUES ('j-2', 't-1', 'r-1', '0 4 * * *')",
+        ] {
+            sqlx::query(sentencia)
+                .execute(&pool)
+                .await
+                .expect("la siembra de la prueba del nombre no puede fallar");
+        }
+
+        let antes = columnas_de(&pool, "backup_jobs").await;
+        assert!(
+            !antes.iter().any(|columna| columna == "name"),
+            "la columna `name` no puede existir antes de la `0005`: {antes:?}"
+        );
+
+        // La migración, sobre esa misma base con las filas dentro.
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la `0005` tiene que aplicarse sobre una base llevada hasta la `0004`");
+
+        let declaradas = columnas_completas_de(&pool, "backup_jobs").await;
+        let nombre = declaradas
+            .iter()
+            .find(|columna| columna.nombre == "name")
+            .unwrap_or_else(|| panic!("la `0005` no dejó la columna `name`: {declaradas:?}"));
+
+        assert_eq!(nombre.tipo, "TEXT", "`name` tiene que ser de tipo TEXT");
+        assert!(!nombre.obligatoria, "`name` tiene que admitir NULL");
+        assert_eq!(
+            nombre.por_defecto, None,
+            "`name` NO tiene valor por defecto"
+        );
+
+        // Y las filas de antes siguen ahí, sin nombre: la tabla no se reconstruyó.
+        let tareas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla tiene que poder contarse");
+
+        assert_eq!(
+            tareas, 2,
+            "la migración se llevó tareas por delante: quedaron {tareas}"
+        );
+
+        let sin_nombre: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs WHERE name IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("la columna `name` tiene que poder consultarse");
+
+        assert_eq!(
+            sin_nombre, 2,
+            "las tareas anteriores al change tienen que quedar con `name` a NULL"
+        );
 
         pool.close().await;
     }

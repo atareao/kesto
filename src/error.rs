@@ -521,6 +521,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
+                name: None,
             })
             .await
             .expect_err(
@@ -725,6 +726,7 @@ mod tests {
                     keep_weekly: 4,
                     keep_monthly: 12,
                     enabled: true,
+                    name: None,
                 })
                 .await
                 .expect_err(

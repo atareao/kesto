@@ -60,12 +60,18 @@ pub fn router() -> Router<AppState> {
 ///
 /// Los dos identificadores viajan como **texto** en su forma canónica con guiones y los nombres de
 /// los campos son los del §3: `target_id`, `repository_id`, `cron_expression`, `keep_daily`,
-/// `keep_weekly`, `keep_monthly` y `enabled`, que son los que el panel pinta en su formulario y los
-/// que hacen legible la tabla con `sqlite3`. `deny_unknown_fields` es lo que convierte una errata
+/// `keep_weekly`, `keep_monthly`, `enabled` y `name` —este último, el que añade la `0005` (issue
+/// #65)—, que son los que el panel pinta en su formulario y los que hacen legible la tabla con
+/// `sqlite3`. `deny_unknown_fields` es lo que convierte una errata
 /// del formulario —un `keep_dailly` de más— en un `400`: sin él, serde ignoraría el campo que no
 /// conoce y la retención se quedaría en su valor por defecto **sin que la respuesta dijera una
 /// palabra**, que es el peor de los desenlaces posibles: una tarea que guarda otra cosa que la que
 /// el operador cree haber programado.
+///
+/// `name` es `Option` y **no** obligatorio, así que un cuerpo que lo omita entra con `None`: el
+/// nombre es opcional por contrato y las tareas que ya existían sin él siguen siendo válidas. Lo que
+/// llega **sin recortar**: el recorte y el paso del blanco a `None` los aplica [`nombre_del_cuerpo`],
+/// y el tope de 120 caracteres se rechaza ahí con un `400` que nombra el campo.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AltaDeTareaDelCable {
@@ -83,16 +89,22 @@ pub struct AltaDeTareaDelCable {
     pub keep_monthly: i64,
     /// Si la tarea está activa.
     pub enabled: bool,
+    /// Nombre legible de la tarea; se recorta y el blanco queda a `null`.
+    pub name: Option<String>,
 }
 
 /// Una tarea tal y como viaja por el cable: lo que devuelve la API.
 ///
-/// Las claves son **exactamente** las del §3 —los dos identificadores, el cron, la retención, el
-/// `enabled` y la fecha del alta—, para que el formulario, el cuerpo de la petición y la columna de
-/// la tabla se llamen igual; una vista que inventara un campo rompería esa correspondencia sin que
-/// nada lo notara. Y no hay ninguna credencial que callar aquí: la tarea no guarda ninguna, porque
-/// las dos que hay en el sistema viven en su target y en su repositorio, que son las filas a las que
-/// ésta apunta.
+/// Las claves son **exactamente** las del §3 más la `name` que añade la `0005` (issue #65)
+/// —los dos identificadores, el cron, la retención, el `enabled`, la fecha del alta y el nombre—,
+/// para que el formulario, el cuerpo de la petición y la columna de la tabla se llamen igual; una
+/// vista que inventara un campo rompería esa correspondencia sin que nada lo notara. Y no hay
+/// ninguna credencial que callar aquí: la tarea no guarda ninguna, porque las dos que hay en el
+/// sistema viven en su target y en su repositorio, que son las filas a las que ésta apunta.
+///
+/// `name` es anulable y viaja **siempre**, con `null` cuando la tarea no tiene nombre: una vista que
+/// omitiera la clave cuando es nula dejaría al panel sin poder distinguir «esta tarea no tiene
+/// nombre» de «el servidor no lo dice».
 #[derive(Debug, Serialize)]
 pub struct TareaDelCable {
     /// Identificador en su forma canónica con guiones.
@@ -113,6 +125,8 @@ pub struct TareaDelCable {
     pub enabled: bool,
     /// Fecha de alta, en RFC3339.
     pub created_at: String,
+    /// Nombre legible de la tarea; `null` si no tiene.
+    pub name: Option<String>,
 }
 
 impl TareaDelCable {
@@ -120,6 +134,10 @@ impl TareaDelCable {
     ///
     /// Es privada porque los cinco manejadores viven en este módulo: no hay ningún llamador
     /// fuera, así que publicarla solo ensancharía la superficie sin que nada la necesite.
+    ///
+    /// El nombre sale **tal y como está en la fila** y sin recortar: el recorte lo aplicó el alta o
+    /// la edición al guardarlo, y volver a recortarlo aquí haría que la vista y la fila pudieran
+    /// decir cosas distintas.
     fn desde(fila: &Tarea) -> Result<Self, AppError> {
         Ok(Self {
             id: fila.id.hyphenated().to_string(),
@@ -133,6 +151,7 @@ impl TareaDelCable {
             created_at: fila.created_at.format(&Rfc3339).map_err(|error| {
                 AppError::Other(format!("la fecha de la fila no se pudo formatear: {error}"))
             })?,
+            name: fila.name.clone(),
         })
     }
 }
@@ -289,11 +308,54 @@ fn cron_que_el_reloj_sepa_leer(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppEr
     Ok(())
 }
 
+/// El tope del nombre de una tarea, en caracteres.
+///
+/// Es una constante y no un literal repetido porque la usan el mensaje del `400` y —en el panel— el
+/// `maxLength` del campo: un tope escrito dos veces puede separarse, y entonces el servidor
+/// rechazaría lo que el formulario deja escribir.
+const NOMBRE_MAXIMO: usize = 120;
+
+/// El `400` de un nombre que no cabe, y la normalización del que sí.
+///
+/// El nombre es **opcional**: `None` entra y sale como `None`. Cuando llega, se **recorta** primero
+/// —los espacios de los extremos no son parte del nombre, y el tope se mide sobre lo recortado, no
+/// sobre lo que alguien pegó— y luego:
+///
+/// * Si queda vacío o en blanco, el nombre es `None` y la columna guarda `NULL`. **Nunca `""`**: una
+///   cadena vacía se lee como un nombre que alguien dejó a medias, y solo el `NULL` es lo que le
+///   dice al panel que caiga al identificador de la tarea.
+/// * Si supera [`NOMBRE_MAXIMO`] caracteres, es un `400` que **nombra `name`** y **no repite el
+///   valor**: la regla de la casa es que un rechazo diga qué campo está mal, nunca lo que traía.
+///
+/// El tope se mide en caracteres y no en bytes: `bytes()` contaría tres por cada acentuada y
+/// rechazaría un nombre que el formulario deja escribir. La comprobación va **antes de escribir** y
+/// la comparten el alta y la edición —las dos pasan por [`alta_desde`]—, así que una petición
+/// rechazada no puede dejar fila y no hay una tercera puerta de escritura que se olvide de ella.
+fn nombre_del_cuerpo(cuerpo: &AltaDeTareaDelCable) -> Result<Option<String>, AppError> {
+    let Some(nombre) = cuerpo.name.as_deref() else {
+        return Ok(None);
+    };
+
+    let recortado = nombre.trim();
+
+    if recortado.chars().count() > NOMBRE_MAXIMO {
+        return Err(AppError::InvalidInput(format!(
+            "el campo `name` no puede superar los {NOMBRE_MAXIMO} caracteres"
+        )));
+    }
+
+    if recortado.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(recortado.to_owned()))
+}
+
 /// Valida el cuerpo y lo convierte en el alta de la capa de acceso.
 ///
 /// La retención se comprueba **antes de tocar la base**: un cuerpo que no puede ser válido por sí
 /// mismo no necesita leer ninguna fila para rechazarse, y así el `400` de las tres reglas a cero no
-/// depende de que las referencias existan.
+/// depende de que las referencias existan. El nombre se normaliza a su lado y por el mismo motivo.
 ///
 /// Las dos referencias se resuelven después, y en este orden: el target primero y el repositorio
 /// después. No es un detalle de estilo —cuando las dos fallan, el `400` nombra **el target**, y eso
@@ -301,15 +363,18 @@ fn cron_que_el_reloj_sepa_leer(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppEr
 ///
 /// La usan **las dos** rutas que escriben una tarea, el alta y la edición: el requisito de la
 /// retención es del par, y con la comprobación aquí no hay forma de añadir una tercera puerta de
-/// escritura que se olvide de ella. La expresión cron se comprueba a su lado, también antes de
-/// tocar la base: su gramática la dicta el planificador —el mismo analizador que la evaluará— y el
-/// rechazo tiene que llegar antes de que quede una fila escrita.
+/// escritura que se olvide de ella. La expresión cron y el nombre se comprueban a su lado, también
+/// antes de tocar la base: la gramática del cron la dicta el planificador —el mismo analizador que la
+/// evaluará— y el nombre ya sale de aquí recortado, para que la fila guarde lo que se lee y no lo
+/// que se envió.
 async fn alta_desde(
     estado: &AppState,
     cuerpo: &AltaDeTareaDelCable,
 ) -> Result<AltaDeTarea, AppError> {
     retencion_que_conserva(cuerpo)?;
     cron_que_el_reloj_sepa_leer(cuerpo)?;
+
+    let name = nombre_del_cuerpo(cuerpo)?;
 
     let target_id = target_resuelto(estado, &cuerpo.target_id).await?;
     let repository_id = repositorio_resuelto(estado, &cuerpo.repository_id).await?;
@@ -322,6 +387,7 @@ async fn alta_desde(
         keep_weekly: cuerpo.keep_weekly,
         keep_monthly: cuerpo.keep_monthly,
         enabled: cuerpo.enabled,
+        name,
     })
 }
 
@@ -421,6 +487,7 @@ pub async fn actualizar(
         keep_monthly: alta.keep_monthly,
         enabled: alta.enabled,
         created_at: actual.created_at,
+        name: alta.name,
     };
 
     if !state.db.tareas.actualizar(&fila).await? {
@@ -630,6 +697,23 @@ mod tests {
         })
     }
 
+    /// El mismo cuerpo del alta con el campo `name`, **tal cual** llegó por el cable.
+    ///
+    /// El valor no se recorta aquí a propósito: lo que este change pide es que el recorte, el blanco
+    /// a `null` y el tope de 120 caracteres los aplique **el servidor**, así que quien manda el
+    /// cuerpo tiene que poder mandar los espacios alrededor y una cadena larga sin que la prueba los
+    /// arregle antes.
+    fn cuerpo_de_tarea_con_nombre(
+        target_id: &str,
+        repository_id: &str,
+        nombre: &str,
+    ) -> serde_json::Value {
+        let mut cuerpo = cuerpo_de_tarea(target_id, repository_id);
+        cuerpo["name"] = serde_json::json!(nombre);
+
+        cuerpo
+    }
+
     /// 1.6 — Las cinco rutas del recurso contestan su código.
     ///
     /// Cubre `api-resources`, requisito 1 (escenario «Las cinco rutas del recurso contestan su
@@ -718,12 +802,13 @@ mod tests {
     /// 1.13j — El alta devuelve los campos con los nombres del §3.
     ///
     /// Cubre el requisito de `api-resources` sobre la correspondencia entre la vista del cable y
-    /// las columnas del §3. Los nombres son los del esquema para que el formulario, el cuerpo y la
-    /// columna se llamen igual, y una vista que inventara un campo rompería esa correspondencia sin
-    /// que nada lo notara: por eso la prueba afirma el **conjunto exacto** de claves y no solo la
-    /// presencia de las que espera. Las dos cosas que **no** pueden estar: ninguna credencial —la
-    /// tarea no guarda ninguna, porque las dos del sistema viven en su target y en su repositorio—
-    /// y ningún nombre inventado que el panel no sepa pintar.
+    /// las columnas del §3 —más la `name` que añade la `0005` (issue #65)—. Los nombres son los del
+    /// esquema para que el formulario, el cuerpo y la columna se llamen igual, y una vista que
+    /// inventara un campo rompería esa correspondencia sin que nada lo notara: por eso la prueba
+    /// afirma el **conjunto exacto** de claves y no solo la presencia de las que espera. Las dos
+    /// cosas que **no** pueden estar: ninguna credencial —la tarea no guarda ninguna, porque las dos
+    /// del sistema viven en su target y en su repositorio— y ningún nombre inventado que el panel no
+    /// sepa pintar.
     #[tokio::test]
     async fn el_alta_devuelve_los_campos_con_los_nombres_del_esquema() {
         let router = api_router(estado_desarrollo().await);
@@ -763,6 +848,11 @@ mod tests {
             "keep_daily",
             "keep_monthly",
             "keep_weekly",
+            // El `name` de la `0005` (issue #65): una tarea sin nombre lo publica a `null`, pero la
+            // **clave** tiene que estar en las dos —una vista que la omitiera cuando es nula dejaría
+            // al panel sin poder distinguir «esta tarea no tiene nombre» de «el servidor no lo
+            // dice»—, y por eso entra en el conjunto exacto.
+            "name",
             "repository_id",
             "target_id",
         ]);
@@ -1159,6 +1249,7 @@ mod tests {
                     keep_weekly: 4,
                     keep_monthly: 12,
                     enabled: true,
+                    name: None,
                 })
                 .await
                 .expect("la tarea de la siembra se da de alta");
@@ -1880,6 +1971,594 @@ mod tests {
             mensaje.contains("cron_expression"),
             "el motivo tiene que nombrar el campo del formulario que hay que corregir, y el \
              mensaje fue {mensaje:?}"
+        );
+    }
+
+    // ── El nombre de la tarea (issue #65) ────────────────────────────────────
+    //
+    // Cubre `api-resources`, requisito «La tarea lleva un nombre legible»: el alta y la edición
+    // aceptan un `name` opcional que se recorta, que se guarda a `null` si queda en blanco y que se
+    // rechaza con `400` **nombrando `name`** si supera los 120 caracteres. El nombre no es único ni
+    // obligatorio, así que las tareas que ya existen sin él siguen siendo válidas.
+
+    /// 1.2 — El alta guarda y publica el nombre **recortado**, y la lectura lo devuelve igual.
+    ///
+    /// Cubre el escenario «El alta guarda el nombre recortado». Se manda `copia nocturna` con
+    /// espacios a los dos lados y se comprueba en las **tres** superficies que publican el nombre
+    /// —la respuesta del alta, la lectura de la fila y el listado—, porque el recorte tiene que estar
+    /// en la fila guardada y no solo en la vista de la respuesta que lo escribió: un `trim` aplicado
+    /// al serializar dejaría la fila con los espacios y el nombre cambiaría de una lectura a otra.
+    #[tokio::test]
+    async fn el_alta_guarda_y_publica_el_nombre_recortado() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-recortado").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-recortado").await;
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "  copia nocturna  "),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un nombre con espacios alrededor tiene que aceptarse y recortarse, no rechazarse: \
+             contestó {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["name"], "copia nocturna",
+            "el alta tiene que publicar el nombre **recortado**: {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let lectura = body_json(get(router.clone(), &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert_eq!(
+            lectura["data"]["name"], "copia nocturna",
+            "la fila guardada tiene que traer el nombre recortado, no el que llegó: {lectura}"
+        );
+
+        let listado = body_json(get(router, "/api/v1/jobs").await).await;
+
+        assert_eq!(
+            listado["data"][0]["name"], "copia nocturna",
+            "el listado tiene que publicar el mismo nombre que la lectura: {listado}"
+        );
+    }
+
+    /// 1.2b — La edición acepta `name`, lo recorta y lo limpia cuando queda en blanco.
+    ///
+    /// Cubre la mitad del `SHALL` que la prueba del alta no mide: `PUT /api/v1/jobs/:id` acepta
+    /// igualmente el campo opcional `name`, con las **mismas** reglas —recorte y blanco a `null`—, y
+    /// lo publica en su respuesta y en la lectura. Sin esta prueba, una edición que ignorara el campo
+    /// dejaría el nombre imposible de **corregir** desde el panel: solo se podría fijar al darse de
+    /// alta, y una errata o un nombre que sobra no tendrían arreglo.
+    #[tokio::test]
+    async fn la_edicion_acepta_recorta_y_limpia_el_nombre() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-de-la-edicion-del-nombre").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-de-la-edicion-del-nombre").await;
+
+        // El alta sigue siendo **sin** nombre: lo que se mide aquí es la edición.
+        let alta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea(&target, &repositorio),
+        )
+        .await;
+
+        let status = alta.status();
+        let alta = body_json(alta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea tiene que darse de alta antes de editarla: contestó {status} con {alta}"
+        );
+
+        let id = alta["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        // Primero se le pone nombre, con espacios alrededor: la edición tiene que recortarlo.
+        let mut edicion = cuerpo_de_tarea_con_nombre(&target, &repositorio, "  copia nocturna  ");
+        edicion["keep_daily"] = serde_json::json!(3);
+
+        let respuesta = put_json(router.clone(), &format!("/api/v1/jobs/{id}"), &edicion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la edición con un nombre —recortable— tiene que aceptarse: contestó {status} con \
+             {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["name"], "copia nocturna",
+            "la edición tiene que publicar el nombre recortado: {cuerpo}"
+        );
+
+        let lectura = body_json(get(router.clone(), &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert_eq!(
+            lectura["data"]["name"], "copia nocturna",
+            "la fila editada tiene que guardar el nombre recortado, no el que llegó: {lectura}"
+        );
+
+        // Y después se limpia: un nombre en blanco vuelve a dejarla **sin** nombre.
+        let mut blanco = cuerpo_de_tarea_con_nombre(&target, &repositorio, "   ");
+        blanco["keep_daily"] = serde_json::json!(3);
+
+        let respuesta = put_json(router.clone(), &format!("/api/v1/jobs/{id}"), &blanco).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "limpiar el nombre tiene que ser una edición válida: contestó {status} con {cuerpo}"
+        );
+        assert!(
+            cuerpo["data"]["name"].is_null(),
+            "un nombre en blanco en la edición tiene que dejar la tarea sin nombre: {cuerpo}"
+        );
+
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert!(
+            lectura["data"]["name"].is_null(),
+            "la fila editada no puede quedarse con una cadena vacía donde el contrato dice `null`: \
+             {lectura}"
+        );
+    }
+
+    /// 1.3 — Un `name` en blanco se guarda como `null`, **no** como cadena vacía.
+    ///
+    /// Cubre el escenario «Un nombre en blanco se guarda como null». La distinción importa: `""` y
+    /// `null` se pintan igual en una tabla pero no son lo mismo —una cadena vacía parece un nombre
+    /// que alguien dejó a medias, y solo el `null` es lo que le dice al panel que caiga al
+    /// identificador de la tarea—. Se comprueba en la respuesta del alta y en la lectura de la fila.
+    #[tokio::test]
+    async fn un_nombre_en_blanco_se_guarda_como_null() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-en-blanco").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-en-blanco").await;
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "   "),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un nombre de solo espacios es una tarea sin nombre y tiene que aceptarse: contestó \
+             {status} con {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["data"]["name"].is_null(),
+            "un nombre en blanco tiene que publicarse como `null`: {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert!(
+            lectura["data"]["name"].is_null(),
+            "la fila guardada no puede llevar una cadena vacía donde el contrato dice `null`: \
+             {lectura}"
+        );
+    }
+
+    /// 1.4 — Un nombre de más de **120** caracteres contesta `400` nombrando `name`.
+    ///
+    /// Cubre el escenario «Un nombre de más de 120 caracteres contesta 400 nombrando name». Es el
+    /// techo del campo, y el rechazo tiene que **nombrar el campo** para que se pueda corregir desde
+    /// el formulario. El mensaje **no** repite el valor —la regla de la casa— y por eso la cadena es
+    /// distinguible: un `contains` sobre el texto crudo no puede dar un falso positivo por
+    /// casualidad. La tabla se cuenta al final para afirmar que el rechazo no escribió nada.
+    #[tokio::test]
+    async fn un_nombre_de_mas_de_120_caracteres_contesta_400_nombrando_el_campo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-nombre-largo").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-largo").await;
+
+        let largo = "n".repeat(121);
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, &largo),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un nombre de 121 caracteres supera el tope de 120 y tiene que rechazarse: contestó \
+             {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto");
+
+        assert!(
+            mensaje.contains("name"),
+            "el rechazo tiene que nombrar el campo `name` para que se pueda corregir desde el \
+             formulario, y el mensaje fue {mensaje:?}"
+        );
+        assert!(
+            !mensaje.contains(&largo),
+            "el rechazo nombra el campo, nunca el valor que traía, y el mensaje fue {mensaje:?}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect(
+                "la tabla tiene que ser contable sobre el fichero con el que se abrió el estado",
+            );
+
+        assert_eq!(
+            filas, 0,
+            "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
+        );
+    }
+
+    /// 1.4b — El listado publica el `name` anulable de **cada** tarea.
+    ///
+    /// Cubre el escenario «El listado de tareas publica el nombre anulable»: una tarea **con**
+    /// nombre y otra **sin** él, dadas de alta por la API. Se afirma la **clave** en las dos —una
+    /// vista que omitiera `name` cuando es `null` dejaría al panel sin poder distinguir «esta tarea
+    /// no tiene nombre» de «el servidor no lo dice»— y el valor en la que lo tiene. El nombre no es
+    /// único ni obligatorio, así que las dos altas tienen que entrar.
+    #[tokio::test]
+    async fn el_listado_publica_el_nombre_anulable_de_cada_tarea() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-listado-con-nombre").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-del-listado-con-nombre").await;
+
+        let con_nombre = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = con_nombre.status();
+        let con_nombre = body_json(con_nombre).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea con nombre tiene que darse de alta: contestó {status} con {con_nombre}"
+        );
+
+        let id_con_nombre = con_nombre["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let sin_nombre = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea(&target, &repositorio),
+        )
+        .await;
+
+        let status = sin_nombre.status();
+        let sin_nombre = body_json(sin_nombre).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea sin nombre —sin la clave o con ella en blanco— tiene que darse de alta igual: \
+             contestó {status} con {sin_nombre}"
+        );
+
+        let id_sin_nombre = sin_nombre["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let respuesta = get(router, "/api/v1/jobs").await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado tiene que contestar 200 con un array en `data`: contestó {status} con \
+             {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]
+            .as_array()
+            .expect("el listado tiene que llegar como un array");
+
+        assert_eq!(filas.len(), 2, "tienen que salir las dos tareas: {cuerpo}");
+
+        let con = filas
+            .iter()
+            .find(|fila| fila["id"].as_str() == Some(id_con_nombre.as_str()))
+            .unwrap_or_else(|| panic!("la tarea con nombre no está en el listado: {cuerpo}"));
+
+        assert_eq!(
+            con["name"], "copia nocturna",
+            "la fila de la tarea con nombre tiene que publicar su `name`: {cuerpo}"
+        );
+
+        let sin = filas
+            .iter()
+            .find(|fila| fila["id"].as_str() == Some(id_sin_nombre.as_str()))
+            .unwrap_or_else(|| panic!("la tarea sin nombre no está en el listado: {cuerpo}"));
+
+        assert!(
+            sin.get("name").is_some(),
+            "la fila de una tarea sin nombre tiene que traer la **clave** `name`, aunque sea a \
+             `null`: {cuerpo}"
+        );
+        assert!(
+            sin["name"].is_null(),
+            "una tarea sin nombre publica `name` a `null`, no una cadena vacía: {cuerpo}"
+        );
+    }
+
+    /// 1.4c — El tope del nombre es **inclusivo**: 120 caracteres entran.
+    ///
+    /// Cubre la frontera exacta del escenario «Un nombre de más de 120 caracteres contesta 400
+    /// nombrando name»: la prueba de 121 fija dónde **empieza** el rechazo y esta fija dónde **acaba**
+    /// lo que sí entra. Un tope escrito con `>=` en vez de `>` rechazaría un nombre de exactamente
+    /// 120 —justo el que el `maxLength` del formulario deja escribir— y solo una prueba sobre la
+    /// frontera lo ve. Se comprueba la respuesta del alta **y** la lectura de la fila: un nombre que
+    /// cupiera en la vista pero se guardara truncado cambiaría de una lectura a otra.
+    #[tokio::test]
+    async fn el_tope_de_120_caracteres_se_acepta_en_el_alta() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-justo").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-justo").await;
+
+        let justo = "n".repeat(120);
+
+        assert_eq!(
+            justo.chars().count(),
+            120,
+            "la cadena de la prueba tiene que tener exactamente 120 caracteres"
+        );
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, &justo),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un nombre de exactamente 120 caracteres está en el tope y tiene que aceptarse: contestó \
+             {status} con {cuerpo}"
+        );
+
+        let devuelto = cuerpo["data"]["name"]
+            .as_str()
+            .expect("el alta tiene que devolver el nombre como texto");
+
+        assert_eq!(
+            devuelto.chars().count(),
+            120,
+            "el alta tiene que devolver el nombre con sus 120 caracteres, sin truncarlo: {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert_eq!(
+            lectura["data"]["name"].as_str(),
+            Some(justo.as_str()),
+            "la fila guardada tiene que conservar el nombre entero, con sus 120 caracteres: {lectura}"
+        );
+    }
+
+    /// 1.4d — El tope se mide en **caracteres**, no en bytes.
+    ///
+    /// Cubre la segunda mitad de la frontera: 120 caracteres acentuados ocupan 240 bytes en UTF-8, así
+    /// que un tope medido con `len()` —bytes— rechazaría un nombre que el formulario, con su
+    /// `maxLength` en caracteres, deja escribir. La prueba afirma las dos cuentas sobre la **misma**
+    /// cadena: 120 caracteres, que es lo que limita el contrato, y 240 bytes, que es lo que un tope
+    /// equivocado habría contado; sin la segunda, la prueba pasaría igual con una cadena ASCII y no
+    /// distinguiría las dos medidas.
+    #[tokio::test]
+    async fn el_tope_del_nombre_se_mide_en_caracteres_y_no_en_bytes() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-acentuado").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-acentuado").await;
+
+        let acentuado = "á".repeat(120);
+
+        assert_eq!(
+            acentuado.chars().count(),
+            120,
+            "la cadena de la prueba tiene que tener 120 caracteres"
+        );
+        assert_eq!(
+            acentuado.len(),
+            240,
+            "y 240 bytes en UTF-8, que es lo que un tope medido con `len()` habría contado"
+        );
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, &acentuado),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un nombre de 120 caracteres acentuados —240 bytes— cabe en el tope en caracteres y \
+             tiene que aceptarse: contestó {status} con {cuerpo}"
+        );
+
+        let devuelto = cuerpo["data"]["name"]
+            .as_str()
+            .expect("el alta tiene que devolver el nombre como texto");
+
+        assert_eq!(
+            devuelto.chars().count(),
+            120,
+            "el alta tiene que devolver los 120 caracteres, no 240: {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert_eq!(
+            lectura["data"]["name"].as_str(),
+            Some(acentuado.as_str()),
+            "la fila guardada tiene que conservar los 120 caracteres acentuados: {lectura}"
+        );
+    }
+
+    /// 1.4e — El tope se aplica igual en la **edición**: 121 caracteres por `PUT` contestan `400`.
+    ///
+    /// Cubre la mitad «o una edición» del escenario «Un nombre de más de 120 caracteres contesta 400
+    /// nombrando name», que hoy solo se ejerce por el alta. Que las dos rutas compartan la
+    /// normalización es una propiedad de la implementación y no del contrato: una edición que validara
+    /// por su cuenta podría dejarse el tope. Se comprueba además que el rechazo **no toca la fila**:
+    /// el cuerpo lleva un `keep_daily` distinto y la lectura tiene que traer el nombre y la retención
+    /// anteriores, así que una edición que escribiera antes de verificar lo delataría por los dos
+    /// lados.
+    #[tokio::test]
+    async fn un_nombre_de_121_caracteres_contesta_400_en_la_edicion() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-largo-en-la-edicion").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-del-nombre-largo-en-la-edicion").await;
+
+        let alta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = alta.status();
+        let alta = body_json(alta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea tiene que darse de alta antes de editarla: contestó {status} con {alta}"
+        );
+
+        let id = alta["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let largo = "n".repeat(121);
+
+        let mut edicion = cuerpo_de_tarea_con_nombre(&target, &repositorio, &largo);
+        edicion["keep_daily"] = serde_json::json!(3);
+
+        let respuesta = put_json(router.clone(), &format!("/api/v1/jobs/{id}"), &edicion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un nombre de 121 caracteres tiene que rechazarse también al editar: contestó {status} \
+             con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto");
+
+        assert!(
+            mensaje.contains("name"),
+            "el rechazo de la edición tiene que nombrar el campo `name`, y el mensaje fue \
+             {mensaje:?}"
+        );
+        assert!(
+            !mensaje.contains(&largo),
+            "el rechazo nombra el campo, nunca el valor que traía, y el mensaje fue {mensaje:?}"
+        );
+
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert_eq!(
+            lectura["data"]["name"], "copia nocturna",
+            "una edición rechazada no puede haber escrito el nombre nuevo: {lectura}"
+        );
+        assert_eq!(
+            lectura["data"]["keep_daily"],
+            serde_json::json!(7),
+            "ni ninguno de los otros campos que traía el cuerpo: {lectura}"
         );
     }
 }

@@ -825,6 +825,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
+                name: None,
             })
             .await
             .expect("el alta de la tarea no puede fallar");
@@ -874,6 +875,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
+                name: None,
             })
             .await
             .expect("el alta de la tarea hermana no puede fallar")

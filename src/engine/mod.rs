@@ -1708,6 +1708,7 @@ mod tests {
                     keep_weekly,
                     keep_monthly,
                     enabled,
+                    name: None,
                 })
                 .await
                 .expect("el alta de la tarea no puede fallar")

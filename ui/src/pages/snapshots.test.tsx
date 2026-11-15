@@ -188,6 +188,56 @@ describe('pantalla de Snapshots', () => {
     })
     unmount()
   })
+
+  it('la columna «Tarea» va entre la fecha y la etiqueta, y no toca la etiqueta', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          // `label` es el identificador de la tarea: lo que la columna «Tarea»
+          // enseña es el `job_name`, y sin nombre cae a ese identificador.
+          snapshots: [
+            snapshot({ id: HEX, label: 'j1', job_name: 'copia nocturna' }),
+            snapshot({ id: OTRO_HEX, label: 'j9', job_name: null }),
+          ],
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+
+    const tabla = await esperarLaTabla()
+
+    const encabezados = within(tabla)
+      .getAllByRole('columnheader')
+      .map((celda) => (celda.textContent ?? '').trim())
+    const fecha = encabezados.indexOf('Fecha')
+    const tarea = encabezados.indexOf('Tarea')
+    const etiqueta = encabezados.indexOf('Etiqueta')
+    expect(fecha).toBeGreaterThanOrEqual(0)
+    expect(etiqueta).toBeGreaterThan(fecha)
+    // «Tarea» es una columna nueva y su sitio es justo ése.
+    expect(tarea).toBeGreaterThan(fecha)
+    expect(tarea).toBeLessThan(etiqueta)
+
+    /** Las celdas de la fila de la instantánea `id`. */
+    const celdasDe = (id: string) => {
+      const fila = within(tabla).getByText(id).closest('tr')
+      if (fila === null) throw new Error(`no se encontró la fila de ${id}`)
+      return within(fila).getAllByRole('cell')
+    }
+
+    const conNombre = celdasDe(HEX)
+    expect(conNombre[tarea]?.textContent).toBe('copia nocturna')
+    // La etiqueta sigue siendo el identificador de la tarea, sin cambios.
+    expect(conNombre[etiqueta]?.textContent).toBe('j1')
+
+    const sinNombre = celdasDe(OTRO_HEX)
+    expect(sinNombre[tarea]?.textContent).toBe('j9')
+    expect(sinNombre[etiqueta]?.textContent).toBe('j9')
+    unmount()
+  })
 })
 
 /**

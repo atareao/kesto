@@ -238,4 +238,130 @@ describe('ModalDeTarea', () => {
     expect(await screen.findByRole('textbox', { name: 'Expresión cron' })).toHaveValue('2 2 2 * * *')
     expect(screen.getByRole('spinbutton', { name: 'Diarias' })).toHaveValue('2')
   })
+
+  it('el campo «Nombre» es opcional y viaja en el alta cuando se escribe', async () => {
+    const usuario = userEvent.setup()
+    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
+    const fetch = instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    await screen.findByRole('dialog')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+
+    // El campo existe, es de texto y arranca vacío: es opcional.
+    expect(screen.getByRole('textbox', { name: 'Nombre' })).toHaveValue('')
+
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
+    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).toMatchObject({ name: 'copia nocturna' })
+  })
+
+  it('sin nombre, el alta no envía el campo', async () => {
+    const usuario = userEvent.setup()
+    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
+    const fetch = instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    await screen.findByRole('dialog')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+
+    expect(screen.getByRole('textbox', { name: 'Nombre' })).toHaveValue('')
+
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
+    // Dejarlo vacío es no mandarlo: el backend guarda `null` y no hay que
+    // distinguir «vacío» de «ausente».
+    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).not.toHaveProperty('name')
+  })
+
+  it('al editar, el nombre de la fila se precarga y viaja en el PUT', async () => {
+    const usuario = userEvent.setup()
+    const original = tarea({
+      id: 'j7',
+      target_id: 't1',
+      repository_id: 'r1',
+      name: 'copia nocturna',
+    })
+    const fetch = instalarFetchFalso(({ ruta, method }) =>
+      ruta === '/api/v1/jobs/j7' && method === 'PUT'
+        ? { status: 200, data: original }
+        : (() => {
+            throw new Error(`ruta inesperada: ${method} ${ruta}`)
+          })(),
+    )
+
+    montar({ tareaEditada: original })
+
+    await screen.findByRole('dialog')
+    expect(screen.getByRole('textbox', { name: 'Nombre' })).toHaveValue('copia nocturna')
+
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() => expect(fetch.a('/api/v1/jobs/j7')).toHaveLength(1))
+    expect(fetch.a('/api/v1/jobs/j7')[0]?.cuerpo).toMatchObject({ name: 'copia nocturna' })
+  })
+
+  it('un nombre borrado con «allowClear» no viaja en el alta', async () => {
+    const usuario = userEvent.setup()
+    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
+    const fetch = instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    await screen.findByRole('dialog')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+
+    const nombre = screen.getByRole('textbox', { name: 'Nombre' })
+    await usuario.type(nombre, 'copia nocturna')
+
+    // La cruz de `allowClear` deja el campo en blanco —`rc-input` escribe `''`—,
+    // y un campo vacío es «sin nombre»: la clave no tiene que viajar.
+    await usuario.click(screen.getByRole('button', { name: 'close-circle' }))
+    expect(nombre).toHaveValue('')
+
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
+    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).not.toHaveProperty('name')
+  })
+
+  it('un nombre de solo espacios no viaja en el alta', async () => {
+    const usuario = userEvent.setup()
+    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
+    const fetch = instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    await screen.findByRole('dialog')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+
+    // El campo se recorta antes de enviarse: unos espacios no son un nombre, y
+    // el backend lo guardaría a `null` igual.
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), '   ')
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
+    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).not.toHaveProperty('name')
+  })
 })

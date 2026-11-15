@@ -137,6 +137,9 @@ describe('tipos del cable', () => {
   it('el resto de DTOs encajan con el JSON del backend', () => {
     const job: Job = {
       id: 'j',
+      // El nombre es anulable y la clave viaja siempre (`issue #65`): sin nombre,
+      // el backend publica `null` en vez de omitirla.
+      name: null,
       target_id: 't',
       repository_id: 'r',
       cron_expression: '0 3 * * *',
@@ -159,6 +162,8 @@ describe('tipos del cable', () => {
     const execution: Execution = {
       id: 'e',
       job_id: 'j',
+      // Su tarea no tiene nombre: la clave va presente con `null` (`issue #65`).
+      job_name: null,
       status: 'running',
       snapshot_id: null,
       bytes_processed: 1024,
@@ -172,6 +177,9 @@ describe('tipos del cable', () => {
       time: '2026-01-02T03:04:05Z',
       paths: ['/srv/web'],
       label: 'manual',
+      // La etiqueta del snapshot no se toca; `job_name` es aparte y anulable
+      // (`issue #65`): aquí no hay tarea con nombre que lo pueble.
+      job_name: null,
       files: 12,
       bytes: 4096,
       target_id: 't',
