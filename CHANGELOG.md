@@ -1,4 +1,32 @@
 # Changelog
+## [0.8.0] - 2026-11-15
+
+### Documentation
+
+- Actualizar el relevo tras la release v0.7.0
+- *(sdd)* Change ajustes-de-sidebar y PLAN-019 (issue #66)
+- FEATURE-019, cierre del plan y archivo del change SDD
+- *(sdd)* Change nombre-de-la-tarea y PLAN-020 (issue #65)
+- FEATURE-020, cierre del plan y archivo del change SDD (issue #65)
+- Relevo tras #65 (nombre de la tarea) y el chore de vampus
+- *(restauracion)* Change SDD, plan 021 y FEATURE-021
+- *(plan)* Marcar el cierre del plan 021 (PR #77)
+- Relevo tras #67 (fase 2 completada, PR #77)
+
+### Features
+
+- *(db,api)* Nombre legible de la tarea en el esquema y en los listados (issue #65)
+- *(ui)* Muestra el nombre de la tarea en Tareas, Histórico y Snapshots (issue #65)
+- *(restauracion)* Restaurar bases de datos en su contenedor y persistir la ejecución
+
+### Miscellaneous Tasks
+
+- *(ci)* Descargar vampus precompilado en lugar de compilarlo
+
+### Styling
+
+- *(ui)* Mandos al pie de la barra lateral y marca oculta al plegar (issue #66)
+- *(ui)* Renombra a «Target» la columna del target en Tareas
 ## [0.7.0] - 2026-11-15
 
 ### Documentation
@@ -26,6 +54,7 @@
 - *(ui)* Separar tsconfig de aplicación, tests y tooling
 - Type-checkear los tests del panel
 - *(db)* Índice sobre job_executions.snapshot_id
+- Release v0.7.0
 
 ### Refactor
 
