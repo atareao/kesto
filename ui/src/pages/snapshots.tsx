@@ -362,6 +362,14 @@ export default function Snapshots() {
       render: (_valor, snapshot) => formatearFecha(snapshot.time),
     },
     {
+      title: 'Tarea',
+      key: 'tarea',
+      // El nombre de la tarea que hizo la copia y, sin él, el identificador que
+      // ya publica `label` (que es el de la tarea). La columna «Etiqueta» no se
+      // toca: sigue siendo la etiqueta del snapshot.
+      render: (_valor, snapshot) => snapshot.job_name ?? snapshot.label ?? '',
+    },
+    {
       title: 'Etiqueta',
       key: 'etiqueta',
       render: (_valor, snapshot) =>

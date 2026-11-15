@@ -6,7 +6,6 @@ import { ConsolaDeEjecucion } from '../components/ConsolaDeEjecucion/ConsolaDeEj
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
 import { useEjecuciones } from '../hooks/useEjecuciones'
 import { useTareas } from '../hooks/useTareas'
-import { useTargets } from '../hooks/useTargets'
 import type { Estado, Execution } from '../services/api/types'
 import { colorDeEstado, etiquetaDeEstado } from '../services/estados'
 import { mensajeDeError } from '../services/errores'
@@ -33,7 +32,6 @@ export default function Historico() {
   const [seleccionada, setSeleccionada] = useState<string | null>(null)
 
   const tareas = useTareas()
-  const targets = useTargets()
   const ejecuciones = useEjecuciones({
     job_id: jobId,
     status: estado,
@@ -44,13 +42,23 @@ export default function Historico() {
   const datos = ejecuciones.data ?? []
   const haySiguiente = datos.length === TAMANO_DE_PAGINA
 
-  const nombresDeTarget = new Map((targets.data ?? []).map((target) => [target.id, target.name]))
+  // La opción se lee por el nombre de la tarea y, sin él, por su identificador:
+  // el nombre del target es justo lo que hacía indistinguibles dos tareas sobre
+  // el mismo origen. El `value` sigue siendo el `job_id` que filtra la API.
   const opcionesDeTarea = (tareas.data ?? []).map((tarea) => ({
     value: tarea.id,
-    label: nombresDeTarget.get(tarea.target_id) ?? formatearUuid(tarea.target_id),
+    label: tarea.name ?? formatearUuid(tarea.id),
   }))
 
   const columnas: TableProps<Execution>['columns'] = [
+    {
+      title: 'Tarea',
+      key: 'tarea',
+      // Sin nombre, cae al identificador de la tarea: el del target no dice de
+      // cuál de las tareas sobre ese target es la ejecución.
+      render: (_valor, ejecucion) =>
+        ejecucion.job_name ?? formatearUuid(ejecucion.job_id),
+    },
     {
       title: 'Inicio',
       key: 'inicio',

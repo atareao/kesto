@@ -10,14 +10,18 @@ import { ProveedorDeEventos } from '../services/events'
 import { NOMBRE_DEL_EVENTO } from '../services/useEventStream'
 import { instalarFetchFalso } from '../../tests/fetchDePrueba'
 import type { ManejadorDeFetch, RespuestaSimulada } from '../../tests/fetchDePrueba'
-import { ejecucion, target, tarea } from '../../tests/fixtures'
+import { ejecucion, tarea } from '../../tests/fixtures'
 import Historico from './historico'
 
 type Usuario = ReturnType<typeof userEvent.setup>
 
 const TAMANO = 20
-const J1 = tarea({ id: 'j1', target_id: 't1', repository_id: 'r1' })
-const TARGETS = [target({ id: 't1', name: 'web' })]
+const J1 = tarea({
+  id: 'j1',
+  target_id: 't1',
+  repository_id: 'r1',
+  name: 'copia nocturna',
+})
 const TAREAS = [J1]
 
 function montar() {
@@ -39,11 +43,10 @@ function lote(cantidad: number, desde = 0) {
   )
 }
 
-/** Rutas comunes a todas las pruebas: tareas y targets para el filtro. */
+/** Rutas comunes a todas las pruebas: las tareas que etiquetan el filtro. */
 function manejadorCon(sobreEjecuciones: ManejadorDeFetch): ManejadorDeFetch {
   return (llamada) => {
     if (llamada.ruta === '/api/v1/jobs') return { status: 200, data: TAREAS }
-    if (llamada.ruta === '/api/v1/targets') return { status: 200, data: TARGETS }
     if (llamada.ruta === '/api/v1/executions') return sobreEjecuciones(llamada)
     throw new Error(`ruta inesperada: ${llamada.method} ${llamada.ruta}`)
   }
@@ -106,7 +109,7 @@ describe('pantalla de Histórico', () => {
     const { unmount } = montar()
     await screen.findByRole('table', { name: 'Ejecuciones' })
 
-    await elegir(usuario, 'Tarea', 'web')
+    await elegir(usuario, 'Tarea', 'copia nocturna')
     await waitFor(() => {
       expect(fetch.a('/api/v1/executions').at(-1)?.url).toContain('job_id=j1')
     })
@@ -225,6 +228,65 @@ describe('tabla de ejecuciones', () => {
     const tabla = await screen.findByRole('table', { name: 'Ejecuciones' })
     expect(within(tabla).getByText('5 min')).toBeInTheDocument()
     expect(within(tabla).getByText('en curso')).toBeInTheDocument()
+    unmount()
+  })
+})
+
+describe('nombre de la tarea en el Histórico', () => {
+  it('el filtro «Tarea» etiqueta las opciones con el nombre de la tarea, no con el del target', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(manejadorCon(() => ({ status: 200, data: lote(2) })))
+
+    const { unmount } = montar()
+    await screen.findByRole('table', { name: 'Ejecuciones' })
+
+    await usuario.click(screen.getByRole('combobox', { name: 'Tarea' }))
+
+    // La opción se lee por el nombre de la tarea; el nombre del target es
+    // justo lo que hacía indistinguibles dos tareas sobre el mismo target.
+    expect(await screen.findByTitle('copia nocturna')).toBeInTheDocument()
+    expect(screen.queryByTitle('web')).not.toBeInTheDocument()
+
+    await usuario.click(screen.getByTitle('copia nocturna'))
+    await waitFor(() => {
+      expect(fetch.a('/api/v1/executions').at(-1)?.url).toContain('job_id=j1')
+    })
+    unmount()
+  })
+
+  it('la tabla muestra una columna «Tarea» con el `job_name` y el identificador cuando no hay nombre', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: [
+          ejecucion({ id: 'e1', job_id: 'j1', job_name: 'copia nocturna' }),
+          ejecucion({ id: 'e2', job_id: 'j2', job_name: null }),
+        ],
+      })),
+    )
+
+    const { unmount } = montar()
+
+    const tabla = await screen.findByRole('table', { name: 'Ejecuciones' })
+
+    const encabezados = within(tabla)
+      .getAllByRole('columnheader')
+      .map((celda) => (celda.textContent ?? '').trim())
+    const columna = encabezados.indexOf('Tarea')
+    expect(columna).toBeGreaterThanOrEqual(0)
+
+    /** Las celdas de la fila `indice`, en el orden en que llegan del listado. */
+    const celdasDe = (indice: number) => {
+      const boton = screen.getAllByRole('button', { name: 'Ver consola' })[indice]
+      const fila = boton.closest('tr')
+      if (fila === null) throw new Error(`no se encontró la fila ${indice}`)
+      return within(fila).getAllByRole('cell')
+    }
+
+    expect(celdasDe(0)[columna]?.textContent).toBe('copia nocturna')
+    // Sin nombre cae al identificador de la tarea, nunca al del target.
+    expect(celdasDe(1)[columna]?.textContent).toBe('j2')
+    expect(within(tabla).queryByText('web')).not.toBeInTheDocument()
     unmount()
   })
 })

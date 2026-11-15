@@ -88,6 +88,13 @@ export default function Tareas() {
 
   const columnas: TableProps<Job>['columns'] = [
     {
+      title: 'Nombre',
+      key: 'nombre',
+      // Sin nombre la celda queda vacía: inventar aquí el del target repetiría
+      // justo la confusión que este campo viene a resolver.
+      render: (_valor, tarea) => tarea.name ?? '',
+    },
+    {
       title: 'Tarea',
       key: 'target',
       render: (_valor, tarea) =>

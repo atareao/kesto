@@ -98,6 +98,12 @@ export interface AltaRepository {
 /** Lectura: `GET /api/v1/jobs` y `GET /api/v1/jobs/{id}`. */
 export interface Job {
   id: string
+  /**
+   * Nombre con el que el operador distingue la tarea; `null` cuando no se le puso
+   * ninguno. La clave **siempre** viaja —el backend no la omite cuando va a
+   * `null`— y no es única: es una etiqueta legible, no un identificador.
+   */
+  name: string | null
   target_id: string
   repository_id: string
   cron_expression: string
@@ -111,6 +117,12 @@ export interface Job {
 
 /** Escritura: `POST` y `PUT` de `/api/v1/jobs`. */
 export interface AltaJob {
+  /**
+   * Nombre de la tarea; opcional. El backend lo recorta y guarda un blanco como
+   * `null`, así que el panel **omite** la clave cuando el campo queda vacío en
+   * vez de mandar una cadena vacía.
+   */
+  name?: string | null
   target_id: string
   repository_id: string
   cron_expression: string
@@ -141,6 +153,13 @@ export interface EjecucionEncolada {
 export interface Execution {
   id: string
   job_id: string
+  /**
+   * Nombre de la tarea que originó la ejecución, resuelto por el backend en el
+   * mismo vínculo que el resto de la fila; `null` cuando esa tarea no tiene
+   * nombre. La clave **siempre** viaja, así que la columna «Tarea» cae al
+   * identificador cuando llega a `null` —nunca al nombre del target—.
+   */
+  job_name: string | null
   status: Estado
   snapshot_id: string | null
   bytes_processed: number
@@ -161,6 +180,13 @@ export interface Snapshot {
   time: string
   paths: string[]
   label: string | null
+  /**
+   * Nombre de la tarea de la que procede la instantánea, por el vínculo
+   * `snapshot → job_executions → backup_jobs`; `null` cuando esa tarea no tiene
+   * nombre **o** cuando la instantánea no casa con ninguna ejecución. La columna
+   * «Tarea» cae entonces al identificador de la tarea que publica `label`.
+   */
+  job_name: string | null
   files: number
   bytes: number
   /**

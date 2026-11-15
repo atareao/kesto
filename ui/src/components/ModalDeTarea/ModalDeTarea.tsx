@@ -1,6 +1,6 @@
 import { useImperativeHandle, useRef, useState } from 'react'
 import type { Ref } from 'react'
-import { Alert, Form, InputNumber, Modal, Select, Space, Switch } from 'antd'
+import { Alert, Form, Input, InputNumber, Modal, Select, Space, Switch } from 'antd'
 import type { FormInstance } from 'antd'
 import { ErrorDeApi } from '../../services/api/envelope'
 import type { AltaJob, Job, Repository, Target } from '../../services/api/types'
@@ -10,6 +10,8 @@ import { useActualizarTarea, useCrearTarea } from '../../hooks/useTareas'
 
 /** Valores del formulario, que coinciden con el cuerpo del alta. */
 export interface ValoresDeTarea {
+  /** El nombre, recortado al enviarlo; vacío significa «sin nombre». */
+  name: string
   target_id: string
   repository_id: string
   cron_expression: string
@@ -31,6 +33,7 @@ export interface PropsDeModalDeTarea {
 
 /** Valores de un alta: todos los días a las 03:00 y retención 7/4/6. */
 const VALORES_POR_DEFECTO: ValoresDeTarea = {
+  name: '',
   target_id: '',
   repository_id: '',
   cron_expression: CRON_POR_DEFECTO,
@@ -42,6 +45,9 @@ const VALORES_POR_DEFECTO: ValoresDeTarea = {
 
 function valoresDe(tarea: Job): ValoresDeTarea {
   return {
+    // Un `null` del contrato se edita como campo vacío: `Input` no acepta `null`
+    // y «sin nombre» y «campo vacío» son lo mismo al guardar.
+    name: tarea.name ?? '',
     target_id: tarea.target_id,
     repository_id: tarea.repository_id,
     cron_expression: tarea.cron_expression,
@@ -50,6 +56,20 @@ function valoresDe(tarea: Job): ValoresDeTarea {
     keep_monthly: tarea.keep_monthly,
     enabled: tarea.enabled,
   }
+}
+
+/**
+ * Convierte los valores del formulario en el cuerpo del alta y de la edición.
+ *
+ * El nombre es opcional y se recorta: en blanco **no viaja** —el backend guarda
+ * `null`—, así que la clave se omite en lugar de mandar una cadena vacía, que el
+ * servidor tendría que volver a interpretar.
+ */
+function cuerpoDeTarea(valores: ValoresDeTarea): AltaJob {
+  const { name, ...resto } = valores
+  const nombre = name.trim()
+
+  return nombre === '' ? { ...resto } : { ...resto, name: nombre }
 }
 
 interface PropsDelFormularioDeTarea {
@@ -82,6 +102,12 @@ function FormularioDeTarea({
       requiredMark
       initialValues={tarea === null ? VALORES_POR_DEFECTO : valoresDe(tarea)}
     >
+      <Form.Item label="Nombre" name="name">
+        {/* El mismo tope que la API: más de 120 caracteres es un `400` que nombra
+            `name`, y aquí se evita antes de salir. */}
+        <Input placeholder="Sin nombre" allowClear maxLength={120} />
+      </Form.Item>
+
       <Form.Item
         label="Target"
         name="target_id"
@@ -190,7 +216,7 @@ export function ModalDeTarea({
       return
     }
 
-    const cuerpo: AltaJob = { ...valores }
+    const cuerpo: AltaJob = cuerpoDeTarea(valores)
 
     try {
       const guardada =
