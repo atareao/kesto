@@ -4,6 +4,7 @@ import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
 import { useRestauraciones } from '../hooks/useRestauraciones'
+import { useTargets } from '../hooks/useTargets'
 import type { Estado, RestauracionRegistrada } from '../services/api/types'
 import { colorDeEstado, etiquetaDeEstado } from '../services/estados'
 import { mensajeDeError } from '../services/errores'
@@ -37,13 +38,23 @@ function nombreDelTarget(fila: RestauracionRegistrada): string {
  * La paginación es por `limit`/`offset`. A diferencia del histórico de
  * ejecuciones, aquí la respuesta **sí** trae el total, así que «Siguiente» se
  * apaga con el total y no con la heurística de «página incompleta».
+ *
+ * El filtro por target se elige en un selector cuyas opciones vienen del catálogo
+ * (`GET /api/v1/targets`) y viaja a la API como `target_id`. El elegido vive en
+ * estado **propio** y no se deriva del catálogo: si el target se borra en otra
+ * pestaña, la pantalla conserva el filtro y pinta su vacío en vez de reconciliar
+ * opciones y romperse.
  */
 export default function Restauraciones() {
   const [estado, setEstado] = useState<Estado | undefined>(undefined)
+  const [targetId, setTargetId] = useState<string | undefined>(undefined)
   const [offset, setOffset] = useState(0)
+
+  const targets = useTargets()
 
   const restauraciones = useRestauraciones({
     status: estado,
+    target_id: targetId,
     limit: TAMANO_DE_PAGINA,
     offset,
   })
@@ -111,6 +122,11 @@ export default function Restauraciones() {
     setOffset(0)
   }
 
+  const cambiarTarget = (valor: string | undefined) => {
+    setTargetId(valor)
+    setOffset(0)
+  }
+
   return (
     <section aria-labelledby="titulo-de-la-pantalla">
       <Typography.Title id="titulo-de-la-pantalla" level={1} style={{ marginTop: 0 }}>
@@ -118,6 +134,18 @@ export default function Restauraciones() {
       </Typography.Title>
 
       <Space size="middle" wrap style={{ marginBottom: 16 }}>
+        <Select
+          allowClear
+          aria-label="Target"
+          placeholder="Todos los targets"
+          style={{ minWidth: 200 }}
+          value={targetId}
+          onChange={cambiarTarget}
+          options={(targets.data ?? []).map((target) => ({
+            value: target.id,
+            label: target.name,
+          }))}
+        />
         <Select
           allowClear
           aria-label="Estado"
