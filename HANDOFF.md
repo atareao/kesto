@@ -1,27 +1,29 @@
-# Handoff — kesto — 2026-11-15 (issue #79 en curso: filtro por target en Restauraciones)
+# Handoff — kesto — 2026-11-15 (issue #79 entregado, PR #80 abierto)
 
 ## Objetivo
-Issue **#79**: añadir un selector de **target** a la pantalla de Restauraciones para acotar el histórico por base de datos. Follow-up de #67. Ciclo **SDD (change aprobado) + TDD**: RED en curso.
+Issue **#79**: selector de **target** en la pantalla de Restauraciones para acotar el histórico por base de datos. **Entregado**; pendiente solo el merge del PR.
 
 ## Estado
-- Relevo anterior **ya cerrado**: PR #77 (`#67` fase 2) **MERGED** y release **v0.8.0** publicada; `main` y `development` idénticas, sin PRs ni issues abiertos.
-- Rama de trabajo: **`feature/filtro-target-en-restauraciones`** desde `development`.
-- Issue **#79** abierto y asignado a `atareao` (punto de entrada).
-- SDD: change `filtro-por-target-en-restauraciones` con sus 4 artefactos; `openspec validate --strict` → **válido**. Delta **solo** sobre la capacidad `ui` (requisito «El panel muestra el histórico de restauraciones» pasa a filtro por estado **y** por target); sin capacidades nuevas y **sin cambios de backend/esquema/API**.
-- Plan: `plans/PLAN-022.md`. Commit de planificación: `30af250` (`📝 docs(plan): spec SDD y PLAN-022 del filtro por target en Restauraciones`).
-- Reconocimiento: `GET /api/v1/restorations` ya acepta y prueba `target_id` (`src/api/restorations.rs`, test `el_filtro_por_target_acota_el_listado`), el índice `idx_restore_executions_target_id` ya existe, y `ui/src/api/restauraciones.ts` + `ui/src/hooks/useRestauraciones.ts` ya transportan el parámetro. **Falta solo el selector en `ui/src/pages/restauraciones.tsx`.**
+- Relevo anterior cerrado: PR #77 (#67 fase 2) **MERGED** y release **v0.8.0**; `main` == `development`.
+- **#79 entregado** en la rama `feature/filtro-target-en-restauraciones` → **PR #80** a `development` (`Closes #79`). Commits: `📝 docs(plan)`, `📝 docs` (relevo), `✅ test` (RED), `✨ feat` (GREEN), `✅ test` (reforzado), `📝 docs(restauracion)` (cierre).
+- SDD: change `filtro-por-target-en-restauraciones` **archivado** en `openspec/changes/archive/2026-11-15-filtro-por-target-en-restauraciones/`; requisito fusionado en `openspec/specs/ui/spec.md:545`; `openspec validate --specs --strict` → 13 pasan, 0 fallan.
+- Plan: `plans/PLAN-022-COMPLETED.md`. Doc: `docs/FEATURE-022-filtro-por-target-en-restauraciones.md`.
+- Entregado: `Select` de target con `allowClear` en `ui/src/pages/restauraciones.tsx` (opciones del catálogo `GET /api/v1/targets`, etiqueta = nombre, valor = `id`), `target_id` en los filtros de `useRestauraciones`, reinicio de `offset` al cambiar filtro, y estado propio del target para sobrevivir a un target borrado del catálogo. **Sin cambios de backend, esquema ni contrato de API.**
+- Verificado `just check-all` **EXIT=0**: backend `fmt`+`clippy -D warnings`+`test` (**527+5 pasan**, 27 `#[ignore]` e2e con podman); panel `lint`+`typecheck`+`typecheck:test`+`test` (**223 pasan**)+`build`.
+- Auditoría `@react-reviewer`: **sin bloqueantes**; el *recomendado* (el caso de reinicio de paginación por estado no salía de la página 1) quedó cerrado en `1fbb6a5` y verificado por mutación.
 
 ## Pendiente
-1. **RED**: `@frontend-dev` escribiendo los casos nuevos en `ui/src/pages/restauraciones.test.tsx` (acotar por target con total, reinicio de paginación, limpiar/combinar filtros, target ausente del catálogo). Confirmar que fallan y que el resto sigue verde + `npx tsc --noEmit`.
-2. **GREEN**: selector de target con `allowClear` en `ui/src/pages/restauraciones.tsx`, opciones de `useTargets()`, patrón del Histórico (`ui/src/pages/historico.tsx`), reinicio de `offset` al cambiar filtro.
-3. **REFACTOR + auditoría**: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test` → `pnpm run build`; `@react-reviewer` sobre el diff sin bloqueantes.
-4. **Cierre**: `just check-all` EXIT=0; `docs/FEATURE-022-filtro-por-target-en-restauraciones.md`; `openspec archive filtro-por-target-en-restauraciones`; `plans/PLAN-022.md` → `-COMPLETED`; PR a `development` con `Closes #79`.
+1. **Mergear el PR #80** a `development` (si CI verde).
+2. Release siguiente (`release-prepare` calculará el bump: `feat` → **minor**); no se etiqueta a mano.
+3. Follow-ups abiertos de #67 (en `docs/FEATURE-022-…`): restauración parcial por rutas, copia previa automática, progreso incremental real (bloqueado por `rustic_core`) y e2e de los `#[ignore]` en CI.
+4. Auditoría sugiere **ticket aparte**: extraer pie de paginación, `TAMANO_DE_PAGINA` y `ESTADOS` compartidos entre `historico.tsx` y `restauraciones.tsx`; y `allowClear` de Antd es solo-ratón (un botón «Limpiar filtros» lo resolvería).
 
 ## Punto de partida
 ```
-git checkout feature/filtro-target-en-restauraciones
-just check-all
-# ui/: pnpm test -- restauraciones   ·   npx tsc --noEmit
+git checkout development && git pull origin development
+# (si el PR #80 siguiera abierto) git fetch && git checkout feature/filtro-target-en-restauraciones
+# backend: just check   ·   ui/: pnpm run lint && npx tsc --noEmit && pnpm test
+# cierre: just check-all
 ```
 
 ## Metodología / reglas
@@ -29,5 +31,4 @@ SDD (change en `openspec/changes/`) + TDD (RED por aserción → GREEN → REFAC
 
 ## Riesgos y notas
 - Restaurar una base **pisa datos vivos**: la única red es `sobrescribir: true` + teclear el nombre del target; no hay copia previa automática (decisión D de #67). Este issue **no** lo mitiga.
-- Decisión D4: si un `target_id` desaparece del catálogo, no se reconcilian las opciones del selector; se pinta el vacío.
-- Follow-ups de #67 que siguen abiertos: restauración parcial por rutas, copia previa automática, progreso incremental real (bloqueado por `rustic_core`) y e2e de los `#[ignore]` en CI.
+- Decisión D4/D5: si un `target_id` desaparece del catálogo, no se reconcilian las opciones (se pinta el vacío); y no se extrajo el patrón de filtro a un componente compartido, por consistencia con Histórico mientras solo haya dos pantallas.
