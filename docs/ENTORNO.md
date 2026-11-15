@@ -36,7 +36,7 @@
 | Rust / Cargo | 1.97 · `edition = "2024"` (exige ≥ 1.85) |
 | Node / pnpm | v24.22.1 · pnpm 12.15.0 (npm 12.2.1) |
 | Contenedores | **no hay `docker` ni `/var/run/docker.sock`**; Podman 6.1.4 con API Docker-compatible en `unix:///run/user/1000/podman/podman.sock` (`/_ping` → 200, `/containers/json` responde) |
-| CLI | `just` 1.59.0 · `openspec` 1.13.2 · `codegraph` 0.7.9 · `gh` 2.102.1 (autenticado como `atareao`) · `vampus` 0.4.6 · `git-cliff` 2.14.2 |
+| CLI | `just` 1.59.0 · `openspec` 1.13.2 · `codegraph` 0.7.9 · `gh` 2.102.1 (autenticado como `atareao`) · `vampus` 0.4.8 · `git-cliff` 2.14.2 |
 
 - **Podman en local, Docker en producción** (decisión tomada el 2026-10-24). En dev, bollard apunta al socket de podman con la ruta configurable (`DOCKER_HOST`); nunca al de Docker. El compose de producción (§8) sigue montando `/var/run/docker.sock`.
 - Cualquier comando `docker ...` falla en esta máquina: usa `podman ...`.
