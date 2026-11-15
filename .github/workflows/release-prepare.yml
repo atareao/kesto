@@ -43,14 +43,18 @@ jobs:
       # `cargo install --git`, que clonaba y compilaba el HEAD del repo en cada
       # release: lento y no reproducible. Con la descarga se fija la versión;
       # súbela aquí y en `docs/ENTORNO.md` a la vez.
+      # El tarball se descarga en `$RUNNER_TEMP`, fuera del árbol, porque uno
+      # descargado dentro del repo acabó commiteado por el `git add -A` del paso
+      # de commit (issue #83).
       - name: Install vampus
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VAMPUS_VERSION: v0.4.8
         run: |
           gh release download "$VAMPUS_VERSION" --repo atareao/vampus \
-            --pattern 'vampus-x86_64-unknown-linux-musl.tar.gz' --output vampus.tgz
-          tar -xzf vampus.tgz -C /usr/local/bin vampus
+            --pattern 'vampus-x86_64-unknown-linux-musl.tar.gz' \
+            --output "$RUNNER_TEMP/vampus.tgz" --clobber
+          tar -xzf "$RUNNER_TEMP/vampus.tgz" -C /usr/local/bin vampus
           vampus --version
 
       # Un merge a `main` puede llegar en tres estados. Comparar la versión de
@@ -158,7 +162,9 @@ jobs:
           V="${{ steps.version.outputs.value }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
+          # Se añade solo lo que la release toca: un artefacto suelto en el árbol
+          # (por ejemplo el tarball de vampus) no debe entrar en el commit.
+          git add CHANGELOG.md .vampus.yml Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
