@@ -115,7 +115,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustic_backend::opendal::OpenDALBackend;
-use rustic_core::repofile::{SnapshotFile, SnapshotId};
+use rustic_core::repofile::{Node, NodeType, SnapshotFile, SnapshotId};
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, Excludes, FileType, IndexedIdsStatus, KeyOptions,
     LocalDestination, LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions, LsOptions,
@@ -924,6 +924,128 @@ impl Repositorio {
             .map_err(|error| fallo(error.display_log()))?;
 
         repo.restore(plan, &opciones, nodos, &destino_local)
+            .map_err(|error| fallo(error.display_log()))
+    }
+
+    /// Vuelca al `destino` **el volcado** que la instantánea guarda.
+    ///
+    /// Es el primer tramo de la restauración de una base de datos: el volcado que la copia archivó
+    /// —un **único** nodo de fichero dentro de la instantánea— sale del repositorio por el
+    /// [`std::io::Write`] que se le pasa, que es lo que la biblioteca exige
+    /// ([`Repository::dump`]). El otro tramo —llevar esos bytes al `stdin` del contenedor— es de
+    /// [`crate::engine::restauracion`], que es quien le entrega un escritor que habla con el `exec`;
+    /// este módulo no sabe nada de contenedores.
+    ///
+    /// # Por qué vuelca **el único** nodo de fichero y no una ruta
+    ///
+    /// Quien restaura no conoce el nombre del volcado: la copia lo decidió al extraer y lo dejó
+    /// dentro del árbol. Lo único que se sabe de él es que una copia de volcado produce un solo
+    /// fichero —el puente
+    /// [`archivar_volcado`](Self::archivar_volcado) no deja otro—, así que la instantánea se
+    /// recorre y se exige que haya exactamente uno. Cero o más de uno es un fallo con motivo
+    /// propio ([`Error::VolcadoQueNoEsUno`]): una instantánea que no es de un volcado no se puede
+    /// restaurar como si lo fuera adivinando cuál de sus ficheros era.
+    ///
+    /// # El índice tiene que ser el completo
+    ///
+    /// Igual que en [`restaurar_snapshot`](Self::restaurar_snapshot), y por la misma razón de la
+    /// biblioteca: leer el contenido de un nodo exige el índice completo
+    /// ([`IndexedFull`](rustic_core::IndexedFull)), no el reducido con el que este tipo se abre.
+    /// De ahí que el método **consuma** el repositorio.
+    ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    ///
+    /// Volcar bloquea el hilo y, con el backend de S3, la biblioteca construye su **propio**
+    /// runtime para hablar con el destino: llamar a esto desde dentro de otro runtime entra en
+    /// **pánico** —medido, literal: «Cannot start a runtime from within a runtime.»—. Quien lo
+    /// llama es un hilo de bloqueo, que es donde corre el motor.
+    ///
+    /// # El `destino` es **bloqueante**, y ahí está la trampa
+    ///
+    /// La biblioteca escribe con [`std::io::Write`] y no tiene forma de escribir con un
+    /// [`tokio::io::AsyncWrite`], así que el escritor que se le pasa bloquea el hilo que llama. Lo
+    /// que se le entregue tiene que ser un puente hacia el lado asíncrono —ver
+    /// [`crate::engine::restauracion::EscritorDelVolcado`]—, no un escritor asíncrono.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::RestauracionFallida`] si el identificador no es un hex completo, si la
+    /// instantánea no está en el repositorio o si el volcado falla; y
+    /// [`Error::VolcadoQueNoEsUno`] si la instantánea no trae exactamente un nodo de fichero.
+    pub fn volcar_a(
+        self,
+        instantanea: &str,
+        destino: &mut impl std::io::Write,
+    ) -> Result<(), Error> {
+        let Repositorio {
+            repo,
+            destino: nombre_del_destino,
+        } = self;
+
+        let fallo = |motivo: String| Error::RestauracionFallida {
+            destino: nombre_del_destino.clone(),
+            instantanea: instantanea.to_owned(),
+            motivo,
+        };
+
+        // El identificador en **hex completo**, igual que en `restaurar_snapshot`: la forma corta
+        // del `Display` de `SnapshotId` son ocho caracteres y es un prefijo ambiguo.
+        let identificador: SnapshotId = instantanea
+            .parse()
+            .map_err(|error: Box<rustic_core::RusticError>| fallo(error.display_log()))?;
+
+        // El índice completo, lo antes posible: es el requisito de `dump` y el único sitio del
+        // recorrido donde se puede pagar, antes de volcar un byte.
+        let repo = repo
+            .to_indexed()
+            .map_err(|error| fallo(error.display_log()))?;
+
+        let hex = identificador.to_hex().as_str().to_owned();
+        let mut copias = repo
+            .get_snapshots(&[hex.as_str()])
+            .map_err(|error| fallo(error.display_log()))?;
+
+        let Some(copia) = copias.pop() else {
+            return Err(fallo(format!(
+                "el repositorio no tiene ninguna instantánea con el identificador `{hex}`"
+            )));
+        };
+
+        // El nodo raíz **sintético** de la instantánea, como en la restauración a un directorio.
+        let raiz = repo
+            .node_from_snapshot_and_path(&copia, "")
+            .map_err(|error| fallo(error.display_log()))?;
+
+        // El volcado: el **único** nodo de fichero de la instantánea. Se cuenta todo lo que haya
+        // —no se corta al primero— porque dos ficheros también es un fallo, y con el primero solo
+        // se volcaría el que la biblioteca listara antes sin que nadie lo sepa.
+        let mut volcado: Option<Node> = None;
+        let mut encontrados = 0_usize;
+
+        let nodos = repo
+            .ls(&raiz, &LsOptions::default())
+            .map_err(|error| fallo(error.display_log()))?;
+
+        for entrada in nodos {
+            let (_, nodo) = entrada.map_err(|error| fallo(error.display_log()))?;
+
+            if nodo.node_type == NodeType::File {
+                encontrados += 1;
+                volcado.get_or_insert(nodo);
+            }
+        }
+
+        // El filtro por `encontrados == 1` es lo que hace que ni el vacío ni el de dos pasen: sin
+        // él, el `Option` de arriba aceptaría el primero de dos.
+        let Some(nodo) = volcado.filter(|_| encontrados == 1) else {
+            return Err(Error::VolcadoQueNoEsUno {
+                destino: nombre_del_destino,
+                instantanea: instantanea.to_owned(),
+                encontrados,
+            });
+        };
+
+        repo.dump(&nodo, destino)
             .map_err(|error| fallo(error.display_log()))
     }
 }
@@ -3080,5 +3202,102 @@ mod tests {
         );
 
         drop(repositorio);
+    }
+
+    // ── Volcar el volcado al escritor ────────────────────────────────────────
+
+    /// **El volcado sale del repositorio por donde entró.**
+    ///
+    /// Es el primer tramo de la restauración de base: archivar un volcado con el puente y luego
+    /// volverlo a sacar por `volcar_a`, al búfer, tiene que devolver los mismos bytes. Se
+    /// reaprovecha el camino de la copia —que ya está probado— para no inventar una instantánea a
+    /// mano, y el escritor es un `Vec<u8>`, que es lo que permite comprobarlo byte a byte.
+    #[test]
+    fn volcar_a_devuelve_los_bytes_del_volcado_archivado() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
+        let contenido =
+            b"-- tienda\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (1);\n";
+
+        let hecho = archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+        drop(repositorio);
+
+        let (otro, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio se vuelve a abrir");
+        let mut salida = Vec::new();
+        otro.volcar_a(&hecho.id, &mut salida)
+            .expect("el volcado de la instantánea se vuelca al búfer");
+
+        assert_eq!(
+            salida, contenido,
+            "el volcado que sale del repositorio no es el que entró"
+        );
+    }
+
+    /// **Una instantánea sin un único volcado no se vuelca, y el motivo lo dice.**
+    ///
+    /// Los dos extremos del requisito —cero ficheros y dos— se miden con instantáneas de verdad,
+    /// archivando directorios por el camino de directorios: una vacía —cero nodos de fichero— y
+    /// otra con dos ficheros. En los dos casos tiene que salir [`Error::VolcadoQueNoEsUno`] y
+    /// **nada** puede haberse escrito en el destino: una restauración no puede empezar con el
+    /// volcado equivocado.
+    #[test]
+    fn volcar_a_rechaza_una_instantanea_que_no_trae_un_unico_volcado() {
+        for (nombre, ficheros) in [
+            ("sin-ficheros", &[] as &[&str]),
+            ("dos-ficheros", &["uno", "dos"]),
+        ] {
+            let destino = Destino::nuevo();
+            let (repositorio, _) = destino
+                .en_marcha(PASSPHRASE_DE_PRUEBA)
+                .expect("el destino se inicializa");
+
+            let fuente = directorio_de_prueba();
+            for fichero in ficheros {
+                std::fs::write(fuente.ruta().join(fichero), b"contenido")
+                    .expect("el fichero de la prueba se escribe");
+            }
+
+            let copia = Copia {
+                rutas: vec![fuente.ruta().to_path_buf()],
+                nombre: "no-es-un-volcado".to_owned(),
+                etiqueta: ETIQUETA.to_owned(),
+                host: "host-de-prueba".to_owned(),
+                comando: COMANDO.to_owned(),
+            };
+
+            let hecho = repositorio
+                .archivar_directorio(&copia)
+                .expect("el directorio de la prueba se archiva");
+            drop(repositorio);
+
+            let (otro, _) = destino
+                .en_marcha(PASSPHRASE_DE_PRUEBA)
+                .expect("el repositorio se vuelve a abrir");
+            let mut salida = Vec::new();
+            let error = otro
+                .volcar_a(&hecho.id, &mut salida)
+                .expect_err("una instantánea que no es de un volcado no se puede volcar");
+
+            assert!(
+                matches!(
+                    &error,
+                    Error::VolcadoQueNoEsUno {
+                        instantanea,
+                        encontrados,
+                        ..
+                    } if instantanea == &hecho.id && *encontrados == ficheros.len()
+                ),
+                "para `{nombre}` el fallo no nombra la instantánea y cuenta lo que hay: {error:?}"
+            );
+            assert!(
+                salida.is_empty(),
+                "para `{nombre}` se escribió algo en el destino antes de rechazar el volcado"
+            );
+        }
     }
 }

@@ -645,11 +645,19 @@ pub(crate) async fn base_con_clave() -> (DirectorioDePrueba, SqlitePool, Arc<Cla
         .await
         .expect("el esquema del §3 debe aplicarse sobre la base de prueba");
 
-    let clave = Arc::new(Clave::desde_maestra(&SecretString::new(
-        MASTER_KEY.to_owned(),
-    )));
+    (directorio, pool, clave_de_prueba())
+}
 
-    (directorio, pool, clave)
+/// La clave de cifrado de las pruebas, derivada de [`MASTER_KEY`].
+///
+/// Existe para las capas que se construyen sin `base_con_clave` —o que la reciben ya usada—,
+/// porque la clave es **una** por proceso y tiene que salir de la misma maestra: dos claves
+/// distintas sobre la misma base harían que un sobre escrito por una no se abriera con la otra,
+/// y el síntoma sería un secreto ilegible sin que nada dijera de dónde viene.
+pub(crate) fn clave_de_prueba() -> Arc<Clave> {
+    Arc::new(Clave::desde_maestra(&SecretString::new(
+        MASTER_KEY.to_owned(),
+    )))
 }
 
 /// Guardas de los directorios de base que el arnés abre y **retiene** hasta que el
@@ -747,6 +755,7 @@ fn motor_de_pruebas(db: &EstadoDeBase) -> Motor {
         targets: db.targets.clone(),
         tareas: db.tareas.clone(),
         ejecuciones: db.ejecuciones.clone(),
+        restauraciones: db.restauraciones.clone(),
     };
 
     Motor::arrancar(ajustes, dependencias)

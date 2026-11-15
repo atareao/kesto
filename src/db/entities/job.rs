@@ -395,7 +395,7 @@ mod tests {
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
     use crate::secret::SecretString;
-    use crate::test_support::{DirectorioDePrueba, base_con_clave};
+    use crate::test_support::{DirectorioDePrueba, base_con_clave, clave_de_prueba};
 
     /// Un `SecretString` con el valor dado.
     fn secreto(valor: &str) -> SecretString {
@@ -629,9 +629,10 @@ mod tests {
             "el fallo debe llegar como error tipado: {error}"
         );
 
-        // Y una ejecución que apunta a una tarea que no existe. La capa solo necesita
-        // el pool, así que se construye aquí a partir del mismo.
-        let ejecuciones = Ejecuciones::nuevo(pool.clone());
+        // Y una ejecución que apunta a una tarea que no existe. La capa pide la clave de
+        // cifrado —resuelve el `db_password` del target del vínculo—, y aquí no se descifra
+        // nada: se le da la de las pruebas, que es la de la base que se acaba de abrir.
+        let ejecuciones = Ejecuciones::nuevo(pool.clone(), clave_de_prueba());
 
         let error = ejecuciones
             .alta(AltaDeEjecucion {

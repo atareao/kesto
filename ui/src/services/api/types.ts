@@ -232,6 +232,47 @@ export interface Restauracion {
   target_name: string
 }
 
+// ─── Histórico de restauraciones ─────────────────────────────────────────────
+
+/**
+ * Lectura: una fila de `GET /api/v1/restorations`.
+ *
+ * Es la ejecución de restauración **persistida** —la tabla
+ * `restore_executions`—, no la respuesta del `POST` (`Restauracion`): aquí llega
+ * el desenlace real, con su `status` y sus fechas, porque el histórico se lee
+ * cuando la operación ya ha ocurrido. Por eso el estado es de fiar y no un
+ * «lanzada» optimista.
+ *
+ * `target_name` y `target_type` los resuelve el backend desde el target
+ * referenciado por `target_id`, y son `null` solo si `target_id` es `null`
+ * —cuando el target se borró y la FK lo puso a nulo—. `error_message` solo
+ * lleva texto en una `failed`; en el resto viene a `null`.
+ */
+export interface RestauracionRegistrada {
+  id: string
+  snapshot_id: string
+  target_id: string | null
+  target_name: string | null
+  target_type: TipoDeTarget | null
+  status: Estado
+  error_message: string | null
+  /** RFC3339, en UTC. */
+  started_at: string
+  /** RFC3339, en UTC, o `null` si todavía no ha terminado. */
+  finished_at: string | null
+}
+
+/**
+ * `GET /api/v1/restorations?status=&target_id=&limit=&offset=` (**200**).
+ *
+ * Trae la página y el **total** de filas que cumplen los filtros: con el total,
+ * el panel sabe si hay página siguiente sin pedir una de más.
+ */
+export interface ListadoDeRestauraciones {
+  restorations: RestauracionRegistrada[]
+  total: number
+}
+
 // ─── Salud y sesión ──────────────────────────────────────────────────────────
 
 /** `GET /api/v1/health`. `auth_mode` decide si el panel tiene capa de sesión. */

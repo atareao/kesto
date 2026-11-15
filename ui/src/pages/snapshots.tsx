@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Empty, Popconfirm, Select, Space, Table, Typography } from 'antd'
+import { Alert, Button, Empty, Input, Modal, Popconfirm, Select, Space, Table, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
 import { useRepositorios } from '../hooks/useRepositorios'
 import { useRestaurarSnapshot, useSnapshots } from '../hooks/useSnapshots'
-import type { EventoDeRestauracion, Snapshot } from '../services/api/types'
+import type { EventoDeRestauracion, Snapshot, TipoDeTarget } from '../services/api/types'
 import { mensajeDeError } from '../services/errores'
 import { formatearBytes, formatearFecha } from '../services/format'
 import { useRestauracion } from '../services/useEventStream'
@@ -38,6 +38,31 @@ interface EnCurso {
 
 /** Las fases con las que el protocolo cierra una restauración. */
 const FASES_TERMINALES: readonly string[] = ['terminada', 'fallida']
+
+/**
+ * Los tipos de target que esta versión **sabe** restaurar. Son los cuatro del
+ * esquema (§3): la restauración de un directorio y la de las tres bases ya no se
+ * distinguen en cuanto a «se ofrece o no» —todas se ofrecen—, y el único tipo
+ * que la fila no reconoce es uno que el contrato añada y este panel no conozca.
+ */
+const TIPOS_RESTAURABLES: readonly TipoDeTarget[] = [
+  'directory',
+  'mariadb',
+  'postgresql',
+  'sqlite',
+]
+
+/**
+ * Los tipos de target que son bases de datos. Su restauración **pisa** datos
+ * vivos, así que la confirmación no basta con pulsarla: exige teclear el nombre
+ * del target y manda `sobrescribir: true` solo cuando coincide.
+ */
+const TIPOS_DE_BASE: readonly TipoDeTarget[] = ['mariadb', 'postgresql', 'sqlite']
+
+/** ¿La restauración de este tipo de target escribe sobre una base de datos viva? */
+function esTargetDeBase(tipo: TipoDeTarget | null): boolean {
+  return tipo !== null && TIPOS_DE_BASE.includes(tipo)
+}
 
 /**
  * Plazo de confirmación de una restauración lanzada: si el panel no recibe su
@@ -104,19 +129,21 @@ function nombreDelTarget(snapshot: Snapshot): string {
 /**
  * Por qué esta fila no ofrece restaurar, o `null` si sí la ofrece.
  *
- * Los dos casos que la acción no debe lanzar: sin `target_type` la instantánea
- * no casa con ninguna ejecución, así que no hay destino sobre el que restaurar;
- * y con un tipo que no sea `directory` la operación no está soportada en esta
- * versión. La limitación se declara **en la fila** y no después del error:
- * ofrecer el botón para que la API conteste `409` o `422` llevaría al operador a
- * confirmar algo que no va a ocurrir.
+ * El único caso en el que no hay destino sobre el que restaurar: sin
+ * `target_type` la instantánea no casa con ninguna ejecución, así que no se sabe
+ * ni dónde escribir. La limitación **por tipo** ya no existe para los cuatro
+ * tipos del esquema —`directory` y las tres bases son todos restaurables—; queda
+ * deshabilitada solo ante un tipo que esta versión **no reconozca**, porque
+ * ofrecer el botón para que la API conteste `422` llevaría al operador a
+ * confirmar algo que no va a ocurrir. La limitación se declara **en la fila** y
+ * no después del error.
  */
 function limitacionDeRestauracion(snapshot: Snapshot): string | null {
   if (snapshot.target_type === null) {
     return 'No se pudo resolver el target de origen de esta instantánea: no hay destino sobre el que restaurar.'
   }
-  if (snapshot.target_type !== 'directory') {
-    return `En esta versión solo se restauran targets de directorio: «${nombreDelTarget(snapshot)}» es de tipo ${snapshot.target_type}.`
+  if (!TIPOS_RESTAURABLES.includes(snapshot.target_type)) {
+    return `Esta versión no reconoce el tipo de target «${snapshot.target_type}» de «${nombreDelTarget(snapshot)}»: no se puede restaurar.`
   }
   return null
 }
@@ -126,7 +153,7 @@ function limitacionDeRestauracion(snapshot: Snapshot): string | null {
  *
  * El tipo se pinta tal cual y sin valor por defecto: a esta confirmación solo se
  * llega cuando `limitacionDeRestauracion` no encontró pega, y eso significa que
- * el tipo se conoce y es `directory`.
+ * el tipo se conoce y es uno de los cuatro restaurables.
  */
 function descripcionDeRestauracion(snapshot: Snapshot): string {
   return `Se restaurará «${etiquetaDeSnapshot(snapshot)}» sobre el target «${nombreDelTarget(snapshot)}» (${snapshot.target_type}).`
@@ -213,12 +240,14 @@ function esperaDeRestauracion(enCurso: EnCurso): string {
  * borrado de instantáneas, y un botón que no puede hacer nada es peor que
  * ninguno.
  *
- * Restaurar sí está, con dos reglas que vienen de la spec: la confirmación
+ * Restaurar sí está, con las reglas que vienen de la spec: la confirmación
  * **nombra el target** sobre el que se va a restaurar —lo publica el listado en
- * cada fila—, y la acción se **deshabilita explicándose** cuando el target no se
- * conoce o no es de directorio. El resultado se comunica al **cerrar la fase**
- * por SSE, no al aceptar el `POST`: si se anunciara antes, el operador vería a
- * la vez «restaurado» y «restaurando».
+ * cada fila—, la acción se **deshabilita explicándose** cuando el target no se
+ * conoce o su tipo no se reconoce, y para un target de **base de datos** la
+ * confirmación exige además **teclear el nombre** del target, advierte de que
+ * **sobrescribe los datos vivos** y solo entonces envía `sobrescribir: true`. El
+ * resultado se comunica al **cerrar la fase** por SSE, no al aceptar el `POST`:
+ * si se anunciara antes, el operador vería a la vez «restaurado» y «restaurando».
  *
  * Y se restaura **de una en una**: mientras hay una en vuelo, las demás filas
  * deshabilitan su acción y explican por qué, con el mismo recurso que las filas
@@ -249,6 +278,14 @@ export default function Snapshots() {
   /** El aviso de progreso se puede cerrar: una operación larga no debe tapar la tabla. */
   const [progresoOculto, setProgresoOculto] = useState(false)
   const restaurar = useRestaurarSnapshot()
+  /**
+   * La instantánea cuya confirmación tipada está abierta, o `null`. Solo un
+   * target de base pasa por aquí: un directorio se confirma con el `Popconfirm`
+   * de la propia fila, que no necesita estado de página.
+   */
+  const [confirmacion, setConfirmacion] = useState<Snapshot | null>(null)
+  /** Lo que el operador ha tecleado en la confirmación de un target de base. */
+  const [nombreTecleado, setNombreTecleado] = useState('')
 
   // Sin elección explícita, se usa el primero: una pantalla que obliga a elegir
   // cuando solo hay un repositorio es un paso de más.
@@ -296,7 +333,7 @@ export default function Snapshots() {
     return () => clearTimeout(plazo)
   }, [enCurso])
 
-  const alRestaurar = async (snapshot: Snapshot) => {
+  const alRestaurar = async (snapshot: Snapshot, sobrescribir = false) => {
     // La guarda no es adorno: el botón deshabilitado es lo que se ve, pero una
     // confirmación abierta de antes del bloqueo llegaría hasta aquí.
     if (repositoryId === null || enCurso !== null) return
@@ -314,6 +351,9 @@ export default function Snapshots() {
       const resultado = await restaurar.mutateAsync({
         repositoryId,
         snapshotId: snapshot.id,
+        // Solo un target de base lleva la confirmación; un `directory` no la
+        // manda, porque no hay nada que sobrescribir.
+        ...(sobrescribir ? { sobrescribir: true } : {}),
       })
       // El `POST` solo acepta el trabajo: aquí no se anuncia nada. Su respuesta
       // sirve para saber en qué ejecución corre la restauración y con qué
@@ -329,6 +369,39 @@ export default function Snapshots() {
       setEnCurso(null)
       setAviso({ tipo: 'error', texto: mensajeDeError(error) })
     }
+  }
+
+  /**
+   * El nombre que hay que teclear para autorizar la restauración de una base. Es
+   * el mismo nombre con el que la fila y el aviso la anuncian.
+   */
+  const nombreExigido = confirmacion === null ? '' : nombreDelTarget(confirmacion)
+
+  /**
+   * La confirmación de un target de base solo autoriza cuando el nombre tecleado
+   * coincide **exactamente** con el del target. Es lo que convierte un clic
+   * accidental en una decisión deliberada.
+   */
+  const nombreCoincide = confirmacion !== null && nombreTecleado.trim() === nombreExigido
+
+  /** Abre la confirmación tipada de un target de base con el campo en blanco. */
+  const abrirConfirmacionDeBase = (snapshot: Snapshot) => {
+    setNombreTecleado('')
+    setConfirmacion(snapshot)
+  }
+
+  /**
+   * Confirma la restauración de una base: cierra la confirmación y lanza el
+   * `POST` con `sobrescribir: true`. La guarda del nombre no es adorno —el botón
+   * deshabilitado es lo que se ve—, sino la red que impide que un `Enter` o un
+   * cierre tardío manden la confirmación sin el nombre escrito.
+   */
+  const confirmarRestauracionDeBase = () => {
+    const snapshot = confirmacion
+    if (snapshot === null || !nombreCoincide) return
+    setConfirmacion(null)
+    setNombreTecleado('')
+    void alRestaurar(snapshot, true)
   }
 
   /**
@@ -430,6 +503,22 @@ export default function Snapshots() {
                 {esperaDeRestauracion(enCurso)}
               </Typography.Text>
             </Space>
+          )
+        }
+
+        // Un target de base no se confirma con un clic: la fila abre el diálogo
+        // que exige teclear el nombre y avisa de la sobrescritura.
+        if (esTargetDeBase(snapshot.target_type)) {
+          return (
+            <Button
+              size="small"
+              aria-label={nombre}
+              loading={restaurar.isPending}
+              disabled={restaurar.isPending}
+              onClick={() => abrirConfirmacionDeBase(snapshot)}
+            >
+              Restaurar
+            </Button>
           )
         }
 
@@ -551,6 +640,42 @@ export default function Snapshots() {
           )}
         </>
       )}
+
+      {/*
+        La confirmación tipada de un target de base. Vive en la página —y no en
+        la fila— porque el botón que autoriza está en el diálogo y su estado
+        depende de lo que se teclee aquí.
+      */}
+      <Modal
+        open={confirmacion !== null}
+        title="¿Restaurar la instantánea?"
+        okText="Restaurar"
+        cancelText="Cancelar"
+        okButtonProps={{ disabled: !nombreCoincide }}
+        onOk={confirmarRestauracionDeBase}
+        onCancel={() => setConfirmacion(null)}
+      >
+        {confirmacion !== null && (
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <Typography.Text>{descripcionDeRestauracion(confirmacion)}</Typography.Text>
+            <Alert
+              data-testid="aviso-de-sobrescritura"
+              type="warning"
+              showIcon
+              message="Esta restauración sobrescribe los datos vivos del target."
+            />
+            <Typography.Text>
+              Para confirmar, escribe el nombre del target «{nombreExigido}».
+            </Typography.Text>
+            <Input
+              aria-label="Nombre del target"
+              placeholder={nombreExigido}
+              value={nombreTecleado}
+              onChange={(evento) => setNombreTecleado(evento.target.value)}
+            />
+          </Space>
+        )}
+      </Modal>
     </section>
   )
 }

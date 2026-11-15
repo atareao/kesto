@@ -1,4 +1,5 @@
 import type { FiltrosDeEjecuciones } from '../api/ejecuciones'
+import type { FiltrosDeRestauraciones } from '../api/restauraciones'
 
 /**
  * Claves de caché de React Query. Viven en un solo sitio para que invalidar sea
@@ -13,4 +14,5 @@ export const claves = {
   tareas: ['tareas'] as const,
   ejecuciones: (filtros: FiltrosDeEjecuciones = {}) => ['ejecuciones', filtros] as const,
   snapshots: (repositoryId: string) => ['snapshots', repositoryId] as const,
+  restauraciones: (filtros: FiltrosDeRestauraciones = {}) => ['restauraciones', filtros] as const,
 }

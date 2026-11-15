@@ -6,11 +6,15 @@
 //! `finished_at` es anulable: una ejecución en curso no tiene final, y `NULL` **no**
 //! significa «ahora».
 //!
-//! **No tiene ninguna columna de secreto**, así que su capa de acceso **no** recibe la
-//! clave de cifrado: pasarle una que no se usa sugeriría que aquí se cifra algo.
+//! **No tiene ninguna columna de secreto.** Su capa de acceso **sí** recibe la clave de
+//! cifrado, y no por esta tabla: la resolución «instantánea → target» —que vive aquí porque
+//! es la ejecución quien guarda el `snapshot_id`— une `backup_targets` y se lleva
+//! `db_password` **descifrado**, para que la restauración no tenga que descifrarlo por un
+//! camino propio. El porqué está en [`ObjetivoDeRestauracion`].
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::Arc;
 
 use sqlx::Row;
 use sqlx::SqlitePool;
@@ -19,7 +23,9 @@ use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::db::DbError;
+use crate::db::crypto::Clave;
 use crate::db::entities::target::TipoDeTarget;
+use crate::secret::SecretString;
 
 /// Estado de una ejecución, tal y como lo declara el `CHECK` del §3.
 ///
@@ -119,6 +125,8 @@ pub struct AltaDeEjecucion {
 /// La capa de acceso de `job_executions`.
 pub struct Ejecuciones {
     pool: SqlitePool,
+    /// La clave con la que se descifra el `db_password` del target que resuelve el vínculo.
+    clave: Arc<Clave>,
 }
 
 /// Los filtros y la ventana del listado de `job_executions`.
@@ -150,6 +158,20 @@ pub struct FiltroDeEjecuciones {
 /// Vive en el módulo de `job_executions` y no en el de `backup_targets` porque es la ejecución
 /// quien tiene el `snapshot_id`: la pregunta empieza en esta tabla y las otras dos entran a
 /// resolver las claves foráneas.
+///
+/// # Los campos del target, y por qué viajan todos
+///
+/// Una restauración no se compone solo con el tipo: el comando inverso necesita el contenedor
+/// donde ejecutarlo, el usuario y la base que nombra, la ruta del fichero en un `sqlite` y la
+/// credencial. Se traen **en la misma lectura** que resuelve el vínculo en vez de dejar que quien
+/// restaure vuelva a preguntar por el target: un segundo viaje a la base sería una segunda
+/// respuesta que podría no coincidir con la primera —el target se edita mientras tanto—, y el
+/// consumidor tendría que casar dos filas leídas en instantes distintos.
+///
+/// `db_password` llega **descifrado**, igual que en [`crate::db::entities::Target`], y eso es lo
+/// que hace que esta capa reciba la clave: el descifrado es el de
+/// [`Clave::descifrar`](crate::db::crypto::Clave::descifrar) y no un segundo camino. El
+/// [`Debug`] es seguro porque [`SecretString`] redacta su contenido.
 #[derive(Debug, Clone)]
 pub struct ObjetivoDeRestauracion {
     /// La tarea de la ejecución que anotó la instantánea.
@@ -158,6 +180,14 @@ pub struct ObjetivoDeRestauracion {
     pub target_id: Uuid,
     /// El tipo de esa fuente, tal y como lo declara el `CHECK` del §3.
     pub target_type: TipoDeTarget,
+    /// El contenedor en el que vive la base; `None` si la fuente no es un contenedor.
+    pub container_name: Option<String>,
+    /// El usuario de la base; `None` si es un directorio o un `sqlite`.
+    pub db_user: Option<String>,
+    /// La contraseña de la base, **ya descifrada**; `None` si no la hay.
+    pub db_password: Option<SecretString>,
+    /// La base concreta; `None` significa el servidor entero —o el `postgres` de `psql`—.
+    pub db_name: Option<String>,
     /// La ruta del host; `None` si la fuente no es un directorio.
     ///
     /// Es un `Option` porque **ningún `CHECK` de la base** exige la ruta a un target de
@@ -167,6 +197,8 @@ pub struct ObjetivoDeRestauracion {
     /// `directory` sin ruta, así que quien lo consuma no puede dar por hecho que está: la
     /// restauración lo comprueba y contesta `422` si falta.
     pub host_path: Option<String>,
+    /// La ruta del `.db` **dentro** del contenedor; `None` salvo en un `sqlite`.
+    pub db_path: Option<String>,
     /// El nombre del target, para que la respuesta pueda nombrarlo.
     pub target_name: String,
 }
@@ -273,7 +305,7 @@ const SQL_BORRAR: &str = "DELETE FROM job_executions WHERE id = ?1";
 /// el orden decide cuál y lo decide de forma estable, con el identificador de la fila como
 /// desempate. Ordenar `e.started_at DESC` es lo mismo que hace el histórico: lo último primero.
 const SQL_OBJETIVO_DE_LA_INSTANTANEA: &str = "SELECT e.job_id, t.id, t.target_type, t.host_path, \
-     t.name FROM job_executions e \
+     t.name, t.container_name, t.db_user, t.db_password, t.db_name, t.db_path FROM job_executions e \
      JOIN backup_jobs j ON j.id = e.job_id \
      JOIN backup_targets t ON t.id = j.target_id \
      WHERE e.snapshot_id = ?1 AND j.repository_id = ?2 \
@@ -303,7 +335,8 @@ const SQL_OBJETIVO_DE_LA_INSTANTANEA: &str = "SELECT e.job_id, t.id, t.target_ty
 /// **no se roza**, porque esta consulta enlaza dos —el array y el repositorio— y no uno por
 /// instantánea, así que no hay lote que trocear mientras las instantáneas quepan en un solo array.
 const SQL_OBJETIVOS_DE_LAS_INSTANTANEAS: &str = "SELECT e.snapshot_id, e.job_id, t.id, \
-     t.target_type, t.host_path, t.name FROM job_executions e \
+     t.target_type, t.host_path, t.name, t.container_name, t.db_user, t.db_password, t.db_name, \
+     t.db_path FROM job_executions e \
      JOIN backup_jobs j ON j.id = e.job_id \
      JOIN backup_targets t ON t.id = j.target_id \
      WHERE e.snapshot_id IN (SELECT value FROM json_each(?1)) AND j.repository_id = ?2 \
@@ -323,12 +356,17 @@ const CONSULTA_LISTA_DE_INSTANTANEAS: &str = "lista JSON de instantáneas del lo
 const CONSULTA_MAPEO: &str = "mapeo de la fila de job_executions";
 
 impl Ejecuciones {
-    /// Construye la capa de acceso sobre un pool.
+    /// Construye la capa de acceso sobre un pool y la clave de cifrado.
     ///
-    /// **Sin clave de cifrado**: `job_executions` no tiene ninguna columna de secreto, y
-    /// pedir una que no se usa sugeriría que aquí se cifra algo.
-    pub fn nuevo(pool: SqlitePool) -> Self {
-        Ejecuciones { pool }
+    /// La clave entra porque la resolución de la instantánea a su target se lleva la
+    /// contraseña del §3 **descifrada** —ver [`ObjetivoDeRestauracion`]—, y el descifrado es el
+    /// mismo que usa [`crate::db::entities::Targets`]. Esta tabla no cifra nada: lo que se
+    /// descifra es una columna de `backup_targets` que la consulta une.
+    ///
+    /// Va en un [`Arc`] por lo mismo que en las otras capas: el material de cifrado se comparte
+    /// por todo el proceso y no se copia.
+    pub fn nuevo(pool: SqlitePool, clave: Arc<Clave>) -> Self {
+        Ejecuciones { pool, clave }
     }
 
     /// Da de alta una ejecución y devuelve la fila tal y como quedó.
@@ -437,7 +475,9 @@ impl Ejecuciones {
             .await
             .map_err(error_de_consulta(SQL_OBJETIVO_DE_LA_INSTANTANEA))?;
 
-        fila.as_ref().map(objetivo_desde_fila).transpose()
+        fila.as_ref()
+            .map(|fila| objetivo_desde_fila(fila, &self.clave))
+            .transpose()
     }
 
     /// Resuelve el objetivo de **varias** instantáneas de una vez: las que tienen vínculo, con él.
@@ -501,7 +541,7 @@ impl Ejecuciones {
             // resuelve el `LIMIT 1` de la hermana, y aquí hace falta porque el lote trae las filas de
             // todas.
             if let Entry::Vacant(hueco) = objetivos.entry(instantanea) {
-                hueco.insert(objetivo_desde_fila(fila)?);
+                hueco.insert(objetivo_desde_fila(fila, &self.clave)?);
             }
         }
 
@@ -635,10 +675,16 @@ where
 
 /// Mapea la fila del vínculo a [`ObjetivoDeRestauracion`].
 ///
-/// `host_path` es la única columna anulable: un target de base de datos no tiene ruta de host y
-/// sale como `None`, nunca como cadena vacía —el §3 distingue `NULL` de `''` y el mapeo no lo
-/// confunde—.
-fn objetivo_desde_fila(fila: &SqliteRow) -> Result<ObjetivoDeRestauracion, DbError> {
+/// Las columnas anulables —todo lo que no es un `directory` lo es en algún tipo— salen como
+/// `None`, nunca como cadena vacía: el §3 distingue `NULL` de `''` y el mapeo no los confunde.
+///
+/// Y `db_password` se descifra **aquí**, con la misma clave y la misma llamada que usa
+/// [`crate::db::entities::Target`] para su `db_password`: es el único camino de descifrado de los
+/// secretos del §3, y estrenar otro para la restauración sería tener dos sitios donde el sobre se
+/// abre. Un `NULL` da `None` —un target de directorio o un `sqlite` no tienen contraseña, y eso
+/// no es un secreto vacío—; un `Some` pasa por el descifrado, que falla en alto si el sobre no
+/// autentica, de modo que una clave maestra rotada se ve aquí y no como un `exec` sin credencial.
+fn objetivo_desde_fila(fila: &SqliteRow, clave: &Clave) -> Result<ObjetivoDeRestauracion, DbError> {
     let job_id = columna::<String>(fila, "job_id")?;
     let job_id = Uuid::parse_str(&job_id).map_err(|causa| DbError::Consulta {
         consulta: CONSULTA_MAPEO,
@@ -651,11 +697,21 @@ fn objetivo_desde_fila(fila: &SqliteRow) -> Result<ObjetivoDeRestauracion, DbErr
         causa: sqlx::Error::Decode(Box::new(causa)),
     })?;
 
+    let db_password = match columna::<Option<String>>(fila, "db_password")? {
+        Some(cifrado) => Some(clave.descifrar(&cifrado)?),
+        None => None,
+    };
+
     Ok(ObjetivoDeRestauracion {
         job_id,
         target_id,
         target_type: columna(fila, "target_type")?,
+        container_name: columna(fila, "container_name")?,
+        db_user: columna(fila, "db_user")?,
+        db_password,
+        db_name: columna(fila, "db_name")?,
         host_path: columna(fila, "host_path")?,
+        db_path: columna(fila, "db_path")?,
         target_name: columna(fila, "name")?,
     })
 }
@@ -708,7 +764,7 @@ mod tests {
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
     use crate::secret::SecretString;
-    use crate::test_support::{DirectorioDePrueba, base_con_clave};
+    use crate::test_support::{DirectorioDePrueba, base_con_clave, clave_de_prueba};
 
     /// Identificador del `snapshot` de las pruebas: distinguible y largo.
     const SNAPSHOT: &str = "snapshot-distinguible-000000000000000000000001";
@@ -830,7 +886,7 @@ mod tests {
             .await
             .expect("el alta de la tarea no puede fallar");
 
-        let ejecuciones = Ejecuciones::nuevo(pool.clone());
+        let ejecuciones = Ejecuciones::nuevo(pool.clone(), clave_de_prueba());
 
         (directorio, pool, ejecuciones, tarea.id)
     }
@@ -1604,6 +1660,140 @@ mod tests {
                 .is_none(),
             "el vínculo se acota al repositorio por el que se pregunta: la copia de otro \
              repositorio no resuelve aquí"
+        );
+    }
+
+    /// **El objetivo de la restauración trae los campos del target, con la contraseña
+    /// descifrada.**
+    ///
+    /// Es lo que la fase de la restauración necesita para componer el comando inverso: el tipo
+    /// solo no basta, porque el reverso de un volcado necesita el contenedor, el usuario, la base
+    /// y la ruta del fichero —y, para MariaDB y PostgreSQL, la credencial—.
+    ///
+    /// Se afirman las dos consultas, la de una instantánea y la del lote, porque las dos comparten
+    /// el mapeo y lo que aquí se mide es que **las dos** traigan los campos nuevos rellenos.
+    ///
+    /// Y el secreto se afirma por **las dos puntas**: lo que sale es el valor que entró —el
+    /// descifrado funcionó— y lo que está en la columna es un sobre, no el valor —el camino es el
+    /// cifrado del §3 y no una copia en claro—. Sin la segunda mitad, un `descifrar` que devolviera
+    /// lo que le llega pasaría la prueba con la columna sin cifrar.
+    #[tokio::test]
+    async fn el_objetivo_de_la_instantanea_trae_los_campos_del_target_y_el_secreto_descifrado() {
+        /// Contraseña distinguible: si aparece en una salida, la salida es el fallo.
+        const PASSWORD: &str = "db-password-distinguible-de-la-restauracion";
+
+        let (_directorio, pool, clave) = base_con_clave().await;
+
+        let repositorio = Repositorios::nuevo(pool.clone(), clave.clone())
+            .alta(alta_repositorio("repo-de-la-restauracion"))
+            .await
+            .expect("el alta del repositorio no puede fallar");
+
+        let target = Targets::nuevo(pool.clone(), clave)
+            .alta(AltaDeTarget {
+                name: "target-de-base-de-la-restauracion".to_owned(),
+                target_type: TipoDeTarget::Mariadb,
+                container_name: Some("contenedor-de-la-base".to_owned()),
+                db_user: Some("operador".to_owned()),
+                db_password: Some(secreto(PASSWORD)),
+                db_name: Some("tienda".to_owned()),
+                host_path: None,
+                db_path: None,
+            })
+            .await
+            .expect("el alta del target no puede fallar");
+
+        let tarea = Tareas::nuevo(pool.clone())
+            .alta(AltaDeTarea {
+                target_id: target.id,
+                repository_id: repositorio.id,
+                cron_expression: "0 3 * * *".to_owned(),
+                keep_daily: 7,
+                keep_weekly: 4,
+                keep_monthly: 12,
+                enabled: true,
+                name: None,
+            })
+            .await
+            .expect("el alta de la tarea no puede fallar");
+
+        let ejecuciones = Ejecuciones::nuevo(pool.clone(), clave_de_prueba());
+
+        ejecuciones
+            .alta(alta_ejecucion(&tarea.id))
+            .await
+            .expect("el alta de la ejecución no puede fallar");
+
+        let objetivo = ejecuciones
+            .objetivo_de_la_instantanea(SNAPSHOT, &repositorio.id)
+            .await
+            .expect("la consulta no puede fallar")
+            .expect("la ejecución anotó la instantánea, así que el vínculo existe");
+
+        assert_eq!(objetivo.target_id, target.id);
+        assert_eq!(objetivo.target_type, TipoDeTarget::Mariadb);
+        assert_eq!(objetivo.target_name, "target-de-base-de-la-restauracion");
+        assert_eq!(
+            objetivo.container_name.as_deref(),
+            Some("contenedor-de-la-base"),
+            "sin el contenedor no hay dónde ejecutar la restauración"
+        );
+        assert_eq!(objetivo.db_user.as_deref(), Some("operador"));
+        assert_eq!(objetivo.db_name.as_deref(), Some("tienda"));
+        assert_eq!(
+            objetivo.db_path, None,
+            "una base de MariaDB no tiene ruta de fichero dentro del contenedor"
+        );
+        assert_eq!(
+            objetivo.host_path, None,
+            "un target de base no tiene ruta de host"
+        );
+        assert_eq!(
+            objetivo.db_password.as_ref().map(SecretString::expose),
+            Some(PASSWORD),
+            "la contraseña no llegó descifrada"
+        );
+
+        // Y en la columna lo que hay es un sobre: el camino es el cifrado del §3.
+        let almacenado: String =
+            sqlx::query_scalar("SELECT db_password FROM backup_targets WHERE id = ?1")
+                .bind(target.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("el secreto almacenado debe poder leerse");
+
+        assert!(
+            !almacenado.contains(PASSWORD),
+            "la contraseña está en claro en la columna: {almacenado}"
+        );
+
+        // El lote resuelve lo mismo: las dos consultas comparten el mapeo, y esto lo fija.
+        let lote = ejecuciones
+            .objetivos_de_las_instantaneas(&[SNAPSHOT.to_owned()], &repositorio.id)
+            .await
+            .expect("la consulta del lote no puede fallar");
+
+        let del_lote = lote
+            .get(SNAPSHOT)
+            .expect("la instantánea anotada tiene que salir en el lote");
+
+        assert_eq!(
+            del_lote.container_name.as_deref(),
+            Some("contenedor-de-la-base")
+        );
+        assert_eq!(del_lote.db_user.as_deref(), Some("operador"));
+        assert_eq!(del_lote.db_name.as_deref(), Some("tienda"));
+        assert_eq!(
+            del_lote.db_password.as_ref().map(SecretString::expose),
+            Some(PASSWORD),
+            "el lote no trae la contraseña descifrada"
+        );
+
+        // Y el `Debug` del objetivo no publica la credencial: lo que lo hace seguro es el
+        // `SecretString`, que redacta su contenido.
+        assert!(
+            !format!("{objetivo:?}").contains(PASSWORD),
+            "el Debug del objetivo publica la contraseña: {objetivo:?}"
         );
     }
 

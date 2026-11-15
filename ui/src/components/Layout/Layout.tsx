@@ -7,6 +7,7 @@ import {
   HistoryOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
+  RollbackOutlined,
   ScheduleOutlined,
   SettingOutlined,
   UserOutlined,
@@ -45,6 +46,7 @@ const ENTRADAS: readonly EntradaDelMenu[] = [
   { ruta: '/tareas', etiqueta: 'Tareas', icono: <ScheduleOutlined /> },
   { ruta: '/historico', etiqueta: 'Histórico', icono: <HistoryOutlined /> },
   { ruta: '/snapshots', etiqueta: 'Snapshots', icono: <CameraOutlined /> },
+  { ruta: '/restauraciones', etiqueta: 'Restauraciones', icono: <RollbackOutlined /> },
   { ruta: '/ajustes', etiqueta: 'Ajustes', icono: <SettingOutlined /> },
   { ruta: '/sesion', etiqueta: 'Sesión', icono: <UserOutlined /> },
 ]
