@@ -1,6 +1,6 @@
 # Relevo — FEATURE-018: restauración de snapshots (PLAN-018 · issue #64)
 
-Rama `feature/restauracion-de-snapshots`. `development` y `main` en **v0.6.1** (tag `v0.6.1`). Todo el trabajo de esta feature está **commiteado** (5 commits) y empujado: el **PR #68** (https://github.com/atareao/kesto/pull/68) está abierto contra `development` con `Closes #64`, pendiente de revisión y merge. El cambio está archivado en `openspec/changes/archive/2026-11-15-restauracion-de-snapshots/` y el plan ya está renombrado a `plans/PLAN-018-COMPLETED.md`.
+Rama `chore/handoff-tras-68` (solo la actualización de este fichero, pendiente de PR). El **PR #68** (https://github.com/atareao/kesto/pull/68) ya está **fusionado en `development`** (merge `fa33aa6`, 2026-11-15), y el feature branch `feature/restauracion-de-snapshots` ya no está pendiente. El issue **#64** hubo que cerrarlo a mano: el `Closes #64` no lo cerró al fusionarse contra `development`, porque GitHub solo lo aplica contra la rama por defecto, `main`. También se cerró a mano el issue **#62**, cuyo PR #63 se había fusionado el 2026-11-14 sin referencia de cierre. `main` sigue en **v0.6.1** (tag `v0.6.1`) y lo que hay en `development` es una feature `feat` todavía sin publicar. El cambio está archivado en `openspec/changes/archive/2026-11-15-restauracion-de-snapshots/` y el plan ya está renombrado a `plans/PLAN-018-COMPLETED.md`.
 
 ## Hecho en esta sesión — `feature/restauracion-de-snapshots` (issue #64)
 
@@ -14,7 +14,7 @@ Proceso: dos auditorías y dos re-auditorías sin bloqueantes; los cuatro bloque
 
 ## Pendiente / siguiente
 
-- **(a) Revisar y fusionar el PR #68 a `development` — lo único que falta.** El commit con gitmoji y el PR ya están hechos (5 commits, `Closes #64`); solo queda la revisión y el merge. Un merge a `main` sería después una release, con el bump que decida `release-prepare`. Nada más de esta feature está pendiente: el plan está marcado y renombrado, el change archivado y las deltas fusionadas en `openspec/specs/api-resources/spec.md` y `openspec/specs/ui/spec.md`.
+- **(a) Publicar la release: abrir el PR `development` → `main` — lo único que falta.** El PR #68 ya está fusionado en `development`, así que la feature está integrada; lo que queda es la release. Un merge a `main` **es** la release: `release-prepare` decide el bump desde los conventional commits (aquí hay varios `feat`, así que **minor**, o sea **v0.7.0**) y empuja él mismo el tag, que es lo que dispara `release.yml` — el tag **no** se pone a mano. Los issues #64 y #62 quedaron cerrados a mano (ver arriba). Nada más de esta feature está pendiente: el plan está marcado y renombrado, el change archivado y las deltas fusionadas en `openspec/specs/api-resources/spec.md` y `openspec/specs/ui/spec.md`.
 - **(b) Fase 2 de la restauración (issue #67).** Persistir la ejecución de restauración —hoy es efímera— y restaurar targets de BD dentro de su contenedor; más adelante, restauración parcial por rutas y purga de snapshots.
 - **(c) Heredados vivos.** Copia binaria `.backup` de SQLite (API `sqlite3_backup`) y Litestream; y el reintento/purga del «olvido fallido» de FEATURE-015.
 - **(d) Follow-up de FEATURE-016.** El bundle del panel sigue en un único chunk (~1,3 MB / ~405 kB gzip) por Antd; `manualChunks`/code-splitting futuro.
