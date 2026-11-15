@@ -184,4 +184,30 @@ describe('pantalla de Tareas', () => {
     // ...y la que no lo tiene deja la columna vacía, no el nombre del target.
     expect(celdasDe('api')[columna]?.textContent?.trim() ?? '').toBe('')
   })
+
+  it('titula «Target» la columna del nombre del target, y no «Tarea»', async () => {
+    instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'GET') return { status: 200, data: [J1] }
+      if (ruta === '/api/v1/targets') return { status: 200, data: TARGETS }
+      if (ruta === '/api/v1/repositories') return { status: 200, data: REPOSITORIOS }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    const tabla = await screen.findByRole('table', { name: 'Tareas programadas' })
+
+    // Igual que en el test de «Nombre»: hay tabla desde el primer pintado, pero
+    // las cabeceras se leen con los datos ya cargados.
+    await screen.findByText('web')
+
+    const encabezados = within(tabla)
+      .getAllByRole('columnheader')
+      .map((celda) => (celda.textContent ?? '').trim())
+
+    // La columna enseña el nombre del target, así que su título es «Target»...
+    expect(encabezados).toContain('Target')
+    // ...y no «Tarea», que es lo que se confunde con el nombre de la tarea.
+    expect(encabezados).not.toContain('Tarea')
+  })
 })
