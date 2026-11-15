@@ -50,8 +50,8 @@ Job `e2e` en `ci.yml` aislado del job `backend`; receta `just e2e`; los 27 `#[ig
 
 ## Verificación
 
-- [ ] `just e2e` verde en local contra podman.
+- [x] `just e2e` verde en local contra podman.
 - [ ] Job `e2e` verde en CI, ejecutando batería y `#[ignore]`.
-- [ ] Una diferencia de datos rompe la prueba de forma visible.
-- [ ] Sin motor o sin S3, la batería falla nombrando lo que falta.
-- [ ] `just check` y `just check-all` verdes.
+- [x] Una diferencia de datos rompe la prueba de forma visible.
+- [x] Sin motor o sin S3, la batería falla nombrando lo que falta.
+- [x] `just check` y `just check-all` verdes.

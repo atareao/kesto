@@ -113,15 +113,22 @@ La restauración hacia un contenedor SHALL estar cubierta por la batería de pun
 
 ### Requirement: Sobrescritura de un destino con contenido
 
-La restauración sobre un destino que ya tiene contenido SHALL estar cubierta: con confirmación explícita, sustituye el contenido anterior; sin confirmación, se rechaza y el contenido previo queda intacto.
+La restauración sobre un destino que ya tiene contenido SHALL estar cubierta y SHALL tratar de forma distinta los dos tipos de destino. Para un target de **base de datos**, sin la confirmación explícita de sobrescritura la operación SHALL rechazarse y el destino vivo NO SHALL tocarse. Para un target de **directorio**, sin la confirmación la restauración SHALL ejecutarse igual y el contenido que sobraba en el destino SHALL permanecer —lo que la instantánea no trae se queda—, mientras que con la confirmación el destino SHALL quedar igual a la instantánea, porque la confirmación es lo que autoriza la poda.
 
-#### Scenario: Sobrescribir un directorio existente
+La poda de `rustic_core` es de mejor esfuerzo: un fichero que no se deja retirar se registra y la restauración continúa. Además ocurre antes de escribir el contenido, de modo que un fallo a mitad deja el destino podado y a medias.
+
+#### Scenario: Sobrescribir un directorio existente con la confirmación
 - **GIVEN** un directorio de destino con ficheros previos
 - **WHEN** se restaura con la confirmación de sobrescritura
-- **THEN** el contenido previo se sustituye por el del snapshot
+- **THEN** el contenido previo se sustituye por el del snapshot y, como la confirmación autoriza la poda, el destino queda igual a la instantánea
 
-#### Scenario: Sin confirmación no se toca el destino
-- **GIVEN** un destino con contenido previo
+#### Scenario: Sin confirmación, un directorio se restaura sin podar
+- **GIVEN** un directorio de destino con ficheros previos
+- **WHEN** se restaura sin la confirmación explícita
+- **THEN** la restauración se ejecuta y el contenido del snapshot se escribe, pero los ficheros previos que la instantánea no trae permanecen en el destino
+
+#### Scenario: Sin confirmación, un destino de base de datos se rechaza
+- **GIVEN** un destino de base de datos con contenido vivo
 - **WHEN** se intenta restaurar sin la confirmación explícita
 - **THEN** la operación se rechaza y el contenido previo sigue intacto
 
