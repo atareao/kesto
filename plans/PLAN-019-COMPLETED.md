@@ -4,7 +4,7 @@
 **Base:** `development` tras la release v0.7.0
 **Rama:** `feature/ajustes-de-sidebar` (desde `development`)
 **Change SDD:** `openspec/changes/ajustes-de-sidebar/`
-**Estado:** En curso — plan y change SDD aprobados; fase TDD en marcha
+**Estado:** Completado — implementado y verificado (TDD RED→GREEN, `just ui-check` verde), auditoría de UI sin bloqueantes; PR a `development`
 
 ## 1. Objetivo
 
@@ -65,10 +65,10 @@ Ver `openspec/changes/ajustes-de-sidebar/tasks.md`. Resumen del ciclo:
 
 ## 7. Criterios de aceptación
 
-- [ ] Con la barra lateral colapsada no se ve (ni se renderiza) el texto «Kesto».
-- [ ] Plegar y tema están al pie de la barra lateral y son accesibles por teclado.
-- [ ] `just ui-check` en verde.
-- [ ] El contrato se actualiza en `openspec/specs/ui/spec.md` y la feature queda documentada en `docs/FEATURE-019-ajustes-de-sidebar.md`.
+- [x] Con la barra lateral colapsada no se ve (ni se renderiza) el texto «Kesto».
+- [x] Plegar y tema están al pie de la barra lateral y son accesibles por teclado.
+- [x] `just ui-check` en verde.
+- [x] El contrato se actualiza en `openspec/specs/ui/spec.md` y la feature queda documentada en `docs/FEATURE-019-ajustes-de-sidebar.md`.
 
 ## 8. Referencias
 
