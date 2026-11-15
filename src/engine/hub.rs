@@ -1,8 +1,9 @@
-//! El hub de eventos: por dónde sale el progreso de una ejecución hacia los clientes del panel.
+//! El hub de eventos: por dónde sale el progreso del motor hacia los clientes del panel.
 //!
-//! Es la mitad del motor que **no** copia nada: recibe avisos y los reparte. Lo que reparte es
-//! un [`EventoDeEjecucion`], con los siete campos del §5, y quien los pinta es el panel, que los
-//! recibe por el stream de `GET /api/v1/events` —que vive en la capa HTTP, no aquí—.
+//! Es la mitad del motor que **no** copia nada: recibe avisos y los reparte. Reparte dos clases
+//! de aviso —[`EventoDeEjecucion`], con los siete campos del §5, y [`EventoDeRestauracion`], con
+//! los siete de una restauración—, y quien los pinta es el panel, que los recibe por el stream de
+//! `GET /api/v1/events` —que vive en la capa HTTP, no aquí—.
 //!
 //! # Un `broadcast` acotado, y por qué no un canal por cliente
 //!
@@ -45,9 +46,10 @@
 //!
 //! # Aquí no vive el cable
 //!
-//! El nombre del evento —`execution_progress`— y los nombres de los campos **no** están en este
-//! módulo: son el cable, y el cable es de la API, que es quien mapea este tipo a su DTO. Aquí los
-//! campos se llaman como el §5 para que ese mapeo sea de siete líneas y se lea de un vistazo.
+//! Los nombres de los eventos —`execution_progress` y `restore_progress`— y los nombres de los
+//! campos **no** están en este módulo: son el cable, y el cable es de la API, que es quien mapea
+//! estos tipos a sus DTO. Aquí los campos se llaman como el §5 para que ese mapeo sea de siete
+//! líneas y se lea de un vistazo.
 //!
 //! Y una decisión que sí es de aquí: el `status` es un [`Estado`] y no una cadena, porque el tipo
 //! del §3 ya garantiza que son los cuatro del `CHECK` —`pending`, `running`, `success` y
@@ -67,8 +69,9 @@ use crate::db::entities::Estado;
 /// La unidad es el evento, y el número sale de comparar lo que se retiene con lo que hace falta:
 /// un cliente que se engancha tarde tiene que poder pintar los últimos avisos de las copias en
 /// marcha —que son unos pocos por ejecución—, y 256 eventos los cubren con holgura, mientras que
-/// la memoria retenida sigue siendo despreciable —un evento son dos identificadores, dos enteros,
-/// un `Option<f64>` y una frase corta—.
+/// la memoria retenida sigue siendo despreciable —un evento de ejecución son dos identificadores,
+/// dos enteros, un `Option<f64>` y una frase corta; uno de restauración, un identificador, dos
+/// cadenas y cuatro enteros—.
 ///
 /// Más grande no compra nada: un cliente que se pierda 256 eventos ya se enterará por el
 /// histórico, que es lo que el contrato manda. Más pequeño, en cambio, empieza a descartar
@@ -124,6 +127,47 @@ pub struct EventoDeEjecucion {
     pub current_action: String,
 }
 
+/// Un aviso de progreso de una restauración, con sus siete campos.
+///
+/// Es el hermano de [`EventoDeEjecucion`] para la otra operación del motor: una restauración no
+/// tiene `job_id` ni `status` —no es una ejecución de una tarea—, sino la instantánea que se
+/// restaura y la fase en la que va. Lo que sí comparte con el progreso de una copia es la forma de
+/// contarlo: cuántos ficheros y bytes se han hecho sobre un total, para que el panel pueda pintar
+/// una barra sin esperar al final.
+///
+/// Como el evento de ejecución, ni lleva bytes del volcado ni una ruta: los contadores son cifras y
+/// la fase es una frase **constante** del motor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventoDeRestauracion {
+    /// La ejecución de restauración de la que habla este aviso.
+    pub execution_id: Uuid,
+    /// La instantánea que se está restaurando.
+    pub snapshot_id: String,
+    /// Qué está haciendo la restauración ahora mismo.
+    pub phase: String,
+    /// Los ficheros restaurados hasta el momento.
+    pub files_done: u64,
+    /// Los ficheros que la restauración tiene que escribir, o `0` si aún no se conoce el total.
+    pub files_total: u64,
+    /// Los bytes restaurados hasta el momento.
+    pub bytes_done: u64,
+    /// Los bytes que la restauración tiene que escribir, o `0` si aún no se conoce el total.
+    pub bytes_total: u64,
+}
+
+/// Lo que el hub reparte: el aviso de una ejecución o el de una restauración.
+///
+/// Es un enum y no dos canales porque el stream es **uno solo** —el §5 lo fija global— y el panel
+/// tiene que poder distinguir las dos clases de aviso por el nombre del evento, no por el canal por
+/// el que llegan. La capa HTTP hace ese `match`; el hub se limita a transportar el tipo.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventoDelMotor {
+    /// Un aviso de progreso de una copia: el [`EventoDeEjecucion`] del §5.
+    Ejecucion(EventoDeEjecucion),
+    /// Un aviso de progreso de una restauración.
+    Restauracion(EventoDeRestauracion),
+}
+
 /// El hub: el reparto de eventos a los clientes del stream.
 ///
 /// Se construye vacío con [`Hub::nuevo`] y se comparte —es `Clone`, y clonarlo no copia ni un
@@ -147,7 +191,7 @@ pub struct Hub {
     /// —mirar el `Option`, suscribir y publicar—, no se mantiene nunca a lo largo de un `await`, y
     /// [`Hub::publicar`] tiene que poder llamarse desde los hilos del motor, que no están dentro de
     /// un runtime.
-    emisor: Arc<Mutex<Option<broadcast::Sender<EventoDeEjecucion>>>>,
+    emisor: Arc<Mutex<Option<broadcast::Sender<EventoDelMotor>>>>,
 }
 
 impl Hub {
@@ -182,7 +226,7 @@ impl Hub {
     /// El candado envenenado devuelve `None` por el mismo motivo que [`Hub::cerrar`] no entra en
     /// pánico: un cierre a medias no puede dejar a un cliente esperando eventos que ya no van a
     /// llegar.
-    pub fn suscribir(&self) -> Option<broadcast::Receiver<EventoDeEjecucion>> {
+    pub fn suscribir(&self) -> Option<broadcast::Receiver<EventoDelMotor>> {
         let emisor = self
             .emisor
             .lock()
@@ -214,6 +258,26 @@ impl Hub {
     /// retrasarse es justo lo que este candado existe para no permitir. Publicar dura microsegundos
     /// y ningún `await` cabe dentro.
     pub fn publicar(&self, evento: EventoDeEjecucion) {
+        self.enviar(EventoDelMotor::Ejecucion(evento));
+    }
+
+    /// Publica un aviso de restauración. Mismas garantías que [`Hub::publicar`]: ni bloquea ni
+    /// falla, y después del cierre es un no-op silencioso.
+    ///
+    /// Es el hermano de [`Hub::publicar`] para la otra operación del motor. Va en un método aparte
+    /// —y no en un `publicar` genérico— para que el llamante no tenga que envolver a mano el
+    /// evento: la variante la elige el método, no quien publica.
+    pub fn publicar_restauracion(&self, evento: EventoDeRestauracion) {
+        self.enviar(EventoDelMotor::Restauracion(evento));
+    }
+
+    /// El envío común: envuelve el evento en la variante que le toca y lo reparte por el canal.
+    ///
+    /// El candado se mantiene **durante el `send`** por el motivo del encabezado de
+    /// [`Hub::publicar`]: soltarlo antes dejaría un extremo de envío vivo en el hueco y un
+    /// [`Hub::cerrar`] que cayera ahí no cerraría el canal. Y se descarta el `Result` del `send`
+    /// por el mismo motivo: «no hay nadie escuchando» no es un fallo del motor.
+    fn enviar(&self, evento: EventoDelMotor) {
         let emisor = self
             .emisor
             .lock()
@@ -297,7 +361,7 @@ mod tests {
     use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     use uuid::Uuid;
 
-    use super::{EventoDeEjecucion, Hub};
+    use super::{EventoDeEjecucion, EventoDelMotor, Hub};
     use crate::db::entities::Estado;
 
     /// Un evento distinguible, con la acción que se le pida.
@@ -347,11 +411,13 @@ mod tests {
             .expect("el segundo suscriptor tiene que recibir el mismo evento");
 
         assert_eq!(
-            del_primero, publicado,
+            del_primero,
+            EventoDelMotor::Ejecucion(publicado.clone()),
             "el primer suscriptor recibió un evento que no es el publicado"
         );
         assert_eq!(
-            del_segundo, publicado,
+            del_segundo,
+            EventoDelMotor::Ejecucion(publicado),
             "los dos suscriptores no recibieron el mismo evento"
         );
     }
@@ -443,6 +509,13 @@ mod tests {
         let segundo = cliente
             .try_recv()
             .expect("el segundo aviso tiene que llegar");
+
+        let EventoDelMotor::Ejecucion(primero) = primero else {
+            panic!("el hub repartió un aviso de restauración donde se esperaba una ejecución");
+        };
+        let EventoDelMotor::Ejecucion(segundo) = segundo else {
+            panic!("el hub repartió un aviso de restauración donde se esperaba una ejecución");
+        };
 
         assert_eq!(primero.current_action, "extrayendo el volcado");
         assert_eq!(
