@@ -4,7 +4,7 @@
 **Base:** `development` tras el merge de #63
 **Rama:** `feature/restauracion-de-snapshots` (desde `development`)
 **Change SDD:** `openspec/changes/restauracion-de-snapshots/`
-**Estado:** Completado — PR a `development` pendiente
+**Estado:** Completado — PR #68 a `development` abierto, pendiente de merge
 
 ## 1. Objetivo
 
@@ -133,7 +133,7 @@ Cada elemento de `data` añade a los seis campos actuales (`id`, `time`, `paths`
 - [x] El panel muestra confirmación con el target, deshabilita las filas no restaurables y refleja la **fase** (D1/D3).
 - [x] No se admiten dos restauraciones concurrentes sobre el mismo destino.
 - [x] `just check` y `just ui-check` verdes.
-- [ ] Change SDD archivado, plan renombrado y PR abierto.
+- [x] Change SDD archivado, plan renombrado y PR abierto.
 
 ## 8. Riesgos
 

@@ -1,6 +1,6 @@
 # Relevo — FEATURE-018: restauración de snapshots (PLAN-018 · issue #64)
 
-Rama `feature/restauracion-de-snapshots`. `development` y `main` en **v0.6.1** (tag `v0.6.1`). Todo el trabajo de esta feature está **sin commitear** al escribir este relevo: `git status` muestra los ficheros tocados en `src/`, `ui/` y `openspec/specs/`, más cuatro sin seguimiento (`docs/FEATURE-018-restauracion-de-snapshots.md`, `migrations/0004_snapshot_id.sql`, `openspec/changes/archive/2026-11-15-restauracion-de-snapshots/`, `plans/PLAN-018-COMPLETED.md`). El cambio está archivado en `openspec/changes/archive/2026-11-15-restauracion-de-snapshots/` y el plan ya está renombrado a `plans/PLAN-018-COMPLETED.md`.
+Rama `feature/restauracion-de-snapshots`. `development` y `main` en **v0.6.1** (tag `v0.6.1`). Todo el trabajo de esta feature está **commiteado** (5 commits) y empujado: el **PR #68** (https://github.com/atareao/kesto/pull/68) está abierto contra `development` con `Closes #64`, pendiente de revisión y merge. El cambio está archivado en `openspec/changes/archive/2026-11-15-restauracion-de-snapshots/` y el plan ya está renombrado a `plans/PLAN-018-COMPLETED.md`.
 
 ## Hecho en esta sesión — `feature/restauracion-de-snapshots` (issue #64)
 
@@ -14,7 +14,7 @@ Proceso: dos auditorías y dos re-auditorías sin bloqueantes; los cuatro bloque
 
 ## Pendiente / siguiente
 
-- **(a) Cerrar la feature — lo único que falta.** Commit con gitmoji y PR de esta rama a `development` con `Closes #64`. Nada más de esta feature está pendiente: el plan está marcado y renombrado, el change archivado y las deltas fusionadas en `openspec/specs/api-resources/spec.md` y `openspec/specs/ui/spec.md`.
+- **(a) Revisar y fusionar el PR #68 a `development` — lo único que falta.** El commit con gitmoji y el PR ya están hechos (5 commits, `Closes #64`); solo queda la revisión y el merge. Un merge a `main` sería después una release, con el bump que decida `release-prepare`. Nada más de esta feature está pendiente: el plan está marcado y renombrado, el change archivado y las deltas fusionadas en `openspec/specs/api-resources/spec.md` y `openspec/specs/ui/spec.md`.
 - **(b) Fase 2 de la restauración (issue #67).** Persistir la ejecución de restauración —hoy es efímera— y restaurar targets de BD dentro de su contenedor; más adelante, restauración parcial por rutas y purga de snapshots.
 - **(c) Heredados vivos.** Copia binaria `.backup` de SQLite (API `sqlite3_backup`) y Litestream; y el reintento/purga del «olvido fallido» de FEATURE-015.
 - **(d) Follow-up de FEATURE-016.** El bundle del panel sigue en un único chunk (~1,3 MB / ~405 kB gzip) por Antd; `manualChunks`/code-splitting futuro.
