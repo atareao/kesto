@@ -1,0 +1,25 @@
+-- `backup_jobs` gana `name` (issue #65): el nombre legible de la tarea.
+--
+-- Va con `ALTER TABLE ... ADD COLUMN` y **no** reconstruyendo la tabla: reconstruir —crear la
+-- nueva, copiar las filas, borrar la vieja y renombrar— es lo que exige **cambiar un `CHECK`**, y
+-- aquí no se toca ninguno. La diferencia no es de estilo: el `DROP TABLE` de una reconstrucción
+-- se lleva por delante, con las claves foráneas encendidas, las filas que cuelgan de la tabla, y
+-- el `ADD COLUMN` ni las mira.
+--
+-- Al añadirla así, la columna queda la **última** del orden declarado de la tabla, y ese orden es
+-- el que publica `PRAGMA table_info`: por eso `name` va detrás de `created_at` y no junto al
+-- `name` de las otras dos tablas. El §3 la declara en ese mismo sitio.
+--
+-- Es **anulable y sin valor por defecto**, y las dos cosas son contrato:
+--
+-- * Anulable porque una tarea sin nombre es un estado válido y anterior a este change: las filas
+--   que ya existían se quedan con `NULL` —una migración que no las tocara pero las dejara sin
+--   poder leerse no serviría de nada—, y el panel cae al identificador de la tarea.
+-- * Sin valor por defecto porque `''` y `NULL` **no** son lo mismo: solo el `NULL` significa
+--   «esta tarea no tiene nombre», y un defecto de cadena vacía le diría al panel lo contrario.
+--
+-- El tope de 120 caracteres no se declara aquí: `ALTER TABLE ... ADD COLUMN` no admite un
+-- `CHECK`, imponerlo obligaría a reconstruir la tabla, y el SRS no lo pide. Lo aplica el borde
+-- HTTP —el alta y la edición—, que es el único que puede contestar un `400` **nombrando el campo**.
+
+ALTER TABLE backup_jobs ADD COLUMN name TEXT;

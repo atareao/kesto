@@ -233,6 +233,44 @@ pub enum Error {
         /// Plazo de inactividad que venció.
         inactividad: Duration,
     },
+
+    /// La orden de restauración dejó de producir salida y el plazo de inactividad venció.
+    ///
+    /// Es el espejo de [`ExtraccionEstancada`](Self::ExtraccionEstancada) para el camino de la
+    /// restauración, y existe con nombre propio por la misma razón por la que existe el otro: lo
+    /// que se acota es la **inactividad entre trozos** —el cliente de la base lento pero que avanza
+    /// tarda lo que haga falta y no puede fallar por esto—, y un cliente colgado que no dice nada
+    /// se caza aquí. El motivo nombra el contenedor y el plazo, que es lo que hace falta para saber
+    /// cuánto estuvo callado antes de darlo por colgado.
+    #[error(
+        "la orden de restauración en `{contenedor}` no produjo salida en {inactividad:?}: el \
+         cliente de la base puede estar colgado"
+    )]
+    RestauracionEstancada {
+        /// Contenedor en el que se ejecutaba la orden.
+        contenedor: String,
+        /// Plazo de inactividad que venció.
+        inactividad: Duration,
+    },
+
+    /// El volcado no llegó entero al `stdin` del `exec`.
+    ///
+    /// Es el fallo del lado de la entrada, y no del contenedor: el repositorio no pudo volcar el
+    /// nodo, o el `stdin` de la orden rechazó la escritura, o la orden terminó **antes** de recibir
+    /// el volcado entero. Se propaga **como error y no como un fin de fichero limpio**: dar por
+    /// buena una restauración incompleta —porque el contenedor salió con cero, o porque su cliente
+    /// decidió que ya tenía bastante— es justo el desenlace que este tipo existe para no cometer.
+    /// La causa es la del puente —nombra el volcado y el motivo del repositorio—, la del `stdin` o
+    /// la de la orden que se fue sin el volcado.
+    #[error("no se pudo entregar el volcado al `stdin` de la orden en `{contenedor}`: {causa}")]
+    EntradaNoEntregada {
+        /// Contenedor en el que se ejecutaba la orden.
+        contenedor: String,
+        /// La causa: el volcado a medias, el `stdin` que rechazó la escritura, o la orden que
+        /// terminó antes de recibir el volcado entero.
+        #[source]
+        causa: std::io::Error,
+    },
 }
 
 impl Error {
@@ -280,6 +318,8 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bollard::errors::Error as ErrorDelMotor;
 
     use super::{Canal, Error, Orden};
@@ -460,5 +500,40 @@ mod tests {
         assert_ne!(Canal::Salida, Canal::Error);
         assert_eq!(format!("{:?}", Canal::Salida), "Salida");
         assert_eq!(format!("{:?}", Canal::Error), "Error");
+    }
+
+    /// **El plazo vencido de una restauración se nombra como tal, y no como el de una copia.**
+    ///
+    /// Son dos desenlaces distintos —uno acota el silencio de una orden que debería **producir**
+    /// salida, el otro el de una que debería **consumir** su entrada y contestar— y el operador los
+    /// lee: el motivo dice cuál venció, en qué contenedor y con qué plazo. Los dos plazos se
+    /// resuelven con el mismo número, así que confundirlos mandaría a mirar el sitio equivocado.
+    #[test]
+    fn el_plazo_vencido_de_una_restauracion_se_distingue_del_de_una_copia() {
+        let plazo = Duration::from_secs(300);
+
+        let restauracion = Error::RestauracionEstancada {
+            contenedor: "contenedor-de-la-base".to_owned(),
+            inactividad: plazo,
+        };
+        let copia = Error::ExtraccionEstancada {
+            contenedor: "contenedor-de-la-base".to_owned(),
+            inactividad: plazo,
+        };
+        let motivo = restauracion.to_string();
+
+        assert!(
+            motivo.contains("contenedor-de-la-base") && motivo.contains("300s"),
+            "el motivo no nombra el contenedor y el plazo que venció: {motivo}"
+        );
+        assert!(
+            motivo.contains("restauración"),
+            "el motivo no dice que el plazo vencido es el de una restauración: {motivo}"
+        );
+        assert_ne!(
+            motivo,
+            copia.to_string(),
+            "el plazo de la restauración y el de la copia se leen igual: {motivo}"
+        );
     }
 }

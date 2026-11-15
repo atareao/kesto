@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::auth::oidc::Discovery;
 use crate::config::{AuthMode, Config, ConfigError, OidcSettings};
 use crate::db::crypto::Clave;
-use crate::db::entities::{Ejecuciones, Repositorios, Tareas, Targets};
+use crate::db::entities::{Ejecuciones, Repositorios, Restauraciones, Tareas, Targets};
 use crate::engine::Motor;
 use crate::secret::SecretString;
 
@@ -216,20 +216,25 @@ pub struct EstadoDeBase {
     pub tareas: Arc<Tareas>,
     /// La capa de acceso de `job_executions`.
     pub ejecuciones: Arc<Ejecuciones>,
+    /// La capa de acceso de `restore_executions`.
+    pub restauraciones: Arc<Restauraciones>,
 }
 
 impl EstadoDeBase {
     /// Construye las cuatro capas sobre el pool y la clave **dados**.
     ///
-    /// `Tareas` y `Ejecuciones` no reciben la clave: `backup_jobs` y `job_executions`
-    /// no tienen ninguna columna de secreto, y pasarle una clave que no se usa
-    /// sugeriría que ahí se cifra algo.
+    /// `Tareas` no recibe la clave: `backup_jobs` no tiene ninguna columna de secreto, y
+    /// pasarle una clave que no se usa sugeriría que ahí se cifra algo. `Ejecuciones` sí, y no
+    /// por `job_executions` —que tampoco tiene secretos— sino porque su resolución «instantánea
+    /// → target» une `backup_targets` y se lleva el `db_password` de esa fila **descifrado**,
+    /// con la misma clave y el mismo camino que `Targets`.
     pub fn nuevo(pool: SqlitePool, clave: Arc<Clave>) -> Self {
         Self {
             repositorios: Arc::new(Repositorios::nuevo(pool.clone(), clave.clone())),
             targets: Arc::new(Targets::nuevo(pool.clone(), clave.clone())),
             tareas: Arc::new(Tareas::nuevo(pool.clone())),
-            ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone())),
+            ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
+            restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
             pool,
             clave,
         }
@@ -532,6 +537,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
+                name: None,
             })
             .await
             .expect("el alta de la tarea por la capa del estado no puede fallar");

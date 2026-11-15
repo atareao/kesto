@@ -88,7 +88,14 @@ export default function Tareas() {
 
   const columnas: TableProps<Job>['columns'] = [
     {
-      title: 'Tarea',
+      title: 'Nombre',
+      key: 'nombre',
+      // Sin nombre la celda queda vacía: inventar aquí el del target repetiría
+      // justo la confusión que este campo viene a resolver.
+      render: (_valor, tarea) => tarea.name ?? '',
+    },
+    {
+      title: 'Target',
       key: 'target',
       render: (_valor, tarea) =>
         nombresDeTarget.get(tarea.target_id) ?? formatearUuid(tarea.target_id),

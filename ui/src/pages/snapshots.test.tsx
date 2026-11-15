@@ -12,7 +12,7 @@ import {
 import { repositorio, snapshot } from '../../tests/fixtures'
 import { ProveedorDeEventos } from '../services/events'
 import { NOMBRE_DEL_EVENTO_DE_RESTAURACION } from '../services/useEventStream'
-import type { Snapshot } from '../services/api/types'
+import type { Snapshot, TipoDeTarget } from '../services/api/types'
 import Snapshots, { PLAZO_DE_CONFIRMACION_MS } from './snapshots'
 
 const HEX = '0123456789abcdef'.repeat(4)
@@ -188,6 +188,56 @@ describe('pantalla de Snapshots', () => {
     })
     unmount()
   })
+
+  it('la columna «Tarea» va entre la fecha y la etiqueta, y no toca la etiqueta', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          // `label` es el identificador de la tarea: lo que la columna «Tarea»
+          // enseña es el `job_name`, y sin nombre cae a ese identificador.
+          snapshots: [
+            snapshot({ id: HEX, label: 'j1', job_name: 'copia nocturna' }),
+            snapshot({ id: OTRO_HEX, label: 'j9', job_name: null }),
+          ],
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+
+    const tabla = await esperarLaTabla()
+
+    const encabezados = within(tabla)
+      .getAllByRole('columnheader')
+      .map((celda) => (celda.textContent ?? '').trim())
+    const fecha = encabezados.indexOf('Fecha')
+    const tarea = encabezados.indexOf('Tarea')
+    const etiqueta = encabezados.indexOf('Etiqueta')
+    expect(fecha).toBeGreaterThanOrEqual(0)
+    expect(etiqueta).toBeGreaterThan(fecha)
+    // «Tarea» es una columna nueva y su sitio es justo ése.
+    expect(tarea).toBeGreaterThan(fecha)
+    expect(tarea).toBeLessThan(etiqueta)
+
+    /** Las celdas de la fila de la instantánea `id`. */
+    const celdasDe = (id: string) => {
+      const fila = within(tabla).getByText(id).closest('tr')
+      if (fila === null) throw new Error(`no se encontró la fila de ${id}`)
+      return within(fila).getAllByRole('cell')
+    }
+
+    const conNombre = celdasDe(HEX)
+    expect(conNombre[tarea]?.textContent).toBe('copia nocturna')
+    // La etiqueta sigue siendo el identificador de la tarea, sin cambios.
+    expect(conNombre[etiqueta]?.textContent).toBe('j1')
+
+    const sinNombre = celdasDe(OTRO_HEX)
+    expect(sinNombre[tarea]?.textContent).toBe('j9')
+    expect(sinNombre[etiqueta]?.textContent).toBe('j9')
+    unmount()
+  })
 })
 
 /**
@@ -197,9 +247,10 @@ describe('pantalla de Snapshots', () => {
  * El contrato que se fija aquí: la fila ofrece una acción que **nombra su
  * instantánea**, la confirmación nombra el **target** sobre el que se restaura
  * (de ahí la petición no sale hasta confirmar), la acción no se ofrece cuando el
- * target no se conoce o no es de directorio, el avance llega por SSE sin
- * recargar el listado y el resultado se anuncia **al cerrar la fase**, no al
- * aceptar el `POST`.
+ * target no se conoce o su tipo no se reconoce, un target de **base de datos**
+ * exige además **teclear su nombre** y solo entonces manda `sobrescribir: true`,
+ * el avance llega por SSE sin recargar el listado y el resultado se anuncia **al
+ * cerrar la fase**, no al aceptar el `POST`.
  *
  * Y tres cosas más que cierran los agujeros de seguirlo todo con una única
  * operación en vuelo: **una restauración cada vez** —la segunda no se lanza, y
@@ -221,6 +272,10 @@ describe('pantalla de Snapshots — restaurar', () => {
     status: 200,
     data: { snapshots: [snapshot({ id: HEX }), snapshot({ id: OTRO_HEX })], truncated: false },
   })
+
+  /** El listado con una instantánea de un target de **base de datos**. */
+  const listadoDeBase = (campos: Partial<Snapshot> = {}): ManejadorDeFetch =>
+    listadoConUna({ target_id: 't2', target_name: 'bbdd', target_type: 'postgresql', ...campos })
 
   const restauracionAceptada = {
     status: 200,
@@ -286,7 +341,34 @@ describe('pantalla de Snapshots — restaurar', () => {
     })
   }
 
-  it('la confirmación nombra el target y no lanza la restauración hasta confirmarla', async () => {
+  /**
+   * La confirmación tipada de un target de base: Antd la pinta como un `Modal`
+   * con rol `dialog` (el `Popconfirm` de un directorio no pasa por aquí).
+   */
+  async function abrirConfirmacionDeBase(
+    usuario: ReturnType<typeof userEvent.setup>,
+    etiqueta: string = HEX,
+  ) {
+    await usuario.click(await botonDeFila(etiqueta))
+    return await waitFor(() => {
+      const dialogo =
+        screen.queryByRole('dialog') ?? document.querySelector<HTMLElement>('.ant-modal')
+      if (dialogo === null) throw new Error('no apareció la confirmación tipada de la base')
+      return dialogo
+    })
+  }
+
+  /** El campo donde se teclea el nombre del target. */
+  function campoDelNombre(dialogo: HTMLElement) {
+    return within(dialogo).getByLabelText('Nombre del target')
+  }
+
+  /** El botón que autoriza la restauración de un target de base. */
+  function confirmarDeBase(dialogo: HTMLElement) {
+    return within(dialogo).getByRole('button', { name: 'Restaurar' })
+  }
+
+  it('Confirmar antes de restaurar: un directorio nombra el target y no lanza hasta confirmarla', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(manejadorCon(listadoConUna(), REPOS, () => restauracionAceptada))
 
@@ -299,6 +381,54 @@ describe('pantalla de Snapshots — restaurar', () => {
     // sitio equivocado: ni el nombre ni el tipo del target pueden faltar.
     expect(confirmacion).toHaveTextContent('web')
     expect(confirmacion).toHaveTextContent('directory')
+    expect(fetch.a(RUTA)).toHaveLength(0)
+    unmount()
+  })
+
+  it('Un target de base exige teclear su nombre y solo entonces envía `sobrescribir`', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(manejadorCon(listadoDeBase(), REPOS, () => restauracionAceptada))
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+
+    const dialogo = await abrirConfirmacionDeBase(usuario)
+
+    // La confirmación nombra el destino y advierte de que pisa datos vivos.
+    expect(dialogo).toHaveTextContent('bbdd')
+    expect(dialogo).toHaveTextContent('postgresql')
+    expect(dialogo).toHaveTextContent(/sobrescribe los datos vivos/i)
+
+    // Sin el nombre tecleado, confirmar está deshabilitado y no sale el `POST`.
+    expect(confirmarDeBase(dialogo)).toBeDisabled()
+    expect(fetch.a(RUTA)).toHaveLength(0)
+
+    await usuario.type(campoDelNombre(dialogo), 'bbdd')
+
+    // Con el nombre exacto se habilita, y solo entonces la petición lleva la
+    // confirmación de sobrescritura que la API exige para un target de base.
+    expect(confirmarDeBase(dialogo)).toBeEnabled()
+    await usuario.click(confirmarDeBase(dialogo))
+    await waitFor(() => {
+      expect(fetch.a(RUTA)).toHaveLength(1)
+    })
+    expect(fetch.a(RUTA)[0]?.cuerpo).toMatchObject({ repository_id: 'r1', sobrescribir: true })
+    unmount()
+  })
+
+  it('El nombre que no coincide no autoriza a confirmar', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(manejadorCon(listadoDeBase(), REPOS, () => restauracionAceptada))
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+
+    const dialogo = await abrirConfirmacionDeBase(usuario)
+    await usuario.type(campoDelNombre(dialogo), 'otro-nombre')
+
+    expect(confirmarDeBase(dialogo)).toBeDisabled()
+    // Deshabilitado de verdad: pulsarlo no lanza nada.
+    await usuario.click(confirmarDeBase(dialogo))
     expect(fetch.a(RUTA)).toHaveLength(0)
     unmount()
   })
@@ -325,7 +455,7 @@ describe('pantalla de Snapshots — restaurar', () => {
     unmount()
   })
 
-  it('refleja la fase que llega por SSE sin recargar y termina con el desenlace', async () => {
+  it('Progreso en vivo y cierre de fase en vivo: la fase llega por SSE sin recargar', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(manejadorCon(listadoConUna(), REPOS, () => restauracionAceptada))
 
@@ -565,7 +695,7 @@ describe('pantalla de Snapshots — restaurar', () => {
     unmount()
   })
 
-  it('no ofrece restaurar una instantánea sin target conocido, y lo explica', async () => {
+  it('Fila sin target conocido: la acción queda deshabilitada y se explica', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(
       manejadorCon(
@@ -588,11 +718,17 @@ describe('pantalla de Snapshots — restaurar', () => {
     unmount()
   })
 
-  it('no ofrece restaurar una instantánea de un target que no es de directorio, y lo explica', async () => {
+  it('Fila de un target no restaurable: un tipo que esta versión no reconoce queda deshabilitado', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(
       manejadorCon(
-        listadoConUna({ target_id: 't2', target_name: 'bbdd', target_type: 'mariadb' }),
+        // Un tipo que el contrato podría añadir mañana: el panel no lo conoce y
+        // no se atreve a restaurarlo.
+        listadoConUna({
+          target_id: 't9',
+          target_name: 'raro',
+          target_type: 'mysql' as TipoDeTarget,
+        }),
         REPOS,
       ),
     )
@@ -602,8 +738,8 @@ describe('pantalla de Snapshots — restaurar', () => {
 
     const boton = await botonDeFila()
     expect(boton).toBeDisabled()
-    expect(screen.getByText(/solo se restauran targets de directorio/i)).toBeInTheDocument()
-    expect(screen.getByText(/mariadb/)).toBeInTheDocument()
+    expect(screen.getByText(/no reconoce el tipo de target/i)).toBeInTheDocument()
+    expect(screen.getByText(/mysql/)).toBeInTheDocument()
 
     await usuario.click(boton)
     expect(fetch.a(RUTA)).toHaveLength(0)
@@ -626,6 +762,28 @@ describe('pantalla de Snapshots — restaurar', () => {
 
     expect(await screen.findByText(mensaje)).toBeInTheDocument()
     // El fallo del `POST` cierra la operación: no queda un aviso de fase en curso.
+    expect(screen.queryByTestId('progreso-de-la-restauracion')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('Resultado: un 428 de la API se muestra como mensaje', async () => {
+    const usuario = userEvent.setup()
+    const mensaje = 'restaurar una base exige confirmar la sobrescritura'
+    const fetch = instalarFetchFalso(
+      manejadorCon(listadoDeBase(), REPOS, () => ({ status: 428, message: mensaje })),
+    )
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+
+    const dialogo = await abrirConfirmacionDeBase(usuario)
+    await usuario.type(campoDelNombre(dialogo), 'bbdd')
+    await usuario.click(confirmarDeBase(dialogo))
+
+    // El `428` llega con su mensaje y el panel no lo reescribe: lo enseña tal cual.
+    expect(await screen.findByText(mensaje)).toBeInTheDocument()
+    expect(fetch.a(RUTA)).toHaveLength(1)
+    // El fallo cierra la operación: no queda un aviso de fase en curso.
     expect(screen.queryByTestId('progreso-de-la-restauracion')).not.toBeInTheDocument()
     unmount()
   })

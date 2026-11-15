@@ -735,7 +735,7 @@ pub enum ErrorDeExtraccion {
 ///
 /// Lo que entra aquí ya viene de [`motivo_para_guardar`]: sin la credencial y recortado. Es la
 /// única forma de que un error pueda llevar lo que dijo el contenedor sin publicar un secreto.
-fn lo_que_dijo_el_contenedor(motivo: &str) -> String {
+pub(crate) fn lo_que_dijo_el_contenedor(motivo: &str) -> String {
     if motivo.trim().is_empty() {
         return String::new();
     }
@@ -788,7 +788,12 @@ impl ErrorDeExtraccion {
 /// El motivo se lee en el panel y nombra el tipo como lo nombra la base —`mariadb`, no
 /// `Mariadb`—, que es como el operador lo ve al mirar la columna. Un `sqlite` se nombra
 /// `sqlite`, no `sqlite3`: el segundo es el binario.
-fn nombre_del_tipo(tipo: TipoDeTarget) -> &'static str {
+///
+/// # Visibilidad
+///
+/// **`pub(crate)`** porque la restauración lo comparte: sus motivos nombran el tipo igual, y dos
+/// bocas que escribieran el mismo vocabulario podrían separarse el día que se añada un tipo.
+pub(crate) fn nombre_del_tipo(tipo: TipoDeTarget) -> &'static str {
     match tipo {
         TipoDeTarget::Mariadb => "mariadb",
         TipoDeTarget::Postgresql => "postgresql",
@@ -864,7 +869,17 @@ fn campo_opcional<'a>(
 /// del tipo sale —y por eso es un método con nombre: cada sitio que lo usa se ve—. Lo que se
 /// construye es el `CLAVE=valor` que el `exec` necesita, y esa cadena vive en una [`Orden`],
 /// cuyo `Debug` publica el nombre de la variable y nunca su valor.
-fn entorno_del_exec(tipo: TipoDeTarget, contrasena: Option<&SecretString>) -> Vec<String> {
+///
+/// # Visibilidad
+///
+/// **`pub(crate)`** porque la restauración lo reutiliza tal cual: el reverso de un volcado se
+/// ejecuta con el mismo cliente y la misma credencial por el mismo camino. Una segunda copia de
+/// esta función sería una segunda verdad sobre el nombre de la variable y sobre qué significa una
+/// contraseña vacía.
+pub(crate) fn entorno_del_exec(
+    tipo: TipoDeTarget,
+    contrasena: Option<&SecretString>,
+) -> Vec<String> {
     // Sin contraseña no se añade **nada**: el `env` es aditivo sobre el del contenedor, así
     // que una variable de más es una variable de más.
     let Some(contrasena) = contrasena else {
@@ -915,7 +930,7 @@ fn entorno_del_exec(tipo: TipoDeTarget, contrasena: Option<&SecretString>) -> Ve
 /// tira aquí es exactamente lo que no cabría en el motivo, y el margen de [`TOPE_DEL_CRUDO`]
 /// cubre que el corte caiga en mitad de un carácter: el recorte por carácter va después y el
 /// margen garantiza que ese corte quede más allá de los caracteres que se conservan.
-fn acumular_el_motivo(crudo: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn acumular_el_motivo(crudo: &mut Vec<u8>, bytes: &[u8]) {
     let libres = TOPE_DEL_CRUDO.saturating_sub(crudo.len());
     let hasta = libres.min(bytes.len());
 

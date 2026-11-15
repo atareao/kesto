@@ -98,6 +98,12 @@ export interface AltaRepository {
 /** Lectura: `GET /api/v1/jobs` y `GET /api/v1/jobs/{id}`. */
 export interface Job {
   id: string
+  /**
+   * Nombre con el que el operador distingue la tarea; `null` cuando no se le puso
+   * ninguno. La clave **siempre** viaja —el backend no la omite cuando va a
+   * `null`— y no es única: es una etiqueta legible, no un identificador.
+   */
+  name: string | null
   target_id: string
   repository_id: string
   cron_expression: string
@@ -111,6 +117,12 @@ export interface Job {
 
 /** Escritura: `POST` y `PUT` de `/api/v1/jobs`. */
 export interface AltaJob {
+  /**
+   * Nombre de la tarea; opcional. El backend lo recorta y guarda un blanco como
+   * `null`, así que el panel **omite** la clave cuando el campo queda vacío en
+   * vez de mandar una cadena vacía.
+   */
+  name?: string | null
   target_id: string
   repository_id: string
   cron_expression: string
@@ -141,6 +153,13 @@ export interface EjecucionEncolada {
 export interface Execution {
   id: string
   job_id: string
+  /**
+   * Nombre de la tarea que originó la ejecución, resuelto por el backend en el
+   * mismo vínculo que el resto de la fila; `null` cuando esa tarea no tiene
+   * nombre. La clave **siempre** viaja, así que la columna «Tarea» cae al
+   * identificador cuando llega a `null` —nunca al nombre del target—.
+   */
+  job_name: string | null
   status: Estado
   snapshot_id: string | null
   bytes_processed: number
@@ -161,6 +180,13 @@ export interface Snapshot {
   time: string
   paths: string[]
   label: string | null
+  /**
+   * Nombre de la tarea de la que procede la instantánea, por el vínculo
+   * `snapshot → job_executions → backup_jobs`; `null` cuando esa tarea no tiene
+   * nombre **o** cuando la instantánea no casa con ninguna ejecución. La columna
+   * «Tarea» cae entonces al identificador de la tarea que publica `label`.
+   */
+  job_name: string | null
   files: number
   bytes: number
   /**
@@ -204,6 +230,47 @@ export interface Restauracion {
   snapshot_id: string
   target_id: string
   target_name: string
+}
+
+// ─── Histórico de restauraciones ─────────────────────────────────────────────
+
+/**
+ * Lectura: una fila de `GET /api/v1/restorations`.
+ *
+ * Es la ejecución de restauración **persistida** —la tabla
+ * `restore_executions`—, no la respuesta del `POST` (`Restauracion`): aquí llega
+ * el desenlace real, con su `status` y sus fechas, porque el histórico se lee
+ * cuando la operación ya ha ocurrido. Por eso el estado es de fiar y no un
+ * «lanzada» optimista.
+ *
+ * `target_name` y `target_type` los resuelve el backend desde el target
+ * referenciado por `target_id`, y son `null` solo si `target_id` es `null`
+ * —cuando el target se borró y la FK lo puso a nulo—. `error_message` solo
+ * lleva texto en una `failed`; en el resto viene a `null`.
+ */
+export interface RestauracionRegistrada {
+  id: string
+  snapshot_id: string
+  target_id: string | null
+  target_name: string | null
+  target_type: TipoDeTarget | null
+  status: Estado
+  error_message: string | null
+  /** RFC3339, en UTC. */
+  started_at: string
+  /** RFC3339, en UTC, o `null` si todavía no ha terminado. */
+  finished_at: string | null
+}
+
+/**
+ * `GET /api/v1/restorations?status=&target_id=&limit=&offset=` (**200**).
+ *
+ * Trae la página y el **total** de filas que cumplen los filtros: con el total,
+ * el panel sabe si hay página siguiente sin pedir una de más.
+ */
+export interface ListadoDeRestauraciones {
+  restorations: RestauracionRegistrada[]
+  total: number
 }
 
 // ─── Salud y sesión ──────────────────────────────────────────────────────────

@@ -23,7 +23,7 @@ use super::planificacion::{Ajustes as AjustesDelPlanificador, Planificador};
 
 use crate::db::entities::{
     AltaDeEjecucion, AltaDeRepositorio, AltaDeTarea, AltaDeTarget, Ejecucion, Ejecuciones, Estado,
-    Repositorios, Tareas, Targets, TipoDeTarget,
+    Repositorios, Restauraciones, Tareas, Targets, TipoDeTarget,
 };
 use crate::engine::{Ajustes as AjustesDelMotor, Dependencias, Motor};
 use crate::rustic::{Acceso, BarrasDelMotor, Error, PuestaEnMarcha, Repositorio};
@@ -92,7 +92,7 @@ impl Aparato {
         let destino = destino_guardado.ruta().to_string_lossy().into_owned();
 
         let repositorios = Repositorios::nuevo(pool.clone(), clave.clone());
-        let targets = Targets::nuevo(pool.clone(), clave);
+        let targets = Targets::nuevo(pool.clone(), clave.clone());
 
         let repositorio = repositorios
             .alta(AltaDeRepositorio {
@@ -129,7 +129,8 @@ impl Aparato {
                 repositorios: Arc::new(repositorios),
                 targets: Arc::new(targets),
                 tareas: Arc::new(Tareas::nuevo(pool.clone())),
-                ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone())),
+                ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
+                restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
             },
         )
         .expect("el motor se monta desde dentro del runtime de la prueba");
@@ -139,7 +140,7 @@ impl Aparato {
             pool: pool.clone(),
             motor,
             tareas: Tareas::nuevo(pool.clone()),
-            ejecuciones: Ejecuciones::nuevo(pool),
+            ejecuciones: Ejecuciones::nuevo(pool, clave),
             repositorio,
             target,
             _destino: destino_guardado,
@@ -173,6 +174,7 @@ impl Aparato {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled,
+                name: None,
             })
             .await
             .expect("el alta de la tarea no puede fallar")

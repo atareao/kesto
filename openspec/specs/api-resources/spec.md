@@ -258,11 +258,13 @@ Cada fila SHALL llevar sus **métricas** —los dos contadores de bytes y sus do
 
 Las fechas de cada fila SHALL publicarse como cadena RFC3339, como en el resto de la superficie.
 
+Cada fila SHALL llevar además **`job_name`** (anulable): el nombre de la tarea de esa ejecución, resuelto por el vínculo con `backup_jobs`. SHALL publicarse como `null` cuando la tarea no tenga nombre o la ejecución no case con ninguna tarea, con la misma tolerancia que el resto del listado: un `job_name` a `null` es un nombre desconocido, no un error, y NO SHALL acortar el listado ni ocultar la fila.
+
 #### Scenario: El listado sin filtros devuelve las ejecuciones con sus métricas
 - **GIVEN** tres ejecuciones dadas de alta
 - **WHEN** se pide el listado sin filtros
 - **THEN** SHALL contestar `200` con las tres filas
-- **AND** cada fila SHALL traer `bytes_processed`, `bytes_uploaded`, `started_at` y `finished_at`
+- **AND** cada fila SHALL traer `bytes_processed`, `bytes_uploaded`, `started_at`, `finished_at` y `job_name`
 
 #### Scenario: Los filtros por job_id y por status acotan el listado
 - **GIVEN** ejecuciones de dos tareas distintas, con estados distintos
@@ -512,6 +514,8 @@ El listado SHALL ser tolerante a la ausencia del vínculo —una consulta por el
 
 El porqué: el panel necesita saber **sobre qué target** se va a restaurar antes de confirmarlo, y si ese target es restaurable, y hoy el listado no lo dice. Sin estos tres campos, la confirmación no puede nombrar el destino —que es justo lo que evita escribir en el sitio equivocado— y la acción no puede saber si debe ofrecerse o explicar su limitación; y como el vínculo con el target puede faltar por causas legítimas, el contrato tiene que decir qué significa su ausencia en vez de dejar que cada cliente la adivine.
 
+Cada elemento de `data` SHALL llevar además **`job_name`** (anulable): el nombre de la tarea de origen, resuelto por el vínculo `snapshot → job_executions → backup_jobs`, y publicado como `null` cuando la instantánea no case con ninguna tarea o la tarea no tenga nombre. La `label` de la instantánea NO SHALL tocarse: SHALL seguir siendo el identificador de la tarea, y los campos que el listado ya publicaba —`id`, `time`, `paths`, `label`, `files`, `bytes`, junto al target— SHALL seguir como están.
+
 #### Scenario: Una instantánea con ejecución trae el target
 
 - **GIVEN** una instantánea cuya fila en `job_executions` casa con una tarea y su target del repositorio que se pide
@@ -527,30 +531,41 @@ El porqué: el panel necesita saber **sobre qué target** se va a restaurar ante
 - **AND** la instantánea SHALL seguir apareciendo en el listado
 - **AND** NO SHALL contestarse `404` ni `409` por esa instantánea
 
+#### Scenario: Cada instantánea declara el nombre de su tarea o null
+
+- **GIVEN** una instantánea cuya tarea tiene nombre, y otra del mismo repositorio cuya tarea no lo tiene
+- **WHEN** se pide `GET /api/v1/snapshots?repository_id=<id>`
+- **THEN** el elemento de la primera SHALL traer `job_name` con el nombre de su tarea
+- **AND** el de la segunda SHALL traer `job_name` a `null`
+- **AND** el campo `label` de ambas SHALL seguir siendo el identificador de la tarea, sin cambios
+
 ### Requirement: La restauración de un snapshot se pide por su recurso y usa el target de origen
 
-El panel SHALL poder pedir la restauración de un snapshot completo mediante `POST /api/v1/snapshots/{id}/restore`, con el `repository_id` en el cuerpo. La petición SHALL resolverse contra la ejecución que produjo el snapshot y su tarea, y SHALL restaurar sobre el target de origen. La respuesta SHALL seguir la envoltura de `api-shell` y SHALL incluir, en `data`, el identificador de la ejecución de restauración, el `snapshot_id`, el `target_id` y un nombre legible del target.
+El panel SHALL poder pedir la restauración de un snapshot completo mediante `POST /api/v1/snapshots/{id}/restore`, con el `repository_id` en el cuerpo y, para un target de base de datos, la confirmación de sobrescritura `sobrescribir: true`. La petición SHALL resolverse contra la ejecución que produjo el snapshot y su tarea, y SHALL restaurar sobre el target de origen. La respuesta SHALL seguir la envoltura de `api-shell` y SHALL incluir, en `data`, el identificador de la ejecución de restauración —que SHALL ser la fila persistida en `restore_executions`—, el `snapshot_id`, el `target_id` y un nombre legible del target.
 
 El endpoint SHALL comprobar, **antes de contestar**, que la instantánea existe en el almacenamiento del repositorio indicado; si no está, SHALL responder `404` y NO SHALL lanzar ninguna ejecución ni publicar ningún aviso. El `200` NO SHALL ser optimista: no SHALL devolverse por el solo hecho de que el `repository_id` resuelva, sino solo cuando la instantánea se haya encontrado de verdad.
 
-Si el snapshot existe pero no está asociado a ninguna ejecución o target, la API SHALL responder `409` con un mensaje claro. Si el target no es restaurable en esta versión (tipos de base de datos), la API SHALL responder `422` explicando la limitación.
+Si el snapshot existe pero no está asociado a ninguna ejecución o target, la API SHALL responder `409` con un mensaje claro. Si el target es un `directory` sin `host_path`, la API SHALL responder `422` con su propio motivo. Si el target es de base de datos y **falta la confirmación de sobrescritura**, la API SHALL responder `428 Precondition Required` explicando que hace falta confirmar, sin lanzar ningún trabajo.
 
-El progreso SHALL publicarse en el stream global de `/api/v1/events` con `event: restore_progress` y un payload con `execution_id`, `snapshot_id`, `phase`, `files_done`, `files_total`, `bytes_done` y `bytes_total`. La fase SHALL ser `restaurando` al arrancar y SHALL publicarse un aviso de cierre con fase `terminada` si la restauración termina bien o `fallida` si falla; el cierre SHALL publicarse en ambos desenlaces. En esta versión los cuatro contadores SHALL publicarse a `0` y NO SHALL interpretarse como «cero ficheros»: el aviso describe el **empezó/terminó** y la fase, no un avance incremental, porque `Repository::restore` de `rustic_core` 0.13 no ofrece un callback de progreso por su API pública. El contrato del evento NO SHALL depender de esos contadores —el campo existe para cuando la biblioteca lo permita, no para que un cliente lea hoy una cifra—, y el aviso NO SHALL prometer un avance incremental.
+El progreso SHALL publicarse en el stream global de `/api/v1/events` con `event: restore_progress` y un payload con `execution_id`, `snapshot_id`, `phase`, `files_done`, `files_total`, `bytes_done` y `bytes_total`. La fase SHALL ser `restaurando` al arrancar y SHALL publicarse un aviso de cierre con fase `terminada` si la restauración termina bien o `fallida` si falla; el cierre SHALL publicarse en ambos desenlaces. Los cuatro contadores SHALL seguir publicándose a `0` en esta versión y NO SHALL interpretarse como «cero ficheros»: `Repository::dump`/`restore` de `rustic_core` 0.13 no ofrecen callback de progreso por su API pública.
 
-El porqué: restaurar es la operación que hace útil una copia; sin endpoint no hay forma de recuperar los datos desde el producto. El mapeo por ejecución es el único vínculo fiable entre un snapshot y su target, porque el snapshot no guarda el nombre de la tarea y el esquema relaciona la ejecución con la tarea y esta con el target. Y la comprobación contra el almacenamiento es lo que distingue «la copia no está» de «la copia está pero no sé sobre qué restaurarla»: sin ella, el `200` prometería un trabajo contra una instantánea que no existe y el panel daría por lanzada una restauración que nunca ocurrirá.
+El porqué: restaurar es la operación que hace útil una copia. La restauración de un target de base de datos pisa datos vivos, así que su petición exige una confirmación explícita; y como hoy el desenlace no se podía seguir después del `200`, la ejecución se persiste.
 
 #### Scenario: Restaurar un snapshot de un target de directorio
+
 - **GIVEN** un snapshot de un target `directory`
 - **WHEN** se envía `POST /api/v1/snapshots/{id}/restore` con su `repository_id`
 - **THEN** la respuesta SHALL traer `data.target_id` y `data.execution_id`
 - **AND** SHALL publicarse `restore_progress` en `/api/v1/events`
 
 #### Scenario: Snapshot sin target
+
 - **GIVEN** un snapshot que existe en el repositorio pero no casa con ninguna ejecución
 - **WHEN** se pide restaurarlo
 - **THEN** la API SHALL responder `409`
 
 #### Scenario: Snapshot que no está en el repositorio
+
 - **GIVEN** un `id` de instantánea que no existe en el almacenamiento del repositorio indicado
 - **WHEN** se envía `POST /api/v1/snapshots/{id}/restore` con su `repository_id`
 - **THEN** la API SHALL responder `404`
@@ -558,13 +573,95 @@ El porqué: restaurar es la operación que hace útil una copia; sin endpoint no
 - **AND** NO SHALL lanzarse ninguna ejecución de restauración
 
 #### Scenario: Target no restaurable
-- **GIVEN** un snapshot de un target `mariadb`
+
+- **GIVEN** un snapshot de un target `directory` cuyo `host_path` falta o está en blanco
 - **WHEN** se pide restaurarlo
-- **THEN** la API SHALL responder `422`
+- **THEN** la API SHALL responder `422` nombrando el campo que falta
+- **AND** NO SHALL lanzarse ninguna ejecución de restauración
 
 #### Scenario: Cierre de la restauración
+
 - **GIVEN** una restauración ya lanzada
 - **WHEN** el trabajo termina bien o falla
 - **THEN** SHALL publicarse `restore_progress` con fase `terminada` o `fallida`, respectivamente
-- **AND** los cuatro contadores del aviso SHALL seguir a `0`
-- **AND** el `Result` del motor SHALL reflejar el mismo desenlace
+- **AND** la fila de `restore_executions` SHALL quedar en `success` o `failed`, respectivamente
+
+#### Scenario: Restaurar un snapshot de un target de base con confirmación
+
+- **GIVEN** un snapshot de un target `mariadb`
+- **WHEN** se envía `POST /api/v1/snapshots/{id}/restore` con su `repository_id` y `sobrescribir: true`
+- **THEN** la respuesta SHALL ser `200` con `data.execution_id`
+- **AND** SHALL publicarse `restore_progress`
+
+#### Scenario: Restaurar un target de base sin confirmación
+
+- **GIVEN** un snapshot de un target `postgresql`
+- **WHEN** se envía `POST /api/v1/snapshots/{id}/restore` con su `repository_id` y sin `sobrescribir`
+- **THEN** la API SHALL responder `428`
+- **AND** NO SHALL lanzarse ninguna ejecución de restauración
+
+### Requirement: La tarea lleva un nombre legible
+
+`POST /api/v1/jobs` y `PUT /api/v1/jobs/:id` SHALL aceptar un campo opcional `name` (texto). El valor SHALL recortarse; si queda vacío o en blanco SHALL guardarse como `null`; si supera **120** caracteres SHALL rechazarse con `400` y la envoltura, **nombrando `name`**.
+
+`GET /api/v1/jobs` y `GET /api/v1/jobs/:id` SHALL publicar `name` (anulable) por tarea.
+
+El nombre NO SHALL ser único ni obligatorio. El porqué: sin nombre el panel cae al identificador de la tarea, y el nombre es lo que distingue dos tareas sobre el mismo target —hoy el Histórico usa el nombre del target como proxy y confunde las dos—. Exigir unicidad obligaría a inventar sufijos para lo que es una etiqueta para el operador, y hacerlo obligatorio rompería las tareas que ya existen sin nombre.
+
+#### Scenario: El alta guarda el nombre recortado
+- **GIVEN** un alta de tarea con `name` con espacios a ambos lados de `copia nocturna`
+- **WHEN** se guarda y se lee la tarea
+- **THEN** su `name` SHALL ser `copia nocturna`, sin los espacios de los extremos
+- **AND** SHALL conservarse el resto de campos de la tarea
+
+#### Scenario: Un nombre en blanco se guarda como null
+- **GIVEN** un alta de tarea con `name` a una cadena de solo espacios
+- **WHEN** se guarda y se lee la tarea
+- **THEN** su `name` SHALL ser `null`
+- **AND** NO SHALL guardarse una cadena vacía
+
+#### Scenario: Un nombre de más de 120 caracteres contesta 400 nombrando name
+- **GIVEN** un alta o una edición de tarea con un `name` de 121 caracteres
+- **WHEN** se envía
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el mensaje SHALL nombrar el campo `name`
+
+#### Scenario: El listado de tareas publica el nombre anulable
+- **GIVEN** una tarea con nombre y otra sin él
+- **WHEN** se pide `GET /api/v1/jobs`
+- **THEN** la primera fila SHALL traer su `name`
+- **AND** la segunda SHALL traer `name` a `null`
+
+### Requirement: El histórico de restauraciones se lista con filtros y paginación
+
+SHALL existir `GET /api/v1/restorations` que devuelva las ejecuciones de restauración persistidas, ordenadas por fecha de comienzo descendente, con paginación acotada y los filtros `status` y `target_id`, y SHALL seguir la envoltura de `api-shell`. Cada fila SHALL publicar `id`, `snapshot_id`, `target_id`, `target_name`, `target_type`, `status`, `error_message`, `started_at` y `finished_at`, con los identificadores como texto en su forma canónica con guiones y las fechas como cadenas RFC3339. `target_name` y `target_type` SHALL resolverse desde el target referenciado por `target_id`, y SHALL publicarse como `null` solo si `target_id` es `null`.
+
+La ruta SHALL colgar de la mitad protegida del router, como el resto de `/api/v1/*`, y NO SHALL añadirse a la lista blanca de rutas públicas.
+
+El porqué: la ejecución de restauración deja de ser efímera; sin un listado, el registro existiría pero nadie podría verlo, y el panel no tendría de dónde pintar el histórico.
+
+#### Scenario: El listado devuelve las restauraciones
+
+- **GIVEN** dos restauraciones persistidas
+- **WHEN** se pide `GET /api/v1/restorations`
+- **THEN** SHALL devolver las dos, la más reciente primero
+- **AND** cada fila SHALL publicar su `status` y sus fechas
+
+#### Scenario: El filtro por estado acota el listado
+
+- **GIVEN** restauraciones en estados distintos
+- **WHEN** se pide `GET /api/v1/restorations?status=failed`
+- **THEN** SHALL devolver solo las fallidas
+
+#### Scenario: El listado pagina de forma acotada
+
+- **GIVEN** más restauraciones que el tope de una página
+- **WHEN** se pide `GET /api/v1/restorations`
+- **THEN** SHALL devolver una página acotada con el total
+- **AND** la siguiente página SHALL traer las restantes
+
+#### Scenario: El listado exige sesión cuando el modo la exige
+
+- **GIVEN** el modo de autenticación habilitado
+- **WHEN** se pide `GET /api/v1/restorations` sin sesión
+- **THEN** SHALL responder como el resto de rutas protegidas

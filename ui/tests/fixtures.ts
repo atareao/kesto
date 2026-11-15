@@ -8,6 +8,7 @@ import type {
   Execution,
   Job,
   Repository,
+  RestauracionRegistrada,
   Snapshot,
   Target,
 } from '../src/services/api/types'
@@ -28,6 +29,9 @@ export function repositorio(campos: Partial<Repository> & { id: string }): Repos
 
 export function tarea(campos: Partial<Job> & { id: string }): Job {
   return {
+    // Sin nombre por defecto: es el caso de casi todas las pruebas, y quien
+    // afirme el nombre lo pasa en `campos`.
+    name: null,
     target_id: 't1',
     repository_id: 'r1',
     cron_expression: '0 0 3 * * *',
@@ -57,6 +61,9 @@ export function target(campos: Partial<Target> & { id: string }): Target {
 
 export function ejecucion(campos: Partial<Execution> & { id: string; job_id: string }): Execution {
   return {
+    // La tarea de la ejecución no tiene nombre por defecto; quien afirme el
+    // nombre lo pasa en `campos`.
+    job_name: null,
     status: 'success',
     snapshot_id: 'a'.repeat(64),
     bytes_processed: 1024,
@@ -73,6 +80,8 @@ export function snapshot(campos: Partial<Snapshot> & { id: string }): Snapshot {
     time: '2026-01-02T03:00:00Z',
     paths: ['/srv/datos'],
     label: null,
+    // Igual que en la ejecución: sin tarea con nombre, la clave va a `null`.
+    job_name: null,
     files: 10,
     bytes: 1024,
     // El listado publica el target de origen de cada instantánea; el defecto es
@@ -80,6 +89,26 @@ export function snapshot(campos: Partial<Snapshot> & { id: string }): Snapshot {
     target_id: 't1',
     target_name: 'web',
     target_type: 'directory',
+    ...campos,
+  }
+}
+
+export function restauracionRegistrada(
+  campos: Partial<RestauracionRegistrada> & { id: string },
+): RestauracionRegistrada {
+  return {
+    snapshot_id: 'a'.repeat(64),
+    // El target de origen del histórico: su nombre y su tipo los resuelve el
+    // backend; quien pruebe un target borrado los pone a `null` con `target_id`.
+    target_id: 't1',
+    target_name: 'web',
+    target_type: 'directory',
+    // El histórico enseña el desenlace real: por defecto, una restauración
+    // terminada sin motivo de error.
+    status: 'success',
+    error_message: null,
+    started_at: '2026-01-02T03:00:00Z',
+    finished_at: '2026-01-02T03:05:00Z',
     ...campos,
   }
 }

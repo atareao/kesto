@@ -7,9 +7,9 @@ El panel web de Kesto: el SPA que convierte la API del §5 en un producto operab
 
 ### Requirement: El layout ofrece las cinco pantallas del §6 y una ruta para cada una
 
-El panel SHALL montarse en un layout con menú lateral y SHALL ofrecer, como mínimo, las rutas `/` (Dashboard), `/tareas`, `/historico`, `/snapshots`, `/ajustes` y `/sesion`. Cada entrada del menú SHALL navegar a su ruta sin recargar el documento, la entrada de la ruta activa SHALL distinguirse visualmente, y una ruta desconocida SHALL renderizar una pantalla de «no encontrada» **dentro** del layout, sin perder el menú. En una ventana estrecha el menú SHALL poder plegarse sin dejar ninguna entrada inalcanzable.
+El panel SHALL montarse en un layout con menú lateral y SHALL ofrecer, como mínimo, las rutas `/` (Dashboard), `/tareas`, `/historico`, `/snapshots`, `/ajustes` y `/sesion`. Cada entrada del menú SHALL navegar a su ruta sin recargar el documento, la entrada de la ruta activa SHALL distinguirse visualmente, y una ruta desconocida SHALL renderizar una pantalla de «no encontrada» **dentro** del layout, sin perder el menú. En una ventana estrecha el menú SHALL poder plegarse sin dejar ninguna entrada inalcanzable. El control de plegado del menú SHALL residir en el pie de la barra lateral —dentro de ella y a continuación del menú—, no en una cabecera aparte.
 
-Las cinco pantallas y sus nombres salen del §6; la de sesión es la que falta en esa lista porque el §6 describe la pantalla ya dentro del producto, no la entrada. Las rutas son del cliente y no del servidor: por eso el backend sirve `index.html` como fallback y una recarga en `/tareas` tiene que seguir funcionando.
+Las cinco pantallas y sus nombres salen del §6; la de sesión es la que falta en esa lista porque el §6 describe la pantalla ya dentro del producto, no la entrada. Las rutas son del cliente y no del servidor: por eso el backend sirve `index.html` como fallback y una recarga en `/tareas` tiene que seguir funcionando. El control que pliega el menú pertenece a la barra que pliega: ponerlo dentro de la barra lateral lo deja donde el operador lo busca y libera la cabecera.
 
 #### Scenario: Cada entrada del menú abre su pantalla
 - **GIVEN** el panel cargado en `/`
@@ -29,6 +29,13 @@ Las cinco pantallas y sus nombres salen del §6; la de sesión es la que falta e
 - **WHEN** se carga el panel
 - **THEN** SHALL mostrarse la pantalla de «no encontrada»
 - **AND** el menú lateral SHALL seguir visible y operativo
+
+#### Scenario: El control de plegado vive en el pie de la barra lateral
+- **GIVEN** el panel con la barra lateral desplegada
+- **WHEN** se pinta la barra lateral
+- **THEN** el control de plegado SHALL estar dentro de la barra lateral, a continuación del menú
+- **AND** SHALL ser alcanzable y activable con el teclado
+- **AND** SHALL conservar su nombre accesible y su estado plegado/desplegado
 
 ### Requirement: El cliente de la API consume la envoltura y no filtra secretos
 
@@ -128,6 +135,8 @@ El Dashboard SHALL mostrar un `Progress` con el avance de la ejecución en curso
 
 La pantalla de Tareas SHALL listar las tareas y SHALL permitir crear y editar en un `Modal` con `Form`, borrar con confirmación y disparar manualmente cada tarea. El formulario SHALL exigir `target_id`, `repository_id`, `cron_expression` y las tres reglas de retención, y SHALL usar `Select` para el target y el repositorio. El campo `container_name` del target SHALL ser un `AutoComplete` que sugiere los contenedores ya usados por los targets existentes y admite texto libre; NO SHALL introducirse un endpoint de contenedores en este change.
 
+El formulario SHALL incluir además un campo de texto opcional `name` («Nombre»), y la tabla de Tareas SHALL mostrar una columna «Nombre», vacía cuando la tarea no lo tenga. El nombre es lo que distingue dos tareas sobre el mismo target en la lista; sin él, dos tareas que copian al mismo sitio se leen igual.
+
 La expresión cron SHALL poder construirse con un generador visual de **seis** campos —segundo, minuto, hora, día del mes, mes y día de la semana— y SHALL poder editarse como texto. La validación del cliente SHALL ser una ayuda y NO SHALL sustituir a la del servidor: un `400` que nombre `cron_expression` SHALL mostrarse en el campo. Las tres reglas de retención SHALL ser `InputNumber` no negativos y el formulario NO SHALL enviar una tarea con las tres a cero.
 
 Cuando haya que crear un target o un repositorio desde el propio formulario, las credenciales —`db_password`, `secret_access_key` y `passphrase`— SHALL escribirse con `Input.Password`, NO SHALL prerrellenarse nunca y, al editar, dejarlas vacías SHALL significar «conservar la que hay».
@@ -170,11 +179,20 @@ El disparo manual SHALL llamar a `POST /api/v1/jobs/:id/run`. Un `202` SHALL inc
 - **THEN** SHALL ser un `Input.Password` vacío
 - **AND** al editar un repositorio existente, dejarlo vacío NO SHALL borrar la credencial guardada
 
+#### Scenario: El formulario acepta un nombre y la tabla lo muestra
+- **GIVEN** el formulario de alta de una tarea
+- **WHEN** se escribe `copia nocturna` en el campo «Nombre» y se guarda
+- **THEN** la petición SHALL llevar `name` con ese valor
+- **AND** la tabla de Tareas SHALL mostrar una columna «Nombre» con ese valor en la fila de la tarea
+- **AND** una tarea sin nombre SHALL mostrar la columna «Nombre» vacía
+
 ### Requirement: El Histórico pagina, filtra y muestra la consola de la ejecución en vivo
 
 El Histórico SHALL listar las ejecuciones con `GET /api/v1/executions`, SHALL paginar con `limit` y `offset` —`50` por defecto y `200` como tope—, y SHALL filtrar por `job_id` y por `status`. Como la respuesta es un array sin total, la paginación SHALL avanzar cuando la página venga llena y SHALL deshabilitar «siguiente» cuando venga vacía o incompleta; NO SHALL inventarse un total.
 
 Cada fila SHALL mostrar las fechas en hora local, la duración cuando haya `finished_at`, los dos contadores de bytes y el estado con su `Badge` y su texto. La consola SHALL mostrar en vivo el `current_action` y el avance de la ejecución seleccionada a partir del stream SSE, SHALL conservar solo un número acotado de líneas y SHALL indicar cuando la conexión está caída.
+
+Cada fila SHALL mostrar además una columna «Tarea» con el `job_name` de la ejecución y, cuando la tarea no tenga nombre, el identificador de la tarea: nunca el nombre del target. El filtro por tarea SHALL etiquetar cada opción con el nombre de la tarea —o con su identificador si no lo tiene—, y NO SHALL usar el nombre del target, que es lo que hoy hace indistinguibles dos tareas sobre el mismo target.
 
 #### Scenario: La paginación avanza y se detiene al final
 - **GIVEN** una primera página con `limit=50` que devuelve 50 filas
@@ -200,9 +218,18 @@ Cada fila SHALL mostrar las fechas en hora local, la duración cuando haya `fini
 - **THEN** SHALL mostrarse el estado vacío
 - **AND** NO SHALL mostrarse un error
 
+#### Scenario: La columna Tarea y el filtro usan el nombre de la tarea
+- **GIVEN** dos tareas sobre el mismo target, una con nombre y otra sin él
+- **WHEN** se carga el Histórico
+- **THEN** la tabla SHALL mostrar una columna «Tarea» con el nombre de la primera y el identificador de la segunda
+- **AND** el filtro de tarea SHALL etiquetar cada opción con el nombre de la tarea
+- **AND** NO SHALL usar el nombre del target para etiquetar las opciones
+
 ### Requirement: Snapshots explora un repositorio y dice cuándo el listado está recortado
 
 La pantalla de Snapshots SHALL exigir elegir un repositorio de los que devuelve `GET /api/v1/repositories` y SHALL listar sus instantáneas con `GET /api/v1/snapshots?repository_id=<id>`. La tabla SHALL mostrar el identificador, la fecha en hora local, la etiqueta, los ficheros y los bytes, y SHALL presentar `paths` sin romper la fila. Cuando `truncated` sea `true`, SHALL avisar de que puede haber más instantáneas y NO SHALL presentar la lista como completa.
+
+La tabla SHALL mostrar además una columna «Tarea» **entre la fecha y la etiqueta**, con el `job_name` de la instantánea y, cuando la tarea no tenga nombre, el identificador de la tarea. La columna «Etiqueta» NO SHALL tocarse: sigue mostrando el identificador del snapshot.
 
 La pantalla NO SHALL ofrecer una acción de purga manual mientras la API no exponga una ruta para ella: un botón que no puede cumplir lo que promete es peor que su ausencia.
 
@@ -223,6 +250,13 @@ La pantalla NO SHALL ofrecer una acción de purga manual mientras la API no expo
 - **WHEN** se consulta
 - **THEN** SHALL mostrarse el estado vacío
 - **AND** la tabla NO SHALL pintar filas inventadas
+
+#### Scenario: La tabla muestra la tarea entre la fecha y la etiqueta
+- **GIVEN** instantáneas listadas, una de una tarea con nombre y otra de una tarea sin él
+- **WHEN** se pinta la tabla
+- **THEN** SHALL verse una columna «Tarea» entre la fecha y la etiqueta
+- **AND** SHALL mostrar el nombre de la tarea, o su identificador cuando no lo tenga
+- **AND** la columna «Etiqueta» SHALL seguir mostrando el identificador del snapshot
 
 ### Requirement: La sesión se adapta al modo de autenticación y no llama a rutas que no existen
 
@@ -331,9 +365,9 @@ El porqué: el formulario es el espejo del contrato de la API y del `CHECK` de l
 
 ### Requirement: El panel declara su identidad de marca
 
-El panel SHALL servir los assets de marca de Kesto y SHALL declararlos en el documento. En concreto SHALL servirse el favicon (`favicon.ico`, `favicon-16x16.png`, `favicon-32x32.png`, `favicon-48x48.png`, `favicon-64x64.png`), el icono para dispositivos Apple (`apple-touch-icon.png`), los iconos de Android (`android-chrome-192x192.png`, `android-chrome-512x512.png`), el icono enmascarable (`maskable-icon-512x512.png`), el icono de Windows (`mstile-150x150.png`) y el manifiesto (`site.webmanifest`). El documento SHALL declarar los `<link>` de iconos, el `<link rel="manifest">`, la meta `theme-color` con el azul de marca y las meta de Open Graph, y el menú lateral SHALL mostrar el logo de Kesto además del nombre.
+El panel SHALL servir los assets de marca de Kesto y SHALL declararlos en el documento. En concreto SHALL servirse el favicon (`favicon.ico`, `favicon-16x16.png`, `favicon-32x32.png`, `favicon-48x48.png`, `favicon-64x64.png`), el icono para dispositivos Apple (`apple-touch-icon.png`), los iconos de Android (`android-chrome-192x192.png`, `android-chrome-512x512.png`), el icono enmascarable (`maskable-icon-512x512.png`), el icono de Windows (`mstile-150x150.png`) y el manifiesto (`site.webmanifest`). El documento SHALL declarar los `<link>` de iconos, el `<link rel="manifest">`, la meta `theme-color` con el azul de marca y las meta de Open Graph, y el menú lateral SHALL mostrar el logo de Kesto además del nombre cuando la barra lateral está desplegada. Con la barra lateral plegada el nombre NO SHALL renderizarse y el logo SHALL permanecer visible.
 
-El porqué: hoy la pestaña del navegador no identifica a Kesto —no hay favicon ni manifest— y la marca del panel es solo texto. Una aplicación que el operador deja abierta todo el día debe poder reconocerse en una pestaña y en un marcador.
+El porqué: hoy la pestaña del navegador no identifica a Kesto —no hay favicon ni manifest— y la marca del panel es solo texto. Una aplicación que el operador deja abierta todo el día debe poder reconocerse en una pestaña y en un marcador. Con la barra plegada el nombre no cabe y solo estorba: retirarlo deja el logo limpio y centrado.
 
 #### Scenario: La pestaña identifica a Kesto
 - **GIVEN** el panel cargado en el navegador
@@ -347,13 +381,24 @@ El porqué: hoy la pestaña del navegador no identifica a Kesto —no hay favico
 - **THEN** SHALL verse el logo de Kesto
 - **AND** el logo SHALL ser legible en el tema activo
 
+#### Scenario: La marca se oculta al plegar
+- **GIVEN** el panel con la barra lateral plegada
+- **WHEN** se pinta la marca del panel
+- **THEN** el nombre «Kesto» NO SHALL renderizarse
+- **AND** el logo SHALL seguir visible
+
+#### Scenario: La marca se ve desplegada
+- **GIVEN** el panel con la barra lateral desplegada
+- **WHEN** se pinta la marca del panel
+- **THEN** SHALL verse el nombre «Kesto» junto al logo
+
 ### Requirement: El panel ofrece tema claro y oscuro, con oscuro por defecto y elección persistida
 
-El panel SHALL arrancar en **tema oscuro** siempre que no exista una elección guardada. Un control en el layout SHALL permitir alternar entre tema claro y oscuro; al activarlo, el tema SHALL cambiar de inmediato en todo el panel y la elección SHALL persistir en el almacenamiento del navegador, de modo que una recarga la respete. El arranque NO SHALL seguir la preferencia del sistema por sí solo: sin elección guardada, el resultado SHALL ser el oscuro.
+El panel SHALL arrancar en **tema oscuro** siempre que no exista una elección guardada. Un control en el layout SHALL permitir alternar entre tema claro y oscuro; al activarlo, el tema SHALL cambiar de inmediato en todo el panel y la elección SHALL persistir en el almacenamiento del navegador, de modo que una recarga la respete. El arranque NO SHALL seguir la preferencia del sistema por sí solo: sin elección guardada, el resultado SHALL ser el oscuro. El control de tema SHALL residir en el pie de la barra lateral, junto al control de plegado.
 
 El control SHALL ser accesible: SHALL tener nombre accesible, SHALL ser alcanzable y activable solo con teclado, y SHALL anunciar el tema hacia el que cambia, no solo su color. Ningún color del panel SHALL quedar fijado a un tema: los colores SHALL proceder del tema activo, de modo que ambos sean legibles.
 
-El porqué: el panel se usa en sesiones largas y la identidad visual pide el modo oscuro por defecto, pero el operador debe poder pasar a claro y que su elección se recuerde. Que el color esté fijado a mano es justo lo que hoy hace ilegible una mitad del producto.
+El porqué: el panel se usa en sesiones largas y la identidad visual pide el modo oscuro por defecto, pero el operador debe poder pasar a claro y que su elección se recuerde. Que el color esté fijado a mano es justo lo que hoy hace ilegible una mitad del producto. El control de tema se agrupa con el de plegado, al pie de la barra lateral, para que los dos mandos del chasis queden juntos.
 
 #### Scenario: Por defecto, oscuro
 - **GIVEN** un navegador sin ninguna elección de tema guardada
@@ -372,9 +417,15 @@ El porqué: el panel se usa en sesiones largas y la identidad visual pide el mod
 - **THEN** el tema SHALL cambiar
 - **AND** el control SHALL anunciar su estado al usuario
 
+#### Scenario: El control de tema vive en el pie de la barra lateral
+- **GIVEN** el panel con la barra lateral desplegada
+- **WHEN** se pinta la barra lateral
+- **THEN** el control de tema SHALL estar en el pie de la barra lateral, junto al de plegado
+- **AND** SHALL ser alcanzable con el teclado
+
 #### Scenario: Ambos temas son legibles
 - **GIVEN** el panel en cualquiera de los dos temas
-- **WHEN** se recorre la cabecera, el menú lateral y el contenido
+- **WHEN** se recorre la barra lateral, su pie y el contenido
 - **THEN** NO SHALL haber texto sobre un fondo del mismo color
 - **AND** los colores SHALL proceder del tema activo
 
@@ -427,45 +478,83 @@ El porqué: la memoización sobrante añade complejidad sin beneficio; retirarla
 
 ### Requirement: El panel ofrece restaurar un snapshot con confirmación y progreso
 
-La pantalla de snapshots SHALL ofrecer, por cada fila, una acción de restaurar. Antes de lanzarla SHALL mostrarse una confirmación que indique el target sobre el que se va a restaurar —nombre y tipo, tomados de `target_name` y `target_type`, que el listado publica por fila—. Durante la operación, el panel SHALL reflejar la **fase** a partir del evento `restore_progress` sin recargar, y SHALL informar del resultado (éxito o error) con el mensaje de la API.
+La pantalla de snapshots SHALL ofrecer, por cada fila con target conocido, una acción de restaurar. Antes de lanzarla SHALL mostrarse una confirmación que indique el target sobre el que se va a restaurar —nombre y tipo, tomados de `target_name` y `target_type`—. Cuando el target sea de **base de datos** (`mariadb`, `postgresql`, `sqlite`), la confirmación SHALL exigir además que el operador **teclee el nombre del target**, SHALL advertir de que la operación **sobrescribe los datos vivos**, y SHALL enviar `sobrescribir: true` solo cuando el nombre tecleado coincida. Durante la operación, el panel SHALL reflejar la **fase** a partir del evento `restore_progress` sin recargar, y SHALL informar del resultado (éxito o error) con el mensaje de la API.
 
-La acción NO SHALL ejecutarse para snapshots de targets no restaurables en esta versión; en su lugar SHALL explicarse la limitación. El panel SHALL deshabilitar la acción y explicarla cuando `target_type` sea `null` —la fila no tiene target conocido, así que no hay destino sobre el que restaurar— o sea distinto de `directory` —los targets de base de datos quedan para la fase 2—.
+La acción NO SHALL ofrecerse para snapshots sin target conocido (`target_type` a `null`): sin destino no hay nada que restaurar, y SHALL explicarse la limitación. La limitación por tipo de target deja de existir para los cuatro tipos del esquema —`directory`, `mariadb`, `postgresql` y `sqlite` son todos restaurables—; SHALL quedar deshabilitada solo ante un `target_type` que esta versión no reconozca.
 
-El progreso que el panel SHALL mostrar es el de la fase, no el de un avance incremental: los contadores del evento van a `0` en esta versión porque `rustic_core` 0.13 no ofrece callback de progreso, así que el panel NO SHALL pintar un porcentaje ni una barra determinada a partir de ellos, y SHALL limitarse a decir que la restauración está **en curso**, **terminada** o **fallida**.
+El progreso que el panel SHALL mostrar es el de la fase, no el de un avance incremental: los contadores del evento van a `0` en esta versión, así que el panel NO SHALL pintar un porcentaje ni una barra determinada, y SHALL limitarse a decir que la restauración está **en curso**, **terminada** o **fallida**.
 
-El porqué: una restauración escribe sobre datos del operador; pedir confirmación con el target a la vista es lo que evita una restauración en el sitio equivocado, y el aviso de fase evita que una operación larga parezca colgada. Ofrecer la acción para una fila sin target conocido —o para un target que esta versión no sabe restaurar— llevaría al operador a confirmar algo que la API va a rechazar, así que la limitación se declara en la propia fila y no después del error.
+El porqué: una restauración escribe sobre datos del operador, y en una base los **pisa**. Pedir que se teclee el nombre del target es lo que convierte un clic accidental en una decisión deliberada, y nombrar el destino evita restaurar en el sitio equivocado.
 
 #### Scenario: Confirmar antes de restaurar
+
 - **GIVEN** una fila de snapshot de un target de directorio
 - **WHEN** se pulsa «Restaurar»
 - **THEN** SHALL mostrarse una confirmación con el nombre y el tipo del target
 - **AND** la restauración NO SHALL empezar hasta confirmarla
 
 #### Scenario: Progreso en vivo
+
 - **GIVEN** una restauración en curso
 - **WHEN** llega un evento `restore_progress` con fase `restaurando`
 - **THEN** el panel SHALL reflejar sin recargar que la restauración está **en curso**
 - **AND** NO SHALL mostrar un porcentaje ni una barra determinada a partir de los contadores
 
 #### Scenario: Cierre de fase en vivo
+
 - **GIVEN** una restauración en curso
 - **WHEN** llega un evento `restore_progress` con fase `terminada` o `fallida`
 - **THEN** el panel SHALL reflejar sin recargar ese desenlace de fase
 - **AND** SHALL mostrar el mensaje con el que la API informa del resultado
 
 #### Scenario: Fila sin target conocido
+
 - **GIVEN** una fila de snapshot cuyo `target_type` es `null`
 - **WHEN** el operador mira la fila
 - **THEN** la acción de restaurar SHALL quedar deshabilitada
 - **AND** SHALL explicarse que no se puede restaurar porque no se conoce el target
 
 #### Scenario: Fila de un target no restaurable
-- **GIVEN** una fila de snapshot cuyo `target_type` es `mariadb`
+
+- **GIVEN** una fila de snapshot cuyo `target_type` no es ninguno de los cuatro tipos que esta versión sabe restaurar
 - **WHEN** el operador mira la fila
 - **THEN** la acción de restaurar SHALL quedar deshabilitada
-- **AND** SHALL explicarse que ese tipo de target no se restaura todavía en esta versión
+- **AND** SHALL explicarse que ese tipo de target no se reconoce
 
 #### Scenario: Resultado
+
 - **GIVEN** una restauración que termina
 - **WHEN** el backend publica el resultado
 - **THEN** el panel SHALL mostrarlo con el mensaje de la API
+
+#### Scenario: Un target de base exige teclear su nombre
+
+- **GIVEN** una fila de snapshot de un target `postgresql`
+- **WHEN** se pulsa «Restaurar»
+- **THEN** la confirmación SHALL pedir el nombre del target y advertir de la sobrescritura
+- **AND** el `POST` NO SHALL enviar `sobrescribir: true` hasta que el nombre tecleado coincida
+
+#### Scenario: El nombre que no coincide no autoriza
+
+- **GIVEN** la confirmación de un target de base
+- **WHEN** el nombre tecleado no coincide con `target_name`
+- **THEN** la acción de confirmar SHALL quedar deshabilitada
+
+### Requirement: El panel muestra el histórico de restauraciones
+
+SHALL existir una pantalla de **Restauraciones**, accesible desde la navegación principal, que liste las ejecuciones de `GET /api/v1/restorations` con su estado, target, snapshot y fechas, con filtro por estado y paginación. El estado SHALL reflejar el desenlace real —no un «lanzada» optimista— y las que están en curso o pendientes SHALL poder refrescarse sin recargar la página.
+
+El porqué: la restauración deja de ser efímera; si el registro existe pero el panel no lo muestra, el operador no puede responder «¿se restauró?» ni «¿por qué falló?» sin mirar la base.
+
+#### Scenario: El histórico lista las restauraciones
+
+- **GIVEN** restauraciones persistidas
+- **WHEN** se abre la pantalla de Restauraciones
+- **THEN** SHALL listarlas con su estado, target y fechas
+- **AND** SHALL poder filtrarse por estado
+
+#### Scenario: Una restauración fallida muestra su motivo
+
+- **GIVEN** una restauración en estado `failed` con `error_message`
+- **WHEN** se mira en el histórico
+- **THEN** SHALL mostrarse su motivo

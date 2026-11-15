@@ -14,6 +14,12 @@
 //! el sentido del «y métricas» del §5: no hay endpoint de agregados, y quien sume los totales
 //! es el panel.
 //!
+//! Y cada fila sale además con **`job_name`** (anulable), el nombre de su tarea: el histórico es la
+//! pantalla que existe para saber qué se copió y cuándo, y sin el nombre dos tareas sobre el mismo
+//! target se leen igual. Lo resuelve este módulo con una lectura por lotes de más —el vínculo
+//! `job_executions.job_id → backup_jobs.name` es de la base, no de la fila— y su ausencia se
+//! publica como `null`, que es un nombre desconocido y no un error: la fila se sigue listando.
+//!
 //! El manejador está **implementado**: valida lo que llega por el cable, se lo pasa a la capa
 //! de acceso como un filtro ya resuelto y publica las filas con el formato del cable —el mismo
 //! de los otros tres recursos—.
@@ -148,6 +154,13 @@ fn estados_admitidos() -> String {
 /// texto que el `CHECK` admite y las dos fechas como cadena RFC3339. `error_message` sale tal
 /// cual —el panel necesita saber por qué falló una copia— y quien la escribe es el motor, que
 /// no debe volcar credenciales ahí.
+///
+/// `job_name` es el campo que **no** sale de la tabla: es el nombre de la tarea de esa ejecución,
+/// resuelto por el vínculo con `backup_jobs`, y es anulable porque la tarea puede no tener nombre o
+/// la ejecución puede no casar con ninguna —una fila huérfana, que la clave foránea no deja escribir
+/// pero que un histórico restaurado a mano sí puede traer—. Viaja **siempre**, con `null`: una vista
+/// que omitiera la clave dejaría al panel sin poder distinguir «sin nombre» de «el servidor no lo
+/// dice».
 #[derive(Debug, Serialize)]
 pub struct EjecucionDelCable {
     /// Identificador de la ejecución.
@@ -168,15 +181,21 @@ pub struct EjecucionDelCable {
     pub started_at: String,
     /// Cuándo terminó, en RFC3339; `null` si sigue en curso.
     pub finished_at: Option<String>,
+    /// Nombre de la tarea de esta ejecución; `null` si no tiene o no casa.
+    pub job_name: Option<String>,
 }
 
 impl EjecucionDelCable {
-    /// Convierte una fila en su vista del cable.
+    /// Convierte una fila en su vista del cable, con el nombre de su tarea.
     ///
     /// Las fechas son las que la base guardó: la capa de acceso las normaliza a UTC **al
     /// enlazarlas**, así que el formateador no tiene que corregir nada —es el mismo reparto que
     /// en los otros tres recursos, y por eso el formato del cable es idéntico en los cuatro—.
-    fn desde(fila: &Ejecucion) -> Result<Self, AppError> {
+    ///
+    /// El nombre entra ya resuelto y como `Option`: no lo lee de la fila porque **no está en ella**
+    /// —vive en `backup_jobs`—, y esta función no consulta la base. Quien llama resuelve el lote y
+    /// pasa `None` cuando su tarea no está en el mapa, que es lo que significa «sin nombre».
+    fn desde(fila: &Ejecucion, job_name: Option<String>) -> Result<Self, AppError> {
         Ok(Self {
             id: fila.id.hyphenated().to_string(),
             job_id: fila.job_id.hyphenated().to_string(),
@@ -187,6 +206,7 @@ impl EjecucionDelCable {
             error_message: fila.error_message.clone(),
             started_at: formatear(fila.started_at)?,
             finished_at: fila.finished_at.map(formatear).transpose()?,
+            job_name,
         })
     }
 }
@@ -202,6 +222,20 @@ fn formatear(fecha: time::OffsetDateTime) -> Result<String, AppError> {
 ///
 /// Una tabla sin filas es un listado de cero elementos, **no** un recurso ausente: contesta
 /// `200` con un array vacío, como los otros tres recursos.
+///
+/// # El nombre de la tarea de cada fila
+///
+/// El vínculo `job_executions.job_id → backup_jobs.name` no lo puede resolver la consulta del
+/// histórico sin arrastrar un `JOIN` a cada fila, así que se resuelve **después** y con **una sola**
+/// lectura por lotes para toda la página —hasta 200 filas, una consulta por fila sería pagar 200
+/// idas y vueltas para pintar una pantalla—. El orden de las dos lecturas es deliberado: primero las
+/// filas con sus filtros y su ventana, y solo con los identificadores que han salido se piden los
+/// nombres. Los filtros, la ventana, el orden y las métricas **no** se tocan: el nombre es un dato
+/// añadido a la vista y no un criterio de la consulta.
+///
+/// La fusión es por el identificador de la tarea y el resultado de no encontrarlo es `null`, no una
+/// fila menos: una tarea sin nombre —o una ejecución que no case con ninguna— tiene que seguir
+/// listándose con su hueco de nombre, que es lo que el contrato publica.
 pub async fn listado(
     State(estado): State<AppState>,
     Query(filtros): Query<FiltrosDelCable>,
@@ -210,9 +244,13 @@ pub async fn listado(
 
     let filas = estado.db.ejecuciones.listar_filtrado(&filtro).await?;
 
+    let tareas: Vec<Uuid> = filas.iter().map(|fila| fila.job_id).collect();
+
+    let nombres = estado.db.tareas.nombres(&tareas).await?;
+
     let vistas: Vec<EjecucionDelCable> = filas
         .iter()
-        .map(EjecucionDelCable::desde)
+        .map(|fila| EjecucionDelCable::desde(fila, nombres.get(&fila.job_id).cloned().flatten()))
         .collect::<Result<_, _>>()?;
 
     Ok(ApiResponse::new(
@@ -294,6 +332,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 6,
                 enabled: true,
+                name: None,
             })
             .await
             .expect("la tarea de prueba se da de alta");
@@ -815,6 +854,94 @@ mod tests {
                 .as_str()
                 .is_some_and(|mensaje| !mensaje.is_empty()),
             "el rechazo trae un mensaje: {texto}"
+        );
+    }
+
+    /// 1.5 — Cada fila del listado publica `job_name`: el nombre de su tarea, o `null`.
+    ///
+    /// Cubre `api-resources`, escenario «El listado sin filtros devuelve las ejecuciones con sus
+    /// métricas», en la parte que añade este change: la fila lleva además **el nombre de la tarea**,
+    /// resuelto por el vínculo `job_executions.job_id → backup_jobs.name`. Se mide **la clave**,
+    /// aunque llegue a `null` —una vista que omitiera `job_name` cuando es nulo dejaría al panel sin
+    /// poder distinguir «esta tarea no tiene nombre» de «el servidor no lo dice»—, y luego el valor,
+    /// una vez que la tarea tiene nombre.
+    ///
+    /// El nombre se escribe con SQL directo porque la tarea se siembra por la capa de acceso —la
+    /// única forma de tener la cadena entera, porque las ejecuciones las crea una copia que corre— y
+    /// lo que esta prueba mide es el **listado**, no el alta de tareas, que tiene las suyas.
+    #[tokio::test]
+    async fn el_listado_publica_el_nombre_de_la_tarea_o_null() {
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        sembrar_ejecucion(
+            &estado,
+            tarea,
+            Estado::Success,
+            datetime!(2026-10-25 03:00:00 UTC),
+            1000,
+        )
+        .await;
+
+        let router = api_router(estado.clone());
+
+        // La tarea todavía no tiene nombre: la fila trae la **clave** `job_name` a `null`.
+        let respuesta = get(router.clone(), "/api/v1/executions").await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado contesta {status}: {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]
+            .as_array()
+            .expect("el listado tiene que llegar como un array");
+
+        assert_eq!(filas.len(), 1, "la fila sembrada tiene que salir: {cuerpo}");
+
+        assert!(
+            filas[0].get("job_name").is_some(),
+            "cada fila tiene que traer la **clave** `job_name`, aunque la tarea no tenga nombre: \
+             {cuerpo}"
+        );
+        assert!(
+            filas[0]["job_name"].is_null(),
+            "una tarea sin nombre publica `job_name` a `null`, no una cadena vacía: {cuerpo}"
+        );
+
+        // Y con nombre en la tarea, la fila lo publica: es lo que distingue el `null` de arriba de
+        // un hueco, y lo que resuelve el vínculo con `backup_jobs`.
+        sqlx::query("UPDATE backup_jobs SET name = ?1 WHERE id = ?2")
+            .bind("copia nocturna")
+            .bind(tarea.hyphenated().to_string())
+            .execute(&estado.db.pool)
+            .await
+            .expect("poner el nombre de la tarea es preparación de la prueba y no puede fallar");
+
+        let respuesta = get(router, "/api/v1/executions").await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado contesta {status}: {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]
+            .as_array()
+            .expect("el listado tiene que llegar como un array");
+
+        assert_eq!(filas.len(), 1, "la fila sembrada tiene que salir: {cuerpo}");
+
+        assert_eq!(
+            filas[0]["job_name"], "copia nocturna",
+            "la fila tiene que publicar el nombre de su tarea: {cuerpo}"
         );
     }
 }

@@ -52,6 +52,18 @@ pub enum AppError {
     #[error("{0}")]
     UnprocessableEntity(String),
 
+    /// A la petición le falta una condición previa que quien pregunta sí puede satisfacer: es un
+    /// `428 Precondition Required`.
+    ///
+    /// Nace con la restauración de un target de base de datos: la operación pisa datos vivos, así
+    /// que quien la pide tiene que **confirmar** la sobrescritura y, sin esa confirmación, no se
+    /// lanza nada. No es un `400` —la petición no trae nada mal escrito—, ni un `409` —no choca con
+    /// lo que ya está pasando—, ni un `422` —la operación **sí** se puede cumplir—: lo que falta es
+    /// un acto explícito de quien llama, y ése es justo el sentido de un `Precondition Required`. El
+    /// motivo se explica —como en el `400`— para que el panel sepa qué condición pedir.
+    #[error("{0}")]
+    PreconditionRequired(String),
+
     /// La petición contradice el estado actual del recurso: es un `409`.
     ///
     /// Existe desde que hay motor de copias, y nace de un caso que ningún recurso tenía: encolar
@@ -121,6 +133,13 @@ impl IntoResponse for AppError {
             Self::Conflict(motivo) => {
                 tracing::debug!(motivo = %motivo, "petición rechazada");
                 (StatusCode::CONFLICT, motivo)
+            }
+            // El `428` es también un rechazo de la petición, y su motivo —«confirma la
+            // sobrescritura»— es lo único que permite al panel saber qué condición pedir. Se traza a
+            // `debug` igual que el `400`.
+            Self::PreconditionRequired(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición rechazada");
+                (StatusCode::PRECONDITION_REQUIRED, motivo)
             }
             // El `422` es también un rechazo de la petición, y su motivo —«ese target todavía no
             // se puede restaurar»— es lo que permite al panel distinguirlo de un recurso ausente.
@@ -521,6 +540,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
+                name: None,
             })
             .await
             .expect_err(
@@ -725,6 +745,7 @@ mod tests {
                     keep_weekly: 4,
                     keep_monthly: 12,
                     enabled: true,
+                    name: None,
                 })
                 .await
                 .expect_err(

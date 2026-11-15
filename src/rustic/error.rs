@@ -244,4 +244,25 @@ pub enum Error {
         /// Lo que dijo la biblioteca, con su contexto ya interpolado: ver la nota de la variante.
         motivo: String,
     },
+
+    /// La instantánea no trae exactamente un volcado que devolver.
+    ///
+    /// Una restauración de base espera **un único nodo de fichero** —el volcado que la copia
+    /// archivó—, y ni cero ni dos sirven: con cero no hay nada que entregar al contenedor, y con
+    /// dos no se puede elegir uno sin adivinar cuál. Es un fallo **propio** y no una
+    /// [`RestauracionFallida`](Self::RestauracionFallida) porque no viene de la biblioteca sino de
+    /// una comprobación de este módulo, y el diagnóstico es otro: mirar qué guardó la copia, no el
+    /// motivo de un fallo de la lectura. Se nombra la instantánea y se cuenta lo que hay.
+    #[error(
+        "la instantánea `{instantanea}` de `{destino}` no trae un único volcado: tiene \
+         {encontrados} nodos de fichero, y una restauración de base espera uno solo"
+    )]
+    VolcadoQueNoEsUno {
+        /// El nombre del repositorio del que se restauraba.
+        destino: String,
+        /// La instantánea que se intentaba restaurar, en hex completo.
+        instantanea: String,
+        /// Cuántos nodos de fichero tiene la instantánea.
+        encontrados: usize,
+    },
 }

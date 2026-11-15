@@ -1,6 +1,7 @@
 //! Las entidades del §3 y la capa de acceso que las lee y las escribe.
 //!
-//! Cada tabla tiene su módulo —`repository`, `target`, `job` y `execution`— con tres
+//! Cada tabla tiene su módulo —`repository`, `target`, `job`, `execution` y `restauracion`—
+//! con tres
 //! piezas: la **entidad** (una fila), el **payload de alta** (lo que quien llama
 //! informa) y la **capa de acceso** (las consultas). Los tipos se nombran en español y
 //! los campos conservan el nombre de la columna en inglés, porque el §3 es el contrato
@@ -27,6 +28,7 @@
 pub mod execution;
 pub mod job;
 pub mod repository;
+pub mod restauracion;
 pub mod target;
 
 pub use execution::{
@@ -34,4 +36,8 @@ pub use execution::{
 };
 pub use job::{AltaDeTarea, Tarea, Tareas};
 pub use repository::{AltaDeRepositorio, Repositorio, Repositorios};
+pub use restauracion::{
+    AltaDeRestauracion, FiltroDeRestauraciones, PaginaDeRestauraciones, Restauracion,
+    RestauracionListada, Restauraciones,
+};
 pub use target::{AltaDeTarget, Target, Targets, TipoDeTarget};

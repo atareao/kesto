@@ -8,6 +8,7 @@ pub mod health;
 pub mod jobs;
 pub mod repositories;
 pub mod response;
+pub mod restorations;
 pub mod snapshots;
 pub mod targets;
 
@@ -106,6 +107,10 @@ pub fn api_router(state: AppState) -> Router {
                 // respuesta lleva la envoltura, así que lo único que tiene que llegarle es el
                 // *gate* de sesión, que es de esta mitad. No entra en la lista blanca.
                 .merge(snapshots::router())
+                // El histórico de restauraciones, como los cuatro recursos y no como el stream:
+                // su respuesta lleva la envoltura, así que lo único que tiene que llegarle es el
+                // *gate* de sesión, que es de esta mitad. No entra en la lista blanca.
+                .merge(restorations::router())
                 // El stream de eventos cuelga de **esta** mitad y no de una tercera: en este
                 // repositorio la envoltura no es una capa del router sino lo que produce un
                 // manejador, así que el stream se salta la envoltura por lo que devuelve su
@@ -131,6 +136,10 @@ pub fn api_router(state: AppState) -> Router {
             // abierto como el resto —es lo que el modo de desarrollo significa— y el panel puede
             // explorar un repositorio sin un proveedor de identidad.
             .merge(snapshots::router())
+            // Y el histórico de restauraciones, igual: en este modo no hay ninguna capa que montar,
+            // así que queda abierto como el resto y el panel puede consultar qué se restauró sin un
+            // proveedor de identidad.
+            .merge(restorations::router())
             // Y el stream, como en la mitad protegida: en este modo no hay ninguna capa que montar,
             // así que queda abierto igual que el resto —es lo que el modo de desarrollo significa—
             // y el panel puede seguirlo sin un proveedor de identidad.
@@ -325,10 +334,12 @@ pub(crate) fn del_motor(error: ErrorDelMotor) -> AppError {
 
         // 500 — un fallo del servidor: la base no atendió el encolado, el hilo de trabajo se cayó, o
         // el motor se montó fuera de un runtime (que no es un desenlace de una petición, pero el
-        // `match` es exhaustivo a propósito).
+        // `match` es exhaustivo a propósito). La restauración del contenedor entra aquí por la misma
+        // razón: corre en segundo plano y su motivo solo va al registro y a la fila del §3.
         ErrorDelMotor::Base { .. }
         | ErrorDelMotor::TrabajoInterrumpido { .. }
-        | ErrorDelMotor::SinRuntime => AppError::Other(motivo),
+        | ErrorDelMotor::SinRuntime
+        | ErrorDelMotor::Restauracion { .. } => AppError::Other(motivo),
 
         // 502 — un servicio de fuera no contesta: el motor de contenedores —desenlace de
         // `Motor::comprobar`, que el arranque usa para avisar—, o el repositorio. Ver arriba por qué

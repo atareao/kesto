@@ -104,7 +104,7 @@ WAL SHALL convivir con ficheros `-wal` y `-shm` **junto a la base**, así que **
 
 ### Requirement: Las cuatro tablas del §3 se reproducen exactas, con sus `CHECK`, sus cascadas y los índices añadidos
 
-Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`.
+Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`. `backup_jobs` SHALL incluir además la columna `name` (`TEXT`, anulable), declarada aquí **como un añadido al SRS** —el §3 no la tiene en su versión original—: un UUID no identifica la tarea al operador, y el nombre es lo que hace legible el histórico y los snapshots.
 
 Las restricciones SHALL estar **en la base** y no solo en Rust: un `INSERT` hecho con `sqlite3` a mano tiene que chocar con el mismo `CHECK` que choca la aplicación. Es la única forma de que el enumerado sea una garantía y no una convención.
 
@@ -156,6 +156,12 @@ Los índices SHALL nombrarse `idx_{tabla}_{columna}`.
 - **WHEN** se planifica el `JOIN` de `job_executions` con `backup_jobs` filtrando por `repository_id`
 - **THEN** el plan SHALL apoyarse en los índices de clave foránea
 - **AND** `job_executions` NO SHALL tener columna `repository_id`
+
+#### Scenario: La columna `name` de `backup_jobs` existe y es anulable
+- **GIVEN** una base con las migraciones aplicadas
+- **WHEN** se consulta la tabla `backup_jobs`
+- **THEN** SHALL existir la columna `name` de tipo `TEXT`
+- **AND** SHALL admitir `NULL` en una fila insertada con SQL directo `INSERT ... (id, target_id, repository_id, cron_expression) VALUES (...)` sin especificarla
 
 ### Requirement: Los identificadores son UUIDv4 en `TEXT` y las fechas son UTC
 
@@ -356,3 +362,32 @@ El porqué: la tabla del §3 fue declarada con el enumerado cerrado y la feature
 - **WHEN** se consultan los índices de `backup_targets` y de las tablas con FK a ella
 - **THEN** los índices declarados SHALL seguir existiendo
 - **AND** las claves foráneas que apuntan a `backup_targets` NO SHALL quedar rotas
+
+### Requirement: El esquema registra las ejecuciones de restauración
+
+La migración `0006_restauraciones.sql` SHALL crear la tabla `restore_executions` con: `id` (`TEXT`, clave primaria, UUID en su forma canónica con guiones), `snapshot_id` (`TEXT`, no nulo), `target_id` (`TEXT`, anulable, clave foránea a `backup_targets(id)` con `ON DELETE CASCADE`), `status` (`TEXT`, no nulo, `CHECK (status IN ('pending','running','success','failed'))`, por defecto `'pending'`), `error_message` (`TEXT`, anulable), `started_at` (`TEXT`, no nulo) y `finished_at` (`TEXT`, anulable). SHALL declarar además los índices `idx_restore_executions_status_started_at`, para el listado por estado y fecha, y `idx_restore_executions_target_id`, columna hija de la clave foránea y apoyo del filtro `target_id` del listado, por coherencia con el resto del esquema.
+
+La tabla SHALL declararse **como un añadido al SRS** —el §3 modela la copia, no la restauración—, y la migración SHALL seguir la forma de nombre con prefijo numérico entero que exige `sqlx::migrate!()`. La capa de acceso SHALL escribir y leer los identificadores en su forma canónica con guiones, como en el resto del esquema.
+
+`target_id` SHALL ser anulable y la clave foránea SHALL ser `ON DELETE CASCADE`, de modo que borrar un target borre su histórico de restauraciones, coherente con el resto del esquema.
+
+El porqué: sin registro, el `execution_id` que hoy devuelve el `200` no dice nada después —no se sabe si la restauración acabó, ni cuándo, ni sobre qué—, y el operador no tiene histórico. La ejecución de restauración merece la misma trazabilidad que la de copia.
+
+#### Scenario: La tabla existe tras migrar
+
+- **GIVEN** una base recién migrada
+- **WHEN** se consultan las tablas y sus índices
+- **THEN** SHALL existir `restore_executions` con sus columnas, su `CHECK` de `status` y su clave foránea a `backup_targets`
+- **AND** SHALL existir `idx_restore_executions_status_started_at` e `idx_restore_executions_target_id`
+
+#### Scenario: El estado no admite un valor fuera del enumerado
+
+- **GIVEN** la tabla `restore_executions`
+- **WHEN** se intenta escribir un `status` distinto de `pending`, `running`, `success` o `failed`
+- **THEN** la escritura SHALL rechazarse por el `CHECK`
+
+#### Scenario: Borrar el target borra su histórico de restauraciones
+
+- **GIVEN** una restauración ligada a un target
+- **WHEN** se borra ese target
+- **THEN** su fila en `restore_executions` NO SHALL existir

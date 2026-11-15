@@ -9,6 +9,7 @@ type Usuario = ReturnType<typeof userEvent.setup>
 
 const J1 = tarea({ id: 'j1', target_id: 't1', repository_id: 'r1' })
 const J2 = tarea({ id: 'j2', target_id: 't2', repository_id: 'r1' })
+
 const TARGETS = [target({ id: 't1', name: 'web' }), target({ id: 't2', name: 'api' })]
 const REPOSITORIOS = [repositorio({ id: 'r1', name: 's3' })]
 
@@ -137,5 +138,76 @@ describe('pantalla de Tareas', () => {
 
     const alta = fetch.a('/api/v1/jobs').find((llamada) => llamada.method === 'POST')
     expect(alta?.cuerpo).toMatchObject({ target_id: 't2', repository_id: 'r1' })
+  })
+
+  it('la tabla muestra una columna «Nombre» con el nombre, y vacía cuando no lo tiene', async () => {
+    const nombrada = tarea({
+      id: 'j1',
+      target_id: 't1',
+      repository_id: 'r1',
+      name: 'copia nocturna',
+    })
+    const anonima = tarea({ id: 'j2', target_id: 't2', repository_id: 'r1' })
+
+    instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'GET') {
+        return { status: 200, data: [nombrada, anonima] }
+      }
+      if (ruta === '/api/v1/targets') return { status: 200, data: TARGETS }
+      if (ruta === '/api/v1/repositories') return { status: 200, data: REPOSITORIOS }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    const tabla = await screen.findByRole('table', { name: 'Tareas programadas' })
+
+    // La tabla se monta con su `loading` desde el primer pintado, así que «hay
+    // tabla» no significa «hay filas»: hay que esperar a la fila del target.
+    await screen.findByText('web')
+
+    const encabezados = within(tabla)
+      .getAllByRole('columnheader')
+      .map((celda) => (celda.textContent ?? '').trim())
+    const columna = encabezados.indexOf('Nombre')
+    expect(columna).toBeGreaterThanOrEqual(0)
+
+    /** Las celdas de la fila de la tarea cuyo target se llama `texto`. */
+    const celdasDe = (texto: string) => {
+      const fila = within(tabla).getByText(texto).closest('tr')
+      if (fila === null) throw new Error(`no se encontró la fila de «${texto}»`)
+      return within(fila).getAllByRole('cell')
+    }
+
+    // La tarea con nombre lo enseña en su columna...
+    expect(celdasDe('web')[columna]?.textContent).toBe('copia nocturna')
+    // ...y la que no lo tiene deja la columna vacía, no el nombre del target.
+    expect(celdasDe('api')[columna]?.textContent?.trim() ?? '').toBe('')
+  })
+
+  it('titula «Target» la columna del nombre del target, y no «Tarea»', async () => {
+    instalarFetchFalso(({ ruta, method }) => {
+      if (ruta === '/api/v1/jobs' && method === 'GET') return { status: 200, data: [J1] }
+      if (ruta === '/api/v1/targets') return { status: 200, data: TARGETS }
+      if (ruta === '/api/v1/repositories') return { status: 200, data: REPOSITORIOS }
+      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    })
+
+    montar()
+
+    const tabla = await screen.findByRole('table', { name: 'Tareas programadas' })
+
+    // Igual que en el test de «Nombre»: hay tabla desde el primer pintado, pero
+    // las cabeceras se leen con los datos ya cargados.
+    await screen.findByText('web')
+
+    const encabezados = within(tabla)
+      .getAllByRole('columnheader')
+      .map((celda) => (celda.textContent ?? '').trim())
+
+    // La columna enseña el nombre del target, así que su título es «Target»...
+    expect(encabezados).toContain('Target')
+    // ...y no «Tarea», que es lo que se confunde con el nombre de la tarea.
+    expect(encabezados).not.toContain('Tarea')
   })
 })

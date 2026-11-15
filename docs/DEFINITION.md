@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS backup_jobs (
     keep_monthly INTEGER NOT NULL DEFAULT 12,
     enabled BOOLEAN NOT NULL DEFAULT 1,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    name TEXT,                    -- Nombre legible de la tarea, opcional (añadido por la 0005; NULL si no tiene)
     FOREIGN KEY(target_id) REFERENCES backup_targets(id) ON DELETE CASCADE,
     FOREIGN KEY(repository_id) REFERENCES repositories(id) ON DELETE CASCADE
 );

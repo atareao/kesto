@@ -787,9 +787,9 @@ mod tests {
         let (_directorio, pool, clave) = base_con_clave().await;
 
         let repositorios = Repositorios::nuevo(pool.clone(), clave.clone());
-        let targets = Targets::nuevo(pool.clone(), clave);
+        let targets = Targets::nuevo(pool.clone(), clave.clone());
         let tareas = Tareas::nuevo(pool.clone());
-        let ejecuciones = Ejecuciones::nuevo(pool.clone());
+        let ejecuciones = Ejecuciones::nuevo(pool.clone(), clave);
 
         let repositorio = repositorios
             .alta(alta("repo-1-33"))
@@ -1012,6 +1012,7 @@ mod tests {
             keep_weekly: 4,
             keep_monthly: 12,
             enabled: true,
+            name: None,
         }
     }
 

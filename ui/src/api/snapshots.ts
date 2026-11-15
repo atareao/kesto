@@ -22,6 +22,13 @@ export function listarSnapshots(
 export interface PeticionDeRestauracion {
   repositoryId: string
   snapshotId: string
+  /**
+   * Confirma la sobrescritura de un target de **base de datos**. Solo se envía
+   * —y solo cuando es `true`— para un target de base: la API contesta `428` si
+   * falta. Para un `directory` se **omite** en vez de mandarse a `false`, porque
+   * no hay nada que sobrescribir y el cuerpo no debe llevar ruido.
+   */
+  sobrescribir?: boolean
   /** Permite cancelar la petición si la pantalla se desmonta. */
   signal?: AbortSignal
 }
@@ -33,8 +40,10 @@ export interface PeticionDeRestauracion {
  * El `repository_id` va en el **cuerpo** (el `id` ya está en la ruta): es el
  * repositorio en el que vive la instantánea, y sin él la API no sabe dónde
  * buscarla. Un `409` significa que el snapshot no casa con ninguna ejecución
- * —no hay target de origen— y un `422` que su target no es restaurable en esta
- * versión; los dos llegan con su `message`, que es lo que se enseña.
+ * —no hay target de origen—, un `422` que su target no es restaurable en esta
+ * versión (un `directory` sin `host_path`) y un `428` que el target es de base y
+ * falta la confirmación de sobrescritura; los tres llegan con su `message`, que
+ * es lo que se enseña.
  *
  * La restauración sigue en segundo plano: el avance llega por SSE
  * (`restore_progress`), no por esta respuesta.
@@ -42,11 +51,16 @@ export interface PeticionDeRestauracion {
 export function restaurarSnapshot({
   repositoryId,
   snapshotId,
+  sobrescribir,
   signal,
 }: PeticionDeRestauracion): Promise<Restauracion> {
   return peticion<Restauracion>(`/snapshots/${snapshotId}/restore`, {
     method: 'POST',
-    cuerpo: { repository_id: repositoryId },
+    // La clave solo viaja cuando se confirma: un `directory` no la manda.
+    cuerpo: {
+      repository_id: repositoryId,
+      ...(sobrescribir === true ? { sobrescribir: true } : {}),
+    },
     signal,
   })
 }
