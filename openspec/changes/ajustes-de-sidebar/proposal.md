@@ -24,7 +24,8 @@ Tres detalles de presentación del layout estorban al operador: al plegar la bar
 
 ## Impacto
 
-- Frontend: `ui/src/components/Layout/Layout.tsx`, `ui/src/estilos.css`, `ui/src/components/Layout/Layout.test.tsx`; comentario menor en `ui/src/components/ConmutadorDeTema/ConmutadorDeTema.tsx`.
+- Frontend: `ui/src/components/Layout/Layout.tsx`, `ui/src/estilos.css`, `ui/src/components/Layout/Layout.test.tsx`; `ui/src/components/ConmutadorDeTema/ConmutadorDeTema.tsx` (se retira la prop `className`, ya sin consumidores).
+- Tests: el barrido con Tab de `Layout.test.tsx` se acota con el ciclo real de tabulación en vez de un límite de pasos a ojo, y el ancho de ventana se guarda y se restaura por prueba.
 - Sin cambios de esquema, API ni backend.
 
 ## Referencias

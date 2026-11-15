@@ -18,18 +18,20 @@ import iconoClaro from '../../assets/kesto-icon.png'
 import iconoOscuro from '../../assets/kesto-icon-dark.png'
 
 /**
- * El armazón del panel: menú lateral con las pantallas del §6, cabecera con el
- * conmutador de tema y el botón de plegado, y el `main` donde se pinta la ruta
- * activa.
+ * El armazón del panel: menú lateral con las pantallas del §6, pie de la barra
+ * lateral con el conmutador de tema y el botón de plegado, y el `main` donde se
+ * pinta la ruta activa.
  *
  * Accesibilidad (§3.5): la navegación es un `nav` con nombre accesible, el
  * contenido vive en un `main` enfocable (`tabIndex={-1}`) al que apunta el
  * enlace de salto, y el botón de plegado anuncia su estado con `aria-expanded`.
  * El foco visible lo pone `estilos.css` con `:focus-visible`.
  *
- * Tema (§ identidad visual y tema): la cabecera y el lateral toman sus colores
- * del tema activo (`theme.useToken()`), sin ningún color fijado a mano, y el
- * logo del lateral cambia de variante según el modo.
+ * Tema (§ identidad visual y tema): el lateral y su pie toman sus colores del
+ * tema activo (`theme.useToken()`), sin ningún color fijado a mano, y el logo
+ * del lateral cambia de variante según el modo. La marca (logo + nombre) vive
+ * sobre el menú; con la barra plegada solo queda el logo, porque el nombre se
+ * deja de renderizar, no se esconde por CSS.
  */
 
 interface EntradaDelMenu {
@@ -98,9 +100,11 @@ export function Layout() {
       >
         <div className="marca-del-panel">
           <img className="logo-del-panel" data-testid="logo-del-panel" src={logoDelPanel} alt="" />
-          <Typography.Text strong style={{ color: token.colorText }}>
-            Kesto
-          </Typography.Text>
+          {!plegado ? (
+            <Typography.Text strong style={{ color: token.colorText }}>
+              Kesto
+            </Typography.Text>
+          ) : null}
         </div>
         <nav id="menu-principal" aria-label="Principal">
           <Menu
@@ -111,16 +115,9 @@ export function Layout() {
             items={entradas}
           />
         </nav>
-      </LayoutDeAntd.Sider>
-
-      <LayoutDeAntd>
-        <LayoutDeAntd.Header
-          className="cabecera-del-panel"
-          style={{
-            background: token.colorBgContainer,
-            borderBottom: `1px solid ${token.colorSplit}`,
-          }}
-        >
+        {/* Los mandos del chasis cierran la barra lateral, pegados al fondo. */}
+        <div className="pie-del-panel">
+          <ConmutadorDeTema />
           <Button
             type="text"
             aria-label={plegado ? 'Desplegar el menú' : 'Plegar el menú'}
@@ -129,8 +126,10 @@ export function Layout() {
             onClick={() => setPlegado((previo) => !previo)}
             icon={plegado ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
           />
-          <ConmutadorDeTema className="conmutador-de-tema" />
-        </LayoutDeAntd.Header>
+        </div>
+      </LayoutDeAntd.Sider>
+
+      <LayoutDeAntd>
         {/* `Layout.Content` ya se pinta como `<main>`: el id y el foco van en él. */}
         <LayoutDeAntd.Content id="contenido" tabIndex={-1} className="contenido-del-panel">
           <Outlet />

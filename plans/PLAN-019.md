@@ -38,7 +38,8 @@ El resultado esperado: los dos controles al pie de la barra lateral —junto al 
 - `ui/src/components/Layout/Layout.tsx`: renderizado condicional de la marca; pie con los dos controles; retirada de la cabecera.
 - `ui/src/estilos.css`: regla del pie, retirada de `.cabecera-del-panel` y del `margin-inline-start: auto`.
 - `ui/src/components/Layout/Layout.test.tsx`: reescribir las aserciones que situaban el switch en la cabecera; añadir el caso de la marca oculta al plegar.
-- Comentario menor en `ConmutadorDeTema.tsx` (la prop `className` ya no se usa para la cabecera).
+- Comentario menor en `ConmutadorDeTema.tsx`: retirar la prop `className`, que ya no pasa nadie (la colocación la da `.pie-del-panel`); el componente queda sin props.
+- `Layout.test.tsx`: el barrido con Tab se acota con el ciclo real de tabulación (no con un número de pasos a ojo) y el ancho de ventana se guarda y se restaura por prueba.
 
 ### Fuera de alcance
 
