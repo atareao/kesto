@@ -70,6 +70,21 @@ function cuerpoDeTarea(valores: ValoresDeTarea): AltaJob {
   return { ...valores, name: valores.name.trim() }
 }
 
+/**
+ * El campo que nombra un rechazo de la API, o `null` si no cita ninguno.
+ *
+ * Los mensajes del backend entrecomillan el campo con backticks —«el campo
+ * `name` es obligatorio», «el campo `cron_expression` no es una expresión cron
+ * válida»—, así que se extrae **lo que va entre backticks** y se compara por el
+ * nombre **completo**. Buscar la subcadena desnuda «name» casaría con cualquier
+ * mensaje futuro que mencionara la palabra por otro motivo —«el `repository_id`
+ * no apunta a ningún repositorio con ese name»— y señalaría el campo equivocado.
+ */
+function campoCitado(mensaje: string): string | null {
+  const cita = /`([^`]+)`/.exec(mensaje)
+  return cita?.[1] ?? null
+}
+
 interface PropsDelFormularioDeTarea {
   tarea: Job | null
   targets: readonly Target[]
@@ -235,7 +250,7 @@ export function ModalDeTarea({
     } catch (error) {
       if (error instanceof ErrorDeApi) {
         // Los rechazos se reparten **por el campo que nombran**: el `409` del
-        // nombre duplicado y el `400` que nombra `name` son del campo «Nombre»
+        // nombre duplicado y el `400` que cita `name` son del campo «Nombre»
         // —es su nombre el que hay que corregir—, y el `400` del cron sigue
         // señalándose en la expresión cron. Señalar el nombre sobre el cron
         // manda a corregir el sitio equivocado.
@@ -245,12 +260,17 @@ export function ModalDeTarea({
         }
 
         if (error.status === 400) {
-          if (error.message.includes('cron_expression')) {
+          // El campo se lee **entre backticks** y se compara por el nombre
+          // completo, no por una subcadena suelta que casaría con cualquier
+          // mensaje que mencionara la palabra de pasada.
+          const campo = campoCitado(error.message)
+
+          if (campo === 'cron_expression') {
             form.setFields([{ name: 'cron_expression', errors: [error.message] }])
             return
           }
 
-          if (error.message.includes('name')) {
+          if (campo === 'name') {
             form.setFields([{ name: 'name', errors: [error.message] }])
             return
           }

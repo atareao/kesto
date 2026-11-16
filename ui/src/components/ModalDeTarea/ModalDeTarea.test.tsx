@@ -150,11 +150,16 @@ describe('ModalDeTarea', () => {
     expect(fetch.llamadas).toHaveLength(0)
   })
 
-  it('un 400 del servidor se pinta junto a `cron_expression` y no cierra el modal', async () => {
+  it('un 400 que cita `cron_expression` se pinta junto a ese campo y no cierra el modal', async () => {
     const usuario = userEvent.setup()
     instalarFetchFalso(({ ruta, method }) =>
       ruta === '/api/v1/jobs' && method === 'POST'
-        ? { status: 400, message: 'cron_expression: la expresión no es válida' }
+        ? {
+            status: 400,
+            // El mensaje real del backend, que cita el campo entre backticks.
+            message:
+              'el campo `cron_expression` no es una expresión cron válida: formato no válido',
+          }
         : (() => {
             throw new Error(`ruta inesperada: ${method} ${ruta}`)
           })(),
@@ -168,13 +173,46 @@ describe('ModalDeTarea', () => {
     await elegir(usuario, 'Repositorio', 's3')
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
 
-    expect(await screen.findByText(/la expresión no es válida/i)).toBeInTheDocument()
+    expect(await screen.findByText(/no es una expresión cron válida/i)).toBeInTheDocument()
     // El rechazo del cron se señala en el cron, no en el nombre.
     const itemNombre = screen.getByRole('textbox', { name: 'Nombre' }).closest('.ant-form-item')
-    expect(within(itemNombre as HTMLElement).queryByText(/no es válida/i)).not.toBeInTheDocument()
+    expect(
+      within(itemNombre as HTMLElement).queryByText(/no es una expresión cron válida/i),
+    ).not.toBeInTheDocument()
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     expect(onCerrar).not.toHaveBeenCalled()
     expect(onGuardado).not.toHaveBeenCalled()
+  })
+
+  it('un 400 que solo menciona «name» de pasada no se señala como el campo «Nombre»', async () => {
+    const usuario = userEvent.setup()
+    // El mensaje menciona la palabra «name», pero el campo que cita —el que va
+    // entre backticks— es otro: no puede repartirse al campo «Nombre».
+    const mensaje = 'el campo `repository_id` no apunta a ningún repositorio con ese name'
+    instalarFetchFalso(({ ruta, method }) =>
+      ruta === '/api/v1/jobs' && method === 'POST'
+        ? { status: 400, message: mensaje }
+        : (() => {
+            throw new Error(`ruta inesperada: ${method} ${ruta}`)
+          })(),
+    )
+
+    const { onGuardado } = montar()
+
+    await screen.findByRole('dialog')
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    // Cae al aviso general del modal, no al campo «Nombre».
+    expect(await screen.findByText(mensaje)).toBeInTheDocument()
+    const itemNombre = screen
+      .getByRole('textbox', { name: 'Nombre' })
+      .closest('.ant-form-item') as HTMLElement
+    expect(within(itemNombre).queryByText(/repository_id/)).not.toBeInTheDocument()
+    expect(onGuardado).not.toHaveBeenCalled()
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
   })
 
   it('un 400 que nombra `name` se señala en el campo «Nombre», no en el cron', async () => {

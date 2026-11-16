@@ -391,6 +391,29 @@ export default function Snapshots() {
    */
   const nombreCoincide = confirmacion !== null && nombreTecleado.trim() === nombreExigido
 
+  /**
+   * Por qué esta confirmación **no** puede salir, o `null` si sí puede. Es el
+   * mismo criterio con el que la fila decide ofrecer su botón
+   * —`limitacionDeRestauracion`—: un target sin tipo conocido o con un tipo que
+   * esta versión no restaura no puede confirmarse. El diálogo no se fía de que la
+   * fila ya lo haya filtrado y lo vuelve a exigir aquí: un cambio futuro en los
+   * tipos restaurables no puede convertirlo en un agujero que mandara
+   * `sobrescribir` sin pedir el nombre de una base.
+   */
+  const motivoDeConfirmacion =
+    confirmacion === null ? null : limitacionDeRestauracion(confirmacion)
+
+  /**
+   * La **única** expresión de «¿se puede confirmar?». El botón del diálogo y el
+   * manejador leen esta misma —no cada uno su copia—, así que no pueden divergir:
+   * el botón no puede ofrecer lo que el manejador rechaza, ni al revés. Exige que
+   * el target sea restaurable y, si es una base, que el nombre tecleado coincida.
+   */
+  const puedeConfirmar =
+    confirmacion !== null &&
+    motivoDeConfirmacion === null &&
+    (!esTargetDeBase(confirmacion.target_type) || nombreCoincide)
+
   /** Abre la confirmación de una fila, con sus campos en blanco. */
   const abrirConfirmacion = (snapshot: Snapshot) => {
     setNombreTecleado('')
@@ -409,18 +432,19 @@ export default function Snapshots() {
    * Confirma la restauración desde el diálogo. Para una **base** exige el nombre
    * tecleado y manda `sobrescribir: true`; para un **directorio** manda la bandera
    * según la casilla de poda —marcada pide la poda, sin marcar solo recibe—. La
-   * guarda del nombre no es adorno —el botón deshabilitado es lo que se ve—, sino
-   * la red que impide que un `Enter` o un cierre tardío manden la confirmación sin
-   * el nombre escrito.
+   * guarda no es adorno —el botón deshabilitado es lo que se ve—, sino la red que
+   * impide que un `Enter` o un cierre tardío manden algo que el botón no habría
+   * dejado pulsar: lee la misma `puedeConfirmar` que el botón, así que no hay dos
+   * verdades que puedan divergir.
    */
   const confirmarRestauracion = () => {
     const snapshot = confirmacion
-    if (snapshot === null) return
+    if (snapshot === null || !puedeConfirmar) return
 
-    const esBase = esTargetDeBase(snapshot.target_type)
-    if (esBase && !nombreCoincide) return
-
-    const sobrescribir = esBase ? true : podar
+    // La bandera se decide aquí y no se deduce del tipo de target: una base pisa
+    // datos vivos y manda siempre `true`; un directorio solo la pide si el
+    // operador marcó la poda.
+    const sobrescribir = esTargetDeBase(snapshot.target_type) ? true : podar
     cerrarConfirmacion()
     void alRestaurar(snapshot, sobrescribir)
   }
@@ -653,26 +677,32 @@ export default function Snapshots() {
         La confirmación de restauración: un solo diálogo para todos los tipos
         restaurables. La rama de base exige teclear el nombre —y por eso vive en
         la página y no en la fila: el estado de lo tecleado es de aquí—, y la de
-        directorio ofrece la casilla que pide la poda del destino.
+        directorio ofrece la casilla que pide la poda del destino. Si el target no
+        fuera restaurable —lo que la fila ya impide, pero el diálogo no da por
+        hecho— no envía nada y lo explica, con la misma guarda que `puedeConfirmar`.
       */}
       <Modal
         open={confirmacion !== null}
         title="¿Restaurar la instantánea?"
         okText="Restaurar"
         cancelText="Cancelar"
-        okButtonProps={{
-          disabled:
-            confirmacion !== null &&
-            esTargetDeBase(confirmacion.target_type) &&
-            !nombreCoincide,
-        }}
+        okButtonProps={{ disabled: !puedeConfirmar }}
         onOk={confirmarRestauracion}
         onCancel={cerrarConfirmacion}
       >
         {confirmacion !== null && (
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-            <Typography.Text>{descripcionDeRestauracion(confirmacion)}</Typography.Text>
-            {esTargetDeBase(confirmacion.target_type) ? (
+            {motivoDeConfirmacion === null && (
+              <Typography.Text>{descripcionDeRestauracion(confirmacion)}</Typography.Text>
+            )}
+            {motivoDeConfirmacion !== null ? (
+              <Alert
+                data-testid="aviso-de-target-no-restaurable"
+                type="error"
+                showIcon
+                message={motivoDeConfirmacion}
+              />
+            ) : esTargetDeBase(confirmacion.target_type) ? (
               <>
                 <Alert
                   data-testid="aviso-de-sobrescritura"
@@ -697,8 +727,13 @@ export default function Snapshots() {
                   showIcon
                   message="Esta restauración retira del destino lo que no está en la instantánea."
                 />
-                <Checkbox checked={podar} onChange={(evento) => setPodar(evento.target.checked)}>
-                  retirar del destino lo que no está en la instantánea (irreversible)
+                <Checkbox
+                  id="poda-del-destino"
+                  aria-label="Retira del destino lo que no está en la instantánea (irreversible)"
+                  checked={podar}
+                  onChange={(evento) => setPodar(evento.target.checked)}
+                >
+                  Retira del destino lo que no está en la instantánea (irreversible).
                 </Checkbox>
               </>
             )}

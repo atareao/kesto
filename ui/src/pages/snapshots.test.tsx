@@ -351,7 +351,7 @@ describe('pantalla de Snapshots — restaurar', () => {
 
   /**
    * La confirmación tipada de un target de base: Antd la pinta como un `Modal`
-   * con rol `dialog` (el `Popconfirm` de un directorio no pasa por aquí).
+   * con rol `dialog`.
    */
   async function abrirConfirmacionDeBase(
     usuario: ReturnType<typeof userEvent.setup>,
@@ -378,7 +378,7 @@ describe('pantalla de Snapshots — restaurar', () => {
 
   /** La casilla con la que un directorio pide la poda del destino. */
   function casillaDePoda(dialogo: HTMLElement) {
-    return within(dialogo).getByRole('checkbox', { name: /retirar del destino/i })
+    return within(dialogo).getByRole('checkbox', { name: /retira del destino/i })
   }
 
   it('Confirmar antes de restaurar: un directorio nombra el target y no lanza hasta confirmarla', async () => {
@@ -640,7 +640,16 @@ describe('pantalla de Snapshots — restaurar', () => {
     // Deshabilitada de verdad: pulsarla no lanza nada ni abre confirmación.
     await usuario.click(otra)
     expect(fetch.a(RUTA)).toHaveLength(1)
-    expect(document.querySelector('.ant-popconfirm')).toBeNull()
+    // El diálogo ya se montó antes en este test, y Antd lo deja en el documento
+    // —con su contenido— mientras cierra su animación: aquí «ya no está» no
+    // vale. Lo observable es que la confirmación que sigue ahí nombra la
+    // instantánea en vuelo y no la segunda: pulsar la fila deshabilitada no
+    // abrió una confirmación para ella. Si el diálogo llegara a desaparecer del
+    // todo, tampoco hay confirmación que valga.
+    const dialogo = screen.queryByRole('dialog')
+    const confirmacionesDeLaSegunda =
+      dialogo === null ? [] : within(dialogo).queryAllByText(OTRO_HEX, { exact: false })
+    expect(confirmacionesDeLaSegunda).toHaveLength(0)
 
     // El desenlace cierra la operación y las filas vuelven a ofrecerse.
     EventSourceFalso.ultima().emitir(
@@ -771,7 +780,9 @@ describe('pantalla de Snapshots — restaurar', () => {
     // Deshabilitada de verdad: pulsarla no lanza la petición ni abre confirmación.
     await usuario.click(boton)
     expect(fetch.a(RUTA)).toHaveLength(0)
-    expect(document.querySelector('.ant-popconfirm')).toBeNull()
+    // Deshabilitada de verdad: pulsarla no abre la confirmación, así que su
+    // diálogo no llega a montarse (Antd no lo crea hasta la primera apertura).
+    expect(screen.queryByText('¿Restaurar la instantánea?')).not.toBeInTheDocument()
     unmount()
   })
 
@@ -800,7 +811,9 @@ describe('pantalla de Snapshots — restaurar', () => {
 
     await usuario.click(boton)
     expect(fetch.a(RUTA)).toHaveLength(0)
-    expect(document.querySelector('.ant-popconfirm')).toBeNull()
+    // Deshabilitada de verdad: pulsarla no abre la confirmación, así que su
+    // diálogo no llega a montarse (Antd no lo crea hasta la primera apertura).
+    expect(screen.queryByText('¿Restaurar la instantánea?')).not.toBeInTheDocument()
     unmount()
   })
 
