@@ -807,6 +807,340 @@ mod tests {
         pool.close().await;
     }
 
+    /// Los dos padres que `backup_jobs` necesita para no ser huérfana.
+    async fn padres_de_la_tarea(pool: &SqlitePool) {
+        for sentencia in [
+            "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+             secret_access_key, passphrase) VALUES ('r-1', 'repo', 'e', 'b', 'r', 'a', 's', 'p')",
+            "INSERT INTO backup_targets (id, name, target_type, host_path) \
+             VALUES ('t-1', 'carpeta', 'directory', '/srv/datos')",
+        ] {
+            sqlx::query(sentencia)
+                .execute(pool)
+                .await
+                .expect("la siembra de los padres no puede fallar");
+        }
+    }
+
+    /// Da de alta una tarea **por SQL directo**, con el nombre que se le pase.
+    ///
+    /// Es la única forma de llegar al estado previo a la `0007` con nombres que la aplicación
+    /// vieja no habría escrito —dos homónimos, un blanco—: el borde los admite hoy porque la
+    /// columna es anulable y no tiene `UNIQUE`.
+    async fn sembrar_tarea(pool: &SqlitePool, id: &str, nombre: Option<&str>) {
+        let consulta = match nombre {
+            Some(_) => {
+                "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression, name) \
+                 VALUES (?1, 't-1', 'r-1', '0 3 * * *', ?2)"
+            }
+            None => {
+                "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+                 VALUES (?1, 't-1', 'r-1', '0 3 * * *')"
+            }
+        };
+
+        let consulta = sqlx::query(consulta).bind(id);
+        let consulta = match nombre {
+            Some(nombre) => consulta.bind(nombre),
+            None => consulta,
+        };
+
+        consulta
+            .execute(pool)
+            .await
+            .expect("la siembra de la tarea no puede fallar");
+    }
+
+    /// Una ejecución que cuelga de la tarea dada.
+    async fn sembrar_ejecucion(pool: &SqlitePool, id: &str, job_id: &str) {
+        sqlx::query(
+            "INSERT INTO job_executions (id, job_id, status, started_at) \
+             VALUES (?1, ?2, 'success', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("la siembra de la ejecución no puede fallar");
+    }
+
+    /// El nombre que quedó en la tarea con ese identificador.
+    async fn nombre_de(pool: &SqlitePool, id: &str) -> String {
+        sqlx::query_scalar("SELECT name FROM backup_jobs WHERE id = ?1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|error| panic!("la tarea `{id}` tiene que seguir ahí: {error}"))
+    }
+
+    /// Afirma que las ejecuciones siguen ahí y que ninguna quedó huérfana.
+    ///
+    /// Es la mitad de la prueba 1.0 que el `DROP TABLE` de una tabla **padre** pone en juego, y la
+    /// que los escenarios nuevos —homónimos y blancos— tienen que seguir cumpliendo.
+    async fn exigir_ejecuciones_intactas(pool: &SqlitePool, esperadas: i64) {
+        let ejecuciones = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM job_executions")
+            .fetch_one(pool)
+            .await
+            .expect("las ejecuciones tienen que poder contarse");
+
+        assert_eq!(
+            ejecuciones, esperadas,
+            "la reconstrucción se llevó ejecuciones por delante: quedaron {ejecuciones}"
+        );
+
+        let huerfanos = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT \"table\" FROM pragma_foreign_key_check ORDER BY \"table\"",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("la comprobación de huérfanos no puede fallar");
+
+        assert!(
+            huerfanos.is_empty(),
+            "la reconstrucción dejó filas huérfanas en: {huerfanos:?}"
+        );
+    }
+
+    /// 1.0c (db) — La `0007` **desambigua** los nombres repetidos antes de exigir la unicidad.
+    ///
+    /// Cubre el escenario «Los nombres repetidos se desambiguan antes de exigir la unicidad». El
+    /// contrato anterior era explícitamente **no único** —el borde viejo no comprobaba
+    /// duplicados—, así que una instalación real puede tener dos tareas llamadas igual, y el
+    /// `INSERT ... SELECT` de la reconstrucción chocaría entonces contra el `UNIQUE(name)` y
+    /// **abortaría la migración entera**: Kesto no arrancaría, y sin ninguna pantalla donde
+    /// arreglarlo, porque el arranque falla antes de servir.
+    ///
+    /// Lo que se mide: de las tres homónimas, la de **menor `rowid`** —la primera sembrada—
+    /// conserva su nombre y las otras dos reciben el sufijo ` (N)` avanzando hasta dar con uno
+    /// libre en **toda** la tabla; aquí ` (2)` ya está ocupado por una cuarta tarea, así que les
+    /// toca ` (3)` y ` (4)`. La cuarta conserva el suyo. Y las ejecuciones de las cuatro siguen
+    /// ahí: el `DROP TABLE` de la tabla padre no se llevó ninguna.
+    #[tokio::test]
+    async fn la_0007_desambigua_los_nombres_repetidos_antes_de_exigir_la_unicidad() {
+        let (_directorio, pool) = base_hasta(6).await;
+        padres_de_la_tarea(&pool).await;
+
+        // Las tres homónimas, en orden de `rowid`: la primera es la que conserva el nombre.
+        let homonimas = [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+        ];
+        let ocupado = "44444444-4444-4444-4444-444444444444";
+
+        for id in homonimas {
+            sembrar_tarea(&pool, id, Some("copia nocturna")).await;
+        }
+
+        // Y una cuarta que ya ocupa el primer sufijo: el desempate no puede contar el grupo, tiene
+        // que mirar la tabla entera.
+        sembrar_tarea(&pool, ocupado, Some("copia nocturna (2)")).await;
+
+        for (indice, id) in homonimas.into_iter().chain([ocupado]).enumerate() {
+            sembrar_ejecucion(&pool, &format!("e-{indice}"), id).await;
+        }
+
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0007 tiene que desambiguar los homónimos en vez de abortar");
+
+        assert_eq!(
+            nombre_de(&pool, homonimas[0]).await,
+            "copia nocturna",
+            "la homónima de menor `rowid` tiene que conservar su nombre"
+        );
+        assert_eq!(
+            nombre_de(&pool, homonimas[1]).await,
+            "copia nocturna (3)",
+            "la segunda homónima tiene que saltarse el sufijo que ya estaba ocupado"
+        );
+        assert_eq!(
+            nombre_de(&pool, homonimas[2]).await,
+            "copia nocturna (4)",
+            "la tercera homónima tiene que tomar el siguiente sufijo libre"
+        );
+        assert_eq!(
+            nombre_de(&pool, ocupado).await,
+            "copia nocturna (2)",
+            "la tarea que ya tenía el sufijo NO puede cambiar de nombre"
+        );
+
+        let distintos =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT name) FROM backup_jobs")
+                .fetch_one(&pool)
+                .await
+                .expect("los nombres tienen que poder contarse");
+
+        assert_eq!(distintos, 4, "los cuatro nombres tienen que ser distintos");
+
+        exigir_ejecuciones_intactas(&pool, 4).await;
+
+        pool.close().await;
+    }
+
+    /// 1.0d (db) — Un `name` vacío o en blanco se trata como **ausente**.
+    ///
+    /// Cubre el escenario «Un nombre vacío o en blanco se trata como ausente». La aplicación vieja
+    /// convertía el blanco a `NULL` al guardar, así que un nombre así solo llega por SQL directo
+    /// —una instalación retocada a mano—; pero si llega, choca contra el
+    /// `CHECK (length(trim(name)) > 0)` de la tabla nueva y aborta la migración, igual que los
+    /// homónimos. Se le da el nombre derivado que le tocaría si estuviera a `NULL`.
+    #[tokio::test]
+    async fn la_0007_da_nombre_derivado_a_un_nombre_en_blanco() {
+        let (_directorio, pool) = base_hasta(6).await;
+        padres_de_la_tarea(&pool).await;
+
+        let vacio = "11111111-1111-1111-1111-111111111111";
+        let espacios = "22222222-2222-2222-2222-222222222222";
+
+        sembrar_tarea(&pool, vacio, Some("")).await;
+        sembrar_tarea(&pool, espacios, Some("   ")).await;
+        sembrar_ejecucion(&pool, "e-0", vacio).await;
+        sembrar_ejecucion(&pool, "e-1", espacios).await;
+
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0007 tiene que tratar el blanco como ausente en vez de abortar");
+
+        for (id, nombre) in [
+            (vacio, nombre_de(&pool, vacio).await),
+            (espacios, nombre_de(&pool, espacios).await),
+        ] {
+            assert!(
+                !nombre.trim().is_empty(),
+                "la tarea `{id}` quedó con el nombre en blanco: {nombre:?}"
+            );
+            assert_eq!(
+                nombre,
+                format!("tarea {}", &id[..8]),
+                "un nombre en blanco tiene que recibir el mismo derivado que un `NULL`: {nombre:?}"
+            );
+        }
+
+        exigir_ejecuciones_intactas(&pool, 2).await;
+
+        pool.close().await;
+    }
+
+    /// 1.0e (db) — La desambiguación también funciona sobre un nombre que ya acaba en `(N)`.
+    ///
+    /// El sufijo es texto, no un contador que se pueda leer de la columna: un nombre que ya tiene
+    /// forma de sufijado se desambigua **añadiendo** otro, sin reescribirlo ni confundirlo con un
+    /// índice. Dos tareas llamadas `copia (2)` quedan en `copia (2)` y `copia (2) (2)`.
+    #[tokio::test]
+    async fn la_0007_desambigua_un_nombre_que_ya_acaba_en_parentesis() {
+        let (_directorio, pool) = base_hasta(6).await;
+        padres_de_la_tarea(&pool).await;
+
+        let primera = "11111111-1111-1111-1111-111111111111";
+        let segunda = "22222222-2222-2222-2222-222222222222";
+
+        sembrar_tarea(&pool, primera, Some("copia (2)")).await;
+        sembrar_tarea(&pool, segunda, Some("copia (2)")).await;
+        sembrar_ejecucion(&pool, "e-0", primera).await;
+        sembrar_ejecucion(&pool, "e-1", segunda).await;
+
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0007 tiene que desambiguar un nombre sufijado");
+
+        assert_eq!(
+            nombre_de(&pool, primera).await,
+            "copia (2)",
+            "la de menor `rowid` conserva su nombre tal cual"
+        );
+        assert_eq!(
+            nombre_de(&pool, segunda).await,
+            "copia (2) (2)",
+            "el sufijo se añade al nombre tal y como estaba"
+        );
+
+        exigir_ejecuciones_intactas(&pool, 2).await;
+
+        pool.close().await;
+    }
+
+    /// 1.0f (db) — La desambiguación aguanta un grupo grande de homónimos, saltando los huecos.
+    ///
+    /// Tres filas homónimas ya afinan el reparto, pero no el número: con **doce** hay que encadenar
+    /// once sufijos y el reparto tiene que seguir siendo determinista y sin repetir ninguno, aunque
+    /// uno de ellos —el ` (7)`— ya esté ocupado por otra tarea y quede un hueco en medio de la serie.
+    #[tokio::test]
+    async fn la_0007_desambigua_un_grupo_grande_de_homonimos() {
+        let (_directorio, pool) = base_hasta(6).await;
+        padres_de_la_tarea(&pool).await;
+
+        let homonimas: Vec<String> = (0..12)
+            .map(|indice| format!("{indice:08x}-1111-1111-1111-111111111111"))
+            .collect();
+        let ocupado = "ffffffff-2222-2222-2222-222222222222";
+
+        for id in &homonimas {
+            sembrar_tarea(&pool, id, Some("copia nocturna")).await;
+        }
+
+        sembrar_tarea(&pool, ocupado, Some("copia nocturna (7)")).await;
+
+        for (indice, id) in homonimas
+            .iter()
+            .map(String::as_str)
+            .chain([ocupado])
+            .enumerate()
+        {
+            sembrar_ejecucion(&pool, &format!("e-{indice}"), id).await;
+        }
+
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0007 tiene que desambiguar un grupo grande de homónimos");
+
+        // La de menor `rowid` conserva el nombre y las demás toman los sufijos libres en orden: los
+        // seis primeros, el ` (7)` se salta por estar ocupado, y sigue con el ` (8)`.
+        let esperados = [
+            "copia nocturna",
+            "copia nocturna (2)",
+            "copia nocturna (3)",
+            "copia nocturna (4)",
+            "copia nocturna (5)",
+            "copia nocturna (6)",
+            "copia nocturna (8)",
+            "copia nocturna (9)",
+            "copia nocturna (10)",
+            "copia nocturna (11)",
+            "copia nocturna (12)",
+            "copia nocturna (13)",
+        ];
+
+        for (id, esperado) in homonimas.iter().zip(esperados) {
+            assert_eq!(
+                nombre_de(&pool, id).await,
+                esperado,
+                "el reparto de sufijos no es el determinista"
+            );
+        }
+
+        assert_eq!(
+            nombre_de(&pool, ocupado).await,
+            "copia nocturna (7)",
+            "la tarea que ya ocupaba un sufijo NO puede cambiar de nombre"
+        );
+
+        let distintos =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT name) FROM backup_jobs")
+                .fetch_one(&pool)
+                .await
+                .expect("los nombres tienen que poder contarse");
+
+        assert_eq!(
+            distintos, 13,
+            "los trece nombres tienen que ser distintos entre sí"
+        );
+
+        exigir_ejecuciones_intactas(&pool, 13).await;
+
+        pool.close().await;
+    }
+
     /// 1.12 — Los enumerados los garantiza un `CHECK` de la base.
     #[tokio::test]
     async fn los_enumerados_los_garantiza_un_check_de_la_base() {
