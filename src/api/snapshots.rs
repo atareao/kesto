@@ -61,11 +61,22 @@
 //! listado **por HTTP**, que es la única forma de medir de dónde sale la respuesta —una lista
 //! deducida del histórico también tendría elementos, y lo que la delata es la instantánea **ajena**,
 //! que la escribió la biblioteca sin que Kesto interviniera y por eso no tiene ninguna fila—. Y lo
-//! que esas pruebas **no** hacen es abrir el repositorio por su cuenta: llamar a
-//! [`crate::rustic::Repositorio::poner_en_marcha`] desde una prueba entraría en pánico dentro del
-//! runtime de Tokio con el backend de S3 y ninguna prueba del CI lo vería, porque toda la suite abre
-//! un repositorio local. Lo abre el manejador, por la capa de Rustic, que es donde tiene que
-//! abrirlo.
+//! que esas pruebas **no** hacen es abrir el repositorio por su cuenta: piden el listado por HTTP y
+//! dejan que lo abra el manejador, por la capa de Rustic, que es donde toca. Y la razón de que la
+//! suite no llame a [`crate::rustic::Repositorio::poner_en_marcha`] desde dentro del runtime de
+//! Tokio ya no es el pánico —esa apertura corre en el hilo de `con_tope`, así que llamarla desde un
+//! `async` ya no entra en «Cannot start a runtime from within a runtime»—, sino que toda la suite
+//! abre un repositorio **local**: lo que hay que medir aquí es de dónde sale la respuesta, no cómo
+//! se abre un S3.
+//!
+//! # El tope del listado, y su peor caso
+//!
+//! El listado corre acotado (§ incidencia #100): abrir y listar llevan **cada uno** su tope de diez
+//! segundos (`TOPE_DEL_DESTINO`), así que un almacenamiento que no contesta hace que esta ruta
+//! devuelva su `502` en un plazo acotado en vez de los 36,9–38,4 s medidos. El peor caso declarado
+//! son **2 × tope** —una apertura lenta que aún responde dentro de su plazo y un listado que se
+//! agota—: son dos topes a propósito, para que un listado sano no herede la lentitud de la
+//! apertura.
 
 use axum::Router;
 use axum::extract::{Path, State};

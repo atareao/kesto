@@ -3,6 +3,26 @@ import { listarSnapshots, restaurarSnapshot } from '../api/snapshots'
 import { claves } from './claves'
 
 /**
+ * Tope de reintento de las consultas que **dependen del S3**. Acotado a
+ * propósito: el `retry: 3` por defecto de React Query multiplica una espera que
+ * ya es larga cuando el repositorio no responde, y la spec exige que estas
+ * vistas alcancen un desenlace —datos, o error con reintentar— sin quedarse
+ * «cargando» de forma indefinida.
+ *
+ * Vive aquí —junto a la consulta más elemental del S3— y la reutiliza
+ * `useEspacioEnS3`: el acotado es de **cada consulta** que depende del S3, así
+ * que la política de reintento **global** del cliente no se toca.
+ *
+ * Y no confundas reintentos con espera: el cliente HTTP **no** trae deadline
+ * (`services/api/client.ts` no impone timeout ni el `AbortSignal` lo lleva), de
+ * modo que `retry: false` solo acota las tentativas. Que un listado que nunca
+ * resuelve deje de ser «cargando» depende del **backend**: rustic corta el
+ * destino a los 10 s (`TOPE_DEL_DESTINO`) y ese corte rechaza el `fetch`. Esta
+ * constante no sustituye esa garantía.
+ */
+export const REINTENTOS_DE_S3 = false
+
+/**
  * Instantáneas de un repositorio. Se pide solo cuando hay `repositoryId`: una
  * pantalla que todavía no lo conoce no dispara una petición vacía.
  */
@@ -19,6 +39,7 @@ export function useSnapshots(repositoryId: string | null | undefined) {
       return listarSnapshots(repositoryId, signal)
     },
     enabled: repositoryId !== null && repositoryId !== undefined && repositoryId !== '',
+    retry: REINTENTOS_DE_S3,
   })
 }
 

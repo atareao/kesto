@@ -42,6 +42,12 @@ pub use progreso::{AvisoDeProgreso, BarrasDelMotor};
 pub use repositorio::{Acceso, Copia, CopiaHecha, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
 pub use retencion::{InformeDeRetencion, Retencion};
 
+// El tope del destino, que el motor necesita para acotar el **listado**: la apertura lo lleva
+// dentro de `poner_en_marcha`, pero el listado no puede —el repositorio de la biblioteca no es
+// `Clone` y solo se puede mover desde quien lo posee, que es el motor—. Se reexporta para que la
+// constante y el mecanismo sean **uno**: una política con dos valores no es una política.
+pub(crate) use repositorio::{TOPE_DEL_DESTINO, con_tope};
+
 // El gancho por el que las pruebas del motor abren un repositorio **local** en vez de uno de S3.
 // Se reexporta y no se usa desde aquí para nada: el módulo `repositorio` es privado, y el arnés de
 // pruebas —y con él el motor— viven fuera. Va detrás de `cfg(test)` a propósito: en un binario de

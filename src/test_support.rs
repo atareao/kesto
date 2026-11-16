@@ -295,9 +295,11 @@ pub(crate) fn abridor_local(
 /// # Por qué un oyente y no un puerto donde no escucha nadie
 ///
 /// Está medido, y es lo que decide la forma: contra un puerto muerto (`http://127.0.0.1:9`) la
-/// biblioteca tarda **entre 41 y 54 segundos** en decirlo, porque `rustic_backend` reintenta cinco
-/// veces con retroceso exponencial y temblor (`DEFAULT_RETRY = 5`); contra este oyente tarda
-/// **825 µs**, porque `opendal` clasifica el `403` como un fallo permanente y no lo reintenta. Lo
+/// biblioteca tarda en decirlo —`rustic_backend` reintenta con retroceso exponencial, y desde el
+/// `retry` acotado que Kesto le declara en las opciones del destino (incidencia #100) ronda el
+/// segundo, frente a los 41–54 segundos que tardaba con su `DEFAULT_RETRY = 5`—; contra este
+/// oyente tarda **825 µs**, porque `opendal` clasifica el `403` como un fallo permanente y no lo
+/// reintenta. Lo
 /// que se mide en estas pruebas es el **desenlace** —que no hay pánico y que el error llega
 /// depurado—, no el reintento, y ese precio no lo debe pagar cada `cargo test`.
 ///
@@ -327,6 +329,53 @@ pub(crate) fn destino_de_s3_que_rechaza() -> String {
             );
 
             let _ = std::io::Write::write_all(&mut flujo, respuesta.as_bytes());
+        }
+    });
+
+    format!("http://127.0.0.1:{puerto}")
+}
+
+/// Un destino de S3 que **acepta** la conexión y **no contesta**.
+///
+/// Es el caso que [`destino_de_s3_que_rechaza`] no cubre, y el del defecto #100: aquí nadie rechaza
+/// —la conexión se establece— y la petición se queda sin respuesta, como un cortafuegos que
+/// descarta en silencio o un servidor colgado. Es el único escenario donde el tope de Kesto
+/// (`TOPE_DEL_DESTINO`) es lo que termina la espera: `reqwest`, por debajo de `opendal`, no trae un
+/// plazo propio, así que sin tope la llamada **no vuelve nunca** y una regresión se vería como un
+/// cuelgue de la suite. Por eso el oyente cierra la conexión sin contestar al cabo de
+/// [`CIERRA_SIN_CONTESTAR`] —más que el tope, a propósito—: sin tope, la prueba termina en un
+/// **fallo medido** —la petición falla tras el cierre, reintenta una vez y la espera pasa del
+/// margen—, no en un cuelgue.
+///
+/// El oyente se queda escuchando hasta que el proceso termina, como el de
+/// [`destino_de_s3_que_rechaza`]: no hay forma de pararlo desde fuera y tampoco hace falta.
+pub(crate) fn destino_de_s3_que_se_traga_la_peticion() -> String {
+    /// Lo que el oyente tarda en soltar la conexión sin haber contestado.
+    ///
+    /// Quince segundos, y no es arbitrario: tiene que ser **mayor** que el tope de Kesto —diez—, o
+    /// el cierre llegaría antes que el tope y la prueba no distinguiría los dos caminos.
+    const CIERRA_SIN_CONTESTAR: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let oyente = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("el oyente local de la prueba se abre en un puerto libre");
+    let puerto = oyente
+        .local_addr()
+        .expect("el oyente local tiene dirección")
+        .port();
+
+    std::thread::spawn(move || {
+        for conexion in oyente.incoming() {
+            let Ok(mut flujo) = conexion else { break };
+
+            // Cada conexión se atiende en su hilo: si no, un reintento del cliente no podría ni
+            // llegar mientras el primero sigue colgado.
+            std::thread::spawn(move || {
+                let mut peticion = [0_u8; 4096];
+                let _ = std::io::Read::read(&mut flujo, &mut peticion);
+                // Ni una palabra de respuesta, y al soltarse el flujo el cliente ve la conexión
+                // cerrada: es lo que hace que una regresión termine en un fallo y no en un cuelgue.
+                std::thread::sleep(CIERRA_SIN_CONTESTAR);
+            });
         }
     });
 

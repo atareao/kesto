@@ -36,9 +36,9 @@ beforeEach(() => {
       return {
         status: 200,
         data: [
-          tarea({ id: 'j1', target_id: 't1' }),
-          tarea({ id: 'j2', target_id: 't2' }),
-          tarea({ id: 'j3', target_id: 't3', enabled: false }),
+          tarea({ id: 'j1', target_id: 't1', name: 'copia web' }),
+          tarea({ id: 'j2', target_id: 't2', name: 'copia base' }),
+          tarea({ id: 'j3', target_id: 't3', name: 'copia pausada', enabled: false }),
         ],
       }
     }
@@ -83,15 +83,15 @@ describe('Dashboard', () => {
     expect(within(screen.getByTestId('tarjeta-espacio')).getByText(/al menos/i)).toBeInTheDocument()
     expect(within(screen.getByTestId('tarjeta-espacio')).getByText('8 KiB')).toBeInTheDocument()
 
-    await screen.findByText('web')
-    expect(within(filaDe('web')).getByText('Correcta')).toBeInTheDocument()
+    await screen.findByText('copia web')
+    expect(within(filaDe('copia web')).getByText('Correcta')).toBeInTheDocument()
 
     EventSourceFalso.ultima().emitir(
       NOMBRE_DEL_EVENTO,
       eventoDePrueba({ execution_id: 'e2', job_id: 'j1', status: 'running', percentage: 42 }),
     )
 
-    expect(within(filaDe('web')).getByText('En curso')).toBeInTheDocument()
+    expect(within(filaDe('copia web')).getByText('En curso')).toBeInTheDocument()
     expect(screen.getAllByText('42%').length).toBeGreaterThan(0)
     unmount()
   })
@@ -99,10 +99,10 @@ describe('Dashboard', () => {
   it('una tarea activa sin ejecuciones no se pinta como correcta', async () => {
     const { unmount } = montar()
 
-    await screen.findByText('base')
+    await screen.findByText('copia base')
 
-    expect(within(filaDe('base')).getByText('Sin ejecuciones')).toBeInTheDocument()
-    expect(within(filaDe('base')).queryByText('Correcta')).not.toBeInTheDocument()
+    expect(within(filaDe('copia base')).getByText('Sin ejecuciones')).toBeInTheDocument()
+    expect(within(filaDe('copia base')).queryByText('Correcta')).not.toBeInTheDocument()
     unmount()
   })
 })
