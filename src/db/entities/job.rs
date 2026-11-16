@@ -853,4 +853,64 @@ mod tests {
             "el nombre pasado a `actualizar` tiene que quedar en la columna"
         );
     }
+
+    /// `nombres` resuelve el lote en **una sola** lectura, y la ausencia de un identificador es
+    /// **falta de clave**, no una entrada con un valor que diga «no sé».
+    ///
+    /// Son las dos mitades del contrato que el listado del histórico y el de instantáneas necesitan
+    /// para publicar `job_name`: quien consulta reúne los `job_id` de su página y lee el mapa con
+    /// `get`, y el `None` que sale de ahí es «esa ejecución no casa con ninguna tarea» —la huérfana—,
+    /// no «la tarea no tiene nombre», que desde la `0007` no existe. El cortocircuito se mide sobre
+    /// un pool **cerrado**: con la lista vacía la función no puede tocar la base, así que una que
+    /// consultara fallaría en vez de devolver el mapa vacío.
+    #[tokio::test]
+    async fn los_nombres_se_resuelven_por_lote_y_la_ausencia_es_falta_de_clave() {
+        let (_directorio, pool, tareas, target_id, repository_id) = base_con_tarea_posible().await;
+
+        let tarea = tareas
+            .alta(alta_tarea(&target_id, &repository_id, "0 3 * * *"))
+            .await
+            .expect("el alta no puede fallar");
+
+        let con_la_tarea = tareas
+            .nombres(&[tarea.id])
+            .await
+            .expect("la resolución del nombre no puede fallar");
+
+        assert_eq!(
+            con_la_tarea.get(&tarea.id).map(String::as_str),
+            Some(tarea.name.as_str()),
+            "el mapa tiene que traer el nombre de la tarea pedida"
+        );
+
+        // Un identificador que no existe **no** estrena una entrada: la clave simplemente no está.
+        let ausente = Uuid::new_v4();
+
+        let con_la_ausente = tareas
+            .nombres(&[tarea.id, ausente])
+            .await
+            .expect("la resolución del nombre no puede fallar");
+
+        assert_eq!(
+            con_la_ausente.len(),
+            1,
+            "un identificador que no existe no puede estrenar una entrada: {con_la_ausente:?}"
+        );
+        assert!(
+            !con_la_ausente.contains_key(&ausente),
+            "la ausencia tiene que ser falta de clave, no un valor vacío"
+        );
+
+        // Y sin identificadores no hay consulta que hacer. El pool se cierra **antes** de la
+        // llamada: una función que consultara la base fallaría al no poder tomar conexión, así que
+        // el mapa vacío es la prueba de que el cortocircuito ocurre antes de la consulta.
+        pool.close().await;
+
+        let vacio = tareas
+            .nombres(&[])
+            .await
+            .expect("sin identificadores no puede haber consulta que falle");
+
+        assert!(vacio.is_empty(), "sin identificadores el mapa va vacío");
+    }
 }
