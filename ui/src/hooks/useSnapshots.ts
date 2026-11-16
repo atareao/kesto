@@ -27,10 +27,12 @@ export interface RestauracionPedida {
   repositoryId: string
   snapshotId: string
   /**
-   * Confirma la sobrescritura de un target de base de datos; se omite para un
-   * `directory`. Lo decide la confirmación de la pantalla, no el hook.
+   * Autoriza la poda del destino: la sobrescritura de los datos vivos de una
+   * base, o retirar del destino lo que no está en la instantánea en un
+   * `directory`. Es **obligatoria** y explícita: la decide la confirmación de la
+   * pantalla, no el hook, y no se deduce del tipo de target.
    */
-  sobrescribir?: boolean
+  sobrescribir: boolean
   /** Permite cancelar la petición si la pantalla se desmonta. */
   signal?: AbortSignal
 }

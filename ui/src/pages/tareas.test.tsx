@@ -131,23 +131,32 @@ describe('pantalla de Tareas', () => {
 
     await elegir(usuario, 'Target', 'api')
     await elegir(usuario, 'Repositorio', 's3')
+    // El nombre es obligatorio: sin él, el formulario no deja salir el alta.
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia de api')
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
 
     const tabla = screen.getByRole('table', { name: 'Tareas programadas' })
     expect(await within(tabla).findByText('api')).toBeInTheDocument()
 
     const alta = fetch.a('/api/v1/jobs').find((llamada) => llamada.method === 'POST')
-    expect(alta?.cuerpo).toMatchObject({ target_id: 't2', repository_id: 'r1' })
+    expect(alta?.cuerpo).toMatchObject({ name: 'copia de api', target_id: 't2', repository_id: 'r1' })
   })
 
-  it('la tabla muestra una columna «Nombre» con el nombre, y vacía cuando no lo tiene', async () => {
+  it('la tabla muestra una columna «Nombre» con el nombre, y un marcador cuando llega nulo', async () => {
     const nombrada = tarea({
       id: 'j1',
       target_id: 't1',
       repository_id: 'r1',
       name: 'copia nocturna',
     })
-    const anonima = tarea({ id: 'j2', target_id: 't2', repository_id: 'r1' })
+    // El contrato ya no admite `null`, pero un panel que hable con un backend
+    // anterior todavía puede recibirlo: la celda tiene que defenderse.
+    const anonima = tarea({
+      id: 'j2',
+      target_id: 't2',
+      repository_id: 'r1',
+      name: null as unknown as string,
+    })
 
     instalarFetchFalso(({ ruta, method }) => {
       if (ruta === '/api/v1/jobs' && method === 'GET') {
@@ -181,8 +190,12 @@ describe('pantalla de Tareas', () => {
 
     // La tarea con nombre lo enseña en su columna...
     expect(celdasDe('web')[columna]?.textContent).toBe('copia nocturna')
-    // ...y la que no lo tiene deja la columna vacía, no el nombre del target.
-    expect(celdasDe('api')[columna]?.textContent?.trim() ?? '').toBe('')
+    // ...y la que llega sin nombre pinta un marcador explícito y atenuado,
+    // nunca el hueco ni el nombre del target (que es justo la confusión que
+    // este campo viene a resolver).
+    const celdaAnonima = celdasDe('api')[columna]?.textContent?.trim()
+    expect(celdaAnonima).toBe('sin nombre')
+    expect(celdaAnonima).not.toBe('api')
   })
 
   it('titula «Target» la columna del nombre del target, y no «Tarea»', async () => {

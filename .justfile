@@ -79,6 +79,30 @@ justfile-check:
 justfile-fmt:
     @just --fmt
 
+# ── Batería e2e (issue #86) ────────────────────────────────────────────────
+
+# Batería de punta a punta de copia y restauración: levanta su propio servidor
+# S3 (SeaweedFS), exige un motor de contenedores y compara los datos
+# restaurados con los sembrados, para los cuatro tipos de origen.
+#
+# El motor se toma de `DOCKER_HOST`; sin él, del socket de podman de esta
+# máquina. Podman-first: aquí no hay `docker` ni `/var/run/docker.sock`.
+#
+# Es una **feature** de Cargo a propósito: `cargo test --locked` —lo que corre
+# el job `backend` del CI— no la compila ni la ejecuta, porque necesita motor de
+# contenedores. La ejecuta el job `e2e` del CI.
+#
+# Cuesta minutos: levanta un servidor y varios contenedores por escenario, y uno
+# de ellos espera al plazo de inactividad del motor (5 min). En serie, que es
+# como corre, un fallo se lee entero.
+e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${DOCKER_HOST:=unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock}"
+    export DOCKER_HOST
+    echo "→ motor de contenedores en ${DOCKER_HOST}"
+    cargo test --features e2e --test e2e -- --test-threads=1
+
 # ── Panel (React + Antd, en ui/) ───────────────────────────────────────────
 # Todavía no existe: estas recetas abortan solas hasta que aparezca ui/.
 

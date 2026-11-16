@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -135,6 +136,22 @@ pub(crate) fn directorio_de_prueba() -> DirectorioDePrueba {
     std::fs::create_dir_all(&ruta).expect("el directorio temporal de la prueba debe crearse");
 
     DirectorioDePrueba { ruta }
+}
+
+/// Un nombre de tarea **distinto en cada llamada**.
+///
+/// Desde la `0007` (`migrations/0007_nombre_de_tarea_obligatorio.sql`) el nombre de una tarea es
+/// `NOT NULL` con `UNIQUE(name)`, así que un ayudante que dé de alta más de una tarea —o una prueba
+/// que llame dos veces al mismo— no puede usar un literal fijo: la segunda alta chocaría contra la
+/// restricción y lo que la prueba mide no es eso. El contador es un `AtomicU64` y no una variable de
+/// cada prueba porque las pruebas corren en paralelo y comparten el proceso; lo que sí hace falta es
+/// que el número sea único **dentro de una misma base**, y esto lo garantiza.
+pub(crate) fn nombre_de_tarea_de_prueba() -> String {
+    static CONTADOR: AtomicU64 = AtomicU64::new(0);
+
+    let numero = CONTADOR.fetch_add(1, Ordering::Relaxed);
+
+    format!("tarea de prueba {numero}")
 }
 
 // ── Repositorios Rustic de prueba ────────────────────────────────────────────
@@ -444,9 +461,12 @@ fn instante(fecha: &str) -> Zoned {
 ///
 /// El camino del fichero dentro del árbol se devuelve porque **no se puede adivinar**: un
 /// origen local archiva las rutas tal y como se las da el sistema de ficheros, así que el
-/// árbol reproduce el camino de la fuente sin su barra inicial, y quien quiera restaurar el
-/// fichero necesita ese camino. Devolverlo aquí es lo que hace que las pruebas de retención
-/// comprueben que el contenido **sigue ahí** en vez de que la instantánea sigue listada.
+/// árbol reproduce el camino de la fuente sin su barra inicial, y quien quiera **volver a sacar
+/// ese nodo** —`dump`, que es lo que hacen las pruebas de retención— necesita ese camino.
+/// Restaurar no: una restauración descuenta la ruta con la que se montó la copia y deja el
+/// fichero en la raíz del destino, así que la restauración de una siembra no se busca por aquí.
+/// Devolverlo es lo que hace que las pruebas de retención comprueben que el contenido **sigue
+/// ahí** en vez de que la instantánea sigue listada.
 pub(crate) struct Siembra {
     /// Los identificadores, en hex completo, en el orden de las fechas que se pidieron.
     pub identificadores: Vec<String>,
@@ -1499,12 +1519,13 @@ pub(crate) fn lector_del_volcado(
 // ── Motor de contenedores ────────────────────────────────────────────────────
 //
 // Las pruebas que necesitan un motor de contenedores van marcadas `#[ignore]`, y hoy son
-// **veinte**: once en `src/docker` (todas en `cliente.rs`) y nueve en `src/engine` (siete
-// en `extraccion.rs` y dos en `mod.rs`). El motivo de que estén marcadas y no se
-// ejecuten es el CI: el job `backend` de `.github/workflows/ci.yml` no declara
-// servicios, así que `cargo test` tiene que quedar verde sin motor. Lo de abajo es el
-// arnés de toda esa capa, y quien las lance con `cargo test -- --ignored` necesita un
-// motor de verdad en la máquina.
+// **veintisiete**: trece en `src/docker` (todas en `cliente.rs`) y catorce en `src/engine`
+// (siete en `extraccion.rs`, cuatro en `mod.rs` y tres en `restauracion.rs`). El motivo de
+// que estén marcadas es el job `backend` de `.github/workflows/ci.yml`: no declara
+// servicios, así que `cargo test` tiene que quedar verde sin motor. Quien las lance con
+// `cargo test -- --ignored` necesita un motor de verdad en la máquina —y el runner del job
+// `e2e` lo tiene—: las pruebas se escriben contra el **contrato** de esta capa, no contra
+// el troceado ni los canales de un motor concreto, que cambian de uno a otro.
 //
 // El motivo completo va escrito **en cada** `#[ignore]` y no solo aquí: quien lee una
 // prueba ignorada lee su atributo, y una nota que vive en otro fichero es una nota que

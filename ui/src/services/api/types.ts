@@ -99,11 +99,12 @@ export interface AltaRepository {
 export interface Job {
   id: string
   /**
-   * Nombre con el que el operador distingue la tarea; `null` cuando no se le puso
-   * ninguno. La clave **siempre** viaja —el backend no la omite cuando va a
-   * `null`— y no es única: es una etiqueta legible, no un identificador.
+   * Nombre con el que el operador distingue la tarea. Es **obligatorio y único**
+   * (#87): la columna es `NOT NULL` con `UNIQUE(name)`, así que la clave viaja
+   * **siempre** como cadena no vacía y nunca `null`. Es la identidad legible de
+   * la tarea —la misma cadena en Tareas, en el Histórico y en Snapshots—.
    */
-  name: string | null
+  name: string
   target_id: string
   repository_id: string
   cron_expression: string
@@ -118,11 +119,11 @@ export interface Job {
 /** Escritura: `POST` y `PUT` de `/api/v1/jobs`. */
 export interface AltaJob {
   /**
-   * Nombre de la tarea; opcional. El backend lo recorta y guarda un blanco como
-   * `null`, así que el panel **omite** la clave cuando el campo queda vacío en
-   * vez de mandar una cadena vacía.
+   * Nombre de la tarea; **obligatorio**. El backend lo recorta, contesta `400`
+   * —nombrando `name`— si falta o queda en blanco tras recortar, y `409` si ya
+   * lo tiene otra tarea. El panel lo manda **siempre**, ya recortado.
    */
-  name?: string | null
+  name: string
   target_id: string
   repository_id: string
   cron_expression: string
@@ -182,9 +183,10 @@ export interface Snapshot {
   label: string | null
   /**
    * Nombre de la tarea de la que procede la instantánea, por el vínculo
-   * `snapshot → job_executions → backup_jobs`; `null` cuando esa tarea no tiene
-   * nombre **o** cuando la instantánea no casa con ninguna ejecución. La columna
-   * «Tarea» cae entonces al identificador de la tarea que publica `label`.
+   * `snapshot → job_executions → backup_jobs`. Toda tarea tiene nombre, así que
+   * el único `null` que queda es la instantánea **huérfana** —la que no casa con
+   * ninguna ejecución—: la columna «Tarea» pinta entonces un marcador atenuado y
+   * **nunca** cae al identificador de la tarea que publica `label`.
    */
   job_name: string | null
   files: number

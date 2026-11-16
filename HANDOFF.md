@@ -1,35 +1,31 @@
-# Handoff — kesto — 2026-11-15 (issue #79 entregado y fusionado; release v0.9.0 pendiente)
+# Handoff — kesto — 2026-11-15 (v0.9.0 publicada; release-prepare desbloqueado)
 
 ## Objetivo
-Issue **#79**: selector de **target** en la pantalla de Restauraciones para acotar el histórico por base de datos. **Entregado y fusionado** en `development` (PR #80, `cb9d882`), CI 3/3 verde. Pendiente solo la **release**.
+Sin tarea abierta. El trabajo de esta sesión —issue **#79** (filtro por target en Restauraciones) y el **desbloqueo del pipeline de release** (#83)— está entregado y publicado en **v0.9.0**.
 
 ## Estado
-- Relevo anterior cerrado: PR #77 (#67 fase 2) **MERGED** y release **v0.8.0**; `main` quedó sincronizada.
-- **#79 cerrado**. PR **#80 MERGED** en `development` (`cb9d882`) con la rama `feature/filtro-target-en-restauraciones`. Commits: `📝 docs(plan)`, `📝 docs` (relevo), `✅ test` (RED), `✨ feat` (GREEN), `✅ test` (reforzado), `📝 docs(restauracion)` (cierre), `📝 docs` (relevo).
-- SDD: change `filtro-por-target-en-restauraciones` **archivado** en `openspec/changes/archive/2026-11-15-filtro-por-target-en-restauraciones/`; requisito fusionado en `openspec/specs/ui/spec.md:545`; sin changes activos; `openspec validate --specs --strict` → 13 pasan, 0 fallan.
-- Plan: `plans/PLAN-022-COMPLETED.md`. Doc: `docs/FEATURE-022-filtro-por-target-en-restauraciones.md`.
-- Entregado: `Select` de target con `allowClear` en `ui/src/pages/restauraciones.tsx` (opciones del catálogo `GET /api/v1/targets`, etiqueta = nombre, valor = `id`), `target_id` en los filtros de `useRestauraciones`, reinicio de `offset` al cambiar filtro y estado propio del target para sobrevivir a un target borrado del catálogo. **Sin cambios de backend, esquema ni contrato de API.**
-- Verificado `just check-all` **EXIT=0**: backend `fmt`+`clippy -D warnings`+`test` (**527+5 pasan**, 27 `#[ignore]` e2e con podman); panel `lint`+`typecheck`+`typecheck:test`+`test` (**223 pasan**)+`build`.
-- Auditoría `@react-reviewer`: **sin bloqueantes**; el *recomendado* (el caso de reinicio de paginación por estado no salía de la página 1) quedó cerrado en `1fbb6a5` y verificado por mutación.
+- **v0.9.0 publicada**: tag `v0.9.0` sobre `e3af578 chore: release v0.9.0`; `.vampus.yml` y `Cargo.toml` en `0.9.0`; GitHub Release `kesto v0.9.0`; `release.yml` completo en verde (crate, imágenes amd64+arm64 con smoke test y manifiesto multi-arquitectura). `main` y `development` **sincronizadas** (0/0).
+- **#79 cerrado** (PR #80, `cb9d882`): selector de **target** en la pantalla de Restauraciones (opciones del catálogo `GET /api/v1/targets`, `target_id` en la consulta, reinicio de paginación). Sin cambios de backend, esquema ni contrato de API. SDD archivado (`openspec/changes/archive/2026-11-15-filtro-por-target-en-restauraciones/`; requisito fusionado en `openspec/specs/ui/spec.md:545`); plan `plans/PLAN-022-COMPLETED.md`; doc `docs/FEATURE-022-filtro-por-target-en-restauraciones.md`.
+- **#83 cerrado** (PR #84, `45903a5`): `release-prepare` estaba **roto de forma permanente** desde v0.8.0. La release v0.8.0 había **versionado `vampus.tgz`** (2 MB) porque la descarga escribía dentro del árbol y el paso de commit usaba `git add -A`; el checkout traía el fichero y la descarga abortaba con «already exists». Arreglado: descarga a `$RUNNER_TEMP` con `--clobber`, `git add` explícito de `CHANGELOG.md .vampus.yml Cargo.toml Cargo.lock`, `vampus.tgz` fuera del índice y en `.gitignore`. Detalle en el issue #83 y en los comentarios del workflow.
+- PRs de relevo: #80 (feat, a `development`), #81 (relevo, a `development`), #82 (release, a `main`), #84 (hotfix, a `main`).
 
 ## Pendiente
-1. **Release v0.9.0**: `development` está por delante de `main`. Abrir PR `development` → `main` y mergear; `release-prepare.yml` deduce **minor** (`✨ feat`), sube la versión con vampus, genera `CHANGELOG.md`, empuja el tag `v0.9.0` (que dispara `release.yml`: imagen a `ghcr.io/atareao/kesto` + GitHub Release) y sincroniza `development`. **No se etiqueta a mano.**
-2. Tras la release, otro relevo (`chore/handoff-tras-v0.9.0`), como manda la convención.
-3. Follow-ups abiertos de #67 (en `docs/FEATURE-022-…`): restauración parcial por rutas, copia previa automática, progreso incremental real (bloqueado por `rustic_core`) y e2e de los `#[ignore]` en CI.
-4. Auditoría sugiere **ticket aparte**: extraer pie de paginación, `TAMANO_DE_PAGINA` y `ESTADOS` compartidos entre `historico.tsx` y `restauraciones.tsx`; y `allowClear` de Antd es solo-ratón (un botón «Limpiar filtros» lo resolvería).
+1. **Ninguna tarea abierta.** No hay issues abiertos ni changes SDD activos (`openspec/changes/` solo tiene `archive/`).
+2. Follow-ups de #67 (listados en `docs/FEATURE-022-…`): restauración parcial por rutas, copia previa automática, progreso incremental real (bloqueado por `rustic_core`) y e2e de los `#[ignore]` en CI.
+3. Auditoría de la UI sugiere **ticket aparte**: extraer pie de paginación, `TAMANO_DE_PAGINA` y `ESTADOS` compartidos entre `historico.tsx` y `restauraciones.tsx`; y `allowClear` de Antd es solo-ratón (un botón «Limpiar filtros» lo resolvería).
+4. Decidir si el arreglo de CI de #83 merece documento propio: **no se creó** `plans/PLAN-023.md` ni `docs/FEATURE-023-…` por proporcionalidad (es un hotfix de 3 líneas de workflow), pero la convención del repo documenta los arreglos de infraestructura como features (`FEATURE-010` a `FEATURE-012`). Si se quiere, es un `📝 docs:` trivial.
 
 ## Punto de partida
 ```
 git checkout development && git pull origin development
-# release: PR development -> main  (el tag y el changelog los hace release-prepare)
 # backend: just check   ·   ui/: pnpm run lint && npx tsc --noEmit && pnpm test
 # cierre: just check-all
 ```
 
 ## Metodología / reglas
-SDD (change en `openspec/changes/`) + TDD (RED por aserción → GREEN → REFACTOR). Rama `feature/*` desde `development`, PR a `development`; nada directo a `main`/`development`. Gitmoji + conventional commits. Cierre: `docs/FEATURE-0NN-<slug>.md` y plan renombrado a `-COMPLETED`.
+SDD (change en `openspec/changes/`) + TDD (RED por aserción → GREEN → REFACTOR). Rama `feature/*` desde `development`, PR a `development`; **hotfix desde `main`** con PR a `main` y sincronización posterior de `development`. Nada directo a `main`/`development`. Gitmoji + conventional commits. Cierre: `docs/FEATURE-0NN-<slug>.md` y plan renombrado a `-COMPLETED`.
 
 ## Riesgos y notas
-- Restaurar una base **pisa datos vivos**: la única red es `sobrescribir: true` + teclear el nombre del target; no hay copia previa automática (decisión D de #67). Este issue **no** lo mitiga.
-- Decisión D4/D5: si un `target_id` desaparece del catálogo, no se reconcilian las opciones (se pinta el vacío); y no se extrajo el patrón de filtro a un componente compartido, por consistencia con Histórico mientras solo haya dos pantallas.
-- Un merge a `main` **es** una release: el PR `development` → `main` no debe llevar nada que no deba publicarse.
+- **Un merge a `main` ES una release.** Y ahora, tras el arreglo de #83, el commit de release solo añade cuatro ficheros: si algún día hace falta versionar otra cosa desde `release-prepare`, hay que ampliar esa lista a propósito.
+- El binario `vampus.tgz` **sigue en el historial de git** (pesa 2 MB). Se retiró del árbol, no del pasado; reescribir el historial no se consideró.
+- Restaurar una base **pisa datos vivos**: la única red es `sobrescribir: true` + teclear el nombre del target; no hay copia previa automática (decisión D de #67).

@@ -41,3 +41,22 @@
 - **Podman en local, Docker en producción** (decisión tomada el 2026-10-24). En dev, bollard apunta al socket de podman con la ruta configurable (`DOCKER_HOST`); nunca al de Docker. El compose de producción (§8) sigue montando `/var/run/docker.sock`.
 - Cualquier comando `docker ...` falla en esta máquina: usa `podman ...`.
 - **La versión de API de bollard se fija en la llamada, no se deja deducir**: `Cliente::conectar` construye el motor con `Docker::connect_with_socket(socket, segundos, bollard::API_DEFAULT_VERSION)` —`src/docker/cliente.rs:68`— y nunca con `connect_with_defaults()`, porque una deducción contra un motor que no es Docker (podman) o contra una versión distinta es exactamente el sitio donde un cliente se atasca en la negociación, y esos fallos aparecen más tarde y más lejos de su causa; el rustdoc de `Cliente::conectar` guarda el resto, incluido que hoy ese prefijo no llega al cable y que si algún día hace falta otra versión lo que toca es negociar, no subir la constante.
+
+## Batería e2e — entorno que necesita
+
+`just e2e` (issue #86) **no** corre donde falte motor de contenedores, y no degrada: sin motor o sin S3 **falla** nombrando lo que falta. Necesita:
+
+- **Un motor de contenedores** al que apuntar por `DOCKER_HOST`. En local, el podman de esta máquina (`unix:///run/user/1000/podman/podman.sock`); en el CI, el Docker del runner (`unix:///var/run/docker.sock`). El arnés habla por `bollard` con la API de Docker, que podman implementa compatible.
+- **Un servidor S3 real**: el arnés levanta su propio **SeaweedFS** en un contenedor (puerto S3 publicado en `127.0.0.1`, credenciales fijas, cubo por escenario). No se usa un doble local.
+- **Las imágenes de origen y de apoyo**, que el CI fija por versión, pre-descarga y pasa por variable; en local el arnés usa las mismas como valor por defecto:
+
+| Pieza | Variable (CI) | Imagen por defecto |
+|---|---|---|
+| Servidor S3 | `S3_IMAGE` | `docker.io/chrislusf/seaweedfs:latest` |
+| Origen MariaDB | `MARIA_IMAGE` | `docker.io/library/mariadb:11` |
+| Origen PostgreSQL | `POSTGRES_IMAGE` | `docker.io/library/postgres:18-alpine` |
+| Contenedor de apoyo (`sqlite`, `stdin` que no drena) | `ALPINE_IMAGE` | `docker.io/library/alpine:3.23` |
+
+- **`KESTO_MASTER_KEY`**: los `#[ignore]` que el job `e2e` ejecuta necesitan una clave; el CI pasa una de relleno (nunca un secreto real) y el arnés arranca el binario con su propia clave constante.
+
+No añade ninguna dependencia a `Cargo.toml`: SeaweedFS y las bases son imágenes externas, y la orquestación usa el `bollard` y el `reqwest` que ya están.

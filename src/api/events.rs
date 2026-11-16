@@ -528,6 +528,7 @@ mod tests {
             router.clone(),
             "/api/v1/jobs",
             &serde_json::json!({
+                "name": "tarea-del-stream",
                 "target_id": target_id,
                 "repository_id": repository_id,
                 "cron_expression": "0 3 * * *",

@@ -40,14 +40,15 @@ pub struct Tarea {
     pub enabled: bool,
     /// Fecha de alta, en UTC.
     pub created_at: OffsetDateTime,
-    /// Nombre legible de la tarea; `None` si no tiene.
+    /// Nombre legible de la tarea: **obligatorio y único**.
     ///
-    /// Es la columna que añade la `0005` (issue #65) y la única anulable de la tabla: el nombre es
-    /// opcional por contrato —una tarea sin él sigue siendo válida, y el panel cae al
-    /// identificador—, así que `None` es un estado del contrato y no un dato que falte. Nunca es
-    /// `Some("")`: un nombre en blanco lo guarda el alta como `NULL`, y `''` y `NULL` no se pintan
-    /// igual en el panel.
-    pub name: Option<String>,
+    /// Es la columna que añadió la `0005` (issue #65) y la que la `0007` hizo obligatoria y única
+    /// (issues #87 y #89). El nombre es la **identidad legible** de la tarea —lo que distingue dos
+    /// tareas sobre el mismo target—, y por eso ya no es un dato que pueda faltar: la columna es
+    /// `NOT NULL` con `UNIQUE(name)`, de modo que `String` y no `Option<String>` es lo que el
+    /// esquema declara. Nunca es `""`: el `CHECK` de la base rechaza un nombre en blanco, y el borde
+    /// HTTP lo rechaza antes con un `400` que nombra el campo.
+    pub name: String,
 }
 
 /// Los datos de un alta. **Sin `id`**: lo genera la capa de acceso.
@@ -67,12 +68,12 @@ pub struct AltaDeTarea {
     pub keep_monthly: i64,
     /// Si la tarea está activa.
     pub enabled: bool,
-    /// Nombre legible de la tarea; `None` si se da de alta sin nombre.
+    /// Nombre legible de la tarea: **obligatorio**, ya recortado.
     ///
-    /// Llega **ya recortado y en blanco convertido a `None`**: el recorte y el paso del blanco a
-    /// `None` son del borde —el alta y la edición comparten ese validador—, porque una cadena vacía
-    /// en la columna fingiría un nombre que nadie escribió. Aquí no se vuelve a mirar.
-    pub name: Option<String>,
+    /// Llega **ya recortado y no vacío**: el recorte y el rechazo del blanco son del borde —el alta
+    /// y la edición comparten ese validador—, y la columna es `NOT NULL` con un `CHECK` de
+    /// no-vacío, así que un `None` no tiene dónde escribirse. Aquí no se vuelve a mirar.
+    pub name: String,
 }
 
 /// La capa de acceso de `backup_jobs`.
@@ -191,7 +192,7 @@ impl Tareas {
             .bind(&alta.name)
             .fetch_one(&self.pool)
             .await
-            .map_err(error_de_consulta(SQL_ALTA))?;
+            .map_err(error_de_escritura(SQL_ALTA))?;
 
         desde_fila(&fila)
     }
@@ -238,7 +239,7 @@ impl Tareas {
             .bind(tarea.id.hyphenated().to_string())
             .execute(&self.pool)
             .await
-            .map_err(error_de_consulta(SQL_ACTUALIZAR))?;
+            .map_err(error_de_escritura(SQL_ACTUALIZAR))?;
 
         Ok(resultado.rows_affected() == 1)
     }
@@ -249,11 +250,14 @@ impl Tareas {
     /// nombre de la tarea de cada fila sin pagar una consulta por fila: quien llama reúne los
     /// `job_id` de su página y recibe aquí el nombre de cada una de golpe.
     ///
-    /// **Una tarea sin nombre sale en el mapa con `None`**, y una tarea que no exista —o una fila sin
-    /// vínculo, que no llega a aportar identificador— **no sale**: el mapa devuelve `None` para las
-    /// dos cuando lo consulta quien llama, y eso es lo correcto, porque el contrato publica `null`
-    /// tanto si la tarea no tiene nombre como si la ejecución no casa con ninguna. Lo que el mapa
-    /// **no** hace es inventar entradas de relleno para identificadores que no pidió nadie.
+    /// **Una tarea cuyo identificador no se pidió no sale del mapa**, y quien consulta recibe
+    /// `None` de su `get`: es el caso de la instantánea **huérfana**, la que no casa con ninguna
+    /// ejecución y por tanto no aporta ningún `job_id`, y el contrato publica `null` para ella.
+    /// Desde la `0007` la columna es `NOT NULL`, así que el valor es un `String` y **no** un
+    /// `Option<String>`: una fila que sale del mapa siempre trae su nombre, y el «no se sabe» viaja
+    /// como **ausencia de clave**, que es la única forma que el esquema deja. Envolverlo en un
+    /// segundo `Option` sería un `None` que nunca ocurre y obligaría a quien consulta a un
+    /// `flatten()` de adorno.
     ///
     /// Las claves son los `Uuid`, no sus formas en texto: quien consulta tiene el identificador ya
     /// convertido —lo sacó de una fila de la capa de acceso— y pasarle una segunda forma que tuviera
@@ -262,7 +266,7 @@ impl Tareas {
     /// # Errors
     ///
     /// Un [`DbError::Consulta`] si la lista no se puede codificar o la sentencia falla.
-    pub async fn nombres(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, Option<String>>, DbError> {
+    pub async fn nombres(&self, ids: &[Uuid]) -> Result<HashMap<Uuid, String>, DbError> {
         // Sin identificadores no hay nada que resolver: la consulta sobra, y un listado de cero
         // filas no tiene por qué costar una ida y vuelta a la base.
         if ids.is_empty() {
@@ -299,7 +303,7 @@ impl Tareas {
             })?;
 
             if let Entry::Vacant(hueco) = nombres.entry(id) {
-                hueco.insert(columna::<Option<String>>(fila, "name")?);
+                hueco.insert(columna::<String>(fila, "name")?);
             }
         }
 
@@ -328,6 +332,28 @@ impl Tareas {
 /// literales que pueden separarse.
 fn error_de_consulta(consulta: &'static str) -> impl FnOnce(sqlx::Error) -> DbError {
     move |causa| DbError::Consulta { consulta, causa }
+}
+
+/// Envuelve un fallo de **escritura** de `sqlx`, nombrando el choque de nombre.
+///
+/// `backup_jobs` tiene **dos** restricciones únicas: su `PRIMARY KEY` y el `UNIQUE(name)` que
+/// añadió la `0007`. Una violación de unicidad en esta tabla solo puede venir de la segunda —el
+/// identificador lo genera esta capa con `Uuid::new_v4()`, así que repetirlo no es un caso que
+/// exista— y por eso traducirla a [`DbError::NombreDeTareaDuplicado`] **nombra la causa real** en
+/// vez de adivinarla. Es lo que permite que el borde conteste el `409` que manda a cambiar el nombre
+/// y no el `500` genérico, que no manda a ninguna parte.
+///
+/// Todo lo demás —incluidas las violaciones de clave foránea, que también son «culpa de quien
+/// pregunta» pero se traducen en `src/error.rs`— sigue siendo la consulta que falló, con su texto
+/// para el registro.
+fn error_de_escritura(consulta: &'static str) -> impl FnOnce(sqlx::Error) -> DbError {
+    move |causa| {
+        if matches!(&causa, sqlx::Error::Database(error) if error.is_unique_violation()) {
+            return DbError::NombreDeTareaDuplicado { causa };
+        }
+
+        DbError::Consulta { consulta, causa }
+    }
 }
 
 /// Lee una columna de la fila, conservando la causa si falta o no tiene el tipo.
@@ -386,6 +412,7 @@ fn desde_fila(fila: &SqliteRow) -> Result<Tarea, DbError> {
 #[cfg(test)]
 mod tests {
     use sqlx::SqlitePool;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -429,6 +456,20 @@ mod tests {
         }
     }
 
+    /// Un nombre de tarea **distinto en cada llamada**.
+    ///
+    /// Desde la `0007` el nombre es `UNIQUE`, así que dos altas de la misma prueba con el nombre fijo
+    /// harían chocar la segunda contra la restricción, y lo que estas pruebas miden no es eso. El
+    /// contador se lleva con un `AtomicU64` y no con una variable por prueba porque las pruebas
+    /// corren en paralelo y lo comparten.
+    fn nombre_de_prueba() -> String {
+        static CONTADOR: AtomicU64 = AtomicU64::new(0);
+
+        let numero = CONTADOR.fetch_add(1, Ordering::Relaxed);
+
+        format!("tarea de prueba {numero}")
+    }
+
     /// Un alta de tarea con los valores del §3 por defecto y `enabled` informado.
     fn alta_tarea(target_id: &Uuid, repository_id: &Uuid, cron: &str) -> AltaDeTarea {
         AltaDeTarea {
@@ -439,7 +480,7 @@ mod tests {
             keep_weekly: 4,
             keep_monthly: 12,
             enabled: true,
-            name: None,
+            name: nombre_de_prueba(),
         }
     }
 
@@ -675,20 +716,21 @@ mod tests {
         );
     }
 
-    /// 1.1 (entidad) — Un `INSERT` directo que omita `name` se acepta y deja la columna a `NULL`.
+    /// 2.1 (entidad) — Un `INSERT` directo que omita `name` choca con el `NOT NULL` de la columna.
     ///
-    /// Es la mitad que el pragma del esquema no mide por sí sola: la columna de la `0005` es
-    /// **anulable**, así que una fila escrita con SQL a mano —sin pasar por esta capa, que es como
-    /// la escribiría `sqlite3`— tiene que entrar sin el nombre y quedar a `NULL`. Una columna
-    /// declarada `NOT NULL` sin valor por defecto pasaría una prueba que solo mirara que existe y
-    /// rechazaría esta inserción.
+    /// Es la mitad que el hecho de que `AltaDeTarea.name` sea `String` no mide por sí sola: la
+    /// garantía tiene que estar **en la base**. Una fila escrita con SQL a mano —sin pasar por esta
+    /// capa, que es como la escribiría `sqlite3` o una migración futura— no puede quedar sin nombre,
+    /// porque el nombre es la identidad legible de la tarea y la columna lo declara `NOT NULL`. Es la
+    /// cara opuesta de la prueba de la `0005`, que medía justo lo contrario: entonces la columna era
+    /// anulable y esta inserción tenía que **entrar**.
     #[tokio::test]
-    async fn un_alta_directa_sin_name_deja_la_columna_a_null() {
+    async fn un_alta_directa_sin_name_se_rechaza() {
         let (_directorio, pool, _tareas, target_id, repository_id) = base_con_tarea_posible().await;
 
         let id = Uuid::new_v4();
 
-        sqlx::query(
+        let rechazo = sqlx::query(
             "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
              VALUES (?1, ?2, ?3, ?4)",
         )
@@ -698,30 +740,84 @@ mod tests {
         .bind("0 3 * * *")
         .execute(&pool)
         .await
-        .expect(
-            "una fila sin `name` tiene que poder insertarse: si la columna fuera `NOT NULL` sin \
-             valor por defecto, esto fallaría",
+        .expect_err(
+            "una fila sin `name` NO puede insertarse: la columna es `NOT NULL` desde la `0007`",
         );
 
-        let nombre =
-            sqlx::query_scalar::<_, Option<String>>("SELECT name FROM backup_jobs WHERE id = ?1")
-                .bind(id.hyphenated().to_string())
-                .fetch_one(&pool)
-                .await
-                .expect("la columna `name` tiene que poder leerse en la fila insertada sin ella");
+        assert!(
+            rechazo.to_string().contains("constraint failed"),
+            "el rechazo tiene que ser el de la restricción de la base, y fue: {rechazo}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("el recuento de tareas no puede fallar");
+
+        assert_eq!(filas, 0, "el rechazo no puede haber dejado la fila escrita");
+    }
+
+    /// 2.2 (entidad) — Un nombre que ya tiene otra tarea se traduce a un error **tipado**.
+    ///
+    /// Es lo que hace posible el `409` del borde: la violación de la unicidad se reconoce en la capa
+    /// de acceso y viaja como [`DbError::NombreDeTareaDuplicado`], no como una consulta fallida
+    /// cualquiera. Se fija aquí, y no solo en la API, porque es la capa de acceso la que distingue
+    /// **cuál** de las dos restricciones únicas de la tabla se violó, y una traducción que se
+    /// perdiera por el camino dejaría al manejador sin nada que traducir.
+    #[tokio::test]
+    async fn un_nombre_que_ya_esta_se_traduce_a_error_tipado() {
+        let (_directorio, _pool, tareas, target_id, repository_id) = base_con_tarea_posible().await;
+
+        let primera = tareas
+            .alta(AltaDeTarea {
+                name: "copia nocturna".to_owned(),
+                ..alta_tarea(&target_id, &repository_id, "0 3 * * *")
+            })
+            .await
+            .expect("la primera tarea tiene que darse de alta");
+
+        let error = tareas
+            .alta(AltaDeTarea {
+                name: "copia nocturna".to_owned(),
+                ..alta_tarea(&target_id, &repository_id, "0 4 * * *")
+            })
+            .await
+            .expect_err("un nombre ya en uso no puede dar una segunda tarea");
 
         assert!(
-            nombre.is_none(),
-            "una fila insertada sin `name` tiene que quedar a NULL, y quedó {nombre:?}"
+            matches!(error, DbError::NombreDeTareaDuplicado { .. }),
+            "el choque de nombre tiene que llegar tipado, y llegó: {error}"
+        );
+
+        // Y el mismo choque por la **edición**, que es la otra sentencia que escribe el nombre.
+        let mut segunda = tareas
+            .alta(AltaDeTarea {
+                name: "copia diaria".to_owned(),
+                ..alta_tarea(&target_id, &repository_id, "0 5 * * *")
+            })
+            .await
+            .expect("la segunda tarea tiene que darse de alta con su propio nombre");
+
+        segunda.name = primera.name.clone();
+
+        let error = tareas
+            .actualizar(&segunda)
+            .await
+            .expect_err("editar con el nombre de otra no puede escribir");
+
+        assert!(
+            matches!(error, DbError::NombreDeTareaDuplicado { .. }),
+            "el choque de nombre al editar tiene que llegar tipado, y llegó: {error}"
         );
     }
 
-    /// 1.2 (entidad) — `actualizar` con un nombre nuevo lo persiste en la columna.
+    /// 1.2 (entidad) — `actualizar` persiste en la columna el nombre que se le pasa.
     ///
-    /// Hoy el nombre solo se prueba por el `PUT` de la API; esta prueba lo fija donde de verdad se
-    /// escribe, que es la sentencia de la capa de acceso. Un `UPDATE` que se dejara `name` fuera de
-    /// la lista de columnas —o que lo bindeara en otro hueco— pasaría el ciclo de la 1.28, que da de
-    /// alta sin nombre y nunca toca el campo, y entonces una edición posterior no guardaría nada.
+    /// El nombre se prueba por el `PUT` de la API, pero se escribe en la sentencia de esta capa: un
+    /// `UPDATE` que se dejara `name` fuera de la lista de columnas —o que lo bindeara en otro
+    /// hueco— pasaría el ciclo de la 1.28, que no toca el campo, y entonces una edición posterior no
+    /// guardaría nada. Se mide el cambio de nombre y **no** la puesta: desde la `0007` no hay tarea
+    /// sin nombre a la que ponérselo.
     #[tokio::test]
     async fn la_actualizacion_persiste_el_nombre_nuevo() {
         let (_directorio, _pool, tareas, target_id, repository_id) = base_con_tarea_posible().await;
@@ -732,11 +828,11 @@ mod tests {
             .expect("el alta no puede fallar");
 
         assert!(
-            tarea.name.is_none(),
-            "el alta de la prueba entra sin nombre, así que lo que se mide es la edición"
+            !tarea.name.trim().is_empty(),
+            "el alta entra con un nombre, así que lo que se mide es la edición"
         );
 
-        tarea.name = Some("copia nocturna".to_owned());
+        tarea.name = "copia nocturna".to_owned();
 
         assert!(
             tareas
@@ -753,9 +849,68 @@ mod tests {
             .expect("la fila debe seguir existiendo");
 
         assert_eq!(
-            releida.name.as_deref(),
-            Some("copia nocturna"),
+            releida.name, "copia nocturna",
             "el nombre pasado a `actualizar` tiene que quedar en la columna"
         );
+    }
+
+    /// `nombres` resuelve el lote en **una sola** lectura, y la ausencia de un identificador es
+    /// **falta de clave**, no una entrada con un valor que diga «no sé».
+    ///
+    /// Son las dos mitades del contrato que el listado del histórico y el de instantáneas necesitan
+    /// para publicar `job_name`: quien consulta reúne los `job_id` de su página y lee el mapa con
+    /// `get`, y el `None` que sale de ahí es «esa ejecución no casa con ninguna tarea» —la huérfana—,
+    /// no «la tarea no tiene nombre», que desde la `0007` no existe. El cortocircuito se mide sobre
+    /// un pool **cerrado**: con la lista vacía la función no puede tocar la base, así que una que
+    /// consultara fallaría en vez de devolver el mapa vacío.
+    #[tokio::test]
+    async fn los_nombres_se_resuelven_por_lote_y_la_ausencia_es_falta_de_clave() {
+        let (_directorio, pool, tareas, target_id, repository_id) = base_con_tarea_posible().await;
+
+        let tarea = tareas
+            .alta(alta_tarea(&target_id, &repository_id, "0 3 * * *"))
+            .await
+            .expect("el alta no puede fallar");
+
+        let con_la_tarea = tareas
+            .nombres(&[tarea.id])
+            .await
+            .expect("la resolución del nombre no puede fallar");
+
+        assert_eq!(
+            con_la_tarea.get(&tarea.id).map(String::as_str),
+            Some(tarea.name.as_str()),
+            "el mapa tiene que traer el nombre de la tarea pedida"
+        );
+
+        // Un identificador que no existe **no** estrena una entrada: la clave simplemente no está.
+        let ausente = Uuid::new_v4();
+
+        let con_la_ausente = tareas
+            .nombres(&[tarea.id, ausente])
+            .await
+            .expect("la resolución del nombre no puede fallar");
+
+        assert_eq!(
+            con_la_ausente.len(),
+            1,
+            "un identificador que no existe no puede estrenar una entrada: {con_la_ausente:?}"
+        );
+        assert!(
+            !con_la_ausente.contains_key(&ausente),
+            "la ausencia tiene que ser falta de clave, no un valor vacío"
+        );
+
+        // Y sin identificadores no hay consulta que hacer. El pool se cierra **antes** de la
+        // llamada: una función que consultara la base fallaría al no poder tomar conexión, así que
+        // el mapa vacío es la prueba de que el cortocircuito ocurre antes de la consulta.
+        pool.close().await;
+
+        let vacio = tareas
+            .nombres(&[])
+            .await
+            .expect("sin identificadores no puede haber consulta que falle");
+
+        assert!(vacio.is_empty(), "sin identificadores el mapa va vacío");
     }
 }

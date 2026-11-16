@@ -368,7 +368,7 @@ mod tests {
     use crate::db::entities::job::{AltaDeTarea, Tareas};
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
     use crate::secret::SecretString;
-    use crate::test_support::{DirectorioDePrueba, base_con_clave};
+    use crate::test_support::{DirectorioDePrueba, base_con_clave, nombre_de_tarea_de_prueba};
 
     /// Contraseña de base distinguible y larga: si aparece en una salida, la salida es
     /// el fallo.
@@ -784,7 +784,7 @@ mod tests {
                     keep_weekly: 4,
                     keep_monthly: 12,
                     enabled: true,
-                    name: None,
+                    name: nombre_de_tarea_de_prueba(),
                 })
                 .await
                 .expect("el alta de la tarea no puede fallar");

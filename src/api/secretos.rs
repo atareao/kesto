@@ -215,6 +215,7 @@ fn cuerpo_de_target(nombre: &str, contrasena: &str) -> serde_json::Value {
 /// El cuerpo de un alta de tarea, apuntando a los dos recursos sembrados.
 fn cuerpo_de_tarea(target_id: &str, repository_id: &str) -> serde_json::Value {
     serde_json::json!({
+        "name": "tarea-sembrada-1-19",
         "target_id": target_id,
         "repository_id": repository_id,
         "cron_expression": "0 3 * * *",

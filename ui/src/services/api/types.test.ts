@@ -137,9 +137,9 @@ describe('tipos del cable', () => {
   it('el resto de DTOs encajan con el JSON del backend', () => {
     const job: Job = {
       id: 'j',
-      // El nombre es anulable y la clave viaja siempre (`issue #65`): sin nombre,
-      // el backend publica `null` en vez de omitirla.
-      name: null,
+      // El nombre es obligatorio y único (#87): la clave viaja siempre como
+      // cadena no vacía, nunca `null`.
+      name: 'copia nocturna',
       target_id: 't',
       repository_id: 'r',
       cron_expression: '0 3 * * *',
@@ -150,6 +150,7 @@ describe('tipos del cable', () => {
       created_at: '2026-01-02T03:04:05Z',
     }
     const altaJob: AltaJob = {
+      name: 'copia nocturna',
       target_id: 't',
       repository_id: 'r',
       cron_expression: '0 3 * * *',
