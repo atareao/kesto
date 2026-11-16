@@ -882,6 +882,16 @@ impl Motor {
     /// son dos sitios que pueden separarse, y el día que se añada un tipo el `match` del módulo de
     /// la restauración avisa mientras que una comprobación suelta no.
     ///
+    /// # La confirmación de sobrescritura, y qué autoriza
+    ///
+    /// `sobrescribir` es la bandera del contrato de la petición. Para un target de base la exige la
+    /// API **siempre** —restaurar una base pisa datos vivos, y el «sí» tiene que ser deliberado—;
+    /// para un target de directorio es la que autoriza a **podar** el destino, esto es, a retirar de
+    /// él lo que no está en la instantánea. Sin la bandera el directorio solo recibe: los ficheros
+    /// de la copia se escriben —encima de los que coincidan— y lo que sobra se queda donde está. El
+    /// porqué de que la poda no sea la conducta por defecto está en
+    /// [`Repositorio::restaurar_snapshot`].
+    ///
     /// # El ciclo de vida de la fila lo escribe este método
     ///
     /// Al empezar, la fila —que dejó en `pending` quien lanzó la restauración— pasa a `running`; al
@@ -952,6 +962,7 @@ impl Motor {
         instantanea: String,
         objetivo: ObjetivoDeRestauracion,
         execution_id: Uuid,
+        sobrescribir: bool,
     ) -> Result<(), ErrorDelMotor> {
         // El camino, **antes** de tocar nada: un objetivo incoherente no llega al punto de anunciar
         // un arranque que no va a ocurrir. La fila sí se cierra —a `failed`—, porque el trabajo se
@@ -981,7 +992,7 @@ impl Motor {
 
         let desenlace = match camino {
             CaminoDeRestauracion::PorDirectorio { ruta } => {
-                self.restaurar_en_el_directorio(acceso, &instantanea, ruta)
+                self.restaurar_en_el_directorio(acceso, &instantanea, ruta, sobrescribir)
                     .await
             }
             CaminoDeRestauracion::PorContenedor {
@@ -1024,14 +1035,16 @@ impl Motor {
     /// Restaura la instantánea en un directorio del sistema de ficheros, **fuera del runtime**.
     ///
     /// Es la rama de un target `directory`: abre el repositorio con el abridor inyectado y le pide
-    /// que restaure la instantánea en la ruta del host. El trabajo va a un hilo de bloqueo por la
-    /// misma razón de siempre —la biblioteca bloquea y construye su propio runtime— y por eso
-    /// delega en [`fuera_del_runtime`].
+    /// que restaure la instantánea en la ruta del host, podando el destino si la confirmación de
+    /// sobrescritura llegó —lo que eso significa, en [`Repositorio::restaurar_snapshot`]—. El
+    /// trabajo va a un hilo de bloqueo por la misma razón de siempre —la biblioteca bloquea y
+    /// construye su propio runtime— y por eso delega en [`fuera_del_runtime`].
     async fn restaurar_en_el_directorio(
         &self,
         acceso: Acceso,
         instantanea: &str,
         ruta: PathBuf,
+        podar: bool,
     ) -> Result<(), ErrorDelMotor> {
         let abridor = self.0.contexto.ajustes.abridor;
         let instantanea = instantanea.to_owned();
@@ -1051,7 +1064,7 @@ impl Motor {
                 })?;
 
             repositorio
-                .restaurar_snapshot(&instantanea, &destino_local)
+                .restaurar_snapshot(&instantanea, &destino_local, podar)
                 .map_err(|causa| ErrorDelMotor::Repositorio {
                     motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
                     causa,
@@ -1502,9 +1515,9 @@ mod tests {
     use crate::rustic::{Acceso, BarrasDelMotor, Error, PuestaEnMarcha, Repositorio};
     use crate::secret::SecretString;
     use crate::test_support::{
-        CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, abridor_local,
-        abrir_local, base_con_clave, destino_de_s3_que_rechaza, directorio_de_prueba,
-        sembrar_snapshots, snapshot_guardado, volcado_guardado,
+        CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, SEMILLA,
+        SEMILLA_CONTENIDO, abridor_local, abrir_local, base_con_clave, destino_de_s3_que_rechaza,
+        directorio_de_prueba, sembrar_snapshots, snapshot_guardado, volcado_guardado,
     };
 
     /// Un plazo generoso para esperar a que una ejecución termine.
@@ -3680,6 +3693,7 @@ mod tests {
                 instantanea.clone(),
                 objetivo_de_directorio(&aparato.destino.to_string_lossy()),
                 execution_id,
+                false,
             )
             .await;
 
@@ -3757,6 +3771,7 @@ mod tests {
                 instantanea,
                 objetivo_de_directorio(&host.ruta().to_string_lossy()),
                 execution_id,
+                false,
             )
             .await;
 
@@ -3810,6 +3825,7 @@ mod tests {
                 instantanea,
                 objetivo_de_directorio(&host.ruta().to_string_lossy()),
                 fila.id,
+                false,
             )
             .await;
 
@@ -3859,6 +3875,7 @@ mod tests {
                 instantanea,
                 objetivo_de_directorio(&host.ruta().to_string_lossy()),
                 fila.id,
+                false,
             )
             .await;
 
@@ -3903,11 +3920,12 @@ mod tests {
             &["2026-01-01T10:00:00Z"],
         );
         let instantanea = siembra.identificadores[0].clone();
-        let camino_del_volcado = siembra.nodo.clone();
 
         let motor = aparato.motor_con(abridor_local);
 
         // 1. Un directorio: el volcado acaba en el host, y no se habla con ningún contenedor.
+        // La confirmación de sobrescritura llega **apagada**, que es lo que hace que el destino —aquí
+        // uno vacío, así que da igual— no se pode.
         let host = directorio_de_prueba();
 
         let desenlace = motor
@@ -3916,6 +3934,7 @@ mod tests {
                 instantanea.clone(),
                 objetivo_de_directorio(&host.ruta().to_string_lossy()),
                 Uuid::new_v4(),
+                false,
             )
             .await;
 
@@ -3923,10 +3942,15 @@ mod tests {
             desenlace.is_ok(),
             "un target de directorio se restaura en el host y no necesita contenedor: {desenlace:?}"
         );
-        assert!(
-            host.ruta().join(&camino_del_volcado).exists(),
-            "un target de directorio tiene que escribir en su `host_path`, y el fichero sembrado no \
-             está en `{}`",
+        // El contenido, en la **raíz** del destino y no anidado bajo la ruta con la que se montó la
+        // fuente —el directorio temporal de la siembra—: la restauración descuenta esa ruta, que es
+        // el contrato de la copia leído al revés, y el fichero queda donde estaba.
+        assert_eq!(
+            std::fs::read(host.ruta().join(SEMILLA))
+                .expect("el fichero sembrado tiene que estar en la raíz del `host_path`"),
+            SEMILLA_CONTENIDO.to_vec(),
+            "un target de directorio tiene que escribir el contenido del snapshot en su `host_path`, \
+             y `{}` no lo tiene",
             host.ruta().display()
         );
 
@@ -3941,6 +3965,7 @@ mod tests {
                 instantanea,
                 objetivo,
                 Uuid::new_v4(),
+                false,
             )
             .await;
 
