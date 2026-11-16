@@ -2,19 +2,20 @@ import { Alert, Badge, Button, Empty, Table, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { useEjecuciones } from '../../hooks/useEjecuciones'
 import { useTareas } from '../../hooks/useTareas'
-import { useTargets } from '../../hooks/useTargets'
 import type { EventoDeEjecucion, Execution, Job } from '../../services/api/types'
 import { colorDeEstado, etiquetaDeEstado } from '../../services/estados'
 import type { EstadoDeTarea } from '../../services/estados'
-import { formatearFecha, formatearUuid } from '../../services/format'
+import { formatearFecha } from '../../services/format'
 import { mensajeDeError } from '../../services/errores'
 import { useEventStream } from '../../services/useEventStream'
+import { MarcadorSinNombre } from '../MarcadorSinNombre/MarcadorSinNombre'
 
 /** Una fila de la tabla del Dashboard. */
 interface FilaDeTarea {
   key: string
   tarea: Job
-  nombre: string
+  /** El nombre de la tarea; `null` solo si un backend anterior lo publicara vacío. */
+  nombre: string | null
   estado: EstadoDeTarea
   porcentaje: number | null
   ultimaEjecucion: Execution | null
@@ -51,13 +52,11 @@ function eventosPorTarea(eventos: ReadonlyMap<string, EventoDeEjecucion>): Map<s
  */
 export function TablaDeTareasEnCurso() {
   const tareas = useTareas()
-  const targets = useTargets()
   const ejecuciones = useEjecuciones({ limit: 200 })
   const { ejecuciones: eventos } = useEventStream()
 
   const ultimas = ultimasPorTarea(ejecuciones.data ?? [])
   const porTarea = eventosPorTarea(eventos)
-  const nombresDeTarget = new Map((targets.data ?? []).map((target) => [target.id, target.name]))
 
   const filas: FilaDeTarea[] = (tareas.data ?? [])
     .filter((tarea) => tarea.enabled)
@@ -69,7 +68,11 @@ export function TablaDeTareasEnCurso() {
       return {
         key: tarea.id,
         tarea,
-        nombre: nombresDeTarget.get(tarea.target_id) ?? formatearUuid(tarea.target_id),
+        // La columna «Tarea» pinta el nombre de la tarea, nunca el del target:
+        // son cosas distintas y confundirlas era justo el defecto. El contrato
+        // garantiza un nombre no vacío; la red de seguridad cubre un `null` (o
+        // en blanco) que un backend anterior todavía pudiera publicar.
+        nombre: tarea.name,
         estado,
         porcentaje: evento?.percentage ?? null,
         ultimaEjecucion: ultima,
@@ -77,7 +80,13 @@ export function TablaDeTareasEnCurso() {
     })
 
   const columnas: TableProps<FilaDeTarea>['columns'] = [
-    { title: 'Tarea', dataIndex: 'nombre', key: 'nombre' },
+    {
+      title: 'Tarea',
+      dataIndex: 'nombre',
+      key: 'nombre',
+      render: (_valor, fila) =>
+        fila.nombre?.trim() ? fila.nombre : <MarcadorSinNombre />,
+    },
     {
       title: 'Estado',
       key: 'estado',
@@ -124,7 +133,7 @@ export function TablaDeTareasEnCurso() {
       rowKey="key"
       columns={columnas}
       dataSource={filas}
-      loading={tareas.isPending || targets.isPending || ejecuciones.isPending}
+      loading={tareas.isPending || ejecuciones.isPending}
       pagination={false}
       size="small"
       locale={{ emptyText: <Empty description="No hay tareas activas" /> }}

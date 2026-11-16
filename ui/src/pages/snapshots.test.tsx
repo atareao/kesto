@@ -10,6 +10,8 @@ import {
   instalarEventSourceFalso,
 } from '../../tests/eventosDePrueba'
 import { repositorio, snapshot } from '../../tests/fixtures'
+import { claves } from '../hooks/claves'
+import { REINTENTOS_DE_S3 } from '../hooks/useSnapshots'
 import { ProveedorDeEventos } from '../services/events'
 import { NOMBRE_DEL_EVENTO_DE_RESTAURACION } from '../services/useEventStream'
 import type { Snapshot, TipoDeTarget } from '../services/api/types'
@@ -186,6 +188,34 @@ describe('pantalla de Snapshots', () => {
     await waitFor(() => {
       expect(fetch.a('/api/v1/snapshots').length).toBeGreaterThan(antes)
     })
+    unmount()
+  })
+
+  it('un listado que no responde acota su reintento y cae en error, no en un «cargando» sin fin', async () => {
+    const fetch = instalarFetchFalso(
+      manejadorCon(() => ({ status: 503, message: 'el repositorio no responde' })),
+    )
+    // Cliente con la política **de fábrica** (`retry: 3`): sin el tope del hook,
+    // la pantalla seguiría «cargando» mientras reintenta.
+    const cliente = new QueryClient({ defaultOptions: { queries: { gcTime: 0, staleTime: 0 } } })
+    const { unmount } = render(
+      <QueryClientProvider client={cliente}>
+        <ProveedorDeEventos>
+          <Snapshots />
+        </ProveedorDeEventos>
+      </QueryClientProvider>,
+    )
+
+    expect(
+      await screen.findByText('No se pudieron cargar las instantáneas', {}, { timeout: 1500 }),
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId('cargando')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reintentar' })).toBeInTheDocument()
+    expect(cliente.getQueryCache().find({ queryKey: claves.snapshots('r1') })?.options.retry).toBe(
+      REINTENTOS_DE_S3,
+    )
+    // Acotado: una sola tentativa, no las cuatro del `retry: 3` de fábrica.
+    expect(fetch.a('/api/v1/snapshots')).toHaveLength(1)
     unmount()
   })
 

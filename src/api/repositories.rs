@@ -338,38 +338,30 @@ pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppEr
 /// puede funcionar—, y `502` si el que no contesta es el destino. La frontera es de quién es la
 /// culpa, y el porqué está escrito allí, con el de la tabla que **no** elige.
 ///
-/// # Lo que cuesta, y por qué no se acota aquí
+/// # Lo que cuesta, y por qué **sí** está acotado
 ///
-/// Hablar con el destino no es gratis cuando el destino no está: un alta contra un S3 inalcanzable
-/// se lleva **41–54 s** medidos —cinco reintentos de `rustic_backend` con retroceso y temblor,
-/// `DEFAULT_RETRY`— antes de contestar el `502`. Se ha decidido **no acotarlo** con un plazo en este
-/// manejador, y los motivos van en orden de peso:
+/// Hablar con el destino no es gratis cuando el destino no está, y el alta lo habla: abre el
+/// repositorio con [`crate::rustic::Repositorio::poner_en_marcha`], que va bajo el tope del destino
+/// —diez segundos— y declara un reintento acotado (`retry = 1`) en las opciones de `opendal`. Un
+/// alta contra un S3 inalcanzable contesta el `502` **dentro de ese plazo**, no en los 41–54 s que
+/// se medían antes (cinco reintentos, `DEFAULT_RETRY`). El tope no se pone aquí, en el manejador,
+/// sino en la construcción del destino: es una política del **repositorio**, no del alta, y así vale
+/// para todo lo que abre o lista —el panel, el `404` de la restauración y esta misma alta— con un
+/// solo número.
 ///
-/// 1. **Un plazo devolvería una respuesta equivocada.** No distingue un destino muerto de uno lento:
-///    contestaría «el destino no se alcanza» sobre un cubo que sí está y que iba despacio, y un
-///    diagnóstico falso es peor que una espera, porque manda a buscar el fallo donde no está.
-/// 2. **El trabajo no se puede cancelar.** El alta espera a un hilo de bloqueo
-///    (`Motor::abrir_repositorio` entra por `spawn_blocking`), y un plazo sobre esa espera **no**
-///    para el hilo: los reintentos siguen corriendo, con los dos secretos vivos dentro, y cada alta
-///    abandonada dejaría un hilo ocupado. La respuesta se adelantaría a los hechos.
-/// 3. **Aquí no hay un número con el que acertar.** Los tres plazos que este proyecto sí pone —el de
-///    la petición al motor de contenedores, el de la inactividad del volcado y el de la parada—
-///    acotan cosas cuya lentitud está medida y cuyo coste de equivocarse es una copia que falla, no
-///    un alta que se rechaza. Éste sería el único plazo elegido contra un desconocido.
+/// Lo que se acepta a cambio, dicho claro: el tope **no distingue** un destino muerto de uno lento.
+/// A los diez segundos contesta «el destino no se alcanza» también sobre un cubo que sí está y va
+/// despacio, y ese diagnóstico falso es un precio declarado —el operador lo tiene que entender como
+/// «no contesta», que es lo que pasó—. Se eligió así porque la alternativa medida era peor: cuarenta
+/// segundos de espera en un formulario, sin forma de cancelar el trabajo, y el mismo diagnóstico
+/// falso al final. Y lo que **no** se puede prometer es un techo contra un destino que traga la
+/// conexión y no contesta: ahí el tope sí acota la **espera** —el hilo de la biblioteca queda
+/// abandonado, no se espera por él—, pero el trabajo sigue corriendo por detrás hasta que el
+/// transporte se rinda.
 ///
-/// Lo que se acepta a cambio, dicho claro: la petición se queda colgada ese tiempo y el operador
-/// espera sin ver nada. Es asumible donde esto se usa —un alta es una acción humana, delante del
-/// formulario, no una llamada en un bucle—, y la espera está **acotada por la biblioteca**, no
-/// abierta. Lo que **no** está medido es un destino que traga la conexión y no contesta nunca —un
-/// cortafuegos que descarta en silencio—: ahí el techo lo pone el tiempo de transporte de `opendal`,
-/// que no se ha podido medir sin red de verdad. Queda declarado como lo que es.
-///
-/// Y la palanca buena, si algún día duele, no está en este fichero: `rustic_backend` construye su
-/// cliente con las opciones de `opendal`, y bajar ahí la política de reintentos —`("retry","0")` deja
-/// el mismo caso en **13 ms** medidos— es un cambio de `src/rustic/repositorio.rs`, que es donde vive
-/// la construcción del destino. Eso sería una política del alta decidida en un solo sitio, y no un
-/// plazo puesto encima. Se deja escrito en vez de callado porque el precio existe y alguien lo va a
-/// preguntar.
+/// La otra mitad —de quién es la culpa— no cambia: [`del_motor_en_el_alta`] sigue mirando la
+/// **variante**, y [`crate::rustic::Error::DestinoNoAlcanzable`] —la que devuelve el tope agotado— es
+/// la que produce el `502`.
 ///
 /// # Errors
 ///

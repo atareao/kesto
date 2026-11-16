@@ -1,20 +1,41 @@
-import { useQueries } from '@tanstack/react-query'
+import { useQueries, useQueryClient } from '@tanstack/react-query'
 import { listarSnapshots } from '../api/snapshots'
 import type { Repository } from '../services/api/types'
 import { claves } from './claves'
+import { REINTENTOS_DE_S3 } from './useSnapshots'
 
-/** Lo que se puede afirmar del espacio ocupado en S3. */
+/**
+ * Lo que se puede afirmar del espacio ocupado en S3.
+ *
+ * El resultado se modela **por repositorio** —no como un único error—: un
+ * repositorio que no responde no borra lo que sí se sabe de los demás. Quien
+ * consuma esto puede seguir pintando las cifras que **no** dependen del S3 y
+ * limitarse a **nombrar** el fallo, en vez de colapsar el resumen entero.
+ */
 export interface EspacioEnS3 {
-  /** Suma de los `bytes` de las instantáneas devueltas. */
+  /** Suma de los `bytes` de las instantáneas que **sí** se pudieron leer. */
   bytes: number
   /**
-   * `true` si algún repositorio devolvió `truncated`: la suma es un **mínimo**,
-   * no el total.
+   * ¿La cifra es un **mínimo**? Es `true` cuando algún listado vino recortado
+   * (`truncated`) **o** cuando algún repositorio no se pudo leer: en los dos
+   * casos la suma es parcial y presentarla como total sería mentir. Es la
+   * **única** expresión de «mínimo»: el consumidor no vuelve a combinar
+   * condiciones.
    */
-  truncado: boolean
+  esMinimo: boolean
+  /**
+   * Nombres de los repositorios que no respondieron, en el orden del listado de
+   * entrada. Vacío si todos respondieron. Es lo que permite **nombrar** el fallo
+   * sin sustituir el resumen por un error global.
+   */
+  repositoriosCaidos: string[]
+  /** ¿Queda todavía algún listado en vuelo? */
   cargando: boolean
-  /** El primer error de las consultas, si alguna falló. */
-  error: unknown
+  /**
+   * Vuelve a pedir el espacio de **todos** los repositorios. Es la acción del
+   * aviso de fallo: reintentar lo decide el operador, no un bucle del panel.
+   */
+  reintentar: () => void
 }
 
 /**
@@ -22,29 +43,61 @@ export interface EspacioEnS3 {
  *
  * Se pide una consulta por repositorio con `useQueries` —no un bucle de hooks—
  * y cada una se cachea con su propia clave, así que volver al Dashboard no
- * repite las peticiones que ya están frescas.
+ * repite las peticiones que ya están frescas. Cada consulta acota su reintento
+ * (`REINTENTOS_DE_S3`): un repositorio mudo tiene que acabar en error, no en un
+ * «cargando» sin fin.
+ *
+ * Ojo con de dónde viene ese desenlace: el cliente HTTP **no** tiene deadline
+ * propio (`services/api/client.ts` no impone un timeout y el `AbortSignal` que
+ * recibe no lo trae), así que `retry: false` solo acota los **reintentos**, no
+ * la **espera**. Que una petición que nunca resuelve deje de ser «cargando»
+ * depende del **backend**: Kesto corta el listado a los 10 s (`TOPE_DEL_DESTINO`
+ * del motor de rustic), y ese corte es lo que hace rechazar el `fetch` y llegar
+ * aquí el error. Si algún día el backend dejara de acotar el destino, esta vista
+ * se quedaría en `cargando` para siempre: la garantía no vive en este hook.
  */
 export function useEspacioEnS3(repositorios: readonly Repository[]): EspacioEnS3 {
+  const cliente = useQueryClient()
   const consultas = useQueries({
     queries: repositorios.map((repositorio) => ({
       queryKey: claves.snapshots(repositorio.id),
       queryFn: ({ signal }: { signal: AbortSignal }) => listarSnapshots(repositorio.id, signal),
+      retry: REINTENTOS_DE_S3,
     })),
   })
 
   let bytes = 0
   let truncado = false
   let cargando = false
-  let error: unknown = null
+  const repositoriosCaidos: string[] = []
 
-  for (const consulta of consultas) {
+  consultas.forEach((consulta, indice) => {
     if (consulta.isPending) cargando = true
-    if (consulta.error !== null) error = error ?? consulta.error
-    if (consulta.data === undefined) continue
+
+    if (consulta.error !== null && consulta.error !== undefined) {
+      // El nombre sale del repositorio que pidió la consulta: `useQueries`
+      // conserva el orden del listado, así que el índice es el suyo.
+      const repositorio = repositorios[indice]
+      if (repositorio !== undefined) repositoriosCaidos.push(repositorio.name)
+    }
+
+    if (consulta.data === undefined) return
 
     truncado = truncado || consulta.data.truncated
-    for (const snapshot of consulta.data.snapshots) bytes += snapshot.bytes
-  }
+    for (const instantanea of consulta.data.snapshots) bytes += instantanea.bytes
+  })
 
-  return { bytes, truncado, cargando, error }
+  return {
+    bytes,
+    // Una sola expresión de «mínimo»: recorte del listado **o** repositorio
+    // ilegible. En los dos casos la suma es parcial, nunca el total.
+    esMinimo: truncado || repositoriosCaidos.length > 0,
+    repositoriosCaidos,
+    cargando,
+    reintentar: () => {
+      for (const repositorio of repositorios) {
+        void cliente.invalidateQueries({ queryKey: claves.snapshots(repositorio.id) })
+      }
+    },
+  }
 }

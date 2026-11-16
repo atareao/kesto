@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Alert, Badge, Button, Empty, Popconfirm, Space, Table, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { ModalDeTarea } from '../components/ModalDeTarea/ModalDeTarea'
+import { MarcadorSinNombre } from '../components/MarcadorSinNombre/MarcadorSinNombre'
 import { useBorrarTarea, useDispararTarea, useTareas } from '../hooks/useTareas'
 import { useRepositorios } from '../hooks/useRepositorios'
 import { useTargets } from '../hooks/useTargets'
@@ -96,11 +97,7 @@ export default function Tareas() {
       // target **no** es un sustituto válido —es justo la confusión que este
       // campo viene a resolver—.
       render: (_valor, tarea) =>
-        tarea.name?.trim() ? (
-          tarea.name
-        ) : (
-          <Typography.Text type="secondary">sin nombre</Typography.Text>
-        ),
+        tarea.name?.trim() ? tarea.name : <MarcadorSinNombre />,
     },
     {
       title: 'Target',
