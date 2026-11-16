@@ -10,7 +10,7 @@ import { useActualizarTarea, useCrearTarea } from '../../hooks/useTareas'
 
 /** Valores del formulario, que coinciden con el cuerpo del alta. */
 export interface ValoresDeTarea {
-  /** El nombre, recortado al enviarlo; vacío significa «sin nombre». */
+  /** El nombre, recortado al enviarlo; **obligatorio**: no vacío tras recortar. */
   name: string
   target_id: string
   repository_id: string
@@ -45,8 +45,9 @@ const VALORES_POR_DEFECTO: ValoresDeTarea = {
 
 function valoresDe(tarea: Job): ValoresDeTarea {
   return {
-    // Un `null` del contrato se edita como campo vacío: `Input` no acepta `null`
-    // y «sin nombre» y «campo vacío» son lo mismo al guardar.
+    // El contrato ya no admite `null`, pero un panel que hable con un backend
+    // anterior todavía puede recibirlo: `Input` no acepta `null` y el campo
+    // arranca vacío, que el `required` del formulario no dejará guardar.
     name: tarea.name ?? '',
     target_id: tarea.target_id,
     repository_id: tarea.repository_id,
@@ -61,15 +62,12 @@ function valoresDe(tarea: Job): ValoresDeTarea {
 /**
  * Convierte los valores del formulario en el cuerpo del alta y de la edición.
  *
- * El nombre es opcional y se recorta: en blanco **no viaja** —el backend guarda
- * `null`—, así que la clave se omite en lugar de mandar una cadena vacía, que el
- * servidor tendría que volver a interpretar.
+ * El nombre es **obligatorio** y viaja **siempre**, recortado: el formulario ya
+ * ha impedido el envío si queda vacío, así que la clave no se omite en ningún
+ * caso y el servidor nunca recibe una tarea sin nombre.
  */
 function cuerpoDeTarea(valores: ValoresDeTarea): AltaJob {
-  const { name, ...resto } = valores
-  const nombre = name.trim()
-
-  return nombre === '' ? { ...resto } : { ...resto, name: nombre }
+  return { ...valores, name: valores.name.trim() }
 }
 
 interface PropsDelFormularioDeTarea {
@@ -102,10 +100,16 @@ function FormularioDeTarea({
       requiredMark
       initialValues={tarea === null ? VALORES_POR_DEFECTO : valoresDe(tarea)}
     >
-      <Form.Item label="Nombre" name="name">
+      <Form.Item
+        label="Nombre"
+        name="name"
+        // `required` con `whitespace: true`: un `required` a secas deja pasar una
+        // cadena de solo espacios, que el servidor rechazaría con un `400`.
+        rules={[{ required: true, whitespace: true, message: 'El nombre es obligatorio.' }]}
+      >
         {/* El mismo tope que la API: más de 120 caracteres es un `400` que nombra
             `name`, y aquí se evita antes de salir. */}
-        <Input placeholder="Sin nombre" allowClear maxLength={120} />
+        <Input allowClear maxLength={120} />
       </Form.Item>
 
       <Form.Item
@@ -167,7 +171,9 @@ function FormularioDeTarea({
  *   tienen las pantallas; no hay peticiones propias.
  * - La retención son tres `InputNumber` no negativos y **no se envía** una tarea
  *   con las tres a cero: no conservaría nada.
- * - Un `400` del servidor se pinta junto a `cron_expression` y el modal **no** se
+ * - El «Nombre» es obligatorio y viaja siempre recortado. Un `400` que nombre
+ *   `name` y el `409` del nombre duplicado se señalan en su campo; un `400` del
+ *   cron se pinta junto a `cron_expression`. En todos los casos el modal **no** se
  *   cierra: la validación del cliente es una ayuda, no la última palabra.
  *
  * El formulario es un subcomponente con `key` por entidad (ver
@@ -227,9 +233,28 @@ export function ModalDeTarea({
       onGuardado(guardada)
       onCerrar()
     } catch (error) {
-      if (error instanceof ErrorDeApi && error.status === 400) {
-        form.setFields([{ name: 'cron_expression', errors: [error.message] }])
-        return
+      if (error instanceof ErrorDeApi) {
+        // Los rechazos se reparten **por el campo que nombran**: el `409` del
+        // nombre duplicado y el `400` que nombra `name` son del campo «Nombre»
+        // —es su nombre el que hay que corregir—, y el `400` del cron sigue
+        // señalándose en la expresión cron. Señalar el nombre sobre el cron
+        // manda a corregir el sitio equivocado.
+        if (error.status === 409) {
+          form.setFields([{ name: 'name', errors: [error.message] }])
+          return
+        }
+
+        if (error.status === 400) {
+          if (error.message.includes('cron_expression')) {
+            form.setFields([{ name: 'cron_expression', errors: [error.message] }])
+            return
+          }
+
+          if (error.message.includes('name')) {
+            form.setFields([{ name: 'name', errors: [error.message] }])
+            return
+          }
+        }
       }
 
       setErrorGeneral(mensajeDeError(error))

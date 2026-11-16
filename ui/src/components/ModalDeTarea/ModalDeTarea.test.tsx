@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
@@ -106,6 +106,7 @@ describe('ModalDeTarea', () => {
     const { onGuardado, onCerrar } = montar()
 
     await screen.findByRole('dialog')
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
     await elegir(usuario, 'Target', 'web')
     await elegir(usuario, 'Repositorio', 's3')
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
@@ -114,6 +115,7 @@ describe('ModalDeTarea', () => {
 
     const alta = fetch.a('/api/v1/jobs').find((llamada) => llamada.method === 'POST')
     expect(alta?.cuerpo).toEqual({
+      name: 'copia nocturna',
       target_id: 't1',
       repository_id: 'r1',
       cron_expression: '0 0 3 * * *',
@@ -161,11 +163,73 @@ describe('ModalDeTarea', () => {
     const { onCerrar, onGuardado } = montar()
 
     await screen.findByRole('dialog')
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
     await elegir(usuario, 'Target', 'web')
     await elegir(usuario, 'Repositorio', 's3')
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
 
     expect(await screen.findByText(/la expresión no es válida/i)).toBeInTheDocument()
+    // El rechazo del cron se señala en el cron, no en el nombre.
+    const itemNombre = screen.getByRole('textbox', { name: 'Nombre' }).closest('.ant-form-item')
+    expect(within(itemNombre as HTMLElement).queryByText(/no es válida/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(onCerrar).not.toHaveBeenCalled()
+    expect(onGuardado).not.toHaveBeenCalled()
+  })
+
+  it('un 400 que nombra `name` se señala en el campo «Nombre», no en el cron', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(({ ruta, method }) =>
+      ruta === '/api/v1/jobs' && method === 'POST'
+        ? { status: 400, message: 'el campo `name` es obligatorio: falta el nombre de la tarea' }
+        : (() => {
+            throw new Error(`ruta inesperada: ${method} ${ruta}`)
+          })(),
+    )
+
+    const { onCerrar } = montar()
+
+    await screen.findByRole('dialog')
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    const itemNombre = screen
+      .getByRole('textbox', { name: 'Nombre' })
+      .closest('.ant-form-item') as HTMLElement
+    expect(await within(itemNombre).findByText(/falta el nombre/i)).toBeInTheDocument()
+
+    const itemCron = screen
+      .getByRole('textbox', { name: 'Expresión cron' })
+      .closest('.ant-form-item') as HTMLElement
+    expect(within(itemCron).queryByText(/falta el nombre/i)).not.toBeInTheDocument()
+    expect(onCerrar).not.toHaveBeenCalled()
+  })
+
+  it('un 409 del nombre duplicado se muestra junto al campo «Nombre» y no cierra el modal', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(({ ruta, method }) =>
+      ruta === '/api/v1/jobs' && method === 'POST'
+        ? { status: 409, message: 'el campo `name` ya está en uso: elige otro nombre para la tarea' }
+        : (() => {
+            throw new Error(`ruta inesperada: ${method} ${ruta}`)
+          })(),
+    )
+
+    const { onCerrar, onGuardado } = montar()
+
+    await screen.findByRole('dialog')
+    await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
+    await elegir(usuario, 'Target', 'web')
+    await elegir(usuario, 'Repositorio', 's3')
+    await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
+
+    const itemNombre = screen
+      .getByRole('textbox', { name: 'Nombre' })
+      .closest('.ant-form-item') as HTMLElement
+    expect(await within(itemNombre).findByText(/ya está en uso/i)).toBeInTheDocument()
+    // El formulario no se cierra: el operador corrige el nombre ahí mismo.
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     expect(onCerrar).not.toHaveBeenCalled()
     expect(onGuardado).not.toHaveBeenCalled()
@@ -239,9 +303,9 @@ describe('ModalDeTarea', () => {
     expect(screen.getByRole('spinbutton', { name: 'Diarias' })).toHaveValue('2')
   })
 
-  it('el campo «Nombre» es opcional y viaja en el alta cuando se escribe', async () => {
+  it('el campo «Nombre» es obligatorio y viaja en el alta', async () => {
     const usuario = userEvent.setup()
-    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
+    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1', name: 'copia nocturna' })
     const fetch = instalarFetchFalso(({ ruta, method }) => {
       if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
       throw new Error(`ruta inesperada: ${method} ${ruta}`)
@@ -253,7 +317,7 @@ describe('ModalDeTarea', () => {
     await elegir(usuario, 'Target', 'web')
     await elegir(usuario, 'Repositorio', 's3')
 
-    // El campo existe, es de texto y arranca vacío: es opcional.
+    // El campo existe, es de texto y arranca vacío; y es obligatorio.
     expect(screen.getByRole('textbox', { name: 'Nombre' })).toHaveValue('')
 
     await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), 'copia nocturna')
@@ -263,12 +327,10 @@ describe('ModalDeTarea', () => {
     expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).toMatchObject({ name: 'copia nocturna' })
   })
 
-  it('sin nombre, el alta no envía el campo', async () => {
+  it('sin nombre, el alta no se envía y lo explica', async () => {
     const usuario = userEvent.setup()
-    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
-    const fetch = instalarFetchFalso(({ ruta, method }) => {
-      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
-      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    const fetch = instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
     })
 
     montar()
@@ -281,10 +343,9 @@ describe('ModalDeTarea', () => {
 
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
 
-    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
-    // Dejarlo vacío es no mandarlo: el backend guarda `null` y no hay que
-    // distinguir «vacío» de «ausente».
-    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).not.toHaveProperty('name')
+    // Una tarea sin nombre ya no es un estado válido: el formulario lo impide.
+    expect(await screen.findByText(/el nombre es obligatorio/i)).toBeInTheDocument()
+    expect(fetch.llamadas).toHaveLength(0)
   })
 
   it('al editar, el nombre de la fila se precarga y viaja en el PUT', async () => {
@@ -314,12 +375,10 @@ describe('ModalDeTarea', () => {
     expect(fetch.a('/api/v1/jobs/j7')[0]?.cuerpo).toMatchObject({ name: 'copia nocturna' })
   })
 
-  it('un nombre borrado con «allowClear» no viaja en el alta', async () => {
+  it('un nombre borrado con «allowClear» bloquea el alta en vez de enviarla sin nombre', async () => {
     const usuario = userEvent.setup()
-    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
-    const fetch = instalarFetchFalso(({ ruta, method }) => {
-      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
-      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    const fetch = instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
     })
 
     montar()
@@ -332,22 +391,20 @@ describe('ModalDeTarea', () => {
     await usuario.type(nombre, 'copia nocturna')
 
     // La cruz de `allowClear` deja el campo en blanco —`rc-input` escribe `''`—,
-    // y un campo vacío es «sin nombre»: la clave no tiene que viajar.
+    // y un campo vacío no es un nombre válido: el alta no sale.
     await usuario.click(screen.getByRole('button', { name: 'close-circle' }))
     expect(nombre).toHaveValue('')
 
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
 
-    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
-    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).not.toHaveProperty('name')
+    expect(await screen.findByText(/el nombre es obligatorio/i)).toBeInTheDocument()
+    expect(fetch.llamadas).toHaveLength(0)
   })
 
-  it('un nombre de solo espacios no viaja en el alta', async () => {
+  it('un nombre de solo espacios no se envía', async () => {
     const usuario = userEvent.setup()
-    const creada = tarea({ id: 'j9', target_id: 't1', repository_id: 'r1' })
-    const fetch = instalarFetchFalso(({ ruta, method }) => {
-      if (ruta === '/api/v1/jobs' && method === 'POST') return { status: 201, data: creada }
-      throw new Error(`ruta inesperada: ${method} ${ruta}`)
+    const fetch = instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
     })
 
     montar()
@@ -356,12 +413,11 @@ describe('ModalDeTarea', () => {
     await elegir(usuario, 'Target', 'web')
     await elegir(usuario, 'Repositorio', 's3')
 
-    // El campo se recorta antes de enviarse: unos espacios no son un nombre, y
-    // el backend lo guardaría a `null` igual.
+    // Unos espacios no son un nombre: el formulario los rechaza antes de salir.
     await usuario.type(screen.getByRole('textbox', { name: 'Nombre' }), '   ')
     await usuario.click(screen.getByRole('button', { name: 'Guardar' }))
 
-    await waitFor(() => expect(fetch.a('/api/v1/jobs')).toHaveLength(1))
-    expect(fetch.a('/api/v1/jobs')[0]?.cuerpo).not.toHaveProperty('name')
+    expect(await screen.findByText(/el nombre es obligatorio/i)).toBeInTheDocument()
+    expect(fetch.llamadas).toHaveLength(0)
   })
 })

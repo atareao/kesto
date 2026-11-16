@@ -90,9 +90,17 @@ export default function Tareas() {
     {
       title: 'Nombre',
       key: 'nombre',
-      // Sin nombre la celda queda vacía: inventar aquí el del target repetiría
-      // justo la confusión que este campo viene a resolver.
-      render: (_valor, tarea) => tarea.name ?? '',
+      // El contrato garantiza un nombre no vacío; la red de seguridad cubre un
+      // `null` que un backend anterior todavía pudiera publicar: un hueco en
+      // blanco no distingue «no tiene nombre» de «no se pintó», y el nombre del
+      // target **no** es un sustituto válido —es justo la confusión que este
+      // campo viene a resolver—.
+      render: (_valor, tarea) =>
+        tarea.name?.trim() ? (
+          tarea.name
+        ) : (
+          <Typography.Text type="secondary">sin nombre</Typography.Text>
+        ),
     },
     {
       title: 'Target',

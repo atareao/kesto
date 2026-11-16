@@ -189,13 +189,15 @@ describe('pantalla de Snapshots', () => {
     unmount()
   })
 
-  it('la columna «Tarea» va entre la fecha y la etiqueta, y no toca la etiqueta', async () => {
+  it('la columna «Tarea» va entre la fecha y la etiqueta, y nunca repite la etiqueta', async () => {
     instalarFetchFalso(
       manejadorCon(() => ({
         status: 200,
         data: {
-          // `label` es el identificador de la tarea: lo que la columna «Tarea»
-          // enseña es el `job_name`, y sin nombre cae a ese identificador.
+          // `label` es el identificador del snapshot (el de la tarea, cuando la
+          // copia la hizo una). «Tarea» enseña el `job_name`; sin él —una
+          // instantánea huérfana, que no casa con ninguna ejecución— pinta un
+          // marcador atenuado, jamás el contenido de `label`.
           snapshots: [
             snapshot({ id: HEX, label: 'j1', job_name: 'copia nocturna' }),
             snapshot({ id: OTRO_HEX, label: 'j9', job_name: null }),
@@ -230,12 +232,14 @@ describe('pantalla de Snapshots', () => {
 
     const conNombre = celdasDe(HEX)
     expect(conNombre[tarea]?.textContent).toBe('copia nocturna')
-    // La etiqueta sigue siendo el identificador de la tarea, sin cambios.
+    // La etiqueta sigue siendo el identificador del snapshot, sin cambios.
     expect(conNombre[etiqueta]?.textContent).toBe('j1')
 
+    // La huérfana no cae a la etiqueta: «Tarea» dice otra cosa.
     const sinNombre = celdasDe(OTRO_HEX)
-    expect(sinNombre[tarea]?.textContent).toBe('j9')
+    expect(sinNombre[tarea]?.textContent?.trim()).toBe('sin tarea')
     expect(sinNombre[etiqueta]?.textContent).toBe('j9')
+    expect(sinNombre[tarea]?.textContent).not.toBe(sinNombre[etiqueta]?.textContent)
     unmount()
   })
 })
@@ -246,11 +250,16 @@ describe('pantalla de Snapshots', () => {
  *
  * El contrato que se fija aquí: la fila ofrece una acción que **nombra su
  * instantánea**, la confirmación nombra el **target** sobre el que se restaura
- * (de ahí la petición no sale hasta confirmar), la acción no se ofrece cuando el
- * target no se conoce o su tipo no se reconoce, un target de **base de datos**
- * exige además **teclear su nombre** y solo entonces manda `sobrescribir: true`,
- * el avance llega por SSE sin recargar el listado y el resultado se anuncia **al
- * cerrar la fase**, no al aceptar el `POST`.
+ * (de ahí la petición no sale hasta confirmar) y **no se reserva a las bases**:
+ * un target de **base de datos** exige además **teclear su nombre** y solo
+ * entonces manda `sobrescribir: true`; un target de **directorio** ofrece una
+ * casilla que, al marcarla, pide la **poda** —retirar del destino lo que no está
+ * en la instantánea— y manda `sobrescribir: true`, y sin marcarla manda
+ * `sobrescribir: false` (el destino solo recibe). La bandera es **explícita** y
+ * no se deduce del tipo de target. La acción no se ofrece cuando el target no se
+ * conoce o su tipo no se reconoce, el avance llega por SSE sin recargar el
+ * listado y el resultado se anuncia **al cerrar la fase**, no al aceptar el
+ * `POST`.
  *
  * Y tres cosas más que cierran los agujeros de seguirlo todo con una única
  * operación en vuelo: **una restauración cada vez** —la segunda no se lanza, y
@@ -309,17 +318,16 @@ describe('pantalla de Snapshots — restaurar', () => {
   }
 
   /**
-   * Pulsa el botón de la fila y espera a la **confirmación**: Antd la pinta como
-   * `Popconfirm` o como `Modal.confirm` según la elección del panel.
+   * Pulsa el botón de la fila y espera a la **confirmación**. El panel la pinta
+   * como un `Modal` (rol `dialog`), tanto para un directorio como para una base.
    */
   async function abrirConfirmacion(usuario: ReturnType<typeof userEvent.setup>) {
     await usuario.click(await botonDeFila())
     return await waitFor(() => {
-      const popup =
-        document.querySelector<HTMLElement>('.ant-popconfirm') ??
-        document.querySelector<HTMLElement>('.ant-modal-confirm')
-      if (popup === null) throw new Error('no apareció la confirmación de restauración')
-      return popup
+      const dialogo =
+        screen.queryByRole('dialog') ?? document.querySelector<HTMLElement>('.ant-modal')
+      if (dialogo === null) throw new Error('no apareció la confirmación de restauración')
+      return dialogo
     })
   }
 
@@ -368,6 +376,11 @@ describe('pantalla de Snapshots — restaurar', () => {
     return within(dialogo).getByRole('button', { name: 'Restaurar' })
   }
 
+  /** La casilla con la que un directorio pide la poda del destino. */
+  function casillaDePoda(dialogo: HTMLElement) {
+    return within(dialogo).getByRole('checkbox', { name: /retirar del destino/i })
+  }
+
   it('Confirmar antes de restaurar: un directorio nombra el target y no lanza hasta confirmarla', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(manejadorCon(listadoConUna(), REPOS, () => restauracionAceptada))
@@ -382,6 +395,48 @@ describe('pantalla de Snapshots — restaurar', () => {
     expect(confirmacion).toHaveTextContent('web')
     expect(confirmacion).toHaveTextContent('directory')
     expect(fetch.a(RUTA)).toHaveLength(0)
+    unmount()
+  })
+
+  it('Un directorio que acepta la poda pide `sobrescribir: true`', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(manejadorCon(listadoConUna(), REPOS, () => restauracionAceptada))
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+
+    const dialogo = await abrirConfirmacion(usuario)
+
+    // La confirmación de un directorio no es una aceptación directa: advierte de
+    // que la operación retira del destino lo que no está en la instantánea.
+    expect(dialogo).toHaveTextContent(/retira del destino/i)
+
+    // Sin marcarla, el destino solo recibe: la poda hay que pedirla.
+    expect(casillaDePoda(dialogo)).not.toBeChecked()
+    await usuario.click(casillaDePoda(dialogo))
+    expect(casillaDePoda(dialogo)).toBeChecked()
+    await usuario.click(confirmar(dialogo))
+
+    await waitFor(() => expect(fetch.a(RUTA)).toHaveLength(1))
+    expect(fetch.a(RUTA)[0]?.cuerpo).toMatchObject({ repository_id: 'r1', sobrescribir: true })
+    unmount()
+  })
+
+  it('Un directorio que no acepta la poda envía `sobrescribir: false` y solo recibe', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(manejadorCon(listadoConUna(), REPOS, () => restauracionAceptada))
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+
+    const dialogo = await abrirConfirmacion(usuario)
+    // Sin marcar la casilla, la bandera va explícita a `false`: el destino recibe
+    // la instantánea sin retirar lo que no está en ella.
+    expect(casillaDePoda(dialogo)).not.toBeChecked()
+    await usuario.click(confirmar(dialogo))
+
+    await waitFor(() => expect(fetch.a(RUTA)).toHaveLength(1))
+    expect(fetch.a(RUTA)[0]?.cuerpo).toMatchObject({ repository_id: 'r1', sobrescribir: false })
     unmount()
   })
 
@@ -444,7 +499,9 @@ describe('pantalla de Snapshots — restaurar', () => {
     const peticion = fetch.a(RUTA)[0]
     expect(peticion?.method).toBe('POST')
     expect(peticion?.url).toContain(`/api/v1/snapshots/${HEX}/restore`)
-    expect(peticion?.cuerpo).toMatchObject({ repository_id: 'r1' })
+    // La bandera viaja explícita en todo tipo: sin poda, un directorio la manda
+    // a `false` (no la omite).
+    expect(peticion?.cuerpo).toMatchObject({ repository_id: 'r1', sobrescribir: false })
 
     // El `POST` solo **acepta** el trabajo: el resultado llega por SSE, así que
     // aquí no puede anunciarse nada. El aviso es el de la fase en curso, con el

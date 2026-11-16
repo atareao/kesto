@@ -29,9 +29,9 @@ export function repositorio(campos: Partial<Repository> & { id: string }): Repos
 
 export function tarea(campos: Partial<Job> & { id: string }): Job {
   return {
-    // Sin nombre por defecto: es el caso de casi todas las pruebas, y quien
-    // afirme el nombre lo pasa en `campos`.
-    name: null,
+    // El contrato exige un nombre no vacío: el defecto es uno válido y quien
+    // afirme otro lo pasa en `campos`.
+    name: 'copia de prueba',
     target_id: 't1',
     repository_id: 'r1',
     cron_expression: '0 0 3 * * *',
