@@ -271,6 +271,20 @@ chrono = "0.4"
 tower-http = { version = "0.6.11", features = ["fs", "set-header"] }
 tower = { version = "0.5.3", features = ["util"] }
 
+[features]
+# La batería de punta a punta del issue #86. Es una feature y no un simple fichero de
+# `tests/` porque su arnés levanta contenedores, un servidor S3 y el propio binario: nada
+# de eso puede correr en el job `backend` del CI, que no tiene motor de contenedores. Con
+# `required-features`, `cargo test --locked` no compila ni ejecuta la batería —el job
+# `backend` sigue siendo el mismo de siempre— y solo el job `e2e` la enciende con
+# `--features e2e`.
+e2e = []
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+required-features = ["e2e"]
+
 [dev-dependencies]
 http-body-util = "0.1"
 # `log` entra **solo** para las pruebas, y por un motivo concreto: el puente `log` → `tracing`

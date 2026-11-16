@@ -928,23 +928,43 @@ mod tests {
         contenedor.retirar().await;
     }
 
-    /// Un binario que **no existe** da `127` y el motivo llega por [`Canal::Error`].
+    /// Un binario que **no existe** da `127`, y el motivo **nombra el binario**.
     ///
     /// Es la prueba que demuestra que un fallo de extracción se distingue de una base
     /// vacía: `mariadb-dump` no está en `alpine`, así que esto es exactamente lo que pasa
     /// cuando el contenedor de la base no trae el cliente de volcado. Una base vacía sería
-    /// un `0` con la salida vacía, que es otra cosa.
+    /// un `0` con la salida vacía, que es otra cosa: aquí el `exec` no llega a arrancar, el
+    /// código es `127` y el aviso del motor nombra el binario que falta.
+    ///
+    /// # Por cuál de los dos canales llega ese aviso lo decide el motor: aquí no se fija
+    ///
+    /// Está medido con los dos. Con **Podman** el `exec` no llega a arrancar, la salida queda
+    /// **vacía** y el motivo —`Error: crun: executable file \`mariadb-dump\` not found in
+    /// $PATH: …`— viaja por [`Canal::Error`]. Con **Docker** —el motor del job `e2e` del CI, que
+    /// es el mismo que el de producción— el error del runtime OCI llega por [`Canal::Salida`]:
+    /// `OCI runtime exec failed: … exec: "mariadb-dump": executable file not found in $PATH`,
+    /// **131 bytes** contados en el runner.
+    ///
+    /// El canal no es contrato de este módulo —lo elige el motor—, así que la prueba no lo fija.
+    /// Lo que sí fija es lo que el módulo promete: que el aviso **está**, en la suma de los dos
+    /// canales, y que **nombra el binario**; y que nada de lo que llegue por la salida puede
+    /// confundirse con una salida del proceso —una salida legítima de este `exec` no existe,
+    /// porque el proceso nunca llegó a existir—, que es la confusión que esta prueba existe para
+    /// impedir.
     #[tokio::test]
     #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
-    async fn un_binario_que_no_existe_da_127_y_el_motivo_por_el_canal_de_error() {
+    async fn un_binario_que_no_existe_da_127_y_el_motivo_nombra_el_binario() {
+        /// El binario que el `alpine` de prueba no trae, y que el aviso tiene que nombrar.
+        const AUSENTE: &str = "mariadb-dump";
+
         let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
         let contenedor = ContenedorDePrueba::nuevo(
-            "un_binario_que_no_existe_da_127_y_el_motivo_por_el_canal_de_error",
+            "un_binario_que_no_existe_da_127_y_el_motivo_nombra_el_binario",
         )
         .await;
 
         let orden = Orden {
-            cmd: vec!["mariadb-dump".to_owned(), "--version".to_owned()],
+            cmd: vec![AUSENTE.to_owned(), "--version".to_owned()],
             env: Vec::new(),
         };
 
@@ -953,14 +973,19 @@ mod tests {
             .expect("que el binario no exista no rompe el `exec`");
 
         assert_eq!(codigo, 127, "un binario ausente sale con 127");
-        assert_eq!(
-            texto_de(&trozos, Canal::Salida),
-            "",
-            "un binario ausente no escribe nada en la salida: {trozos:?}"
+
+        let por_la_salida = texto_de(&trozos, Canal::Salida);
+        let por_el_error = texto_de(&trozos, Canal::Error);
+
+        assert!(
+            por_el_error.contains(AUSENTE) || por_la_salida.contains(AUSENTE),
+            "el aviso del motor no nombra el binario ausente ({AUSENTE}), lo ponga el motor por \
+             el canal que lo ponga: {trozos:?}"
         );
         assert!(
-            !texto_de(&trozos, Canal::Error).is_empty(),
-            "el motivo del contenedor se perdió: {trozos:?}"
+            por_la_salida.is_empty() || por_la_salida.contains(AUSENTE),
+            "por la salida llegó algo que no es el aviso del motor sobre {AUSENTE}, y este \
+             proceso no puede tener una salida propia: {trozos:?}"
         );
 
         contenedor.retirar().await;

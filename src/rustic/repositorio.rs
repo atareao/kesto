@@ -817,8 +817,18 @@ impl Repositorio {
     ///
     /// Es la operación que hace útil una copia: leer del repositorio y dejar los datos otra vez
     /// donde estaban. Se restaura **la instantánea entera** y no una ruta suya —el panel restaura
-    /// una copia, no un fichero suelto—, así que el nodo de partida es el raíz del árbol de la
-    /// instantánea y el recorrido baja por todo él.
+    /// una copia, no un fichero suelto—, así que el recorrido baja por todo el árbol.
+    ///
+    /// # La ruta montada se descuenta
+    ///
+    /// El contenido queda en la **raíz** del destino, no anidado bajo la ruta con la que se copió.
+    /// La instantánea guarda el contenido con la ruta con la que se montó
+    /// (`openspec/specs/extraction/spec.md:97-102`), así que el árbol de una copia de
+    /// `/backup_sources/x` cuelga de `backup_sources/x`; restaurarlo desde la raíz sintética
+    /// recrearía esa ruta entera **dentro** del destino, y lo que pide el motor para un target
+    /// `directory` es escribir al `host_path` con `LocalDestination`
+    /// (`openspec/specs/engine/spec.md:291`). El prefijo sale de la ruta que la instantánea declara
+    /// —[`ruta_declarada`], que dice también cuándo no hay ninguno que descontar—.
     ///
     /// # El índice tiene que ser el completo, y eso es lo que decide la firma
     ///
@@ -835,14 +845,32 @@ impl Repositorio {
     /// situación de cada trozo. Es lo que la biblioteca exige para restaurar, y hacerlo de otra
     /// forma sería deducir los tamaños de otra fuente.
     ///
-    /// # El destino se crea, y no se borra nada
+    /// # El destino se crea, y lo que sobra solo se retira si se ha confirmado
     ///
     /// El destino es la ruta del `host_path` del target: se **crea** si no está y la restauración
-    /// escribe dentro. Y se restaura con la poda **desactivada** (`delete: false`): lo que hay en el
-    /// destino y no estaba en la instantánea se queda donde está. Es la decisión conservadora, y es
-    /// la única defendible por defecto: `delete: true` borra del host todo lo que la instantánea no
-    /// contenga, y una restauración lanzada por error sobre el directorio equivocado se lleva por
-    /// delante datos que no tienen copia.
+    /// escribe dentro. Lo que ya estaba y **no** está en la instantánea se queda donde está, salvo
+    /// que `podar` venga activado: entonces el destino queda **igual a la instantánea** y lo que
+    /// sobra se retira —la poda de la biblioteca, `RestoreOptions::delete`—.
+    ///
+    /// Por defecto no se poda, y es la decisión conservadora: `delete: true` borra del host todo lo
+    /// que la instantánea no contenga, y una restauración lanzada por error sobre el directorio
+    /// equivocado se lleva por delante datos que no tienen copia. Por eso poda quien **confirma** la
+    /// sobrescritura, con la misma bandera booleana del contrato de la petición que una base exige
+    /// siempre (`openspec/specs/restauracion/spec.md`, «La restauración de un target de base exige
+    /// confirmación explícita de sobrescritura»): un destino de directorio se sustituye cuando el
+    /// operador lo ha autorizado, y sin ese «sí» deliberado solo recibe
+    /// (`openspec/changes/bateria-e2e-de-copia-y-restauracion/specs/verificacion-e2e/spec.md`,
+    /// «Sobrescritura de un destino con contenido»).
+    ///
+    /// La poda es de **mejor esfuerzo**, y eso es de la biblioteca, no de aquí: retirar un fichero
+    /// que no se deja se registra y la restauración sigue, así que un `Ok` con poda no promete que
+    /// el destino quedara exactamente igual a la instantánea. Lo que promete es que la
+    /// restauración escribió todo lo que tenía que escribir.
+    ///
+    /// Y es **irreversible**, que es el otro lado de lo mismo: la poda ocurre en
+    /// `prepare_restore`, **antes** de escribir el contenido, de modo que un fallo a mitad de
+    /// escritura deja el destino **ya podado** y a medias —lo que sobraba no vuelve—, y el motivo
+    /// de la ejecución hablará del fallo de restauración, no de la pérdida de datos.
     ///
     /// En cambio `verify_existing` va **activado**: un fichero que ya está y coincide se compara por
     /// contenido y no por fecha y tamaño. Lo que cuesta es relectura, y lo que compra es no dar por
@@ -859,9 +887,15 @@ impl Repositorio {
     /// # Errors
     ///
     /// Devuelve [`Error::RestauracionFallida`] si el identificador no es un hex completo, si la
-    /// instantánea no está en el repositorio, si el destino no se deja preparar o si la
-    /// restauración no termina.
-    pub fn restaurar_snapshot(self, instantanea: &str, destino_local: &str) -> Result<(), Error> {
+    /// instantánea no está en el repositorio, si la instantánea declara más de una ruta, si declara
+    /// una ruta que su árbol no tiene, si el destino no se deja preparar o si la restauración no
+    /// termina.
+    pub fn restaurar_snapshot(
+        self,
+        instantanea: &str,
+        destino_local: &str,
+        podar: bool,
+    ) -> Result<(), Error> {
         let Repositorio { repo, destino } = self;
 
         let fallo = |motivo: String| Error::RestauracionFallida {
@@ -895,29 +929,45 @@ impl Repositorio {
             )));
         };
 
-        // El nodo del que cuelga todo el árbol. La ruta vacía no es un atajo: el recorrido de la
-        // biblioteca empieza en un nodo raíz **sintético** —sin nombre y con el árbol de la
-        // instantánea por debajo—, que es justo lo que se pide al restaurar la copia entera.
+        // El nodo del que cuelga todo el árbol que se restaura: el de la **ruta declarada**, que es
+        // el prefijo que se descuenta. El árbol de una copia de directorio cuelga de la ruta con la
+        // que se montó —`backup_sources/x`, y no la raíz—, así que empezar el recorrido en la raíz
+        // sintética recrearía esa ruta entera **dentro** del destino; empezarlo en el nodo de la
+        // ruta declarada deja su contenido en la raíz del destino, que es lo que pide el motor para
+        // un target `directory` —`openspec/specs/engine/spec.md:291`, el `host_path` con
+        // `LocalDestination`—. La función que decide el prefijo, [`ruta_declarada`], dice por qué.
+        //
+        // La cadena vacía sigue siendo el caso del `None`, y no es un atajo: la biblioteca
+        // interpreta una ruta sin componentes como el nodo raíz **sintético** —sin nombre y con el
+        // árbol entero por debajo—, que es justo lo que se pide cuando no hay un prefijo que
+        // descontar. Y una instantánea que declare **varias** rutas no llega hasta aquí: es un
+        // fallo de restauración, con su motivo, porque no hay un prefijo único que descontar.
+        let prefijo = ruta_declarada(&copia).map_err(&fallo)?;
         let raiz = repo
-            .node_from_snapshot_and_path(&copia, "")
+            .node_from_snapshot_and_path(&copia, prefijo.unwrap_or(""))
             .map_err(|error| fallo(error.display_log()))?;
 
         // El recorrido, clonable: se consume una vez para preparar el plan y otra para restaurar,
-        // y las dos tienen que ver **los mismos** nodos.
+        // y las dos tienen que ver **los mismos** nodos. Y las rutas que devuelve son **relativas
+        // al nodo de partida** —lo promete `Repository::ls`—, que es la otra mitad del descuento:
+        // con el nodo de la ruta declarada por raíz, `a.txt` es `a.txt` y no `backup_sources/x/a.txt`.
         let nodos = repo
             .ls(&raiz, &LsOptions::default())
             .map_err(|error| fallo(error.display_log()))?;
 
         // El destino se crea si no está y **no** se espera un fichero suelto: lo que se restaura es
-        // un árbol dentro de un directorio.
+        // un árbol dentro de un directorio. El tercer argumento es `expect_file`, no la poda: la
+        // poda viaja en las opciones, más abajo.
         let destino_local = LocalDestination::new(destino_local, true, false)
             .map_err(|error| fallo(error.display_log()))?;
 
         // Las opciones, por sus mutadores y no por literal: el tipo es `#[non_exhaustive]`, así que
         // desde fuera del crate no se puede construir con una expresión de struct —ni con la
-        // actualización funcional—, y los dos valores por defecto que se cambian son los dos que
-        // están medidos arriba.
-        let opciones = RestoreOptions::default().verify_existing(true);
+        // actualización funcional—, y los dos valores que se tocan son los dos que están medidos
+        // arriba: `verify_existing` siempre activado, y `delete` —la poda— según la confirmación.
+        let opciones = RestoreOptions::default()
+            .verify_existing(true)
+            .delete(podar);
 
         let plan = repo
             .prepare_restore(&opciones, nodos.clone(), &destino_local, false)
@@ -1048,6 +1098,55 @@ impl Repositorio {
         repo.dump(&nodo, destino)
             .map_err(|error| fallo(error.display_log()))
     }
+}
+
+/// La ruta de la que cuelga el árbol de una instantánea, cuando declara **una sola**.
+///
+/// Es el prefijo que una restauración tiene que descontar. La instantánea guarda el contenido con
+/// la ruta con la que se montó y no con la del host (`openspec/specs/extraction/spec.md:97-102`),
+/// así que el árbol de una copia de `/backup_sources/x` cuelga de `backup_sources/x`: la biblioteca
+/// archiva las rutas tal cual y descarta solo la barra inicial, de modo que el nodo de esa ruta
+/// declarada **es** el contenido del directorio. Restaurar desde la raíz sintética lo dejaría
+/// anidado —`<destino>/backup_sources/x/a.txt`— y lo que se pide es que quede en la raíz del
+/// destino.
+///
+/// La ruta se devuelve **tal como la declaró la instantánea**, prestada de ella y sin quitarle
+/// nada: la biblioteca descarta por su cuenta los componentes que no son nombres —la raíz de una
+/// ruta absoluta— al resolver el nodo, así que lo único que hay que hacer aquí es no inventarse un
+/// prefijo.
+///
+/// # Cuándo no hay prefijo, y por qué varias rutas son un fallo
+///
+/// `Ok(None)` es el caso de **cero rutas declaradas**: no hay ningún prefijo que descontar y
+/// adivinarlo de la forma del árbol sería inventarse de dónde salió la copia; un árbol que ya es
+/// plano —la instantánea cuelga entera de la raíz sintética— es legítimo, y entonces el recorrido
+/// empieza ahí, que es lo que se hacía antes de existir esto.
+///
+/// `Err` con el motivo es el caso de **dos o más**: no hay un prefijo **único** que descontar, y
+/// elegir uno dejaría fuera del destino el contenido del resto. Antes se devolvía `None` también
+/// aquí, y eso **reintroducía el anidado en silencio** —el recorrido arrancaba en la raíz sintética
+/// y el árbol salía anidado bajo las rutas declaradas— con la ejecución acabando en `success`. En
+/// vez de eso se rechaza, con el mismo trato que los demás fallos de restauración: acaba en
+/// `failed` y el motivo lo dice. Hoy es inalcanzable por API —una instantánea sin vínculo con la
+/// ejecución contesta `409`—, así que no rompe ningún camino legítimo.
+///
+/// Kesto no produce ninguna de las dos formas: una copia declara la ruta de su `host_path` o el
+/// nombre de su volcado, siempre una.
+fn ruta_declarada(copia: &SnapshotFile) -> Result<Option<&str>, String> {
+    let mut declaradas = copia.paths.iter();
+
+    let Some(unica) = declaradas.next() else {
+        return Ok(None);
+    };
+
+    if let Some(otra) = declaradas.next() {
+        return Err(format!(
+            "la instantánea declara más de una ruta —`{unica}` y `{otra}`—, así que no hay un \
+             prefijo único que descontar al restaurar"
+        ));
+    }
+
+    Ok(Some(unica.as_str()))
 }
 
 /// Construye el destino de S3 a partir de la fila.
@@ -3202,6 +3301,264 @@ mod tests {
         );
 
         drop(repositorio);
+    }
+
+    // ── Restaurar el árbol de un directorio ──────────────────────────────────
+
+    /// **Cuál es el prefijo que se descuenta, cuándo no hay ninguno y cuándo es un fallo.**
+    ///
+    /// Es la decisión de [`super::ruta_declarada`] medida sola, sin repositorio: el prefijo es la
+    /// ruta que la instantánea declara, y solo cuando declara **una**. Las instantáneas se montan a
+    /// mano porque lo que se mide es la función, no una copia: construir un repositorio para esto
+    /// costaría una derivación de clave por caso y no añadiría nada a lo que se afirma.
+    ///
+    /// Los tres casos se afirman por separado porque **cero** y **dos** no son el mismo: sin rutas
+    /// no hay ningún prefijo declarado que descontar —`Ok(None)`, el árbol ya es plano y el
+    /// recorrido empieza en la raíz sintética—, mientras que con dos no hay uno **único** —elegir
+    /// uno dejaría fuera del destino el contenido de la otra—, así que es un `Err` con el motivo y
+    /// **no** un `None`: devolver `None` aquí volvería a anidar el árbol en silencio, con la
+    /// ejecución acabando en `success`.
+    #[test]
+    fn ruta_declarada_es_la_unica_ruta_que_la_instantanea_declara() {
+        let instantanea = || {
+            SnapshotOptions::default()
+                .to_snapshot()
+                .expect("una instantánea vacía se construye")
+        };
+
+        let sin_rutas = instantanea();
+        assert_eq!(
+            super::ruta_declarada(&sin_rutas),
+            Ok(None),
+            "una instantánea que no declara ninguna ruta no tiene prefijo que descontar"
+        );
+
+        let con_una = {
+            let mut copia = instantanea();
+            copia.paths.add("/backup_sources/tienda".to_owned());
+            copia
+        };
+        assert_eq!(
+            super::ruta_declarada(&con_una),
+            Ok(Some("/backup_sources/tienda")),
+            "con una sola ruta declarada, el prefijo es esa ruta tal cual"
+        );
+
+        let con_dos = {
+            let mut copia = con_una.clone();
+            copia.paths.add("/backup_sources/otra".to_owned());
+            copia
+        };
+        let motivo = super::ruta_declarada(&con_dos)
+            .expect_err("con dos rutas declaradas no hay un prefijo único que descontar");
+        assert!(
+            motivo.contains("/backup_sources/tienda") && motivo.contains("/backup_sources/otra"),
+            "el motivo tiene que nombrar las rutas declaradas y por qué no se puede elegir una, y \
+             dijo `{motivo}`"
+        );
+    }
+
+    /// **27.** La restauración de un directorio deja su contenido en la **raíz** del destino.
+    ///
+    /// Es el contrato de la copia leído al revés. La instantánea guarda el contenido del
+    /// directorio **con la ruta con la que se montó, no con la del host**
+    /// (`openspec/specs/extraction/spec.md:97-102`), así que el árbol cuelga de
+    /// `backup_sources/x` —de `/tmp/…/origen`, en una prueba— y no de la raíz. Y la restauración
+    /// de un target `directory` escribe al `host_path` con `LocalDestination`
+    /// (`openspec/specs/engine/spec.md:291`): lo que había en la raíz del origen tiene que quedar
+    /// en la raíz del destino.
+    ///
+    /// Sin descontar ese prefijo, restaurar `/tmp/x/origen` recrea la ruta absoluta **dentro** del
+    /// destino —`<destino>/tmp/x/origen/a.txt`—, que es lo que midió la batería de punta a punta y
+    /// lo que esta prueba mide sin contenedores ni S3: la ruta del origen se sortea con un UUID,
+    /// así que el anidado no se puede confundir con el contenido restaurado.
+    ///
+    /// Se afirman las dos mitades del contrato y en el orden en que ocurren: que la instantánea
+    /// **declara** la ruta montada —de donde sale el prefijo— y que la restauración la descuenta.
+    #[test]
+    fn la_restauracion_deja_el_contenido_del_directorio_en_la_raiz_del_destino() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+
+        let fuente = directorio_de_prueba();
+        std::fs::create_dir_all(fuente.ruta().join("sub/anidado"))
+            .expect("el árbol de la fuente se crea");
+        std::fs::write(fuente.ruta().join("a.txt"), b"contenido de a\n")
+            .expect("el fichero de la raíz de la fuente se escribe");
+        std::fs::write(fuente.ruta().join("sub/b.bin"), [0u8, 1, 2, 255])
+            .expect("el fichero anidado de la fuente se escribe");
+
+        let copia = Copia {
+            rutas: vec![fuente.ruta().to_path_buf()],
+            nombre: "directorio".to_owned(),
+            etiqueta: ETIQUETA.to_owned(),
+            host: "host-de-prueba".to_owned(),
+            comando: "copia de directorio".to_owned(),
+        };
+
+        let hecho = repositorio
+            .archivar_directorio(&copia)
+            .expect("copiar un directorio no puede fallar");
+        drop(repositorio);
+
+        // La primera mitad: la instantánea declara la ruta con la que se montó, que es de donde
+        // sale el prefijo que la restauración tiene que descontar.
+        let guardado = snapshot_guardado(&destino.ruta, PASSPHRASE_DE_PRUEBA, &hecho.id);
+        assert_eq!(
+            guardado.paths.iter().cloned().collect::<Vec<String>>(),
+            vec![fuente.ruta().to_string_lossy().into_owned()],
+            "la instantánea tiene que declarar la ruta con la que se montó el directorio"
+        );
+
+        // Y la segunda: la restauración, a un destino **vacío**. El repositorio se vuelve a abrir
+        // porque restaurar lo consume —pasa al índice completo—, que es lo que el motor hace en
+        // cada trabajo.
+        let restaurado = directorio_de_prueba();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio se vuelve a abrir");
+        repositorio
+            .restaurar_snapshot(&hecho.id, &restaurado.ruta().to_string_lossy(), false)
+            .expect("restaurar una instantánea que está en el repositorio no puede fallar");
+
+        assert_eq!(
+            std::fs::read(restaurado.ruta().join("a.txt"))
+                .expect("el fichero de la raíz del origen tiene que estar en la raíz del destino"),
+            b"contenido de a\n".to_vec(),
+            "el fichero de la raíz del origen no quedó en la raíz del destino"
+        );
+        assert_eq!(
+            std::fs::read(restaurado.ruta().join("sub/b.bin"))
+                .expect("el fichero anidado del origen tiene que estar en el mismo sitio"),
+            vec![0u8, 1, 2, 255],
+            "el fichero anidado del origen no quedó en el mismo sitio del destino"
+        );
+
+        let anidada = restaurado.ruta().join(
+            fuente
+                .ruta()
+                .strip_prefix("/")
+                .expect("la ruta de la fuente de la prueba es absoluta"),
+        );
+        assert!(
+            !anidada.exists(),
+            "la restauración recreó la ruta absoluta del origen dentro del destino (`{}`): el \
+             prefijo con el que se montó el directorio no se descontó",
+            anidada.display()
+        );
+    }
+
+    /// **28.** La poda del destino la decide la confirmación de sobrescritura, y sin ella no se
+    /// retira nada.
+    ///
+    /// Es la otra mitad de la restauración de un directorio: lo que había en el destino y **no**
+    /// está en la instantánea. Con la poda activada el destino queda **igual a la instantánea** —el
+    /// fichero que sobra desaparece, y el **directorio** que sobra también, porque `remove_dir_all`
+    /// es recursivo—, y sin ella se queda donde está, que es la conducta conservadora por defecto:
+    /// podar borra del host datos que no tienen copia, así que lo hace quien **confirma** la
+    /// sobrescritura
+    /// (`openspec/changes/bateria-e2e-de-copia-y-restauracion/specs/verificacion-e2e/spec.md`,
+    /// «Sobrescritura de un destino con contenido»).
+    ///
+    /// Se siembran los **dos** tipos de resto a la vez —un fichero suelto y un directorio no vacío—
+    /// porque no se retiran por el mismo camino, y se restaura la **misma** instantánea dos veces,
+    /// primero sin poda y luego con ella, y por eso lo que sobra se vuelve a sembrar entre las dos:
+    /// si la primera pasada lo hubiera retirado, la segunda no probaría nada —no habría nada que
+    /// podar— y la prueba pasaría por no medir. El repositorio se reabre entre las dos porque
+    /// restaurar lo consume.
+    #[test]
+    fn la_poda_del_destino_la_decide_la_confirmacion_de_sobrescritura() {
+        let destino = Destino::nuevo();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+
+        let fuente = directorio_de_prueba();
+        std::fs::write(fuente.ruta().join("a.txt"), b"contenido de a\n")
+            .expect("el fichero de la fuente se escribe");
+
+        let copia = Copia {
+            rutas: vec![fuente.ruta().to_path_buf()],
+            nombre: "directorio".to_owned(),
+            etiqueta: ETIQUETA.to_owned(),
+            host: "host-de-prueba".to_owned(),
+            comando: "copia de directorio".to_owned(),
+        };
+
+        let hecho = repositorio
+            .archivar_directorio(&copia)
+            .expect("copiar un directorio no puede fallar");
+        drop(repositorio);
+
+        let restaurado = directorio_de_prueba();
+        let obsoleto = restaurado.ruta().join("obsoleto.txt");
+        // Un **directorio** que sobra, además del fichero: la poda lo retira porque `remove_dir_all`
+        // es recursivo, y con un fichero suelto ese camino no se medía. No está vacío —lleva un
+        // fichero dentro, en un subdirectorio—, que es lo que hace que la poda tenga que ser
+        // recursiva y no un `remove` a secas.
+        let sobrante = restaurado.ruta().join("sobrante");
+        let dentro_del_sobrante = sobrante.join("anidado").join("sobrante.bin");
+        let sembrar_lo_que_sobra = || {
+            std::fs::write(&obsoleto, b"no esta en la instantanea\n")
+                .expect("el fichero que sobra se escribe en el destino");
+            std::fs::create_dir_all(sobrante.join("anidado"))
+                .expect("el directorio que sobra se crea en el destino");
+            std::fs::write(&dentro_del_sobrante, b"tampoco esta en la instantanea\n")
+                .expect("el fichero del directorio que sobra se escribe en el destino");
+        };
+
+        // Sin confirmación: el destino solo recibe, y lo que sobra se queda.
+        sembrar_lo_que_sobra();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio se vuelve a abrir");
+        repositorio
+            .restaurar_snapshot(&hecho.id, &restaurado.ruta().to_string_lossy(), false)
+            .expect("restaurar sin poda no puede fallar");
+
+        assert!(
+            obsoleto.exists(),
+            "sin la confirmación de sobrescritura el destino no se poda, y `obsoleto.txt` \
+             desapareció de `{}`",
+            restaurado.ruta().display()
+        );
+        assert!(
+            dentro_del_sobrante.exists(),
+            "sin la confirmación de sobrescritura el directorio que sobra tampoco se toca, y \
+             `{}` desapareció de `{}`",
+            dentro_del_sobrante.display(),
+            restaurado.ruta().display()
+        );
+
+        // Y con ella: el destino queda igual a la instantánea, sin nada de lo previo.
+        sembrar_lo_que_sobra();
+        let (repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio se vuelve a abrir");
+        repositorio
+            .restaurar_snapshot(&hecho.id, &restaurado.ruta().to_string_lossy(), true)
+            .expect("restaurar con poda no puede fallar");
+
+        assert!(
+            !obsoleto.exists(),
+            "con la confirmación de sobrescritura el contenido previo se sustituye por el del \
+             snapshot, y `obsoleto.txt` sigue en `{}`",
+            restaurado.ruta().display()
+        );
+        assert!(
+            !sobrante.exists(),
+            "con la confirmación de sobrescritura el contenido previo se sustituye por el del \
+             snapshot, y el directorio que sobra sigue en `{}`",
+            restaurado.ruta().display()
+        );
+        assert_eq!(
+            std::fs::read(restaurado.ruta().join("a.txt"))
+                .expect("la poda no puede llevarse por delante lo que sí está en la instantánea"),
+            b"contenido de a\n".to_vec(),
+            "el contenido del snapshot no quedó en el destino después de podar"
+        );
     }
 
     // ── Volcar el volcado al escritor ────────────────────────────────────────

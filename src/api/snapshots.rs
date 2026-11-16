@@ -161,6 +161,11 @@ pub struct CuerpoDeLaRestauracion {
     /// confirmación no es «un campo mal escrito» sino «una condición previa sin cumplir», y quien la
     /// decide es la puerta del manejador —que contesta `428`—, no el extractor —que contestaría
     /// `400`—. `deny_unknown_fields` sigue rechazando cualquier otro campo.
+    ///
+    /// En un target de **directorio** no se exige, y no es un campo que se ignore: viaja al motor y
+    /// es lo que autoriza a **podar** el destino —retirar de él lo que no está en la instantánea—,
+    /// de modo que sin ella un directorio solo recibe. Ver
+    /// [`Motor::restaurar`](crate::engine::Motor::restaurar).
     #[serde(default)]
     pub sobrescribir: bool,
 }
@@ -502,6 +507,12 @@ pub async fn restaurar(
     let acceso = acceso_del_repositorio(&fila);
     let instantanea_tarea = instantanea.clone();
 
+    // La confirmación viaja **entera** al motor, y no solo por la puerta del `428` de más arriba:
+    // para un target de base la API la exige, y para uno de directorio es la que autoriza a **podar**
+    // el destino —retirar lo que hay en él y no está en la instantánea—, de modo que un directorio
+    // sin confirmar solo recibe. Ver [`Motor::restaurar`](crate::engine::Motor::restaurar).
+    let sobrescribir = cuerpo.sobrescribir;
+
     tokio::spawn(async move {
         // La reserva vive lo que dure el trabajo: se suelta al terminar —y también si el futuro se
         // desmonta por un pánico o por una cancelación, porque es un local suyo y su `Drop` corre
@@ -510,7 +521,13 @@ pub async fn restaurar(
         let _reserva = reserva;
 
         if let Err(error) = motor
-            .restaurar(acceso, instantanea_tarea, objetivo, execution_id)
+            .restaurar(
+                acceso,
+                instantanea_tarea,
+                objetivo,
+                execution_id,
+                sobrescribir,
+            )
             .await
         {
             tracing::error!(%error, "la restauración en segundo plano falló");
@@ -838,7 +855,7 @@ mod tests {
     use crate::engine::EventoDelMotor;
     use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
-        DirectorioDePrueba, ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA,
+        DirectorioDePrueba, ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA, SEMILLA,
         SEMILLA_CONTENIDO, base_con_clave, body_json, config_con_dsn, directorio_de_prueba,
         estado_de_prueba, get, nombre_de_tarea_de_prueba, post_json, router_desarrollo,
         sembrar_snapshot_ajeno, sembrar_snapshots,
@@ -1888,9 +1905,9 @@ mod tests {
     ///
     /// La respuesta no basta como medida: un `200` con la ejecución y el target correctos lo
     /// cumple un manejador que resuelva el mapeo y no restaure nada. El criterio de aceptación es
-    /// el otro —el fichero sembrado aparece bajo el `host_path` del target—, y por eso el destino
-    /// es un directorio **vacío**: con uno que ya tuviera la fuente no se podría distinguir «se
-    /// restauró» de «ya estaba».
+    /// el otro —el fichero sembrado aparece **en la raíz** del `host_path` del target—, y por eso el
+    /// destino es un directorio **vacío**: con uno que ya tuviera la fuente no se podría distinguir
+    /// «se restauró» de «ya estaba».
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restaurar_una_instantanea_de_un_target_de_directorio_devuelve_su_ejecucion_y_su_target()
      {
@@ -1965,10 +1982,16 @@ mod tests {
         let encontrado =
             espera_el_contenido(host.ruta(), SEMILLA_CONTENIDO, PLAZO_DE_LA_RESTAURACION).await;
 
-        assert!(
-            encontrado.is_some(),
-            "el fichero sembrado no reapareció bajo `{}` en {PLAZO_DE_LA_RESTAURACION:?}: una \
-             restauración que contesta 200 y no devuelve los datos no ha restaurado nada",
+        // Y **en la raíz** del `host_path`, no anidado bajo la ruta con la que se montó la fuente
+        // —el directorio temporal de la siembra—: la restauración descuenta esa ruta, que es el
+        // contrato de la copia leído al revés. Buscar el contenido sólo por su valor lo encontraría
+        // también anidado, así que lo que se afirma es dónde quedó.
+        assert_eq!(
+            encontrado.as_deref(),
+            Some(host.ruta().join(SEMILLA).as_path()),
+            "el fichero sembrado no reapareció en la raíz de `{}` en {PLAZO_DE_LA_RESTAURACION:?}: \
+             una restauración que contesta 200 y no devuelve los datos donde estaban no ha \
+             restaurado nada (apareció en {encontrado:?})",
             host.ruta().display()
         );
     }
@@ -2590,6 +2613,88 @@ mod tests {
             Estado::Success,
             "una restauración contra un contenedor que no existe no puede darse por buena: la fila \
              quedaría mintiendo en el histórico"
+        );
+    }
+
+    /// 1.47 — Con la confirmación, la restauración de un directorio **poda** el destino.
+    ///
+    /// Cubre `bateria-e2e-de-copia-y-restauracion`, escenario «Sobrescribir un directorio
+    /// existente»: el contenido previo del destino se sustituye por el del snapshot. La bandera del
+    /// cuerpo es la que autoriza a retirar del destino lo que la instantánea no contiene —la misma
+    /// confirmación que un target de base exige siempre—, y sin ella el directorio solo recibe. La
+    /// otra mitad —sin confirmación no se toca— la mide una prueba de `rustic::repositorio`, donde
+    /// la bandera se pasa a mano.
+    ///
+    /// Se siembra un fichero que **no está** en la copia y se espera a que desaparezca, además de
+    /// esperar a que llegue el contenido de la copia: un destino vacío cumple «el obsoleto no está»
+    /// sin haber restaurado nada, así que las dos mitades se afirman juntas. La poda ocurre **antes**
+    /// de escribir los ficheros —la biblioteca la hace al preparar el plan—, así que la aparición del
+    /// contenido es también la prueba de que el destino ya se podó.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restaurar_un_directorio_con_la_confirmacion_poda_el_destino() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let repositorio = alta_de_repositorio(&router, "restaurador-1-47", &ruta).await;
+        let repositorio_id = Uuid::parse_str(&repositorio)
+            .expect("el alta del repositorio devuelve un identificador con forma de UUID");
+
+        let host = directorio_de_prueba();
+        let instantanea = siembra.identificadores[0].clone();
+
+        // El contenido previo del destino: un fichero que la copia **no** tiene.
+        let obsoleto = host.ruta().join("obsoleto.txt");
+        std::fs::write(&obsoleto, b"contenido previo del destino\n")
+            .expect("el fichero previo del destino se escribe");
+
+        let (_target, _ejecucion) = sembrar_cadena(
+            &estado,
+            repositorio_id,
+            &instantanea,
+            TipoDeTarget::Directory,
+            Some(host.ruta().to_string_lossy().into_owned()),
+        )
+        .await;
+
+        let respuesta = post_json(
+            router,
+            &format!("/api/v1/snapshots/{instantanea}/restore"),
+            &serde_json::json!({ "repository_id": repositorio, "sobrescribir": true }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "restaurar un directorio con la confirmación tiene que contestar 200; contestó {status} \
+             con {cuerpo}"
+        );
+
+        let encontrado =
+            espera_el_contenido(host.ruta(), SEMILLA_CONTENIDO, PLAZO_DE_LA_RESTAURACION).await;
+
+        assert!(
+            encontrado.is_some(),
+            "el contenido de la copia no apareció bajo `{}` en {PLAZO_DE_LA_RESTAURACION:?}, así que \
+             no hubo restauración que podar",
+            host.ruta().display()
+        );
+        assert!(
+            !obsoleto.exists(),
+            "con la confirmación de sobrescritura el contenido previo del destino se sustituye por \
+             el del snapshot, y `{}` sigue ahí",
+            obsoleto.display()
         );
     }
 }
