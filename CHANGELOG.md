@@ -1,4 +1,44 @@
 # Changelog
+## [0.10.0] - 2026-11-16
+
+### Bug Fixes
+
+- *(restauracion)* El directorio restaurado deja el contenido en la raíz del destino (#86)
+- *(e2e)* La batería ignorada mide el contrato, no el canal del motor (#86)
+- *(e2e)* Esperar a que la base exista, no a que el servidor escuche
+- *(db)* La 0007 desambigua los nombres repetidos antes de exigir unicidad
+- *(db)* La migración descarta la conexión si no reenciende las claves foráneas
+
+### Documentation
+
+- Relevo tras v0.9.0 y el desbloqueo de release-prepare
+- *(spec)* Nombre de tarea obligatorio y único, y renders del panel (#87 #89 #93)
+- *(spec)* Propuesta de batería e2e de copia y restauración (#86)
+- *(spec)* Archiva el cambio de la batería e2e y su plan (#86)
+- Feature 023, comandos y entorno de la batería e2e (#86)
+- *(spec)* La 0007 desambigua los homónimos y trata el blanco como ausente
+- El §3 y los docstrings de `job_name`, al día con la 0007
+- *(spec)* Archivar contratos-y-renders-del-panel
+- Feature 024, tareas del change cerradas (#87 #89 #93)
+- Cerrar el PLAN-024 (PR #96)
+
+### Features
+
+- *(tareas)* El nombre de la tarea es obligatorio y único (#87)
+- *(ui)* Nombre obligatorio, renders del panel y poda de directorio (#87 #89 #93)
+
+### Miscellaneous Tasks
+
+- Job e2e con motor de contenedores y los tests ignorados (#86)
+
+### Refactor
+
+- *(ui)* Una sola condición de confirmación y limpieza de la auditoría (#93)
+
+### Testing
+
+- *(e2e)* Batería de punta a punta de copia y restauración (#86)
+- *(db)* `nombres` resuelve el lote y la ausencia es falta de clave
 ## [0.9.0] - 2026-11-15
 
 ### Bug Fixes
@@ -16,6 +56,10 @@
 ### Features
 
 - *(restauracion)* Selector de target en la pantalla de Restauraciones
+
+### Miscellaneous Tasks
+
+- Release v0.9.0
 
 ### Testing
 
