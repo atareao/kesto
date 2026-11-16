@@ -76,11 +76,11 @@ documentada de limpiar los restos, y que el arnés avise —sin bloquear— cuan
 
 ## Criterios de aceptación
 
-- [ ] Matar la suite a mitad **no** deja restos que se acumulen: la siguiente corrida los recoge.
-- [ ] `df -i /tmp` no crece entre ejecuciones consecutivas.
-- [ ] Documentado cómo limpiar (receta `just clean-tmp`).
-- [ ] `just check` en verde y sin dependencias nuevas.
-- [ ] Esquiva el barrido: solo borra `kesto-prueba-*` de pids muertos.
+- [x] Matar la suite a mitad **no** deja restos que se acumulen: la siguiente corrida los recoge.
+- [x] `df -i /tmp` no crece entre ejecuciones consecutivas.
+- [x] Documentado cómo limpiar (receta `just clean-tmp`).
+- [x] `just check` en verde y sin dependencias nuevas.
+- [x] Esquiva el barrido: solo borra `kesto-prueba-*` de pids muertos.
 
 ## Nota de arranque
 
