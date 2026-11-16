@@ -323,7 +323,7 @@ mod tests {
     use crate::secret::SecretString;
     use crate::test_support::{
         MASTER_KEY, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER_URL, SESSION_SECRET, auth_oidc,
-        base_con_clave, config_con_dsn, estado_de_prueba, lookup_from,
+        base_con_clave, config_con_dsn, estado_de_prueba, lookup_from, nombre_de_tarea_de_prueba,
     };
 
     #[tokio::test]
@@ -537,7 +537,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect("el alta de la tarea por la capa del estado no puede fallar");

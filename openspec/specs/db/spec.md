@@ -104,7 +104,7 @@ WAL SHALL convivir con ficheros `-wal` y `-shm` **junto a la base**, así que **
 
 ### Requirement: Las cuatro tablas del §3 se reproducen exactas, con sus `CHECK`, sus cascadas y los índices añadidos
 
-Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`. `backup_jobs` SHALL incluir además la columna `name` (`TEXT`, anulable), declarada aquí **como un añadido al SRS** —el §3 no la tiene en su versión original—: un UUID no identifica la tarea al operador, y el nombre es lo que hace legible el histórico y los snapshots.
+Las migraciones SHALL declarar las cuatro tablas del §3 —`repositories`, `backup_targets`, `backup_jobs` y `job_executions`— con las columnas, los tipos y los valores por defecto de ese apartado, incluidos los `CHECK` de enumerado `target_type IN ('mariadb', 'postgresql', 'directory', 'sqlite')` y `status IN ('pending', 'running', 'success', 'failed')`, y las tres claves foráneas `ON DELETE CASCADE`. `backup_targets` SHALL incluir además la columna `db_path` (`TEXT`, anulable), que junto a `container_name` describe una fuente `sqlite`. `backup_jobs` SHALL incluir además la columna `name` (`TEXT`, **no nula**, con `UNIQUE(name)`), declarada aquí **como un añadido al SRS** —el §3 no la tiene en su versión original—: un UUID no identifica la tarea al operador, y el nombre es lo que hace legible el histórico y los snapshots. La creó anulable la `0005` y la hizo obligatoria y única la `0007`; este apartado fija el **estado final**, y el escenario que describe el estado intermedio lo dice en su propio `GIVEN`. La forma exacta de esa columna la fija el requisito «La obligatoriedad y la unicidad del nombre reconstruyen `backup_jobs`, y la reconstrucción no se lleva ninguna fila».
 
 Las restricciones SHALL estar **en la base** y no solo en Rust: un `INSERT` hecho con `sqlite3` a mano tiene que chocar con el mismo `CHECK` que choca la aplicación. Es la única forma de que el enumerado sea una garantía y no una convención.
 
@@ -119,13 +119,13 @@ Los tres primeros SHALL existir porque **SQLite no crea índices para las claves
 
 Filtrar las ejecuciones **por repositorio** SHALL resolverse con el `JOIN` por `backup_jobs` apoyado en los índices anteriores, y NO SHALL añadirse una columna `repository_id` a `job_executions`: duplicaría un dato que ya vive en la tarea y crearía una segunda verdad que se puede desincronizar.
 
-Los índices SHALL nombrarse `idx_{tabla}_{columna}`.
+Los índices SHALL nombrarse `idx_{tabla}_{columna}`. Una reconstrucción de la tabla SHALL recrearlos: el `DROP TABLE` de la vieja se los lleva con ella.
 
 #### Scenario: Las cuatro tablas existen con sus columnas
 - **GIVEN** una base con las migraciones aplicadas
 - **WHEN** se enumeran las tablas y sus columnas
 - **THEN** SHALL existir `repositories`, `backup_targets`, `backup_jobs` y `job_executions`
-- **AND** sus columnas SHALL ser las del §3, más `backup_targets.db_path`
+- **AND** sus columnas SHALL ser las del §3, más `backup_targets.db_path` y `backup_jobs.name`
 
 #### Scenario: Los enumerados están garantizados por un `CHECK`
 - **GIVEN** una base con las migraciones aplicadas
@@ -158,10 +158,17 @@ Los índices SHALL nombrarse `idx_{tabla}_{columna}`.
 - **AND** `job_executions` NO SHALL tener columna `repository_id`
 
 #### Scenario: La columna `name` de `backup_jobs` existe y es anulable
-- **GIVEN** una base con las migraciones aplicadas
+- **GIVEN** una base llevada a mano hasta la `0005` —el estado intermedio que la `0007` tiene que migrar, no el final—
 - **WHEN** se consulta la tabla `backup_jobs`
 - **THEN** SHALL existir la columna `name` de tipo `TEXT`
 - **AND** SHALL admitir `NULL` en una fila insertada con SQL directo `INSERT ... (id, target_id, repository_id, cron_expression) VALUES (...)` sin especificarla
+
+#### Scenario: La columna `name` de `backup_jobs` es obligatoria y única
+- **GIVEN** una base con las migraciones aplicadas
+- **WHEN** se consulta la tabla `backup_jobs` y se intenta insertar una fila con SQL directo sin `name`, o con un `name` que ya tiene otra fila
+- **THEN** SHALL existir la columna `name` de tipo `TEXT`
+- **AND** su nulabilidad SHALL ser `NOT NULL`
+- **AND** las dos inserciones SHALL fallar por la restricción de la base
 
 ### Requirement: Los identificadores son UUIDv4 en `TEXT` y las fechas son UTC
 
@@ -391,3 +398,91 @@ El porqué: sin registro, el `execution_id` que hoy devuelve el `200` no dice na
 - **GIVEN** una restauración ligada a un target
 - **WHEN** se borra ese target
 - **THEN** su fila en `restore_executions` NO SHALL existir
+
+### Requirement: La obligatoriedad y la unicidad del nombre reconstruyen `backup_jobs`, y la reconstrucción no se lleva ninguna fila
+
+La migración `0007_nombre_de_tarea_obligatorio.sql` SHALL declarar `backup_jobs.name` como `TEXT NOT NULL`, SHALL declarar la restricción `UNIQUE(name)` y SHALL hacerlo **reconstruyendo** la tabla —crear la nueva con la columna y la restricción, copiar las filas, borrar la vieja y renombrar—, porque SQLite no puede reescribir con `ALTER TABLE` la nulabilidad de una columna que ya existe —el `ADD COLUMN` de la `0005` la declaró anulable— ni añadir una restricción de tabla a una tabla existente. El nombre del fichero SHALL llevar el prefijo numérico entero que exige `sqlx::migrate!()`.
+
+La reconstrucción SHALL copiar **columna a columna, nombradas** —no con un `SELECT *`, que dependería del orden de la tabla vieja—, SHALL recrear los dos índices de la tabla, `idx_backup_jobs_target_id` e `idx_backup_jobs_repository_id`, que el `DROP TABLE` se lleva con la tabla vieja, y SHALL declarar `name` en la **última** posición, como la dejó la `0005`, para que el orden que publica `PRAGMA table_info` no cambie bajo los pies de nadie.
+
+`backup_jobs` es **padre** de `job_executions`: su `DROP TABLE` con las claves foráneas encendidas dispara el `ON DELETE CASCADE` y se lleva por delante las ejecuciones de **todas** las tareas —y con ellas el histórico de copias— antes de que esta migración haya copiado nada, sin que nada lo delate. La migración SHALL correr con `foreign_keys` **apagado**, como corre el resto del migrador (`db::migrate::aplicar`, que lo apaga en la conexión y fuera de transacción), y la comprobación posterior del migrador SHALL confirmar que no quedaron filas huérfanas. Ninguna fila de ninguna tabla SHALL perderse por la reconstrucción.
+
+Las filas que ya existían con `name` a `NULL` SHALL rellenarse **dentro de la propia migración** con un nombre derivado, porque `NOT NULL` no admite un `NULL` preexistente y una migración que dejara filas ilegibles no serviría de nada. El derivado SHALL ser único entre **todas** las filas de la tabla —no sólo entre las rellenadas—, NO SHALL coincidir con ningún nombre que ya estuviera presente, NO SHALL ser el identificador de la tarea ni una copia de él, SHALL quedar no vacío tras recortar y SHALL medir **120** caracteres o menos. La forma del derivado SHALL ser `tarea <octeto corto del id>`: el literal `tarea `, un espacio y el **primer octeto** del identificador de la tarea en minúsculas —los ocho primeros dígitos hexadecimales, no el UUID entero—, de donde salen 14 caracteres; SHALL derivarse en SQL general, aplicable a cualquier fila sin nombre y no sólo a las de este entorno, y NO SHALL chocar con un nombre ya presente: si el derivado de una fila coincidiera con un nombre que ya estaba, la migración SHALL usar el siguiente tramo del identificador hasta quedar libre. El detalle de qué tramo se usa ante ese choque es una elección de la implementación; lo que el contrato fija es que el resultado es único, no vacío, distinto del identificador y de 120 caracteres o menos.
+
+Las filas que ya tenían un nombre SHALL **conservarlo**, y el nombre pasa a ser una identidad de la tarea: dos tareas distintas NO SHALL poder compartirlo. El contrato anterior era explícitamente **no único** —el borde HTTP no comprobaba duplicados—, así que una base puede tener homónimos y la migración NO SHALL abortar por ellos: de cada grupo de filas que comparten nombre, la de **menor `rowid`** SHALL conservar el suyo tal cual y las demás SHALL recibir un nombre desambiguado con el sufijo ` (2)`, ` (3)`, … —añadido al nombre tal y como estaba, de modo que uno que ya acabe en `(N)` se desambigua añadiendo otro—, avanzando hasta dar con uno **libre en toda la tabla** y no sólo entre las filas de su grupo. La desambiguación SHALL ser determinista: el mismo `rowid` produce el mismo resultado. Un `name` **vacío o en blanco** SHALL tratarse como **ausente** y recibir el nombre derivado: el `CHECK` de no-vacío de la columna nueva no lo admitiría, y la migración no puede abortar por una fila que la aplicación no puede escribir. La unicidad SHALL ser sensible a mayúsculas —la colación `BINARY` de SQLite, el defecto sin colación declarada—, de modo que lo que la base rechaza es exactamente lo que el borde HTTP contesta `409`.
+
+La columna SHALL declarar además `CHECK (length(trim(name)) > 0)`, y esta parte es la **decisión D7 del proposal, aprobada**: un nombre en blanco es una fila sin valor, y el momento de cerrarle la puerta en la base es **éste**, porque sólo se reconstruye una vez.
+
+El §3 del SRS SHALL declarar la columna en su forma nueva —`name TEXT NOT NULL` con `UNIQUE(name)`—: sigue siendo un añadido al SRS, y esta migración actualiza su forma. El tope de **120** caracteres NO SHALL declararse como `CHECK`: lo impone el borde HTTP, único que puede contestar un `400` nombrando el campo, como decidió la `0005`.
+
+El porqué de reconstruir en vez de parchear: es el procedimiento canónico de SQLite para lo que `ALTER TABLE` no sabe hacer, ya usado por la `0003` para ampliar un `CHECK`, y el único camino que convierte «el nombre es obligatorio y único» en una garantía de la base en vez de una convención de la aplicación. Y el porqué del relleno: una tarea sin nombre es un estado **anterior** a esta migración, no un estado válido después de ella; conservar las filas rellenándolas es lo que permite exigir el nombre sin borrar el histórico de nadie.
+
+#### Scenario: La migración deja la columna obligatoria y única
+
+- **GIVEN** una base con las migraciones aplicadas hasta la `0007`
+- **WHEN** se consulta `PRAGMA table_info(backup_jobs)` y se intentan dos inserciones directas —una sin `name` y otra con un `name` repetido—
+- **THEN** la columna `name` SHALL ser `NOT NULL`
+- **AND** SHALL existir un índice único sobre `name`
+- **AND** las dos inserciones SHALL fallar
+
+#### Scenario: Las tareas que no tenían nombre se rellenan con nombres únicos
+
+- **GIVEN** una base llevada a mano hasta la `0006` con dos tareas cuyo `name` es `NULL` y una tercera con un nombre puesto
+- **WHEN** se aplica la `0007`
+- **THEN** las tres filas SHALL tener un nombre no vacío
+- **AND** los tres nombres SHALL ser distintos entre sí
+- **AND** el nombre de la tercera NO SHALL haber cambiado
+- **AND** ningún nombre derivado SHALL ser el identificador de su tarea
+
+#### Scenario: Los nombres repetidos se desambiguan antes de exigir la unicidad
+
+- **GIVEN** una base llevada a mano hasta la `0006` con tres tareas cuyo `name` es el mismo, una cuarta tarea cuyo `name` es ése mismo más el sufijo ` (2)`, y ejecuciones colgando de las cuatro
+- **WHEN** se aplica la `0007`
+- **THEN** la homónima de menor `rowid` SHALL conservar su nombre
+- **AND** las otras dos SHALL recibir un nombre con sufijo, saltándose el ` (2)` que ya estaba ocupado
+- **AND** la tarea que ya tenía el ` (2)` NO SHALL haber cambiado de nombre
+- **AND** los cuatro nombres SHALL ser distintos entre sí
+- **AND** ninguna fila de `job_executions` SHALL perderse
+
+#### Scenario: Un nombre vacío o en blanco se trata como ausente
+
+- **GIVEN** una base llevada a mano hasta la `0006` con dos tareas cuyo `name` es, respectivamente, la cadena vacía y una cadena de sólo espacios
+- **WHEN** se aplica la `0007`
+- **THEN** la migración NO SHALL abortar
+- **AND** las dos tareas SHALL quedar con un nombre derivado, no vacío y distinto del de la otra
+
+#### Scenario: Un nombre que ya acaba en `(N)` se desambigua añadiendo otro sufijo
+
+- **GIVEN** una base llevada a mano hasta la `0006` con dos tareas cuyo `name` es `copia (2)`
+- **WHEN** se aplica la `0007`
+- **THEN** la de menor `rowid` SHALL conservar `copia (2)`
+- **AND** la otra SHALL quedar con `copia (2) (2)`
+
+#### Scenario: El nombre derivado no choca con uno que ya estaba
+
+- **GIVEN** una tarea ya nombrada cuyo nombre coincide con el derivado que le tocaría a otra tarea sin nombre
+- **WHEN** se aplica la `0007`
+- **THEN** los nombres de las dos filas SHALL seguir siendo distintos
+- **AND** el nombre que ya estaba NO SHALL haber cambiado
+
+#### Scenario: Ninguna ejecución se pierde en la reconstrucción
+
+- **GIVEN** una base con tareas —algunas sin nombre— y filas en `job_executions` colgando de ellas
+- **WHEN** se aplica la `0007`
+- **THEN** todas las filas de `job_executions` SHALL seguir ahí, con su `job_id` resolviendo a su tarea
+- **AND** NO SHALL haber quedado ninguna fila huérfana
+- **AND** las claves foráneas de `job_executions` NO SHALL quedar rotas
+
+#### Scenario: Los índices de la tabla sobreviven a la reconstrucción
+
+- **GIVEN** una base migrada a la `0007`
+- **WHEN** se consultan los índices de `backup_jobs`
+- **THEN** SHALL seguir existiendo `idx_backup_jobs_target_id` e `idx_backup_jobs_repository_id`
+- **AND** SHALL existir el índice único de `name`
+
+#### Scenario: Un nombre en blanco no cabe en la base
+
+- **GIVEN** una base migrada a la `0007`
+- **WHEN** se inserta con SQL directo una fila cuyo `name` es una cadena de solo espacios
+- **THEN** la inserción SHALL fallar por la restricción de la columna
+- **AND** NO SHALL depender de que la validación la haya hecho la aplicación

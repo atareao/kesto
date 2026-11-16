@@ -30,7 +30,7 @@ use crate::rustic::{Acceso, BarrasDelMotor, Error, PuestaEnMarcha, Repositorio};
 use crate::secret::SecretString;
 use crate::test_support::{
     CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, base_con_clave,
-    directorio_de_prueba,
+    directorio_de_prueba, nombre_de_tarea_de_prueba,
 };
 
 /// El socket de un motor de contenedores que no existe.
@@ -174,7 +174,7 @@ impl Aparato {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect("el alta de la tarea no puede fallar")

@@ -23,12 +23,13 @@ export interface PeticionDeRestauracion {
   repositoryId: string
   snapshotId: string
   /**
-   * Confirma la sobrescritura de un target de **base de datos**. Solo se envía
-   * —y solo cuando es `true`— para un target de base: la API contesta `428` si
-   * falta. Para un `directory` se **omite** en vez de mandarse a `false`, porque
-   * no hay nada que sobrescribir y el cuerpo no debe llevar ruido.
+   * Autoriza la **poda** del destino. Para un target de **base de datos** confirma
+   * la sobrescritura de los datos vivos —la API contesta `428` si falta—; para un
+   * `directory` retira del destino lo que no está en la instantánea. Viaja
+   * **siempre**, como booleano explícito, para todo tipo: la bandera no se deduce
+   * del tipo de target.
    */
-  sobrescribir?: boolean
+  sobrescribir: boolean
   /** Permite cancelar la petición si la pantalla se desmonta. */
   signal?: AbortSignal
 }
@@ -56,10 +57,12 @@ export function restaurarSnapshot({
 }: PeticionDeRestauracion): Promise<Restauracion> {
   return peticion<Restauracion>(`/snapshots/${snapshotId}/restore`, {
     method: 'POST',
-    // La clave solo viaja cuando se confirma: un `directory` no la manda.
+    // La bandera viaja explícita en todo tipo: `true` para confirmar la poda —la
+    // sobrescritura de una base, o retirar del destino lo que no está en la
+    // instantánea— y `false` cuando el destino solo recibe.
     cuerpo: {
       repository_id: repositoryId,
-      ...(sobrescribir === true ? { sobrescribir: true } : {}),
+      sobrescribir,
     },
     signal,
   })

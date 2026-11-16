@@ -60,7 +60,7 @@ pub fn router() -> Router<AppState> {
 ///
 /// Los dos identificadores viajan como **texto** en su forma canónica con guiones y los nombres de
 /// los campos son los del §3: `target_id`, `repository_id`, `cron_expression`, `keep_daily`,
-/// `keep_weekly`, `keep_monthly`, `enabled` y `name` —este último, el que añade la `0005` (issue
+/// `keep_weekly`, `keep_monthly`, `enabled` y `name` —este último, el que añadió la `0005` (issue
 /// #65)—, que son los que el panel pinta en su formulario y los que hacen legible la tabla con
 /// `sqlite3`. `deny_unknown_fields` es lo que convierte una errata
 /// del formulario —un `keep_dailly` de más— en un `400`: sin él, serde ignoraría el campo que no
@@ -68,10 +68,12 @@ pub fn router() -> Router<AppState> {
 /// palabra**, que es el peor de los desenlaces posibles: una tarea que guarda otra cosa que la que
 /// el operador cree haber programado.
 ///
-/// `name` es `Option` y **no** obligatorio, así que un cuerpo que lo omita entra con `None`: el
-/// nombre es opcional por contrato y las tareas que ya existían sin él siguen siendo válidas. Lo que
-/// llega **sin recortar**: el recorte y el paso del blanco a `None` los aplica [`nombre_del_cuerpo`],
-/// y el tope de 120 caracteres se rechaza ahí con un `400` que nombra el campo.
+/// `name` es `Option<String>` **en el cable** y obligatorio en el negocio (#87 y #89): un cuerpo que
+/// no traiga la clave entra aquí con `None` en vez de ser rechazado por el extractor, que es lo que
+/// permite contestar un `400` con la envoltura que **nombra `name`** —el extractor rechaza por su
+/// cuenta un cuerpo que no case con el tipo, con un mensaje ajeno al §5 y sin nombrar el campo—. El
+/// `None` y el blanco los traduce [`nombre_del_cuerpo`] a ese `400`. Lo que llega **sin recortar**:
+/// el recorte lo aplica el mismo sitio, y el tope de 120 caracteres se rechaza ahí.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AltaDeTareaDelCable {
@@ -89,22 +91,24 @@ pub struct AltaDeTareaDelCable {
     pub keep_monthly: i64,
     /// Si la tarea está activa.
     pub enabled: bool,
-    /// Nombre legible de la tarea; se recorta y el blanco queda a `null`.
+    /// Nombre legible de la tarea: `Option` en el cable, obligatorio ya recortado en la fila.
     pub name: Option<String>,
 }
 
 /// Una tarea tal y como viaja por el cable: lo que devuelve la API.
 ///
-/// Las claves son **exactamente** las del §3 más la `name` que añade la `0005` (issue #65)
+/// Las claves son **exactamente** las del §3 más la `name` que añadió la `0005` (issue #65)
 /// —los dos identificadores, el cron, la retención, el `enabled`, la fecha del alta y el nombre—,
 /// para que el formulario, el cuerpo de la petición y la columna de la tabla se llamen igual; una
 /// vista que inventara un campo rompería esa correspondencia sin que nada lo notara. Y no hay
 /// ninguna credencial que callar aquí: la tarea no guarda ninguna, porque las dos que hay en el
 /// sistema viven en su target y en su repositorio, que son las filas a las que ésta apunta.
 ///
-/// `name` es anulable y viaja **siempre**, con `null` cuando la tarea no tiene nombre: una vista que
-/// omitiera la clave cuando es nula dejaría al panel sin poder distinguir «esta tarea no tiene
-/// nombre» de «el servidor no lo dice».
+/// `name` viaja como **cadena no vacía**, nunca `null`: desde la `0007` la columna es `NOT NULL` con
+/// `UNIQUE(name)`, y las tareas anteriores a la migración llevan el nombre derivado que ella
+/// escribió, así que no hay ninguna fila de la que no se pueda decir el nombre. La clave va
+/// **siempre** —una vista que la omitiera dejaría al panel sin poder distinguir «esta tarea no tiene
+/// nombre» de «el servidor no lo dice»— y ahora también el valor.
 #[derive(Debug, Serialize)]
 pub struct TareaDelCable {
     /// Identificador en su forma canónica con guiones.
@@ -125,8 +129,8 @@ pub struct TareaDelCable {
     pub enabled: bool,
     /// Fecha de alta, en RFC3339.
     pub created_at: String,
-    /// Nombre legible de la tarea; `null` si no tiene.
-    pub name: Option<String>,
+    /// Nombre legible de la tarea: obligatorio y único, nunca vacío.
+    pub name: String,
 }
 
 impl TareaDelCable {
@@ -315,15 +319,21 @@ fn cron_que_el_reloj_sepa_leer(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppEr
 /// rechazaría lo que el formulario deja escribir.
 const NOMBRE_MAXIMO: usize = 120;
 
-/// El `400` de un nombre que no cabe, y la normalización del que sí.
+/// El `400` de un nombre que falta o no cabe, y la normalización del que sí.
 ///
-/// El nombre es **opcional**: `None` entra y sale como `None`. Cuando llega, se **recorta** primero
-/// —los espacios de los extremos no son parte del nombre, y el tope se mide sobre lo recortado, no
-/// sobre lo que alguien pegó— y luego:
+/// El nombre es **obligatorio**: un cuerpo que no traiga la clave, que la traiga a `null` o que la
+/// traiga en blanco —vacía o de solo espacios— es un `400` que **nombra `name`**, porque lo que hay
+/// que hacer con él es escribirlo y el panel tiene que saber en qué campo. El `400` nace **aquí** y
+/// no en el extractor de JSON: `name` sigue siendo `Option<String>` en el struct del cuerpo, así que
+/// `None` y el blanco llegan hasta este punto —el extractor solo rechazaría un cuerpo que no case
+/// con el tipo, con un error ajeno a la envoltura del §5 y sin nombrar `name`—, y de aquí sale un
+/// rechazo **distinguible** del `409` del duplicado, que nace al violar la unicidad de la base.
 ///
-/// * Si queda vacío o en blanco, el nombre es `None` y la columna guarda `NULL`. **Nunca `""`**: una
-///   cadena vacía se lee como un nombre que alguien dejó a medias, y solo el `NULL` es lo que le
-///   dice al panel que caiga al identificador de la tarea.
+/// Cuando llega, se **recorta** primero —los espacios de los extremos no son parte del nombre, y el
+/// tope se mide sobre lo recortado, no sobre lo que alguien pegó— y luego:
+///
+/// * Si tras recortar queda vacío, es un `400`: una tarea sin nombre no es un estado posible desde
+///   la `0007` —la columna es `NOT NULL`—, así que no hay un `None` al que caer.
 /// * Si supera [`NOMBRE_MAXIMO`] caracteres, es un `400` que **nombra `name`** y **no repite el
 ///   valor**: la regla de la casa es que un rechazo diga qué campo está mal, nunca lo que traía.
 ///
@@ -331,9 +341,11 @@ const NOMBRE_MAXIMO: usize = 120;
 /// rechazaría un nombre que el formulario deja escribir. La comprobación va **antes de escribir** y
 /// la comparten el alta y la edición —las dos pasan por [`alta_desde`]—, así que una petición
 /// rechazada no puede dejar fila y no hay una tercera puerta de escritura que se olvide de ella.
-fn nombre_del_cuerpo(cuerpo: &AltaDeTareaDelCable) -> Result<Option<String>, AppError> {
+fn nombre_del_cuerpo(cuerpo: &AltaDeTareaDelCable) -> Result<String, AppError> {
     let Some(nombre) = cuerpo.name.as_deref() else {
-        return Ok(None);
+        return Err(AppError::InvalidInput(
+            "el campo `name` es obligatorio: falta el nombre de la tarea".to_owned(),
+        ));
     };
 
     let recortado = nombre.trim();
@@ -345,10 +357,12 @@ fn nombre_del_cuerpo(cuerpo: &AltaDeTareaDelCable) -> Result<Option<String>, App
     }
 
     if recortado.is_empty() {
-        return Ok(None);
+        return Err(AppError::InvalidInput(
+            "el campo `name` es obligatorio: falta el nombre de la tarea".to_owned(),
+        ));
     }
 
-    Ok(Some(recortado.to_owned()))
+    Ok(recortado.to_owned())
 }
 
 /// Valida el cuerpo y lo convierte en el alta de la capa de acceso.
@@ -578,6 +592,7 @@ pub async fn disparar(
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use axum::Router;
     use axum::http::StatusCode;
@@ -594,7 +609,8 @@ mod tests {
     use crate::test_support::{
         CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, base_con_clave,
         body_json, body_text, capturar_log, config_con_dsn, delete, destino_local_de_prueba,
-        directorio_de_prueba, estado_de_prueba, estado_desarrollo, get, post, post_json, put_json,
+        directorio_de_prueba, estado_de_prueba, estado_desarrollo, get, nombre_de_tarea_de_prueba,
+        post, post_json, put_json,
     };
 
     /// Credencial distinguible que ningún rechazo puede ver salir.
@@ -679,14 +695,31 @@ mod tests {
             .to_owned()
     }
 
+    /// Un nombre de tarea **distinto en cada llamada**, para sembrar por la API.
+    ///
+    /// Desde la `0007` el nombre es `UNIQUE`, así que un cuerpo de siembra con el nombre fijo haría
+    /// chocar la segunda tarea contra un `409` que ninguna de estas pruebas ha pedido. El contador
+    /// se lleva con un `AtomicU64` y no con una variable por prueba porque las pruebas corren en
+    /// paralelo y lo comparten: un contador por prueba repetiría el `0` en todas y volvería el
+    /// problema por la puerta de atrás.
+    fn nombre_de_siembra() -> String {
+        static CONTADOR: AtomicU64 = AtomicU64::new(0);
+
+        let numero = CONTADOR.fetch_add(1, Ordering::Relaxed);
+
+        format!("tarea sembrada {numero}")
+    }
+
     /// El cuerpo de un alta de tarea, con las dos referencias que recibe.
     ///
-    /// La tarea no tiene nombre —no hay nada que distinguir en el listado—, así que lo que
-    /// parametriza el cuerpo son sus dos referencias: el target del que se extrae y el repositorio
-    /// al que se sube. Los tres campos de retención llevan valores distintos a propósito, para que
-    /// una vista que cruzara dos columnas no pasara inadvertida.
+    /// La tarea lleva un nombre de siembra —distinto en cada llamada, ver [`nombre_de_siembra`]—,
+    /// porque desde la `0007` el nombre es obligatorio y único y un cuerpo sin él sería un `400`:
+    /// lo que parametriza este cuerpo son sus dos referencias —el target del que se extrae y el
+    /// repositorio al que se sube—, y el nombre es lo que hay que **no** tener que pensar en cada
+    /// prueba. Los tres campos de retención llevan valores distintos a propósito, para que una vista
+    /// que cruzara dos columnas no pasara inadvertida.
     fn cuerpo_de_tarea(target_id: &str, repository_id: &str) -> serde_json::Value {
-        serde_json::json!({
+        let mut cuerpo = serde_json::json!({
             "target_id": target_id,
             "repository_id": repository_id,
             "cron_expression": "0 3 * * *",
@@ -694,15 +727,35 @@ mod tests {
             "keep_weekly": 4,
             "keep_monthly": 6,
             "enabled": true,
-        })
+        });
+
+        cuerpo["name"] = serde_json::json!(nombre_de_siembra());
+
+        cuerpo
+    }
+
+    /// El mismo cuerpo del alta **sin** el campo `name`: la falta, no el blanco.
+    ///
+    /// Es el caso del formulario que no llegó a informar el campo —la clave no viaja—, que es
+    /// distinto del que la manda vacía y que tiene su propia prueba. Se construye quitando la clave
+    /// en vez de armando un cuerpo aparte para que lo único que cambie respecto de
+    /// [`cuerpo_de_tarea`] sea eso.
+    fn cuerpo_de_tarea_sin_nombre(target_id: &str, repository_id: &str) -> serde_json::Value {
+        let mut cuerpo = cuerpo_de_tarea(target_id, repository_id);
+        cuerpo
+            .as_object_mut()
+            .expect("el cuerpo de la siembra es un objeto")
+            .remove("name");
+
+        cuerpo
     }
 
     /// El mismo cuerpo del alta con el campo `name`, **tal cual** llegó por el cable.
     ///
-    /// El valor no se recorta aquí a propósito: lo que este change pide es que el recorte, el blanco
-    /// a `null` y el tope de 120 caracteres los aplique **el servidor**, así que quien manda el
-    /// cuerpo tiene que poder mandar los espacios alrededor y una cadena larga sin que la prueba los
-    /// arregle antes.
+    /// El valor no se recorta aquí a propósito: lo que este change pide es que el recorte, el rechazo
+    /// del blanco y el tope de 120 caracteres los aplique **el servidor**, así que quien manda el
+    /// cuerpo tiene que poder mandar los espacios alrededor, una cadena en blanco y una larga sin que
+    /// la prueba los arregle antes.
     fn cuerpo_de_tarea_con_nombre(
         target_id: &str,
         repository_id: &str,
@@ -848,10 +901,10 @@ mod tests {
             "keep_daily",
             "keep_monthly",
             "keep_weekly",
-            // El `name` de la `0005` (issue #65): una tarea sin nombre lo publica a `null`, pero la
-            // **clave** tiene que estar en las dos —una vista que la omitiera cuando es nula dejaría
-            // al panel sin poder distinguir «esta tarea no tiene nombre» de «el servidor no lo
-            // dice»—, y por eso entra en el conjunto exacto.
+            // El `name` de la `0005` (issue #65), obligatorio y único desde la `0007` (#87 y #89): la
+            // **clave** tiene que estar siempre —una vista que la omitiera dejaría al panel sin
+            // poder distinguir «esta tarea no tiene nombre» de «el servidor no lo dice»— y su valor
+            // es una cadena, nunca `null`.
             "name",
             "repository_id",
             "target_id",
@@ -1249,7 +1302,7 @@ mod tests {
                     keep_weekly: 4,
                     keep_monthly: 12,
                     enabled: true,
-                    name: None,
+                    name: nombre_de_tarea_de_prueba(),
                 })
                 .await
                 .expect("la tarea de la siembra se da de alta");
@@ -1974,12 +2027,13 @@ mod tests {
         );
     }
 
-    // ── El nombre de la tarea (issue #65) ────────────────────────────────────
+    // ── El nombre de la tarea (#87 y #89, antes #65) ─────────────────────────
     //
-    // Cubre `api-resources`, requisito «La tarea lleva un nombre legible»: el alta y la edición
-    // aceptan un `name` opcional que se recorta, que se guarda a `null` si queda en blanco y que se
-    // rechaza con `400` **nombrando `name`** si supera los 120 caracteres. El nombre no es único ni
-    // obligatorio, así que las tareas que ya existen sin él siguen siendo válidas.
+    // Cubre `api-resources`, requisito «El nombre de la tarea es obligatorio y único»: el alta y la
+    // edición **exigen** un `name` que se recorta, que contesta `400` nombrando el campo si falta o
+    // si queda en blanco tras recortar y `409` si ya lo tiene otra tarea. El nombre es la identidad
+    // legible de la tarea y lo garantiza la base —`NOT NULL` y `UNIQUE(name)`—, así que el borde no
+    // comprueba la unicidad: la deja reventar contra la restricción y traduce el choque.
 
     /// 1.2 — El alta guarda y publica el nombre **recortado**, y la lectura lo devuelve igual.
     ///
@@ -2037,22 +2091,413 @@ mod tests {
         );
     }
 
-    /// 1.2b — La edición acepta `name`, lo recorta y lo limpia cuando queda en blanco.
+    /// 1.1 — Un alta **sin** `name` contesta `400` con la envoltura y un mensaje que nombra `name`.
     ///
-    /// Cubre la mitad del `SHALL` que la prueba del alta no mide: `PUT /api/v1/jobs/:id` acepta
-    /// igualmente el campo opcional `name`, con las **mismas** reglas —recorte y blanco a `null`—, y
-    /// lo publica en su respuesta y en la lectura. Sin esta prueba, una edición que ignorara el campo
-    /// dejaría el nombre imposible de **corregir** desde el panel: solo se podría fijar al darse de
-    /// alta, y una errata o un nombre que sobra no tendrían arreglo.
+    /// Cubre el escenario «Un alta sin name contesta 400 nombrando name». La clave **no viaja**, que
+    /// es el caso del formulario que no llegó a informar el campo, y el rechazo tiene que nombrarlo
+    /// para que se pueda corregir sin adivinar cuál de los ocho campos falta. La tabla se cuenta al
+    /// final: un rechazo que escribiera primero sería peor que no rechazar.
     #[tokio::test]
-    async fn la_edicion_acepta_recorta_y_limpia_el_nombre() {
+    async fn un_alta_sin_name_contesta_400_nombrando_name() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-alta-sin-nombre").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-alta-sin-nombre").await;
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_sin_nombre(&target, &repositorio),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un alta sin `name` tiene que rechazarse con la envoltura: contestó {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            mensaje.contains("name"),
+            "el rechazo tiene que nombrar el campo `name` para que se pueda corregir desde el \
+             formulario, y el mensaje fue {mensaje:?}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect(
+                "la tabla tiene que ser contable sobre el fichero con el que se abrió el estado",
+            );
+
+        assert_eq!(
+            filas, 0,
+            "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
+        );
+    }
+
+    /// 1.2 — Un `name` en blanco contesta `400` nombrando `name`, y **no** se guarda.
+    ///
+    /// Cubre el escenario «Un nombre en blanco contesta 400 nombrando name», que sustituye al del
+    /// contrato derogado —«un nombre en blanco se guarda como `null`»—: el blanco ya no es una tarea
+    /// sin nombre sino una petición que hay que reescribir. Se manda una cadena de **solo espacios**
+    /// para que el rechazo dependa del recorte y no de comparar con la cadena vacía: una validación
+    /// que mirara `is_empty()` a secas dejaría pasar el blanco y esta prueba lo delata.
+    #[tokio::test]
+    async fn un_nombre_en_blanco_contesta_400_nombrando_name() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-nombre-en-blanco").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-en-blanco").await;
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "   "),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un nombre de solo espacios tiene que rechazarse, no guardarse vacío: contestó {status} \
+             con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            mensaje.contains("name"),
+            "el rechazo tiene que nombrar el campo `name`, y el mensaje fue {mensaje:?}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect(
+                "la tabla tiene que ser contable sobre el fichero con el que se abrió el estado",
+            );
+
+        assert_eq!(
+            filas, 0,
+            "un nombre en blanco no puede dejar una fila con el nombre vacío: quedaron {filas}"
+        );
+    }
+
+    /// 1.3 — Un `name` que ya tiene otra tarea contesta `409`, y el mensaje no repite el valor.
+    ///
+    /// Cubre el escenario «Un nombre duplicado en el alta contesta 409». El `409` sale de **violar
+    /// la restricción de la base** y no de una lectura previa: comprobar y luego escribir deja la
+    /// ventana abierta a que dos altas simultáneas pasen las dos la comprobación. Por eso la prueba
+    /// no espía el camino —no puede— y se limita a fijar el desenlace del contrato: la segunda alta
+    /// no entra y contesta `409` nombrando el campo, sin repetir el valor que traía.
+    #[tokio::test]
+    async fn un_nombre_duplicado_en_el_alta_contesta_409() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-duplicado").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-duplicado").await;
+
+        let primera = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = primera.status();
+        let primera = body_json(primera).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la primera tarea tiene que darse de alta: contestó {status} con {primera}"
+        );
+
+        let respuesta = post_json(
+            router,
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "un nombre que ya está en uso tiene que chocar con el estado actual: contestó {status} \
+             con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto: {cuerpo}");
+
+        assert!(
+            mensaje.contains("name"),
+            "el rechazo tiene que nombrar el campo `name`, y el mensaje fue {mensaje:?}"
+        );
+        assert!(
+            !mensaje.contains("copia nocturna"),
+            "el rechazo nombra el campo, nunca el valor que traía, y el mensaje fue {mensaje:?}"
+        );
+    }
+
+    /// 1.3b — Un `name` que ya tiene otra tarea contesta `409` también al **editar**.
+    ///
+    /// Cubre el escenario «Un nombre duplicado en la edición contesta 409», la mitad del `SHALL` que
+    /// el alta no mide: las dos rutas escriben por la misma sentencia, así que la restricción las
+    /// cubre a las dos, pero una edición que se saltara la escritura —o que guardara el nombre por
+    /// otro camino— no lo delataría. Se afirma además que la segunda tarea **conserva** su nombre
+    /// anterior: un rechazo que hubiera escrito antes de chocar sería peor que no rechazar.
+    #[tokio::test]
+    async fn un_nombre_duplicado_en_la_edicion_contesta_409() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-duplicado-al-editar").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-del-nombre-duplicado-al-editar").await;
+
+        let primera = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = primera.status();
+        let primera = body_json(primera).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la primera tarea tiene que darse de alta: contestó {status} con {primera}"
+        );
+
+        let segunda = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia diaria"),
+        )
+        .await;
+
+        let status = segunda.status();
+        let segunda = body_json(segunda).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la segunda tarea tiene que darse de alta con su propio nombre: contestó {status} con \
+             {segunda}"
+        );
+
+        let id = segunda["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let respuesta = put_json(
+            router.clone(),
+            &format!("/api/v1/jobs/{id}"),
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "editar una tarea con el nombre de otra tiene que chocar: contestó {status} con {cuerpo}"
+        );
+
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
+
+        assert_eq!(
+            lectura["data"]["name"], "copia diaria",
+            "una edición rechazada no puede haber escrito el nombre nuevo: {lectura}"
+        );
+    }
+
+    /// 1.4 — Editar una tarea **conservando su propio nombre** no choca: contesta `200`.
+    ///
+    /// Cubre el escenario «Editar una tarea conservando su propio nombre no choca». Es la prueba que
+    /// impide que el `UNIQUE` convierta el formulario en intocable: una tarea no choca consigo misma,
+    /// así que cambiar el cron —o cualquier otro campo— enviando el nombre que ya tenía tiene que
+    /// seguir siendo una edición válida. Sin ella, un `409` que comparara «existe una fila con este
+    /// nombre» sin excluir la propia pasaría por bueno y dejaría el nombre imposible de conservar.
+    #[tokio::test]
+    async fn editar_conservando_el_propio_nombre_no_choca() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-nombre-propio").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-propio").await;
+
+        let alta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = alta.status();
+        let alta = body_json(alta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea tiene que darse de alta antes de editarla: contestó {status} con {alta}"
+        );
+
+        let id = alta["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
+        let mut edicion = cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna");
+        edicion["cron_expression"] = serde_json::json!("0 5 * * *");
+
+        let respuesta = put_json(router.clone(), &format!("/api/v1/jobs/{id}"), &edicion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "una tarea no choca consigo misma: conservar el propio nombre tiene que aceptarse, y \
+             contestó {status} con {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["name"], "copia nocturna",
+            "su nombre tiene que seguir siendo el mismo: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["cron_expression"], "0 5 * * *",
+            "y el campo que sí se cambió tiene que haber entrado: {cuerpo}"
+        );
+    }
+
+    /// 1.5 — Los dos rechazos del nombre —el `400` de la falta y el `409` del duplicado— se
+    /// distinguen entre sí.
+    ///
+    /// Cubre el escenario «Los dos rechazos del nombre se distinguen entre sí». Los dos hablan del
+    /// mismo campo, pero mandan a hacer cosas distintas —uno a escribir un nombre, el otro a
+    /// cambiarlo— y un panel que no los distinga obliga al operador a adivinar cuál de las dos
+    /// arreglar. La aserción compara los dos textos, así que un mensaje copiado de un sitio al otro
+    /// la hace fallar aunque los dos nombren `name`.
+    #[tokio::test]
+    async fn los_dos_rechazos_del_nombre_se_distinguen() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-de-los-dos-rechazos").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-de-los-dos-rechazos").await;
+
+        let falta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_sin_nombre(&target, &repositorio),
+        )
+        .await;
+
+        let status_falta = falta.status();
+        let falta = body_json(falta).await;
+
+        assert_eq!(
+            status_falta,
+            StatusCode::BAD_REQUEST,
+            "el alta sin nombre tiene que contestar 400: contestó {status_falta} con {falta}"
+        );
+
+        let alta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = alta.status();
+        let alta = body_json(alta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea que ocupa el nombre tiene que darse de alta: contestó {status} con {alta}"
+        );
+
+        let duplicado = post_json(
+            router,
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status_duplicado = duplicado.status();
+        let duplicado = body_json(duplicado).await;
+
+        assert_eq!(
+            status_duplicado,
+            StatusCode::CONFLICT,
+            "el nombre ya en uso tiene que contestar 409: contestó {status_duplicado} con {duplicado}"
+        );
+
+        let mensaje_falta = falta["message"]
+            .as_str()
+            .expect("el 400 tiene que traer un `message` de texto");
+        let mensaje_duplicado = duplicado["message"]
+            .as_str()
+            .expect("el 409 tiene que traer un `message` de texto");
+
+        assert_ne!(
+            mensaje_falta, mensaje_duplicado,
+            "los dos rechazos dicen cosas distintas del mismo campo y no pueden compartir mensaje: \
+             {mensaje_falta:?} y {mensaje_duplicado:?}"
+        );
+    }
+
+    /// 1.2c — La edición acepta `name` y lo recorta.
+    ///
+    /// Cubre la mitad del `SHALL` que la prueba del alta no mide: `PUT /api/v1/jobs/:id` acepta el
+    /// campo con las **mismas** reglas —recorte y tope— y lo publica en su respuesta y en la lectura.
+    /// Sin esta prueba, una edición que ignorara el campo dejaría el nombre imposible de **corregir**
+    /// desde el panel: solo se podría fijar al darse de alta, y una errata no tendría arreglo.
+    #[tokio::test]
+    async fn la_edicion_acepta_y_recorta_el_nombre() {
         let router = api_router(estado_desarrollo().await);
 
         let target = target_de_prueba(&router, "target-de-la-edicion-del-nombre").await;
         let repositorio =
             repositorio_de_prueba(&router, "repositorio-de-la-edicion-del-nombre").await;
 
-        // El alta sigue siendo **sin** nombre: lo que se mide aquí es la edición.
         let alta = post_json(
             router.clone(),
             "/api/v1/jobs",
@@ -2074,7 +2519,7 @@ mod tests {
             .expect("el alta debe devolver el identificador de la tarea")
             .to_owned();
 
-        // Primero se le pone nombre, con espacios alrededor: la edición tiene que recortarlo.
+        // Se le cambia el nombre, con espacios alrededor: la edición tiene que recortarlo.
         let mut edicion = cuerpo_de_tarea_con_nombre(&target, &repositorio, "  copia nocturna  ");
         edicion["keep_daily"] = serde_json::json!(3);
 
@@ -2094,14 +2539,55 @@ mod tests {
             "la edición tiene que publicar el nombre recortado: {cuerpo}"
         );
 
-        let lectura = body_json(get(router.clone(), &format!("/api/v1/jobs/{id}")).await).await;
+        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
 
         assert_eq!(
             lectura["data"]["name"], "copia nocturna",
             "la fila editada tiene que guardar el nombre recortado, no el que llegó: {lectura}"
         );
+        assert_eq!(
+            lectura["data"]["keep_daily"],
+            serde_json::json!(3),
+            "y el resto de campos que traía la edición tiene que haber entrado: {lectura}"
+        );
+    }
 
-        // Y después se limpia: un nombre en blanco vuelve a dejarla **sin** nombre.
+    /// 1.2d — La edición con un nombre en blanco contesta `400` y **no** toca la fila.
+    ///
+    /// Cubre la mitad «o una edición» del escenario «Un nombre en blanco contesta 400 nombrando
+    /// name». El nombre en blanco ya no es un modo de dejar la tarea sin nombre —eso no existe desde
+    /// la `0007`— sino una petición que hay que reescribir, y la fila tiene que quedar **intacta**:
+    /// el cuerpo trae además un `keep_daily` distinto, así que una edición que escribiera antes de
+    /// validar lo delataría por el nombre y por la retención.
+    #[tokio::test]
+    async fn la_edicion_con_un_nombre_en_blanco_contesta_400_y_no_toca_la_fila() {
+        let router = api_router(estado_desarrollo().await);
+
+        let target = target_de_prueba(&router, "target-del-blanco-en-la-edicion").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-del-blanco-en-la-edicion").await;
+
+        let alta = post_json(
+            router.clone(),
+            "/api/v1/jobs",
+            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "copia nocturna"),
+        )
+        .await;
+
+        let status = alta.status();
+        let alta = body_json(alta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "la tarea tiene que darse de alta antes de editarla: contestó {status} con {alta}"
+        );
+
+        let id = alta["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador de la tarea")
+            .to_owned();
+
         let mut blanco = cuerpo_de_tarea_con_nombre(&target, &repositorio, "   ");
         blanco["keep_daily"] = serde_json::json!(3);
 
@@ -2112,69 +2598,20 @@ mod tests {
 
         assert_eq!(
             status,
-            StatusCode::OK,
-            "limpiar el nombre tiene que ser una edición válida: contestó {status} con {cuerpo}"
-        );
-        assert!(
-            cuerpo["data"]["name"].is_null(),
-            "un nombre en blanco en la edición tiene que dejar la tarea sin nombre: {cuerpo}"
+            StatusCode::BAD_REQUEST,
+            "un nombre en blanco en la edición tiene que rechazarse: contestó {status} con {cuerpo}"
         );
 
         let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
-
-        assert!(
-            lectura["data"]["name"].is_null(),
-            "la fila editada no puede quedarse con una cadena vacía donde el contrato dice `null`: \
-             {lectura}"
-        );
-    }
-
-    /// 1.3 — Un `name` en blanco se guarda como `null`, **no** como cadena vacía.
-    ///
-    /// Cubre el escenario «Un nombre en blanco se guarda como null». La distinción importa: `""` y
-    /// `null` se pintan igual en una tabla pero no son lo mismo —una cadena vacía parece un nombre
-    /// que alguien dejó a medias, y solo el `null` es lo que le dice al panel que caiga al
-    /// identificador de la tarea—. Se comprueba en la respuesta del alta y en la lectura de la fila.
-    #[tokio::test]
-    async fn un_nombre_en_blanco_se_guarda_como_null() {
-        let router = api_router(estado_desarrollo().await);
-
-        let target = target_de_prueba(&router, "target-del-nombre-en-blanco").await;
-        let repositorio = repositorio_de_prueba(&router, "repositorio-del-nombre-en-blanco").await;
-
-        let respuesta = post_json(
-            router.clone(),
-            "/api/v1/jobs",
-            &cuerpo_de_tarea_con_nombre(&target, &repositorio, "   "),
-        )
-        .await;
-
-        let status = respuesta.status();
-        let cuerpo = body_json(respuesta).await;
 
         assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "un nombre de solo espacios es una tarea sin nombre y tiene que aceptarse: contestó \
-             {status} con {cuerpo}"
+            lectura["data"]["name"], "copia nocturna",
+            "una edición rechazada no puede haber escrito el nombre en blanco: {lectura}"
         );
-
-        assert!(
-            cuerpo["data"]["name"].is_null(),
-            "un nombre en blanco tiene que publicarse como `null`: {cuerpo}"
-        );
-
-        let id = cuerpo["data"]["id"]
-            .as_str()
-            .expect("el alta debe devolver el identificador de la tarea")
-            .to_owned();
-
-        let lectura = body_json(get(router, &format!("/api/v1/jobs/{id}")).await).await;
-
-        assert!(
-            lectura["data"]["name"].is_null(),
-            "la fila guardada no puede llevar una cadena vacía donde el contrato dice `null`: \
-             {lectura}"
+        assert_eq!(
+            lectura["data"]["keep_daily"],
+            serde_json::json!(7),
+            "ni ninguno de los otros campos que traía el cuerpo: {lectura}"
         );
     }
 
@@ -2245,15 +2682,15 @@ mod tests {
         );
     }
 
-    /// 1.4b — El listado publica el `name` anulable de **cada** tarea.
+    /// 1.6 — El listado publica el `name` de **cada** tarea, y nunca lo publica a `null`.
     ///
-    /// Cubre el escenario «El listado de tareas publica el nombre anulable»: una tarea **con**
-    /// nombre y otra **sin** él, dadas de alta por la API. Se afirma la **clave** en las dos —una
-    /// vista que omitiera `name` cuando es `null` dejaría al panel sin poder distinguir «esta tarea
-    /// no tiene nombre» de «el servidor no lo dice»— y el valor en la que lo tiene. El nombre no es
-    /// único ni obligatorio, así que las dos altas tienen que entrar.
+    /// Cubre el escenario «El listado de tareas publica el nombre de cada tarea»: dos tareas dadas de
+    /// alta por la API, una con nombre propio y otra con el de siembra. Se afirma la **clave** y el
+    /// **valor** en las dos, y que ninguna llega a `null`: desde la `0007` la columna es `NOT NULL`,
+    /// así que un `null` en el listado solo podría venir de una vista que lo anulara por su cuenta, y
+    /// eso es exactamente lo que este change retira.
     #[tokio::test]
-    async fn el_listado_publica_el_nombre_anulable_de_cada_tarea() {
+    async fn el_listado_publica_el_nombre_de_cada_tarea() {
         let router = api_router(estado_desarrollo().await);
 
         let target = target_de_prueba(&router, "target-del-listado-con-nombre").await;
@@ -2273,7 +2710,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::CREATED,
-            "la tarea con nombre tiene que darse de alta: contestó {status} con {con_nombre}"
+            "la tarea con nombre propio tiene que darse de alta: contestó {status} con {con_nombre}"
         );
 
         let id_con_nombre = con_nombre["data"]["id"]
@@ -2281,24 +2718,26 @@ mod tests {
             .expect("el alta debe devolver el identificador de la tarea")
             .to_owned();
 
-        let sin_nombre = post_json(
-            router.clone(),
-            "/api/v1/jobs",
-            &cuerpo_de_tarea(&target, &repositorio),
-        )
-        .await;
+        // La segunda lleva el nombre de siembra que arma [`cuerpo_de_tarea`], distinto del de la
+        // primera: es con el que se afirma que el valor publicado es el de **cada** fila.
+        let sembrada = cuerpo_de_tarea(&target, &repositorio);
+        let nombre_sembrado = sembrada["name"]
+            .as_str()
+            .expect("el cuerpo de siembra trae un nombre de texto")
+            .to_owned();
 
-        let status = sin_nombre.status();
-        let sin_nombre = body_json(sin_nombre).await;
+        let otra = post_json(router.clone(), "/api/v1/jobs", &sembrada).await;
+
+        let status = otra.status();
+        let otra = body_json(otra).await;
 
         assert_eq!(
             status,
             StatusCode::CREATED,
-            "la tarea sin nombre —sin la clave o con ella en blanco— tiene que darse de alta igual: \
-             contestó {status} con {sin_nombre}"
+            "la segunda tarea tiene que darse de alta: contestó {status} con {otra}"
         );
 
-        let id_sin_nombre = sin_nombre["data"]["id"]
+        let id_de_la_otra = otra["data"]["id"]
             .as_str()
             .expect("el alta debe devolver el identificador de la tarea")
             .to_owned();
@@ -2331,20 +2770,24 @@ mod tests {
             "la fila de la tarea con nombre tiene que publicar su `name`: {cuerpo}"
         );
 
-        let sin = filas
+        let otra = filas
             .iter()
-            .find(|fila| fila["id"].as_str() == Some(id_sin_nombre.as_str()))
-            .unwrap_or_else(|| panic!("la tarea sin nombre no está en el listado: {cuerpo}"));
+            .find(|fila| fila["id"].as_str() == Some(id_de_la_otra.as_str()))
+            .unwrap_or_else(|| panic!("la segunda tarea no está en el listado: {cuerpo}"));
 
-        assert!(
-            sin.get("name").is_some(),
-            "la fila de una tarea sin nombre tiene que traer la **clave** `name`, aunque sea a \
-             `null`: {cuerpo}"
+        assert_eq!(
+            otra["name"], nombre_sembrado,
+            "cada fila tiene que publicar **su** nombre, no el de otra: {cuerpo}"
         );
-        assert!(
-            sin["name"].is_null(),
-            "una tarea sin nombre publica `name` a `null`, no una cadena vacía: {cuerpo}"
-        );
+
+        // Y ninguna llega a `null`: la columna es `NOT NULL` desde la `0007`, así que un `null` solo
+        // podría venir de una vista que lo anulara por su cuenta.
+        for fila in filas {
+            assert!(
+                fila["name"].is_string(),
+                "ninguna fila del listado puede publicar `name` a `null`: {cuerpo}"
+            );
+        }
     }
 
     /// 1.4c — El tope del nombre es **inclusivo**: 120 caracteres entran.

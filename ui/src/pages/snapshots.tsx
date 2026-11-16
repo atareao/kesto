@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Empty, Input, Modal, Popconfirm, Select, Space, Table, Typography } from 'antd'
+import { Alert, Button, Checkbox, Empty, Input, Modal, Select, Space, Table, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
@@ -243,11 +243,16 @@ function esperaDeRestauracion(enCurso: EnCurso): string {
  * Restaurar sí está, con las reglas que vienen de la spec: la confirmación
  * **nombra el target** sobre el que se va a restaurar —lo publica el listado en
  * cada fila—, la acción se **deshabilita explicándose** cuando el target no se
- * conoce o su tipo no se reconoce, y para un target de **base de datos** la
- * confirmación exige además **teclear el nombre** del target, advierte de que
- * **sobrescribe los datos vivos** y solo entonces envía `sobrescribir: true`. El
- * resultado se comunica al **cerrar la fase** por SSE, no al aceptar el `POST`:
- * si se anunciara antes, el operador vería a la vez «restaurado» y «restaurando».
+ * conoce o su tipo no se reconoce, y la confirmación **no se reserva a las
+ * bases**. Para un target de **base de datos** exige **teclear el nombre** del
+ * target y advierte de que **sobrescribe los datos vivos**, y solo entonces
+ * envía `sobrescribir: true`; para un **directorio** ofrece una **casilla** que,
+ * al marcarla, pide la **poda** del destino —retirar lo que no está en la
+ * instantánea— y manda `sobrescribir: true`, y sin marcarla manda
+ * `sobrescribir: false` (el destino solo recibe). La bandera es **explícita** y no
+ * se deduce del tipo de target. El resultado se comunica al **cerrar la fase**
+ * por SSE, no al aceptar el `POST`: si se anunciara antes, el operador vería a la
+ * vez «restaurado» y «restaurando».
  *
  * Y se restaura **de una en una**: mientras hay una en vuelo, las demás filas
  * deshabilitan su acción y explican por qué, con el mismo recurso que las filas
@@ -279,13 +284,15 @@ export default function Snapshots() {
   const [progresoOculto, setProgresoOculto] = useState(false)
   const restaurar = useRestaurarSnapshot()
   /**
-   * La instantánea cuya confirmación tipada está abierta, o `null`. Solo un
-   * target de base pasa por aquí: un directorio se confirma con el `Popconfirm`
-   * de la propia fila, que no necesita estado de página.
+   * La instantánea cuya confirmación está abierta, o `null`. Un **solo** diálogo
+   * para todos los tipos restaurables: la rama de base exige teclear el nombre y
+   * la de directorio ofrece la casilla de poda.
    */
   const [confirmacion, setConfirmacion] = useState<Snapshot | null>(null)
   /** Lo que el operador ha tecleado en la confirmación de un target de base. */
   const [nombreTecleado, setNombreTecleado] = useState('')
+  /** Si el operador ha pedido la poda del destino en la confirmación de un directorio. */
+  const [podar, setPodar] = useState(false)
 
   // Sin elección explícita, se usa el primero: una pantalla que obliga a elegir
   // cuando solo hay un repositorio es un paso de más.
@@ -333,7 +340,7 @@ export default function Snapshots() {
     return () => clearTimeout(plazo)
   }, [enCurso])
 
-  const alRestaurar = async (snapshot: Snapshot, sobrescribir = false) => {
+  const alRestaurar = async (snapshot: Snapshot, sobrescribir: boolean) => {
     // La guarda no es adorno: el botón deshabilitado es lo que se ve, pero una
     // confirmación abierta de antes del bloqueo llegaría hasta aquí.
     if (repositoryId === null || enCurso !== null) return
@@ -351,9 +358,9 @@ export default function Snapshots() {
       const resultado = await restaurar.mutateAsync({
         repositoryId,
         snapshotId: snapshot.id,
-        // Solo un target de base lleva la confirmación; un `directory` no la
-        // manda, porque no hay nada que sobrescribir.
-        ...(sobrescribir ? { sobrescribir: true } : {}),
+        // La bandera es explícita para todo tipo y viaja siempre: `true` pide la
+        // poda del destino y `false` deja que solo reciba.
+        sobrescribir,
       })
       // El `POST` solo acepta el trabajo: aquí no se anuncia nada. Su respuesta
       // sirve para saber en qué ejecución corre la restauración y con qué
@@ -384,24 +391,62 @@ export default function Snapshots() {
    */
   const nombreCoincide = confirmacion !== null && nombreTecleado.trim() === nombreExigido
 
-  /** Abre la confirmación tipada de un target de base con el campo en blanco. */
-  const abrirConfirmacionDeBase = (snapshot: Snapshot) => {
+  /**
+   * Por qué esta confirmación **no** puede salir, o `null` si sí puede. Es el
+   * mismo criterio con el que la fila decide ofrecer su botón
+   * —`limitacionDeRestauracion`—: un target sin tipo conocido o con un tipo que
+   * esta versión no restaura no puede confirmarse. El diálogo no se fía de que la
+   * fila ya lo haya filtrado y lo vuelve a exigir aquí: un cambio futuro en los
+   * tipos restaurables no puede convertirlo en un agujero que mandara
+   * `sobrescribir` sin pedir el nombre de una base.
+   */
+  const motivoDeConfirmacion =
+    confirmacion === null ? null : limitacionDeRestauracion(confirmacion)
+
+  /**
+   * La **única** expresión de «¿se puede confirmar?». El botón del diálogo y el
+   * manejador leen esta misma —no cada uno su copia—, así que no pueden divergir:
+   * el botón no puede ofrecer lo que el manejador rechaza, ni al revés. Exige que
+   * el target sea restaurable y, si es una base, que el nombre tecleado coincida.
+   */
+  const puedeConfirmar =
+    confirmacion !== null &&
+    motivoDeConfirmacion === null &&
+    (!esTargetDeBase(confirmacion.target_type) || nombreCoincide)
+
+  /** Abre la confirmación de una fila, con sus campos en blanco. */
+  const abrirConfirmacion = (snapshot: Snapshot) => {
     setNombreTecleado('')
+    setPodar(false)
     setConfirmacion(snapshot)
   }
 
-  /**
-   * Confirma la restauración de una base: cierra la confirmación y lanza el
-   * `POST` con `sobrescribir: true`. La guarda del nombre no es adorno —el botón
-   * deshabilitado es lo que se ve—, sino la red que impide que un `Enter` o un
-   * cierre tardío manden la confirmación sin el nombre escrito.
-   */
-  const confirmarRestauracionDeBase = () => {
-    const snapshot = confirmacion
-    if (snapshot === null || !nombreCoincide) return
+  /** Cierra la confirmación y deja sus campos en blanco. */
+  const cerrarConfirmacion = () => {
     setConfirmacion(null)
     setNombreTecleado('')
-    void alRestaurar(snapshot, true)
+    setPodar(false)
+  }
+
+  /**
+   * Confirma la restauración desde el diálogo. Para una **base** exige el nombre
+   * tecleado y manda `sobrescribir: true`; para un **directorio** manda la bandera
+   * según la casilla de poda —marcada pide la poda, sin marcar solo recibe—. La
+   * guarda no es adorno —el botón deshabilitado es lo que se ve—, sino la red que
+   * impide que un `Enter` o un cierre tardío manden algo que el botón no habría
+   * dejado pulsar: lee la misma `puedeConfirmar` que el botón, así que no hay dos
+   * verdades que puedan divergir.
+   */
+  const confirmarRestauracion = () => {
+    const snapshot = confirmacion
+    if (snapshot === null || !puedeConfirmar) return
+
+    // La bandera se decide aquí y no se deduce del tipo de target: una base pisa
+    // datos vivos y manda siempre `true`; un directorio solo la pide si el
+    // operador marcó la poda.
+    const sobrescribir = esTargetDeBase(snapshot.target_type) ? true : podar
+    cerrarConfirmacion()
+    void alRestaurar(snapshot, sobrescribir)
   }
 
   /**
@@ -437,10 +482,17 @@ export default function Snapshots() {
     {
       title: 'Tarea',
       key: 'tarea',
-      // El nombre de la tarea que hizo la copia y, sin él, el identificador que
-      // ya publica `label` (que es el de la tarea). La columna «Etiqueta» no se
-      // toca: sigue siendo la etiqueta del snapshot.
-      render: (_valor, snapshot) => snapshot.job_name ?? snapshot.label ?? '',
+      // El nombre de la tarea que hizo la copia. Sin él —una instantánea
+      // huérfana, que no casa con ninguna ejecución— pinta un marcador atenuado:
+      // **nunca** cae al identificador que ya publica `label`, que es lo que
+      // dejaba «Tarea» y «Etiqueta» diciendo lo mismo. La columna «Etiqueta» no
+      // se toca: sigue siendo el identificador del snapshot.
+      render: (_valor, snapshot) =>
+        snapshot.job_name?.trim() ? (
+          snapshot.job_name
+        ) : (
+          <Typography.Text type="secondary">sin tarea</Typography.Text>
+        ),
     },
     {
       title: 'Etiqueta',
@@ -506,39 +558,19 @@ export default function Snapshots() {
           )
         }
 
-        // Un target de base no se confirma con un clic: la fila abre el diálogo
-        // que exige teclear el nombre y avisa de la sobrescritura.
-        if (esTargetDeBase(snapshot.target_type)) {
-          return (
-            <Button
-              size="small"
-              aria-label={nombre}
-              loading={restaurar.isPending}
-              disabled={restaurar.isPending}
-              onClick={() => abrirConfirmacionDeBase(snapshot)}
-            >
-              Restaurar
-            </Button>
-          )
-        }
-
+        // Toda fila restaurable abre la misma confirmación: una base exige teclear
+        // el nombre, un directorio ofrece la casilla de poda. La bandera no se
+        // deduce del tipo de target, la decide el diálogo.
         return (
-          <Popconfirm
-            title="¿Restaurar la instantánea?"
-            description={descripcionDeRestauracion(snapshot)}
-            okText="Restaurar"
-            cancelText="Cancelar"
-            onConfirm={() => void alRestaurar(snapshot)}
+          <Button
+            size="small"
+            aria-label={nombre}
+            loading={restaurar.isPending}
+            disabled={restaurar.isPending}
+            onClick={() => abrirConfirmacion(snapshot)}
           >
-            <Button
-              size="small"
-              aria-label={nombre}
-              loading={restaurar.isPending}
-              disabled={restaurar.isPending}
-            >
-              Restaurar
-            </Button>
-          </Popconfirm>
+            Restaurar
+          </Button>
         )
       },
     },
@@ -642,37 +674,69 @@ export default function Snapshots() {
       )}
 
       {/*
-        La confirmación tipada de un target de base. Vive en la página —y no en
-        la fila— porque el botón que autoriza está en el diálogo y su estado
-        depende de lo que se teclee aquí.
+        La confirmación de restauración: un solo diálogo para todos los tipos
+        restaurables. La rama de base exige teclear el nombre —y por eso vive en
+        la página y no en la fila: el estado de lo tecleado es de aquí—, y la de
+        directorio ofrece la casilla que pide la poda del destino. Si el target no
+        fuera restaurable —lo que la fila ya impide, pero el diálogo no da por
+        hecho— no envía nada y lo explica, con la misma guarda que `puedeConfirmar`.
       */}
       <Modal
         open={confirmacion !== null}
         title="¿Restaurar la instantánea?"
         okText="Restaurar"
         cancelText="Cancelar"
-        okButtonProps={{ disabled: !nombreCoincide }}
-        onOk={confirmarRestauracionDeBase}
-        onCancel={() => setConfirmacion(null)}
+        okButtonProps={{ disabled: !puedeConfirmar }}
+        onOk={confirmarRestauracion}
+        onCancel={cerrarConfirmacion}
       >
         {confirmacion !== null && (
           <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-            <Typography.Text>{descripcionDeRestauracion(confirmacion)}</Typography.Text>
-            <Alert
-              data-testid="aviso-de-sobrescritura"
-              type="warning"
-              showIcon
-              message="Esta restauración sobrescribe los datos vivos del target."
-            />
-            <Typography.Text>
-              Para confirmar, escribe el nombre del target «{nombreExigido}».
-            </Typography.Text>
-            <Input
-              aria-label="Nombre del target"
-              placeholder={nombreExigido}
-              value={nombreTecleado}
-              onChange={(evento) => setNombreTecleado(evento.target.value)}
-            />
+            {motivoDeConfirmacion === null && (
+              <Typography.Text>{descripcionDeRestauracion(confirmacion)}</Typography.Text>
+            )}
+            {motivoDeConfirmacion !== null ? (
+              <Alert
+                data-testid="aviso-de-target-no-restaurable"
+                type="error"
+                showIcon
+                message={motivoDeConfirmacion}
+              />
+            ) : esTargetDeBase(confirmacion.target_type) ? (
+              <>
+                <Alert
+                  data-testid="aviso-de-sobrescritura"
+                  type="warning"
+                  showIcon
+                  message="Esta restauración sobrescribe los datos vivos del target."
+                />
+                <Typography.Text>
+                  Para confirmar, escribe el nombre del target «{nombreExigido}».
+                </Typography.Text>
+                <Input
+                  aria-label="Nombre del target"
+                  placeholder={nombreExigido}
+                  value={nombreTecleado}
+                  onChange={(evento) => setNombreTecleado(evento.target.value)}
+                />
+              </>
+            ) : (
+              <>
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="Esta restauración retira del destino lo que no está en la instantánea."
+                />
+                <Checkbox
+                  id="poda-del-destino"
+                  aria-label="Retira del destino lo que no está en la instantánea (irreversible)"
+                  checked={podar}
+                  onChange={(evento) => setPodar(evento.target.checked)}
+                >
+                  Retira del destino lo que no está en la instantánea (irreversible).
+                </Checkbox>
+              </>
+            )}
           </Space>
         )}
       </Modal>

@@ -1517,7 +1517,8 @@ mod tests {
     use crate::test_support::{
         CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, SEMILLA,
         SEMILLA_CONTENIDO, abridor_local, abrir_local, base_con_clave, destino_de_s3_que_rechaza,
-        directorio_de_prueba, sembrar_snapshots, snapshot_guardado, volcado_guardado,
+        directorio_de_prueba, nombre_de_tarea_de_prueba, sembrar_snapshots, snapshot_guardado,
+        volcado_guardado,
     };
 
     /// Un plazo generoso para esperar a que una ejecución termine.
@@ -2096,7 +2097,7 @@ mod tests {
                     keep_weekly,
                     keep_monthly,
                     enabled,
-                    name: None,
+                    name: nombre_de_tarea_de_prueba(),
                 })
                 .await
                 .expect("el alta de la tarea no puede fallar")
