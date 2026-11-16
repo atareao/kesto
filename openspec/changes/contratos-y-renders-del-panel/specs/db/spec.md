@@ -82,7 +82,7 @@ La reconstrucción SHALL copiar **columna a columna, nombradas** —no con un `S
 
 Las filas que ya existían con `name` a `NULL` SHALL rellenarse **dentro de la propia migración** con un nombre derivado, porque `NOT NULL` no admite un `NULL` preexistente y una migración que dejara filas ilegibles no serviría de nada. El derivado SHALL ser único entre **todas** las filas de la tabla —no sólo entre las rellenadas—, NO SHALL coincidir con ningún nombre que ya estuviera presente, NO SHALL ser el identificador de la tarea ni una copia de él, SHALL quedar no vacío tras recortar y SHALL medir **120** caracteres o menos. La forma del derivado SHALL ser `tarea <octeto corto del id>`: el literal `tarea `, un espacio y el **primer octeto** del identificador de la tarea en minúsculas —los ocho primeros dígitos hexadecimales, no el UUID entero—, de donde salen 14 caracteres; SHALL derivarse en SQL general, aplicable a cualquier fila sin nombre y no sólo a las de este entorno, y NO SHALL chocar con un nombre ya presente: si el derivado de una fila coincidiera con un nombre que ya estaba, la migración SHALL usar el siguiente tramo del identificador hasta quedar libre. El detalle de qué tramo se usa ante ese choque es una elección de la implementación; lo que el contrato fija es que el resultado es único, no vacío, distinto del identificador y de 120 caracteres o menos.
 
-Las filas que ya tenían nombre NO SHALL tocarse, y el nombre pasa a ser una identidad de la tarea: dos tareas distintas NO SHALL poder compartirlo. La unicidad SHALL ser sensible a mayúsculas —la colación `BINARY` de SQLite, el defecto sin colación declarada—, de modo que lo que la base rechaza es exactamente lo que el borde HTTP contesta `409`.
+Las filas que ya tenían un nombre SHALL **conservarlo**, y el nombre pasa a ser una identidad de la tarea: dos tareas distintas NO SHALL poder compartirlo. El contrato anterior era explícitamente **no único** —el borde HTTP no comprobaba duplicados—, así que una base puede tener homónimos y la migración NO SHALL abortar por ellos: de cada grupo de filas que comparten nombre, la de **menor `rowid`** SHALL conservar el suyo tal cual y las demás SHALL recibir un nombre desambiguado con el sufijo ` (2)`, ` (3)`, … —añadido al nombre tal y como estaba, de modo que uno que ya acabe en `(N)` se desambigua añadiendo otro—, avanzando hasta dar con uno **libre en toda la tabla** y no sólo entre las filas de su grupo. La desambiguación SHALL ser determinista: el mismo `rowid` produce el mismo resultado. Un `name` **vacío o en blanco** SHALL tratarse como **ausente** y recibir el nombre derivado: el `CHECK` de no-vacío de la columna nueva no lo admitiría, y la migración no puede abortar por una fila que la aplicación no puede escribir. La unicidad SHALL ser sensible a mayúsculas —la colación `BINARY` de SQLite, el defecto sin colación declarada—, de modo que lo que la base rechaza es exactamente lo que el borde HTTP contesta `409`.
 
 La columna SHALL declarar además `CHECK (length(trim(name)) > 0)`, y esta parte es la **decisión D7 del proposal, aprobada**: un nombre en blanco es una fila sin valor, y el momento de cerrarle la puerta en la base es **éste**, porque sólo se reconstruye una vez.
 
@@ -106,6 +106,30 @@ El porqué de reconstruir en vez de parchear: es el procedimiento canónico de S
 - **AND** los tres nombres SHALL ser distintos entre sí
 - **AND** el nombre de la tercera NO SHALL haber cambiado
 - **AND** ningún nombre derivado SHALL ser el identificador de su tarea
+
+#### Scenario: Los nombres repetidos se desambiguan antes de exigir la unicidad
+
+- **GIVEN** una base llevada a mano hasta la `0006` con tres tareas cuyo `name` es el mismo, una cuarta tarea cuyo `name` es ése mismo más el sufijo ` (2)`, y ejecuciones colgando de las cuatro
+- **WHEN** se aplica la `0007`
+- **THEN** la homónima de menor `rowid` SHALL conservar su nombre
+- **AND** las otras dos SHALL recibir un nombre con sufijo, saltándose el ` (2)` que ya estaba ocupado
+- **AND** la tarea que ya tenía el ` (2)` NO SHALL haber cambiado de nombre
+- **AND** los cuatro nombres SHALL ser distintos entre sí
+- **AND** ninguna fila de `job_executions` SHALL perderse
+
+#### Scenario: Un nombre vacío o en blanco se trata como ausente
+
+- **GIVEN** una base llevada a mano hasta la `0006` con dos tareas cuyo `name` es, respectivamente, la cadena vacía y una cadena de sólo espacios
+- **WHEN** se aplica la `0007`
+- **THEN** la migración NO SHALL abortar
+- **AND** las dos tareas SHALL quedar con un nombre derivado, no vacío y distinto del de la otra
+
+#### Scenario: Un nombre que ya acaba en `(N)` se desambigua añadiendo otro sufijo
+
+- **GIVEN** una base llevada a mano hasta la `0006` con dos tareas cuyo `name` es `copia (2)`
+- **WHEN** se aplica la `0007`
+- **THEN** la de menor `rowid` SHALL conservar `copia (2)`
+- **AND** la otra SHALL quedar con `copia (2) (2)`
 
 #### Scenario: El nombre derivado no choca con uno que ya estaba
 
