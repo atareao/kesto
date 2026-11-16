@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -135,6 +136,22 @@ pub(crate) fn directorio_de_prueba() -> DirectorioDePrueba {
     std::fs::create_dir_all(&ruta).expect("el directorio temporal de la prueba debe crearse");
 
     DirectorioDePrueba { ruta }
+}
+
+/// Un nombre de tarea **distinto en cada llamada**.
+///
+/// Desde la `0007` (`migrations/0007_nombre_de_tarea_obligatorio.sql`) el nombre de una tarea es
+/// `NOT NULL` con `UNIQUE(name)`, así que un ayudante que dé de alta más de una tarea —o una prueba
+/// que llame dos veces al mismo— no puede usar un literal fijo: la segunda alta chocaría contra la
+/// restricción y lo que la prueba mide no es eso. El contador es un `AtomicU64` y no una variable de
+/// cada prueba porque las pruebas corren en paralelo y comparten el proceso; lo que sí hace falta es
+/// que el número sea único **dentro de una misma base**, y esto lo garantiza.
+pub(crate) fn nombre_de_tarea_de_prueba() -> String {
+    static CONTADOR: AtomicU64 = AtomicU64::new(0);
+
+    let numero = CONTADOR.fetch_add(1, Ordering::Relaxed);
+
+    format!("tarea de prueba {numero}")
 }
 
 // ── Repositorios Rustic de prueba ────────────────────────────────────────────

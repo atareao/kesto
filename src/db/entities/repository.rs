@@ -316,7 +316,9 @@ mod tests {
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
     use crate::error::AppError;
     use crate::secret::SecretString;
-    use crate::test_support::{DirectorioDePrueba, base_con_clave, body_text, capturar_log};
+    use crate::test_support::{
+        DirectorioDePrueba, base_con_clave, body_text, capturar_log, nombre_de_tarea_de_prueba,
+    };
 
     /// Secreto de acceso distinguible y largo: si aparece en una salida, la salida
     /// es el fallo.
@@ -1012,7 +1014,7 @@ mod tests {
             keep_weekly: 4,
             keep_monthly: 12,
             enabled: true,
-            name: None,
+            name: nombre_de_tarea_de_prueba(),
         }
     }
 

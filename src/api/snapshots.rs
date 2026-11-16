@@ -676,7 +676,7 @@ impl ListadoDelCable {
     fn desde(
         instantaneas: &[ResumenDeSnapshot],
         objetivos: &HashMap<String, ObjetivoDeRestauracion>,
-        nombres: &HashMap<Uuid, Option<String>>,
+        nombres: &HashMap<Uuid, String>,
         truncated: bool,
     ) -> Result<Self, AppError> {
         let snapshots = instantaneas
@@ -787,7 +787,7 @@ impl SnapshotDelCable {
     fn desde(
         resumen: &ResumenDeSnapshot,
         objetivo: Option<&ObjetivoDeRestauracion>,
-        nombres: &HashMap<Uuid, Option<String>>,
+        nombres: &HashMap<Uuid, String>,
     ) -> Result<Self, AppError> {
         Ok(Self {
             id: resumen.id.clone(),
@@ -803,8 +803,7 @@ impl SnapshotDelCable {
             // `job_id` del objetivo es la llave con la que se busca en el mapa que resolvió el
             // manejador. Sin objetivo no hay llave —y el `and_then` deja el `null` sin consultar—;
             // con él y sin entrada en el mapa, también `null`.
-            job_name: objetivo
-                .and_then(|objetivo| nombres.get(&objetivo.job_id).cloned().flatten()),
+            job_name: objetivo.and_then(|objetivo| nombres.get(&objetivo.job_id).cloned()),
         })
     }
 }
@@ -841,8 +840,8 @@ mod tests {
     use crate::test_support::{
         DirectorioDePrueba, ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA,
         SEMILLA_CONTENIDO, base_con_clave, body_json, config_con_dsn, directorio_de_prueba,
-        estado_de_prueba, get, post_json, router_desarrollo, sembrar_snapshot_ajeno,
-        sembrar_snapshots,
+        estado_de_prueba, get, nombre_de_tarea_de_prueba, post_json, router_desarrollo,
+        sembrar_snapshot_ajeno, sembrar_snapshots,
     };
 
     /// Un identificador bien formado cualquiera, que no corresponde a ninguna fila.
@@ -1415,17 +1414,20 @@ mod tests {
     /// 1.6 — Cada instantánea publica `job_name`: el nombre de su tarea, o `null`.
     ///
     /// Cubre `api-resources`, escenario «Cada instantánea declara el nombre de su tarea o null». Se
-    /// siembran **tres** instantáneas del mismo repositorio para que los dos motivos del `null` se
+    /// siembran **tres** instantáneas del mismo repositorio para que los dos desenlaces del nombre se
     /// distingan en la misma respuesta:
     ///
-    /// * una cuya tarea **sí** tiene nombre, que lo publica;
-    /// * otra cuya tarea **no** lo tiene —el estado de todas las tareas anteriores a este change—,
-    ///   que publica `null`;
-    /// * y una **sin vínculo** con ninguna ejecución, que también publica `null`.
+    /// * dos cuya tarea tiene nombre —obligatorio desde la `0007`—, y cada una publica el **suyo**;
+    /// * y una **sin vínculo** con ninguna ejecución, que publica `null`.
     ///
-    /// El nombre se escribe con SQL directo: la tarea se siembra por la capa de acceso —la única
-    /// forma de tener la cadena `instantánea → ejecución → tarea`— y lo que esta prueba mide es el
-    /// **listado**, no el alta de tareas, que tiene las suyas.
+    /// El otro `null` que el contrato declara —el de una tarea ausente del mapa— no se puede montar
+    /// aquí: una instantánea sin vínculo no aporta `job_id` con el que consultar, y una tarea que
+    /// exista trae nombre siempre. La huérfana cubre, por tanto, el único `null` alcanzable en este
+    /// listado.
+    ///
+    /// El nombre se **cambia** con SQL directo para medir que el listado sigue al dato: la tarea se
+    /// siembra por la capa de acceso —la única forma de tener la cadena `instantánea → ejecución →
+    /// tarea`— y lo que esta prueba mide es el **listado**, no el alta de tareas, que tiene las suyas.
     ///
     /// Y se afirma que la `label` **no** cambia: SHALL seguir siendo la que la instantánea trae del
     /// repositorio, para que el nombre nuevo no acabe sustituyéndola por la puerta de atrás.
@@ -1451,31 +1453,48 @@ mod tests {
         let repositorio_id = Uuid::parse_str(&repositorio)
             .expect("el alta del repositorio devuelve un identificador con forma de UUID");
 
-        let con_nombre = siembra.identificadores[0].clone();
-        let sin_nombre = siembra.identificadores[1].clone();
+        let primera = siembra.identificadores[0].clone();
+        let segunda = siembra.identificadores[1].clone();
         // La tercera se queda **sin** vínculo: es la copia que el histórico no anotó.
         let huerfana = siembra.identificadores[2].clone();
 
         sembrar_cadena(
             &estado,
             repositorio_id,
-            &con_nombre,
+            &primera,
             TipoDeTarget::Directory,
-            Some("/srv/explorador-1-6-con-nombre".to_owned()),
+            Some("/srv/explorador-1-6-primera".to_owned()),
         )
         .await;
 
         sembrar_cadena(
             &estado,
             repositorio_id,
-            &sin_nombre,
+            &segunda,
             TipoDeTarget::Directory,
-            Some("/srv/explorador-1-6-sin-nombre".to_owned()),
+            Some("/srv/explorador-1-6-segunda".to_owned()),
         )
         .await;
 
-        // La primera lectura, con **ninguna** tarea con nombre todavía: la clave tiene que estar en
-        // las tres y a `null` en las tres.
+        // El nombre de la tarea de la instantánea dada, leído del vínculo `instantánea → ejecución →
+        // tarea`. Se lee aquí para poder afirmar que el listado publica **ese** nombre y no otro.
+        async fn nombre_de_la_tarea(pool: &sqlx::SqlitePool, instantanea: &str) -> String {
+            sqlx::query_scalar(
+                "SELECT name FROM backup_jobs WHERE id = \
+                 (SELECT job_id FROM job_executions WHERE snapshot_id = ?1)",
+            )
+            .bind(instantanea.to_owned())
+            .fetch_one(pool)
+            .await
+            .expect("la tarea de la instantánea tiene que estar")
+        }
+
+        let nombre_primera = nombre_de_la_tarea(&estado.db.pool, &primera).await;
+        let nombre_segunda = nombre_de_la_tarea(&estado.db.pool, &segunda).await;
+
+        // La primera lectura: las tres traen la **clave** `job_name`; las dos con vínculo publican
+        // el nombre de su tarea, y solo la huérfana —sin `job_id` con el que consultar— publica
+        // `null`.
         let respuesta = get(
             router.clone(),
             &format!("/api/v1/snapshots?repository_id={repositorio}"),
@@ -1495,31 +1514,47 @@ mod tests {
             .as_array()
             .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
 
-        for instantanea in [&con_nombre, &sin_nombre, &huerfana] {
+        for instantanea in [&primera, &segunda, &huerfana] {
             let elemento = elemento_con_id(listado, instantanea, &cuerpo);
 
             assert!(
                 elemento.get("job_name").is_some(),
-                "la instantánea `{instantanea}` tiene que traer la **clave** `job_name`, aunque sea \
-                 a `null`: {cuerpo}"
-            );
-            assert!(
-                elemento["job_name"].is_null(),
-                "mientras ninguna de las tres tareas tiene nombre, `job_name` tiene que llegar a \
-                 `null`: {cuerpo}"
+                "la instantánea `{instantanea}` tiene que traer la **clave** `job_name`: {cuerpo}"
             );
         }
 
-        // Ahora se le pone nombre a la tarea de la primera instantánea, y **solo** a la suya.
+        let elemento = elemento_con_id(listado, &primera, &cuerpo);
+
+        assert_eq!(
+            elemento["job_name"], nombre_primera,
+            "la instantánea de la primera tarea tiene que publicar el nombre de **su** tarea: {cuerpo}"
+        );
+
+        let elemento = elemento_con_id(listado, &segunda, &cuerpo);
+
+        assert_eq!(
+            elemento["job_name"], nombre_segunda,
+            "cada instantánea publica el nombre de su propia tarea, no el de otra: {cuerpo}"
+        );
+
+        let elemento = elemento_con_id(listado, &huerfana, &cuerpo);
+
+        assert!(
+            elemento["job_name"].is_null(),
+            "una instantánea sin vínculo con ninguna tarea publica `job_name` a `null`: {cuerpo}"
+        );
+
+        // Y el nombre sigue al dato: se renombra la tarea de la primera instantánea —y **solo** la
+        // suya—, para medir que el listado publica el nuevo sin contagiar a la segunda.
         sqlx::query(
             "UPDATE backup_jobs SET name = ?1 WHERE id = \
              (SELECT job_id FROM job_executions WHERE snapshot_id = ?2)",
         )
         .bind("copia nocturna")
-        .bind(&con_nombre)
+        .bind(&primera)
         .execute(&estado.db.pool)
         .await
-        .expect("poner el nombre de la tarea es preparación de la prueba y no puede fallar");
+        .expect("cambiar el nombre de la tarea es preparación de la prueba y no puede fallar");
 
         let respuesta = get(
             router,
@@ -1540,20 +1575,19 @@ mod tests {
             .as_array()
             .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
 
-        let elemento = elemento_con_id(listado, &con_nombre, &cuerpo);
+        let elemento = elemento_con_id(listado, &primera, &cuerpo);
 
         assert_eq!(
             elemento["job_name"], "copia nocturna",
-            "la instantánea de la tarea con nombre tiene que publicarlo: {cuerpo}"
+            "la instantánea de la tarea renombrada tiene que publicar el nombre nuevo: {cuerpo}"
         );
 
-        // Las otras dos siguen a `null`, cada una por su motivo: una porque su tarea no tiene
-        // nombre, y la otra porque no casó con ninguna tarea.
-        let elemento = elemento_con_id(listado, &sin_nombre, &cuerpo);
+        // La segunda sigue publicando el suyo, y la huérfana, `null`: el renombrado no se contagia.
+        let elemento = elemento_con_id(listado, &segunda, &cuerpo);
 
-        assert!(
-            elemento["job_name"].is_null(),
-            "una tarea sin nombre publica `job_name` a `null`, no una cadena vacía: {cuerpo}"
+        assert_eq!(
+            elemento["job_name"], nombre_segunda,
+            "el nombre de la segunda tarea no puede cambiar porque se renombre la primera: {cuerpo}"
         );
 
         let elemento = elemento_con_id(listado, &huerfana, &cuerpo);
@@ -1565,7 +1599,7 @@ mod tests {
 
         // Y la `label` de las tres sigue siendo la que la instantánea trae del repositorio: el
         // nombre nuevo vive en su propio campo y **no** sustituye a la etiqueta.
-        for instantanea in [&con_nombre, &sin_nombre, &huerfana] {
+        for instantanea in [&primera, &segunda, &huerfana] {
             let elemento = elemento_con_id(listado, instantanea, &cuerpo);
 
             assert_eq!(
@@ -1741,7 +1775,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 6,
                 enabled: true,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect("la tarea de la restauración se da de alta");

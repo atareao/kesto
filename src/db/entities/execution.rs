@@ -764,7 +764,9 @@ mod tests {
     use crate::db::entities::repository::{AltaDeRepositorio, Repositorios};
     use crate::db::entities::target::{AltaDeTarget, Targets, TipoDeTarget};
     use crate::secret::SecretString;
-    use crate::test_support::{DirectorioDePrueba, base_con_clave, clave_de_prueba};
+    use crate::test_support::{
+        DirectorioDePrueba, base_con_clave, clave_de_prueba, nombre_de_tarea_de_prueba,
+    };
 
     /// Identificador del `snapshot` de las pruebas: distinguible y largo.
     const SNAPSHOT: &str = "snapshot-distinguible-000000000000000000000001";
@@ -881,7 +883,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect("el alta de la tarea no puede fallar");
@@ -931,7 +933,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect("el alta de la tarea hermana no puede fallar")
@@ -1712,7 +1714,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect("el alta de la tarea no puede fallar");

@@ -214,6 +214,11 @@ impl IntoResponse for AppError {
 ///   ciegas y mandaría a corregir un campo que puede estar bien. Lo que hay que poder
 ///   hacer con un `409` es **enterarse de que ocurrió**, y para eso está el registro, que
 ///   recibe la causa entera.
+/// * Y un **nombre de tarea repetido** contesta `409` con un mensaje propio que **nombra el
+///   campo**: es el otro `409` del recurso de tareas, y el único de los dos que sí puede
+///   decir qué corregir, porque la restricción que falla es una sola y se sabe cuál. Su
+///   mensaje tiene que ser **distinto** del `400` de la falta de nombre, porque los dos
+///   hablan del mismo campo y mandan a hacer cosas distintas.
 ///
 /// Y el `409` es una **red de seguridad, no el camino normal**: el manejador valida que las
 /// referencias existen antes de escribir, así que solo se llega aquí si algo cambia **entre
@@ -235,6 +240,23 @@ fn traducir_base(causa: DbError) -> (StatusCode, String) {
         return (
             StatusCode::BAD_REQUEST,
             format!("el campo `{campo}` no puede ir vacío"),
+        );
+    }
+
+    if let DbError::NombreDeTareaDuplicado { .. } = &causa {
+        // El `409` del nombre repetido. Sale de la restricción de la base y no de una lectura
+        // previa —comprobar y luego escribir deja la ventana abierta a que dos altas simultáneas
+        // pasen las dos la comprobación—, así que es la restricción la que decide y aquí solo se
+        // traduce. El mensaje **nombra el campo** y dice que ya está en uso, y es **distinto** del
+        // `400` de la falta de nombre: los dos rechazan la misma entrada y mandan a hacer cosas
+        // distintas —uno a escribir un nombre, el otro a cambiarlo—, y un panel que no los
+        // distinguiera obligaría al operador a adivinar cuál de las dos arreglar. **No repite el
+        // valor**: el nombre que se intentó escribir no viaja, como en todo rechazo de campo.
+        tracing::debug!(campo = "name", "petición rechazada");
+
+        return (
+            StatusCode::CONFLICT,
+            "el campo `name` ya está en uso: elige otro nombre para la tarea".to_owned(),
         );
     }
 
@@ -285,7 +307,9 @@ mod tests {
     use crate::db::DbError;
     use crate::db::entities::{AltaDeRepositorio, AltaDeTarea, Repositorios, Tareas};
     use crate::secret::SecretString;
-    use crate::test_support::{base_con_clave, body_json, body_text, capturar_log};
+    use crate::test_support::{
+        base_con_clave, body_json, body_text, capturar_log, nombre_de_tarea_de_prueba,
+    };
 
     /// Credencial distinguible: si aparece en el cuerpo, el error la filtró.
     const CREDENCIAL: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -540,7 +564,7 @@ mod tests {
                 keep_weekly: 4,
                 keep_monthly: 12,
                 enabled: true,
-                name: None,
+                name: nombre_de_tarea_de_prueba(),
             })
             .await
             .expect_err(
@@ -745,7 +769,7 @@ mod tests {
                     keep_weekly: 4,
                     keep_monthly: 12,
                     enabled: true,
-                    name: None,
+                    name: nombre_de_tarea_de_prueba(),
                 })
                 .await
                 .expect_err(

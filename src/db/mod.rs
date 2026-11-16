@@ -168,6 +168,24 @@ pub enum DbError {
         causa: sqlx::Error,
     },
 
+    /// El nombre de una tarea chocó con el de otra: la columna es `UNIQUE`.
+    ///
+    /// Nace de la restricción de la base y no de una comprobación previa —`UNIQUE(name)` desde la
+    /// `0007`—, y eso es deliberado: mirar antes y escribir después deja la ventana abierta a que
+    /// dos altas simultáneas pasen las dos la comprobación, así que la única respuesta fiable es la
+    /// que da la restricción. `src/error.rs` lo traduce al **`409`** que describe el choque —la
+    /// petición está bien y contradice lo que ya hay— y le pone un mensaje **distinto** del `400`
+    /// de la falta de nombre: los dos hablan del mismo campo y mandan a hacer cosas distintas.
+    ///
+    /// El mensaje **no repite el valor** —no lo tiene: la causa de `sqlx` nombra la restricción, no
+    /// el nombre que se intentó escribir—, que es la regla de la casa para todo rechazo de campo.
+    #[error("el nombre de la tarea ya está en uso")]
+    NombreDeTareaDuplicado {
+        /// Causa, tal y como la informa `sqlx`: nombra la restricción, nunca el valor.
+        #[source]
+        causa: sqlx::Error,
+    },
+
     /// Se intentó guardar un secreto **vacío**.
     ///
     /// El cifrado en reposo ya tiene la mitad que falla al leer —un descifrado no

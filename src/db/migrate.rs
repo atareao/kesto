@@ -327,12 +327,10 @@ mod tests {
                     columna("keep_monthly", "INTEGER", true, Some("12")),
                     columna("enabled", "BOOLEAN", true, Some("1")),
                     columna("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP")),
-                    // La columna la añade la `0005` (issue #65), **sin** reconstruir la tabla: un
-                    // `ALTER TABLE ... ADD COLUMN` la deja al final del orden declarado, y por eso
-                    // va aquí y no junto al `name` de las otras dos tablas. Es anulable y sin valor
-                    // por defecto: una tarea sin nombre es un estado válido y anterior a este
-                    // change, así que las filas que ya había tienen que quedar con `NULL`.
-                    columna("name", "TEXT", false, None),
+                    // La columna la añade la `0005` (issue #65) **sin** reconstruir la tabla, y la
+                    // reconstruye la `0007` para hacerla obligatoria y única: sigue en la última
+                    // posición, porque el orden declarado no cambió, pero deja de ser anulable.
+                    columna("name", "TEXT", true, None),
                 ],
             ),
             (
@@ -370,10 +368,10 @@ mod tests {
     /// tabla.
     ///
     /// Se parte de una base llevada hasta la `0004` —el estado de una instalación anterior a este
-    /// change— y **con tareas dentro**, y se aplica el migrador entero. Lo que se mide es lo que
-    /// distingue un `ALTER TABLE ... ADD COLUMN` de una reconstrucción: que el fichero entre, que
-    /// deje la columna declarada con su tipo y su anulabilidad, y que las filas que ya había
-    /// **sigan ahí** con `name` a `NULL`. Una reconstrucción —`CREATE`/`INSERT SELECT`/`DROP`/
+    /// change— y **con tareas dentro**, y se aplica el migrador **hasta la `0005`**. Lo que se mide
+    /// es lo que distingue un `ALTER TABLE ... ADD COLUMN` de una reconstrucción: que el fichero
+    /// entre, que deje la columna declarada con su tipo y su anulabilidad, y que las filas que ya
+    /// había **sigan ahí** con `name` a `NULL`. Una reconstrucción —`CREATE`/`INSERT SELECT`/`DROP`/
     /// `RENAME`— que se equivocara se llevaría las tareas por delante, y eso no lo ve una prueba
     /// que solo mire el directorio de migraciones.
     #[tokio::test]
@@ -405,8 +403,10 @@ mod tests {
             "la columna `name` no puede existir antes de la `0005`: {antes:?}"
         );
 
-        // La migración, sobre esa misma base con las filas dentro.
-        super::aplicar(&pool, &super::migrador())
+        // La migración, sobre esa misma base con las filas dentro. Se aplica **solo** hasta la
+        // `0005`: el estado que se mide es el que deja esa migración, y el migrador entero llegaría
+        // hasta la `0007`, que es la que después vuelve el nombre obligatorio y único.
+        super::aplicar(&pool, &migrador_hasta(5))
             .await
             .expect("la `0005` tiene que aplicarse sobre una base llevada hasta la `0004`");
 
@@ -443,6 +443,365 @@ mod tests {
         assert_eq!(
             sin_nombre, 2,
             "las tareas anteriores al change tienen que quedar con `name` a NULL"
+        );
+
+        pool.close().await;
+    }
+
+    /// El nombre del índice **único** que cubre una columna, si lo hay.
+    ///
+    /// `UNIQUE (name)` no se declara con un `CREATE INDEX` sino como restricción de columna, así que
+    /// el índice que la base crea para ella es el **implícito** de la tabla
+    /// (`sqlite_autoindex_backup_jobs_N`) y no lleva el prefijo `idx_`: [`indices_de_tabla`] no lo
+    /// ve. Se recorre `pragma_index_list` y, de los índices únicos, se devuelve el que cubre
+    /// **exactamente** la columna pedida —`id` es `PRIMARY KEY` y también estrena su implícito, así
+    /// que «que haya algún índice único» no bastaría—.
+    async fn indice_unico_sobre(pool: &SqlitePool, tabla: &str, columna: &str) -> Option<String> {
+        let indices = sqlx::query("SELECT name, \"unique\" FROM pragma_index_list(?1)")
+            .bind(tabla)
+            .fetch_all(pool)
+            .await
+            .expect("los índices deben poder consultarse");
+
+        for fila in &indices {
+            let unico = fila
+                .try_get::<i64, _>("unique")
+                .expect("unique es un entero")
+                != 0;
+
+            if !unico {
+                continue;
+            }
+
+            let nombre = fila.try_get::<String, _>("name").expect("name es texto");
+
+            let columnas: Vec<String> = sqlx::query("SELECT name FROM pragma_index_info(?1)")
+                .bind(&nombre)
+                .fetch_all(pool)
+                .await
+                .expect("las columnas del índice deben poder consultarse")
+                .iter()
+                .map(|columna| columna.try_get::<String, _>("name").expect("name es texto"))
+                .collect();
+
+            if columnas == [columna.to_owned()] {
+                return Some(nombre);
+            }
+        }
+
+        None
+    }
+
+    /// 1.0 (db) — La `0007` hace el nombre **obligatorio y único** sin llevarse ninguna fila.
+    ///
+    /// Cubre `db`, requisito «La obligatoriedad y la unicidad del nombre reconstruyen `backup_jobs`,
+    /// y la reconstrucción no se lleva ninguna fila», y sus escenarios. Se parte de una base llevada
+    /// hasta la `0006` —el estado de una instalación anterior a este change— y **con filas dentro**:
+    /// dos tareas sin nombre, una con él, y las ejecuciones colgando de ellas. La `0007` es la
+    /// primera reconstrucción de una tabla **padre** de un histórico, así que lo que se mide no es
+    /// solo el esquema final: es que el `DROP TABLE` **no** se llevó por delante las ejecuciones con
+    /// las claves foráneas encendidas.
+    #[tokio::test]
+    async fn la_0007_hace_el_nombre_obligatorio_y_unico_sin_perder_filas() {
+        let (_directorio, pool) = base_hasta(6).await;
+
+        // Los padres de las tareas y las tareas: dos sin nombre y una con él —la que NO se puede
+        // tocar—. Los identificadores tienen forma de UUID porque el §3 los declara así, y de ahí
+        // sale el «octeto» del nombre derivado.
+        let sin_nombre = [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ];
+        let con_nombre = "33333333-3333-3333-3333-333333333333";
+
+        for sentencia in [
+            "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+             secret_access_key, passphrase) VALUES ('r-1', 'repo', 'e', 'b', 'r', 'a', 's', 'p')",
+            "INSERT INTO backup_targets (id, name, target_type, host_path) \
+             VALUES ('t-1', 'carpeta', 'directory', '/srv/datos')",
+        ] {
+            sqlx::query(sentencia)
+                .execute(&pool)
+                .await
+                .expect("la siembra de los padres no puede fallar");
+        }
+
+        for (indice, id) in sin_nombre.iter().copied().enumerate() {
+            sqlx::query(
+                "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+                 VALUES (?1, 't-1', 'r-1', ?2)",
+            )
+            .bind(id)
+            .bind(format!("0 {} * * *", indice + 3))
+            .execute(&pool)
+            .await
+            .expect("las tareas sin nombre tienen que entrar antes de la 0007");
+        }
+
+        sqlx::query(
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression, name) \
+             VALUES (?1, 't-1', 'r-1', '0 9 * * *', 'copia nocturna')",
+        )
+        .bind(con_nombre)
+        .execute(&pool)
+        .await
+        .expect("la tarea con nombre tiene que entrar antes de la 0007");
+
+        // Las ejecuciones: son las filas que el `DROP TABLE` de la vieja se llevaría por delante con
+        // las claves foráneas encendidas. Una cuelga de cada tarea, la nombrada incluida.
+        for (indice, id) in [sin_nombre[0], sin_nombre[1], con_nombre]
+            .into_iter()
+            .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO job_executions (id, job_id, status, started_at) \
+                 VALUES (?1, ?2, 'success', '2026-01-01T00:00:00Z')",
+            )
+            .bind(format!("e-{indice}"))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("las ejecuciones tienen que entrar antes de la 0007");
+        }
+
+        // La migración, sobre esa misma base con las filas dentro.
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0007 tiene que aplicarse sobre una base llevada hasta la 0006");
+
+        // 1. La columna queda obligatoria, y con el índice único que la restricción crea.
+        let declaradas = columnas_completas_de(&pool, "backup_jobs").await;
+        let nombre = declaradas
+            .iter()
+            .find(|columna| columna.nombre == "name")
+            .unwrap_or_else(|| panic!("la 0007 no dejó la columna `name`: {declaradas:?}"));
+
+        assert_eq!(nombre.tipo, "TEXT", "`name` tiene que ser de tipo TEXT");
+        assert!(nombre.obligatoria, "`name` tiene que ser NOT NULL");
+        assert_eq!(
+            nombre.por_defecto, None,
+            "`name` NO tiene valor por defecto: el nombre no se inventa por omisión"
+        );
+        assert_eq!(
+            declaradas.last().map(|columna| columna.nombre.as_str()),
+            Some("name"),
+            "`name` tiene que seguir en la **última** posición, como la dejó la 0005: {declaradas:?}"
+        );
+
+        assert!(
+            indice_unico_sobre(&pool, "backup_jobs", "name")
+                .await
+                .is_some(),
+            "la 0007 tiene que dejar un índice único sobre `name`"
+        );
+
+        // 2. Ninguna fila se perdió, y las dos sin nombre se rellenaron con el derivado.
+        let filas = sqlx::query("SELECT id, name FROM backup_jobs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("las tareas tienen que poder releerse");
+
+        assert_eq!(
+            filas.len(),
+            3,
+            "la reconstrucción se llevó tareas por delante"
+        );
+
+        let mut nombres = Vec::new();
+
+        for fila in &filas {
+            let id = fila.try_get::<String, _>("id").expect("id es texto");
+            let nombre = fila
+                .try_get::<Option<String>, _>("name")
+                .expect("name es texto");
+            let nombre = nombre.unwrap_or_else(|| panic!("la tarea `{id}` quedó sin nombre"));
+
+            assert!(
+                !nombre.trim().is_empty(),
+                "el nombre de `{id}` quedó en blanco: {nombre:?}"
+            );
+            assert!(
+                nombre.chars().count() <= 120,
+                "el nombre derivado de `{id}` supera el tope: {nombre:?}"
+            );
+            assert_ne!(
+                nombre, id,
+                "el nombre derivado NO puede ser el identificador de la tarea"
+            );
+
+            if id == con_nombre {
+                assert_eq!(
+                    nombre, "copia nocturna",
+                    "la fila que ya tenía nombre NO puede cambiar"
+                );
+            } else {
+                let esperado = format!("tarea {}", &id[..8]);
+
+                assert_eq!(
+                    nombre, esperado,
+                    "el nombre derivado tiene que ser `tarea <octeto corto del id>`: {nombre:?}"
+                );
+            }
+
+            nombres.push(nombre);
+        }
+
+        nombres.sort();
+        nombres.dedup();
+
+        assert_eq!(
+            nombres.len(),
+            3,
+            "los tres nombres tienen que ser distintos entre sí: {nombres:?}"
+        );
+
+        // 3. Las ejecuciones sobreviven, y ninguna quedó huérfana.
+        let ejecuciones = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM job_executions")
+            .fetch_one(&pool)
+            .await
+            .expect("las ejecuciones tienen que poder contarse");
+
+        assert_eq!(
+            ejecuciones, 3,
+            "la reconstrucción se llevó ejecuciones por delante: quedaron {ejecuciones}"
+        );
+
+        let huerfanos = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT \"table\" FROM pragma_foreign_key_check ORDER BY \"table\"",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("la comprobación de huérfanos no puede fallar");
+
+        assert!(
+            huerfanos.is_empty(),
+            "la reconstrucción dejó filas huérfanas en: {huerfanos:?}"
+        );
+
+        // 4. Los dos índices de la tabla, que el `DROP TABLE` se lleva, vuelven a estar.
+        let indices = indices_de_tabla(&pool, "backup_jobs").await;
+
+        for esperado in ["idx_backup_jobs_target_id", "idx_backup_jobs_repository_id"] {
+            assert!(
+                indices.iter().any(|indice| indice == esperado),
+                "la reconstrucción se dejó {esperado} por el camino: {indices:?}"
+            );
+        }
+
+        // 5. La restricción está **en la base**: sin nombre, con nombre repetido y en blanco choca
+        // cada uno con su regla, sin depender de la aplicación.
+        for (sentencia, motivo) in [
+            (
+                "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+                 VALUES ('44444444-4444-4444-4444-444444444444', 't-1', 'r-1', '0 1 * * *')",
+                "una fila sin `name` tiene que chocar con el NOT NULL",
+            ),
+            (
+                "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression, name) \
+                 VALUES ('55555555-5555-5555-5555-555555555555', 't-1', 'r-1', '0 1 * * *', \
+                 'copia nocturna')",
+                "un `name` repetido tiene que chocar con el UNIQUE",
+            ),
+            (
+                "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression, name) \
+                 VALUES ('66666666-6666-6666-6666-666666666666', 't-1', 'r-1', '0 1 * * *', '   ')",
+                "un `name` en blanco tiene que chocar con el CHECK",
+            ),
+        ] {
+            let rechazo = sqlx::query(sentencia)
+                .execute(&pool)
+                .await
+                .expect_err(motivo);
+
+            assert!(
+                rechazo.to_string().contains("constraint failed"),
+                "{motivo}, y el rechazo fue: {rechazo}"
+            );
+        }
+
+        pool.close().await;
+    }
+
+    /// 1.0b (db) — El nombre derivado **no** choca con uno que ya estaba: ensancha el identificador.
+    ///
+    /// Cubre el escenario «El nombre derivado no choca con uno que ya estaba». Se prepara la
+    /// colisión exacta: una tarea ya nombrada con el nombre derivado que le tocaría a otra tarea sin
+    /// nombre. El derivado no puede repetirlo —el `UNIQUE` no lo admitiría—, así que la migración
+    /// tiene que **ensanchar** el tramo del identificador hasta quedar libre; lo que se afirma es que
+    /// los dos nombres siguen siendo distintos y que el que ya estaba no se toca.
+    #[tokio::test]
+    async fn el_nombre_derivado_no_choca_con_uno_que_ya_estaba() {
+        let (_directorio, pool) = base_hasta(6).await;
+
+        let sin_nombre = "11111111-1111-1111-1111-111111111111";
+        let ocupado = "22222222-2222-2222-2222-222222222222";
+
+        for sentencia in [
+            "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+             secret_access_key, passphrase) VALUES ('r-1', 'repo', 'e', 'b', 'r', 'a', 's', 'p')",
+            "INSERT INTO backup_targets (id, name, target_type, host_path) \
+             VALUES ('t-1', 'carpeta', 'directory', '/srv/datos')",
+        ] {
+            sqlx::query(sentencia)
+                .execute(&pool)
+                .await
+                .expect("la siembra de los padres no puede fallar");
+        }
+
+        // La tarea sin nombre, cuyo derivado de un octeto sería `tarea 11111111`.
+        sqlx::query(
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
+             VALUES (?1, 't-1', 'r-1', '0 3 * * *')",
+        )
+        .bind(sin_nombre)
+        .execute(&pool)
+        .await
+        .expect("la tarea sin nombre tiene que entrar");
+
+        // Y otra tarea que **ya** se llama así: le roba el derivado de un octeto.
+        sqlx::query(
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression, name) \
+             VALUES (?1, 't-1', 'r-1', '0 4 * * *', ?2)",
+        )
+        .bind(ocupado)
+        .bind(format!("tarea {}", &sin_nombre[..8]))
+        .execute(&pool)
+        .await
+        .expect("la tarea que ocupa el derivado tiene que entrar");
+
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0007 tiene que aplicarse con el derivado ya ocupado");
+
+        let derivado: String = sqlx::query_scalar("SELECT name FROM backup_jobs WHERE id = ?1")
+            .bind(sin_nombre)
+            .fetch_one(&pool)
+            .await
+            .expect("el nombre derivado tiene que poder leerse");
+
+        let intacto: String = sqlx::query_scalar("SELECT name FROM backup_jobs WHERE id = ?1")
+            .bind(ocupado)
+            .fetch_one(&pool)
+            .await
+            .expect("el nombre que ya estaba tiene que poder leerse");
+
+        assert_eq!(
+            intacto,
+            format!("tarea {}", &sin_nombre[..8]),
+            "el nombre que ya estaba NO puede cambiar"
+        );
+        assert_ne!(
+            derivado, intacto,
+            "el derivado tiene que ensancharse para no repetir un nombre que ya estaba"
+        );
+        assert!(
+            derivado.starts_with(&intacto),
+            "el derivado ensanchado tiene que ser el siguiente tramo del mismo identificador: \
+             {derivado:?} sobre {intacto:?}"
+        );
+        assert!(
+            derivado.len() > intacto.len(),
+            "ensanchar el tramo tiene que dar un nombre más largo: {derivado:?}"
         );
 
         pool.close().await;
@@ -511,8 +870,8 @@ mod tests {
         .expect("un repositorio debe entrar");
 
         sqlx::query(
-            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression) \
-             VALUES ('j-ok', 't-ok', 'r-ok', '0 3 * * *')",
+            "INSERT INTO backup_jobs (id, target_id, repository_id, cron_expression, name) \
+             VALUES ('j-ok', 't-ok', 'r-ok', '0 3 * * *', 'tarea-de-los-enumerados')",
         )
         .execute(&pool)
         .await
