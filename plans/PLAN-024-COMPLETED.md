@@ -2,8 +2,8 @@
 
 - **Issues:** #87, #89, #93
 - **Rama:** `feature/panel-contratos-de-tareas`
-- **Change SDD:** `openspec/changes/contratos-y-renders-del-panel/`
-- **Estado:** en curso
+- **Change SDD:** `openspec/changes/archive/2026-11-16-contratos-y-renders-del-panel/`
+- **Estado:** completado (PR #96)
 
 ## Objetivo
 
