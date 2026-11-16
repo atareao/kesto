@@ -51,8 +51,10 @@ pub async fn migrar(pool: &SqlitePool) -> Result<(), DbError> {
 /// Se vuelve a encender **siempre**, también cuando la migración ha fallado: la
 /// conexión regresa al pool y la usa el motor, y una conexión del pool con las
 /// claves apagadas es justo el silencio que [`opciones_del_dsn`] existe para evitar.
-/// Y ya encendidas se comprueba que no quedaran filas huérfanas, que es lo único que
-/// el apagado podía dejar pasar.
+/// Si ese reencendido fallara —el único punto que podía devolver una conexión
+/// envenenada—, la conexión se **descarta** en vez de devolverla al pool, y el error
+/// de la migración se propaga por delante del del pragma. Y ya encendidas se comprueba
+/// que no quedaran filas huérfanas, que es lo único que el apagado podía dejar pasar.
 pub async fn aplicar(pool: &SqlitePool, migrator: &Migrator) -> Result<(), DbError> {
     let mut conexion = pool
         .acquire()
@@ -72,7 +74,28 @@ pub async fn aplicar(pool: &SqlitePool, migrator: &Migrator) -> Result<(), DbErr
         .await
         .map_err(|causa| DbError::Migracion { causa });
 
-    pragma_de_la_conexion(&mut conexion, PRAGMA_CON_CLAVES_FORANEAS).await?;
+    // El pragma de vuelta se intenta **siempre**, y su fallo **no** se propaga con un `?`: un `?`
+    // aquí devolvería antes que el error de la migración —tapándolo con un fallo de restauración— y,
+    // sobre todo, dejaría la conexión de regreso en el pool con las claves **apagadas**, que es el
+    // silencio que [`opciones_del_dsn`] existe para evitar. Cuando el pragma falla no hay forma de
+    // reencender esa conexión, así que se **descarta**: `close` la saca del pool en vez de
+    // devolverla, y la siguiente que el pool abra nace con `foreign_keys` encendido, que va en las
+    // opciones de conexión. El apagado, así, no sobrevive a esta función.
+    if let Err(causa) = pragma_de_la_conexion(&mut conexion, PRAGMA_CON_CLAVES_FORANEAS).await {
+        tracing::error!(
+            %causa,
+            "no se pudo reencender `foreign_keys`; la conexión se descarta para que no vuelva al \
+             pool con las claves apagadas"
+        );
+
+        if let Err(error) = conexion.close().await {
+            tracing::error!(%error, "tampoco se pudo cerrar la conexión envenenada");
+        }
+
+        // El error de la migración manda: `and` deja pasar el suyo y solo estrena el del pragma
+        // cuando la migración fue bien, que es el orden en que se leen las causas.
+        return resultado.and(Err(causa));
+    }
 
     resultado?;
 
