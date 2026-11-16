@@ -156,11 +156,12 @@ fn estados_admitidos() -> String {
 /// no debe volcar credenciales ahí.
 ///
 /// `job_name` es el campo que **no** sale de la tabla: es el nombre de la tarea de esa ejecución,
-/// resuelto por el vínculo con `backup_jobs`, y es anulable porque la tarea puede no tener nombre o
-/// la ejecución puede no casar con ninguna —una fila huérfana, que la clave foránea no deja escribir
-/// pero que un histórico restaurado a mano sí puede traer—. Viaja **siempre**, con `null`: una vista
-/// que omitiera la clave dejaría al panel sin poder distinguir «sin nombre» de «el servidor no lo
-/// dice».
+/// resuelto por el vínculo con `backup_jobs`, y es anulable porque la ejecución puede no casar con
+/// ninguna tarea —una fila huérfana, que la clave foránea no deja escribir pero que un histórico
+/// restaurado a mano sí puede traer—. Desde la `0007` la tarea **siempre** tiene nombre, así que el
+/// `null` ya no significa «la tarea no tiene nombre». Viaja **siempre**, con `null`: una vista que
+/// omitiera la clave dejaría al panel sin poder distinguir «la ejecución no casa con ninguna tarea»
+/// de «el servidor no lo dice».
 #[derive(Debug, Serialize)]
 pub struct EjecucionDelCable {
     /// Identificador de la ejecución.
@@ -181,7 +182,7 @@ pub struct EjecucionDelCable {
     pub started_at: String,
     /// Cuándo terminó, en RFC3339; `null` si sigue en curso.
     pub finished_at: Option<String>,
-    /// Nombre de la tarea de esta ejecución; `null` si no tiene o no casa.
+    /// Nombre de la tarea de esta ejecución; `null` si no casa con ninguna.
     pub job_name: Option<String>,
 }
 
@@ -194,7 +195,8 @@ impl EjecucionDelCable {
     ///
     /// El nombre entra ya resuelto y como `Option`: no lo lee de la fila porque **no está en ella**
     /// —vive en `backup_jobs`—, y esta función no consulta la base. Quien llama resuelve el lote y
-    /// pasa `None` cuando su tarea no está en el mapa, que es lo que significa «sin nombre».
+    /// pasa `None` cuando su tarea no está en el mapa: el único caso que queda es la ejecución
+    /// **huérfana**, la que no casa con ninguna tarea.
     fn desde(fila: &Ejecucion, job_name: Option<String>) -> Result<Self, AppError> {
         Ok(Self {
             id: fila.id.hyphenated().to_string(),
@@ -234,8 +236,9 @@ fn formatear(fecha: time::OffsetDateTime) -> Result<String, AppError> {
 /// añadido a la vista y no un criterio de la consulta.
 ///
 /// La fusión es por el identificador de la tarea y el resultado de no encontrarlo es `null`, no una
-/// fila menos: una tarea sin nombre —o una ejecución que no case con ninguna— tiene que seguir
-/// listándose con su hueco de nombre, que es lo que el contrato publica.
+/// fila menos: una ejecución que no case con ninguna tarea —la huérfana, que la clave foránea no
+/// deja escribir pero que un histórico restaurado a mano sí puede traer— tiene que seguir listándose
+/// con su hueco de nombre, que es lo que el contrato publica.
 pub async fn listado(
     State(estado): State<AppState>,
     Query(filtros): Query<FiltrosDelCable>,
