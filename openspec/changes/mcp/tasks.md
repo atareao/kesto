@@ -27,26 +27,26 @@
 
 ## 4. Fase 2 — Crate `kesto-mcp` (RED)
 
-- [ ] 4.1 Tests del cliente HTTP contra un servidor de pruebas: `KESTO_URL` obligatoria, `KESTO_API_TOKEN` por entorno y por cabecera → verificación: `cargo test -p kesto-mcp` en rojo.
-- [ ] 4.2 Tests de las siete herramientas de lectura, una por una, contra el servidor de pruebas → verificación: en rojo.
-- [ ] 4.3 Tests de las dos herramientas de acción: `run_backup` y `check_repository_health` con `run`; rechazo con `read` → verificación: en rojo.
-- [ ] 4.4 Tests de error: sin token, token revocado, scope insuficiente; el servidor sigue vivo → verificación: en rojo.
-- [ ] 4.5 Tests de transporte: arranque por `stdio` y por `Streamable HTTP`, mismo catálogo de herramientas → verificación: en rojo.
-- [ ] 4.6 Test del catálogo: exactamente nueve herramientas y ninguna destructiva → verificación: en rojo.
+- [x] 4.1 Tests del cliente HTTP contra un servidor de pruebas: `KESTO_URL` obligatoria, `KESTO_API_TOKEN` por entorno y por cabecera → verificación: `cargo test -p kesto-mcp` en rojo.
+- [x] 4.2 Tests de las siete herramientas de lectura, una por una, contra el servidor de pruebas → verificación: en rojo.
+- [x] 4.3 Tests de las dos herramientas de acción: `run_backup` y `check_repository_health` con `run`; rechazo con `read` → verificación: en rojo.
+- [x] 4.4 Tests de error: sin token, token revocado, scope insuficiente; el servidor sigue vivo; y `get_health` sin token cuando la API está en modo `disabled` → verificación: en rojo.
+- [x] 4.5 Tests de transporte: arranque por `stdio` y por `Streamable HTTP`, mismo catálogo de herramientas → verificación: en rojo.
+- [x] 4.6 Test del catálogo: exactamente nueve herramientas y ninguna destructiva → verificación: en rojo.
 
 ## 5. Fase 2 — Crate `kesto-mcp` (GREEN)
 
-- [ ] 5.1 Crate `kesto-mcp/` en el workspace con `rmcp` y su binario → verificación: `cargo build -p kesto-mcp` compila.
-- [ ] 5.2 Cliente HTTP de la API con configuración por entorno y token fuera de logs → verificación: 4.1 en verde.
-- [ ] 5.3 Las siete herramientas de lectura con resultado estructurado → verificación: 4.2 en verde.
-- [ ] 5.4 Las dos herramientas de acción con scope `run` → verificación: 4.3 en verde.
-- [ ] 5.5 Mapeo de errores a mensajes que dicen qué falta → verificación: 4.4 en verde.
-- [ ] 5.6 Transportes `stdio` y `Streamable HTTP` con el mismo catálogo → verificación: 4.5 y 4.6 en verde.
+- [x] 5.1 Crate `kesto-mcp/` en el workspace con `rmcp` y su binario → verificación: `cargo build -p kesto-mcp` compila.
+- [x] 5.2 Cliente HTTP de la API con configuración por entorno y token fuera de logs → verificación: 4.1 en verde.
+- [x] 5.3 Las siete herramientas de lectura con resultado estructurado → verificación: 4.2 en verde.
+- [x] 5.4 Las dos herramientas de acción con scope `run` → verificación: 4.3 en verde.
+- [x] 5.5 Mapeo de errores a mensajes que dicen qué falta → verificación: 4.4 en verde.
+- [x] 5.6 Transportes `stdio` y `Streamable HTTP` con el mismo catálogo → verificación: 4.5 y 4.6 en verde.
 
 ## 6. Fase 2 — Crate `kesto-mcp` (REFACTOR)
 
-- [ ] 6.1 Revisar el catálogo y confirmar que no hay ninguna herramienta destructiva → verificación: test de 4.6 en verde.
-- [ ] 6.2 `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test --locked` → verificación: `just check` en verde.
+- [x] 6.1 Revisar el catálogo y confirmar que no hay ninguna herramienta destructiva → verificación: test de 4.6 en verde.
+- [x] 6.2 `cargo fmt --all` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --locked --workspace` → verificación: `just check` en verde.
 
 ## 7. Documentación y cierre
 
