@@ -1,4 +1,24 @@
 # Changelog
+## [0.11.0] - 2026-11-17
+
+### Documentation
+
+- Relevo tras v0.10.0 y la release del panel
+- *(specs)* Archivar renders-y-resiliencia-del-panel y cerrar PLAN-025
+- *(specs)* Proponer recogida-de-temporales-de-prueba (#94)
+- *(specs)* Archivar recogida-de-temporales-de-prueba y cerrar PLAN-026
+
+### Features
+
+- *(panel)* Renders correctos y resiliencia ante un S3 caído
+
+### Miscellaneous Tasks
+
+- Handoff tras cerrar #99/#100/#101 y #94
+
+### Testing
+
+- *(pruebas)* El arnés recoge sus temporales y no agota los inodos
 ## [0.10.0] - 2026-11-16
 
 ### Bug Fixes
@@ -30,6 +50,7 @@
 ### Miscellaneous Tasks
 
 - Job e2e con motor de contenedores y los tests ignorados (#86)
+- Release v0.10.0
 
 ### Refactor
 
