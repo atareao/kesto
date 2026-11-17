@@ -14,7 +14,8 @@ vampus.tgz
 # Fichero local de relevo entre sesiones
 HANDOFF.md
 
-# Artefactos de LocalAI/Ollama ajenos al proyecto (5,3 GB en local)
+# Artefactos de LocalAI/Ollama ajenos al proyecto (~7,9 GB en local: 5,3 GB de cache/downloading/models + 2,6 GB de backends)
 /cache
 /downloading
 /models
+/backends
