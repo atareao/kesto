@@ -1,4 +1,18 @@
 # Changelog
+## [0.12.0] - 2026-11-17
+
+### Documentation
+
+- *(agents)* El handoff es local y no se versiona
+- *(agents)* El handoff es local y no se versiona
+
+### Features
+
+- *(repositorios)* Salud por repositorio (estado, comprobación e indicador)
+
+### Miscellaneous Tasks
+
+- Sacar HANDOFF.md del control de versiones
 ## [0.11.0] - 2026-11-17
 
 ### Documentation
@@ -15,6 +29,7 @@
 ### Miscellaneous Tasks
 
 - Handoff tras cerrar #99/#100/#101 y #94
+- Release v0.11.0
 
 ### Testing
 
