@@ -10,3 +10,6 @@ vampus.tgz
 
 # Banco de pruebas local (RustFS, fuentes, restauraciones)
 /lab
+
+# Fichero local de relevo entre sesiones
+HANDOFF.md
