@@ -29,7 +29,7 @@ export default function Historico() {
   const [jobId, setJobId] = useState<string | undefined>(undefined)
   const [estado, setEstado] = useState<Estado | undefined>(undefined)
   const [offset, setOffset] = useState(0)
-  const [seleccionada, setSeleccionada] = useState<string | null>(null)
+  const [seleccionadaId, setSeleccionadaId] = useState<string | null>(null)
 
   const tareas = useTareas()
   const ejecuciones = useEjecuciones({
@@ -41,6 +41,12 @@ export default function Historico() {
 
   const datos = ejecuciones.data ?? []
   const haySiguiente = datos.length === TAMANO_DE_PAGINA
+
+  // Solo se guarda el id: la fila se **deriva** de los datos vivos para que un
+  // refresco traiga el `status`/`error_message` actuales. Congelar la fila al
+  // pulsar «Ver consola» dejaba una ejecución `running` que luego falla sonando
+  // «todavía no hay eventos» para siempre.
+  const seleccionada = datos.find((fila) => fila.id === seleccionadaId) ?? null
 
   // La opción se lee por el nombre de la tarea y, sin él, por su identificador:
   // el nombre del target es justo lo que hacía indistinguibles dos tareas sobre
@@ -94,7 +100,7 @@ export default function Historico() {
       title: 'Consola',
       key: 'consola',
       render: (_valor, ejecucion) => (
-        <Button size="small" onClick={() => setSeleccionada(ejecucion.id)}>
+        <Button size="small" onClick={() => setSeleccionadaId(ejecucion.id)}>
           Ver consola
         </Button>
       ),
@@ -182,7 +188,11 @@ export default function Historico() {
       <Typography.Title level={2} style={{ marginTop: 24 }}>
         Consola de la ejecución
       </Typography.Title>
-      <ConsolaDeEjecucion executionId={seleccionada} />
+      <ConsolaDeEjecucion
+        executionId={seleccionadaId}
+        status={seleccionada?.status ?? null}
+        errorMessage={seleccionada?.error_message ?? null}
+      />
     </section>
   )
 }

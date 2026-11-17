@@ -113,6 +113,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use rustic_backend::opendal::OpenDALBackend;
 use rustic_core::repofile::{Node, NodeType, SnapshotFile, SnapshotId};
@@ -168,7 +170,12 @@ impl Acceso {
     /// `endpoint` y `bucket` juntos, que es lo que identifica al cubo sin depender de cómo
     /// esté escrito el endpoint: con barra final o sin ella, lo que se lee es el mismo
     /// sitio. Ni la clave de acceso ni, por supuesto, los secretos entran aquí.
-    fn nombre_del_destino(&self) -> String {
+    ///
+    /// **`pub(crate)`** para que el motor pueda nombrar el destino en el tope que él mismo impone
+    /// al **listado** —ver [`con_tope`] y el rustdoc de
+    /// [`Repositorio::listar_snapshots`]—: el nombre tiene que salir del mismo sitio en los dos
+    /// topes, o el operador leería dos nombres distintos para el mismo destino.
+    pub(crate) fn nombre_del_destino(&self) -> String {
         format!(
             "{}/{}",
             self.endpoint.trim_end_matches('/'),
@@ -475,37 +482,56 @@ impl Repositorio {
     /// Pone el repositorio en marcha: **conecta si existe, inicializa si no**, y dice cuál
     /// de los dos desenlaces ocurrió.
     ///
-    /// Construye el destino de S3 con los datos del [`Acceso`] y delega en
-    /// [`poner_en_marcha_con`], que es donde viven los tres desenlaces.
+    /// Construye el destino de S3 con los datos del [`Acceso`] y abre con [`abrir_con`], que es
+    /// donde viven los tres desenlaces —con el tope de [`TOPE_DEL_DESTINO`] por delante, que es la
+    /// parte que este camino tiene y el de prueba no—.
     ///
-    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio
+    /// # El tope del destino
+    ///
+    /// La apertura corre bajo [`con_tope`], así que un destino que no responde devuelve
+    /// [`Error::DestinoNoAlcanzable`] en diez segundos en vez de agotar los cinco reintentos de la
+    /// biblioteca —el defecto medido de la incidencia #100: 36,9–38,4 s—. La construcción del
+    /// backend **no** entra en el tope, porque no habla con nadie: es local y no puede quedarse
+    /// colgada.
+    ///
+    /// # ⚠️ La biblioteca entra en pánico si se la llama desde dentro de un runtime
     ///
     /// Con el backend de S3 la biblioteca construye su **propio** runtime y bloquea el hilo
-    /// para hablar con el destino, así que llamar a esto desde dentro de otro runtime entra
+    /// para hablar con el destino, así que llamarla desde dentro de otro runtime entra
     /// en **pánico** —medido, literal: «Cannot start a runtime from within a runtime.»—, y un
-    /// pánico no es un error devuelto: se lleva por delante al hilo que lo sufre. Los sitios
-    /// desde los que sí se llama son el hilo del trabajador del motor —un `std::thread`
+    /// pánico no es un error devuelto: se lleva por delante al hilo que lo sufre. Esa llamada es
+    /// ahora la del hilo de [`con_tope`] y no la de quien llama, así que por **este** método el
+    /// pánico no ocurre: quien lo llame desde dentro de un runtime obtiene el error del destino,
+    /// no un hilo caído. Lo que **no** cambia es la regla para el resto del módulo —archivar,
+    /// restaurar, retener y olvidar siguen llamando a la biblioteca en el hilo de quien llama, y
+    /// sus avisos siguen en pie—, así que la advertencia del módulo no se retira.
+    ///
+    /// Los sitios desde los que sí se llama son el hilo del trabajador del motor —un `std::thread`
     /// pelado, ver `src/engine/cola.rs`— y
     /// [`Motor::abrir_repositorio`](crate::engine::Motor::abrir_repositorio), que saca el
     /// trabajo del runtime antes de llegar aquí.
     ///
-    /// El aviso va en este método y no solo en el motor porque este es el que se puede llamar
-    /// desde fuera: el motor lo dice de sí mismo y aquí hay que decirlo del módulo.
-    ///
     /// # Errors
     ///
     /// Devuelve [`Error::AccesoInvalido`] si la fila no describe un destino utilizable,
-    /// [`Error::DestinoNoAlcanzable`] si el destino no se alcanza o no se puede preparar, y
-    /// [`Error::PassphraseNoAbre`] si el repositorio existe y la passphrase no lo abre —lo
+    /// [`Error::DestinoNoAlcanzable`] si el destino no se alcanza, no se puede preparar o agota el
+    /// tope, y [`Error::PassphraseNoAbre`] si el repositorio existe y la passphrase no lo abre —lo
     /// que incluye, medido, el caso de un repositorio sin claves utilizables: ver el
     /// rustdoc de esa variante—.
     pub fn poner_en_marcha(
         acceso: &Acceso,
         barras: BarrasDelMotor,
     ) -> Result<(Self, PuestaEnMarcha), Error> {
+        // Construir el backend no habla con el destino —es lo que hace `OpenDALBackend::new`, sin
+        // red—, así que se queda fuera del tope y el acceso no tiene que cruzar al hilo.
         let backends = backends_de_s3(acceso)?;
+        let destino = acceso.nombre_del_destino();
+        let destino_del_hilo = destino.clone();
+        let credenciales = Credentials::Password(acceso.passphrase.expose().to_owned());
 
-        poner_en_marcha_con(acceso, backends, barras)
+        con_tope(&destino, TOPE_DEL_DESTINO, move || {
+            abrir_con(credenciales, destino_del_hilo, backends, barras)
+        })
     }
 
     /// Archiva un volcado que llega por el puente.
@@ -680,40 +706,27 @@ impl Repositorio {
     /// [`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots), que saca el trabajo
     /// del runtime antes de llegar aquí.
     ///
+    /// # El tope de esta operación lo pone el motor, y aquí está el porqué
+    ///
+    /// El listado también tiene tope —un repositorio que se abre y luego deja de contestar no
+    /// puede dejar al panel cargando sin fin—, pero **no** puede vivir en este método: un tope
+    /// necesita mover el trabajo a otro hilo y este tipo no tiene nada que mover. El repositorio
+    /// de la biblioteca no es `Clone` —su estado de índices no lo es— y el backend que lleva
+    /// dentro no se puede sacar, así que lo único portable sería el repositorio entero, y eso es
+    /// consumirlo. Consumirlo rompería a quien lista dos veces —el motor no, dos pruebas sí— y
+    /// además ataría el tope a que el repositorio se suelte aquí. Quien **sí** lo posee es
+    /// [`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots), que es donde está el
+    /// tope, y por eso este método se queda con el cuerpo puro: [`listar_del_repositorio`].
+    ///
+    /// Lo que **no** cambia por eso es el desenlace: un tope agotado sigue llegando como
+    /// [`Error::DestinoNoAlcanzable`], que es el error que el borde traduce a `502`.
+    ///
     /// # Errors
     ///
     /// Devuelve [`Error::ListadoFallido`] si el repositorio no se puede listar, si alguna
     /// instantánea no se puede leer o si su fecha no es representable.
     pub fn listar_snapshots(&self, ventana: usize) -> Result<Vec<ResumenDeSnapshot>, Error> {
-        let fallo = |motivo: String| Error::ListadoFallido {
-            destino: self.destino.clone(),
-            motivo,
-        };
-
-        // El identificador se pasa en **hex completo**: el `Display` de `SnapshotId` da
-        // solo sus ocho primeros caracteres, que es un prefijo ambiguo.
-        let identificadores: Vec<String> = self
-            .repo
-            .list::<SnapshotId>()
-            .map_err(|error| fallo(error.display_log()))?
-            .take(ventana)
-            .map(|id| id.to_hex().as_str().to_owned())
-            .collect();
-
-        if identificadores.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut instantaneas = self
-            .repo
-            .get_snapshots(&identificadores)
-            .map_err(|error| fallo(error.display_log()))?;
-        instantaneas.sort_unstable_by(|una, otra| otra.time.cmp(&una.time));
-
-        instantaneas
-            .iter()
-            .map(|instantanea| ResumenDeSnapshot::desde(instantanea, &self.destino))
-            .collect()
+        listar_del_repositorio(&self.repo, &self.destino, ventana)
     }
 
     /// Dice si el repositorio tiene una instantánea con ese identificador, **sin restaurarla**.
@@ -744,16 +757,25 @@ impl Repositorio {
     /// está»— en vez de un error de servidor por una errata en la ruta.
     ///
     /// No se lee el índice **completo** —el que trae los tamaños, que es lo que exige
-    /// `prepare_restore`— ni se toca el destino ni el árbol: es una lectura de metadatos. No se puede
-    /// llamar desde dentro de un runtime de Tokio por lo mismo que las demás —la biblioteca
-    /// construye su propio runtime—, y quien la llama es
+    /// `prepare_restore`— ni se toca el destino ni el árbol: es una lectura de metadatos.
+    ///
+    /// # ⚠️ No se puede llamar desde dentro de un runtime de Tokio, y el tope no vive aquí
+    ///
+    /// La biblioteca construye su propio runtime para hablar con el destino, así que llamarla desde
+    /// dentro de otro entra en **pánico**. Quien la llama es
     /// [`Motor::tiene_la_instantanea`](crate::engine::Motor::tiene_la_instantanea), que saca el
-    /// trabajo del runtime antes de llegar aquí.
+    /// trabajo del runtime **y** le pone el tope de [`TOPE_DEL_DESTINO`] por delante: este método
+    /// es el cuerpo puro, sin plazo, y el motivo es el mismo que en
+    /// [`Repositorio::listar_snapshots`] —mover el `list` a otro hilo exige poseer el repositorio, y
+    /// este tipo no es `Clone`—. Con el tope por delante, la llamada corre en el hilo de
+    /// [`con_tope`] y no en el de quien pregunta, así que el pánico del runtime no ocurre por ese
+    /// camino.
     ///
     /// # Errors
     ///
     /// Devuelve [`Error::ListadoFallido`] si el repositorio no se deja leer —el mismo desenlace que
-    /// el listado, porque es la misma lectura de índice—.
+    /// el listado, porque es la misma lectura de índice—. El tope agotado **no** sale de aquí: sale
+    /// de [`Motor::tiene_la_instantanea`], como [`Error::DestinoNoAlcanzable`].
     pub fn tiene_la_instantanea(&self, id: &str) -> Result<bool, Error> {
         let fallo = |motivo: String| Error::ListadoFallido {
             destino: self.destino.clone(),
@@ -1100,6 +1122,51 @@ impl Repositorio {
     }
 }
 
+/// Lista las instantáneas de un repositorio **ya abierto**, como mucho `ventana`.
+///
+/// Es el cuerpo de [`Repositorio::listar_snapshots`] separado por el tope: [`con_tope`] ejecuta su
+/// cierre en otro hilo, así que lo que cruza es el repositorio —un puñado de `Arc`, de ahí el
+/// `clone` de la llamada— y el **nombre** del destino, que es lo único que hace falta para el
+/// motivo de un fallo. Nada de aquí se guarda: el repositorio del hilo se suelta con él.
+///
+/// # Errors
+///
+/// Las mismas que [`Repositorio::listar_snapshots`]: [`Error::ListadoFallido`] si el repositorio no
+/// se deja listar, si una instantánea no se puede leer o si su fecha no es representable.
+fn listar_del_repositorio(
+    repo: &Repository<IndexedIdsStatus>,
+    destino: &str,
+    ventana: usize,
+) -> Result<Vec<ResumenDeSnapshot>, Error> {
+    let fallo = |motivo: String| Error::ListadoFallido {
+        destino: destino.to_owned(),
+        motivo,
+    };
+
+    // El identificador se pasa en **hex completo**: el `Display` de `SnapshotId` da
+    // solo sus ocho primeros caracteres, que es un prefijo ambiguo.
+    let identificadores: Vec<String> = repo
+        .list::<SnapshotId>()
+        .map_err(|error| fallo(error.display_log()))?
+        .take(ventana)
+        .map(|id| id.to_hex().as_str().to_owned())
+        .collect();
+
+    if identificadores.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut instantaneas = repo
+        .get_snapshots(&identificadores)
+        .map_err(|error| fallo(error.display_log()))?;
+    instantaneas.sort_unstable_by(|una, otra| otra.time.cmp(&una.time));
+
+    instantaneas
+        .iter()
+        .map(|instantanea| ResumenDeSnapshot::desde(instantanea, destino))
+        .collect()
+}
+
 /// La ruta de la que cuelga el árbol de una instantánea, cuando declara **una sola**.
 ///
 /// Es el prefijo que una restauración tiene que descontar. La instantánea guarda el contenido con
@@ -1149,11 +1216,167 @@ fn ruta_declarada(copia: &SnapshotFile) -> Result<Option<&str>, String> {
     Ok(Some(unica.as_str()))
 }
 
+/// El tope con el que Kesto acota las operaciones que **abren o listan** el destino.
+///
+/// Se impone en Kesto y no en las opciones del backend porque la versión pinada no tiene dónde
+/// ponerlo: `opendal` 0.58.2 no declara ningún campo de tiempo en la configuración de S3, y
+/// `rustic_backend` 0.7.0 lee del mapa solo `retry`, `connections` y `throttle` —construye el
+/// operador por dentro, con `Operator::via_iter`, sin punto de inyección—. Las versiones están
+/// pinadas a la caché y el build es **offline**, así que subir `opendal` o llevarlo a un `git`
+/// no es una alternativa: lo que hay es esta capa.
+///
+/// El valor es el que decidió el operador para la incidencia #100: contra un destino que no
+/// responde, el panel esperaba **36,9–38,4 s** antes de dar el `502`, y lo que el operador ve
+/// tiene que ser un error en un plazo que se note como «no responde» y no como «va lento».
+/// # Dónde vive
+///
+/// **`pub(crate)`**: el tope de la apertura se impone en [`Repositorio::poner_en_marcha`]; el del
+/// **listado** y el de la **pregunta por una instantánea** —el `list` del índice que hace el `404`
+/// de la restauración— en [`Motor::listar_snapshots`](crate::engine::Motor::listar_snapshots) y
+/// [`Motor::tiene_la_instantanea`](crate::engine::Motor::tiene_la_instantanea), que son los únicos
+/// sitios donde el repositorio está en la mano para moverlo a un hilo. La constante y el mecanismo
+/// son los mismos, y por eso están expuestos al crate en vez de escritos dos veces: una política
+/// con dos valores no es una política.
+///
+/// # El peor caso de una lectura del panel
+///
+/// Cada tramo lleva **su** tope, así que una petición que encadena dos —el
+/// `GET /api/v1/snapshots`, que abre y lista— puede tardar hasta **2 × esta constante** en el caso
+/// extremo: una apertura lenta que aún responde dentro de su plazo y un listado que se agota. No se
+/// funde en un tope único a propósito; el porqué, en el rustdoc de [`con_tope`].
+pub(crate) const TOPE_DEL_DESTINO: Duration = Duration::from_secs(10);
+
+/// Los reintentos que Kesto le declara a la biblioteca en el mapa de opciones.
+///
+/// No es una opción de `opendal`: es la clave que `rustic_backend` lee para acotar el reintento de
+/// su capa, y su valor por defecto —`DEFAULT_RETRY = 5`— es el que producía los 36,9–38,4 s de
+/// retroceso exponencial del informe. **Uno**, y no cero: un reintento es lo que sobrevive a un
+/// fallo pasajero del destino —cuando ya no se puede reintentar, el fallo es del destino y no del
+/// momento—, y el total no depende de este número porque [`TOPE_DEL_DESTINO`] lo acota en la capa
+/// de Kesto. Con uno, un destino que rechaza en el acto contesta en torno a un segundo.
+const REINTENTOS_DEL_DESTINO: &str = "1";
+
+/// Ejecuta `operacion` en un hilo propio y espera su desenlace **como mucho** `limite`.
+///
+/// Es el tope de Kesto: cuando el límite se agota, la operación se **abandona** y lo que se
+/// devuelve es [`Error::DestinoNoAlcanzable`] —el mismo error tipado del destino que no se
+/// alcanza, que el borde ya traduce a `502`—, con un motivo escrito aquí y no el texto crudo de la
+/// dependencia. El `destino` es el nombre con el que el operador reconoce el sitio al que no se
+/// llegó.
+///
+/// # Por qué un hilo y un canal
+///
+/// Porque no hay otra forma de abandonar una llamada que bloquea el hilo: la biblioteca no ofrece
+/// cancelación, así que la única manera de **volver** dentro del plazo es dejar la operación en un
+/// hilo y no esperarla más que el límite. El precio, que hay que saber, es que la operación
+/// abandonada **sigue corriendo** hasta que la dependencia se rinda sola —una contra un destino
+/// que se traga los paquetes sin contestar nunca no termina, y ahí queda un hilo por petición—.
+/// No es un pánico ni una fuga silenciosa: el hilo muere con su desenlace, y que el receptor ya no
+/// esté no es un error.
+///
+/// # Qué **no** lleva este tope
+///
+/// Solo las operaciones que abren o listan: abandonar una lectura cuesta una lectura, y abandonar
+/// una **escritura** —el archivado, la restauración, la retención— dejaría un escritor trabajando
+/// por detrás mientras quien mandó la copia ya leyó un fallo, que es exactamente la copia a medias
+/// que este módulo existe para no dar por buena.
+///
+/// # Lo que este tope cambia de sitio
+///
+/// La operación deja de correr en el hilo de quien llama y corre en uno de Kesto, así que el
+/// pánico con el que la biblioteca protesta cuando se la llama desde dentro de un runtime —«Cannot
+/// start a runtime from within a runtime»— no ocurre por los caminos que pasan por aquí: el hilo
+/// que abre y el que lista no están dentro de ninguno. La advertencia de cada método afectado dice
+/// de quién es el hilo en cada caso.
+///
+/// # Lo que cambia en el borde, y es a propósito
+///
+/// Un **pánico** de dentro de la biblioteca, en el hilo de esta operación, ya no llega al borde
+/// como [`crate::engine::ErrorDelMotor::TrabajoInterrumpido`] —que se traduce a `500`—: el emisor
+/// se suelta sin mandar nada y el receptor lo lee como
+/// [`mpsc::RecvTimeoutError::Disconnected`], que aquí es [`Error::DestinoNoAlcanzable`] y el borde
+/// traduce a `502`. Antes de este tope ese pánico subía por `spawn_blocking` y el motor lo
+/// devolvía como trabajo interrumpido; ahora la llamada que puede caerse ya no está en el hilo del
+/// motor y lo que el operador ve es el destino inalcanzable. Se ha elegido así porque un hilo de la
+/// biblioteca que se cae al hablar con el destino **es**, para quien pregunta, un destino del que no
+/// se ha sabido nada, y porque el `500` de un pánico no es una respuesta que el panel pueda
+/// arreglar; lo que este cambio **no** hace es dejar de distinguir un fallo del destino —sigue
+/// siendo `Error::DestinoNoAlcanzable`, con su variante tipada, y no otro error—, ni retirar
+/// [`crate::engine::ErrorDelMotor::TrabajoInterrumpido`], que sigue cubriendo el pánico del propio
+/// hilo de bloqueo del motor.
+///
+/// # El peor caso, y por qué son dos topes y no uno
+///
+/// Cada operación lleva **su** tope, y una lectura del panel encadena dos: abrir el repositorio y
+/// listarlo. Si el destino responde muy despacio al abrir —sin llegar a agotar el tope— y luego se
+/// atasca al listar, el `GET /api/v1/snapshots` puede tardar hasta **2 × [`TOPE_DEL_DESTINO`]**. Es
+/// el precio de que cada tramo tenga su propio plazo y de no meter una apertura ya lenta dentro del
+/// de un listado que aún no ha empezado: un tope único sobre el conjunto haría que un listado sano
+/// heredara la lentitud de la apertura. Se declara aquí porque es una cifra que el operador puede
+/// medir.
+pub(crate) fn con_tope<T>(
+    destino: &str,
+    limite: Duration,
+    operacion: impl FnOnce() -> Result<T, Error> + Send + 'static,
+) -> Result<T, Error>
+where
+    T: Send + 'static,
+{
+    let (emisor, receptor) = mpsc::channel();
+    let destino = destino.to_owned();
+
+    // `Builder` y no `thread::spawn`, que **panica** si el SO no puede crear el hilo —un límite de
+    // hilos por proceso, memoria agotada—: un tope que se cae con un pánico al ponerse es peor que
+    // el problema que viene a resolver, así que el `Err` se devuelve como el error tipado del
+    // destino. El nombre del hilo es lo que sale en un volcado de pilas del proceso.
+    if let Err(error) = std::thread::Builder::new()
+        .name("kesto-tope-del-destino".to_owned())
+        // Detachado a propósito: si el tope se agota, este hilo es lo que se abandona.
+        .spawn(move || {
+            let _ = emisor.send(operacion());
+        })
+    {
+        return Err(Error::DestinoNoAlcanzable {
+            destino,
+            motivo: format!(
+                "Kesto no ha podido abrir un hilo para hablar con el destino ({error}), así que \
+                 la operación no llegó a empezar"
+            ),
+        });
+    }
+
+    match receptor.recv_timeout(limite) {
+        Ok(desenlace) => desenlace,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::DestinoNoAlcanzable {
+            destino,
+            motivo: format!(
+                "el destino no ha contestado en {limite:?}: Kesto ha agotado su tope de espera y \
+                 ha abandonado la operación, así que no se sabe si el repositorio está ni si se \
+                 llegó a preparar"
+            ),
+        }),
+        // El emisor se suelta sin mandar nada solo si el hilo se cayó antes —un pánico de dentro
+        // de la biblioteca—: eso es un destino del que no se ha sabido nada, no una espera larga,
+        // y por eso llega como el mismo error del destino y no como un trabajo interrumpido.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::DestinoNoAlcanzable {
+            destino,
+            motivo:
+                "el hilo que hablaba con el destino se ha caído antes de contestar, así que no \
+                     se sabe si el repositorio está ni si se llegó a preparar"
+                    .to_owned(),
+        }),
+    }
+}
+
 /// Construye el destino de S3 a partir de la fila.
 ///
 /// Las claves de las opciones son las de `opendal` —`endpoint`, `region`, `bucket`,
 /// `access_key_id`, `secret_access_key`—, y la del esquema es la del **esquema**, no la de
 /// la URL del backend. Ver el encabezado del módulo para la medición de `"opendal:s3"`.
+///
+/// El `retry` va dentro por lo mismo que el `endpoint`: sin declararlo, `rustic_backend` aplica sus
+/// cinco reintentos y el destino que no responde multiplica su espera. No es una clave de `opendal`
+/// —la lee `rustic_backend`—, y por eso el valor está en [`REINTENTOS_DEL_DESTINO`] y no aquí.
 ///
 /// # Errors
 ///
@@ -1201,6 +1424,7 @@ fn opciones_de_s3(acceso: &Acceso) -> Result<BTreeMap<String, String>, Error> {
             "secret_access_key",
             acceso.secret_access_key.expose().to_owned(),
         ),
+        ("retry", REINTENTOS_DEL_DESTINO.to_owned()),
     ]
     .into_iter()
     .map(|(clave, valor)| (clave.to_owned(), valor))
@@ -1235,19 +1459,29 @@ const ESQUEMA_DE_S3: &str = "s3";
 ///    [`Error::PassphraseNoAbre`] para lo que ese desenlace significa de verdad, que no es
 ///    exactamente «la passphrase es la equivocada».
 ///
+/// # El tope no va aquí
+///
+/// Y es a propósito: este es el camino por el que las pruebas abren un repositorio **local**, y un
+/// destino local contesta en el acto —lo que sí tarda, medido, son las 6,4 s de derivación de clave
+/// de `init` y `open` en la compilación de pruebas—, así que un tope de diez segundos aquí sería un
+/// margen de uno y medio sobre algo que no es el problema. El tope de producción lo pone
+/// [`Repositorio::poner_en_marcha`], que es la boca que habla con S3.
+///
 /// # Visibilidad
 ///
-/// **`pub(crate)`**, y no privada como decía antes su documentación: la prueba del motor
-/// necesita abrir un repositorio **local** —un directorio del sistema de ficheros en vez de un
-/// cubo de S3— para poder recorrer el ciclo de vida completo sin red, sin credenciales y sin
-/// motor de contenedores, y este es el único punto por el que se le puede dar un backend que no
-/// sea el de S3. Lo que no es, es `pub`: el destino local que recibe es un gancho de prueba, no
-/// un modo de funcionamiento, y la API pública construye siempre el de S3.
+/// **`pub(crate)`** y **solo en las pruebas** (`#[cfg(test)]`): la prueba del motor necesita abrir
+/// un repositorio **local** —un directorio del sistema de ficheros en vez de un cubo de S3— para
+/// poder recorrer el ciclo de vida completo sin red, sin credenciales y sin motor de contenedores,
+/// y este es el único punto por el que se le puede dar un backend que no sea el de S3. Lo que no es,
+/// es `pub`: el destino local que recibe es un gancho de prueba, no un modo de funcionamiento, y la
+/// API pública construye siempre el de S3. En un binario de producción nadie la usa —de ahí el
+/// `cfg`—, porque el camino de verdad es [`Repositorio::poner_en_marcha`] con [`abrir_con`] dentro.
 ///
 /// # Errors
 ///
 /// Las tres del desenlace y las de la construcción del propio repositorio. Ver
 /// [`Repositorio::poner_en_marcha`].
+#[cfg(test)]
 pub(crate) fn poner_en_marcha_con(
     acceso: &Acceso,
     backends: RepositoryBackends,
@@ -1255,7 +1489,28 @@ pub(crate) fn poner_en_marcha_con(
 ) -> Result<(Repositorio, PuestaEnMarcha), Error> {
     acceso.validar()?;
 
-    let destino = acceso.nombre_del_destino();
+    abrir_con(
+        Credentials::Password(acceso.passphrase.expose().to_owned()),
+        acceso.nombre_del_destino(),
+        backends,
+        barras,
+    )
+}
+
+/// Pone el repositorio en marcha sobre unos backends ya construidos y un destino **nombrado**.
+///
+/// Es el cuerpo de [`poner_en_marcha_con`] con lo que hace falta para trabajar suelto en un hilo:
+/// las credenciales ya construidas y el nombre del destino, en vez del [`Acceso`] prestado. Existe
+/// por el tope —[`con_tope`] necesita un cierre `'static` y el acceso **no se clona** a propósito,
+/// para no duplicar sus dos secretos en memoria—, y ahí está la razón de que los dos secretos se
+/// conviertan en [`Credentials`] antes de cruzar: lo que viaja al hilo es el material que la
+/// biblioteca necesita y no el acceso entero.
+fn abrir_con(
+    credenciales: Credentials,
+    destino: String,
+    backends: RepositoryBackends,
+    barras: BarrasDelMotor,
+) -> Result<(Repositorio, PuestaEnMarcha), Error> {
     let fallo_del_destino = |error: Box<rustic_core::RusticError>| Error::DestinoNoAlcanzable {
         destino: destino.clone(),
         motivo: error.display_log(),
@@ -1268,7 +1523,6 @@ pub(crate) fn poner_en_marcha_con(
         Repository::new_with_progress(&RepositoryOptions::default(), &backends, barras)
             .map_err(fallo_del_destino)?;
 
-    let credenciales = Credentials::Password(acceso.passphrase.expose().to_owned());
     let sin_configuracion = configuracion
         .list(FileType::Config)
         .map_err(fallo_del_destino)?
@@ -1337,13 +1591,14 @@ mod tests {
     use crate::test_support::{
         AJENA_CONTENIDO, CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, ETIQUETA_AJENA,
         ETIQUETA_SEMBRADA, OTRA_PASSPHRASE_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, SEMILLA_CONTENIDO,
-        acceso_local, backends_locales, barras_mudas, directorio_de_prueba, nodo_del_snapshot,
-        sembrar_snapshot_ajeno, sembrar_snapshots, snapshot_guardado, volcado_guardado,
+        acceso_local, backends_locales, barras_mudas, destino_de_s3_que_se_traga_la_peticion,
+        directorio_de_prueba, nodo_del_snapshot, sembrar_snapshot_ajeno, sembrar_snapshots,
+        snapshot_guardado, volcado_guardado,
     };
 
     use super::{
         Acceso, Copia, CopiaHecha, ESQUEMA_DE_S3, Error, PuestaEnMarcha, Repositorio,
-        backends_de_s3, opciones_de_s3, poner_en_marcha_con,
+        TOPE_DEL_DESTINO, backends_de_s3, con_tope, opciones_de_s3, poner_en_marcha_con,
     };
 
     /// El plazo de inactividad de los túneles de prueba.
@@ -3034,6 +3289,184 @@ mod tests {
         assert!(
             !motivo.contains(OTRA_PASSPHRASE_DE_PRUEBA),
             "el motivo de un fallo de S3 publica la passphrase: {motivo}"
+        );
+    }
+
+    /// **#100 — Un destino que no responde agota el tope, no la paciencia del operador.**
+    ///
+    /// Es el defecto medido y esta es su medición, por la **boca de producción**: contra un puerto
+    /// donde nadie escucha —`http://127.0.0.1:9`, el mismo destino del caso reportado— el listado
+    /// del panel tardaba **36,9–38,4 s** y acababa en `502`, porque `rustic_backend` reintenta
+    /// cinco veces con retroceso exponencial (`DEFAULT_RETRY = 5`) y cada reintento suma su
+    /// espera. La llamada de aquí es la de verdad —[`Repositorio::poner_en_marcha`], con el mapa
+    /// de opciones de producción tal cual, sin `retry = 0` de prueba— y lo que se mide es que el
+    /// desenlace llegue **acotado**: el tope de Kesto son diez segundos y el reintento que Kesto
+    /// declara está acotado, así que quince segundos de margen solo se pasan si el tope no está
+    /// —con el defecto, esta misma llamada tarda los 38,4 s del informe—.
+    ///
+    /// El desenlace tiene que ser [`Error::DestinoNoAlcanzable`] y no otra cosa: es el error
+    /// tipado que el borde ya traduce a `502`, así que el contrato HTTP no cambia por esto.
+    ///
+    /// **Lo que esta prueba no demuestra**, y por eso está la siguiente: con el `retry` acotado, un
+    /// puerto cerrado contesta en torno al segundo, así que pasaría aunque se quitara [`con_tope`]
+    /// de [`Repositorio::poner_en_marcha`]. Lo que fija es el desenlace y el rumbo del reloj, no que
+    /// el tope sea lo que corta: eso lo mide
+    /// [`un_destino_que_se_traga_la_peticion_lo_corta_el_tope_y_no_la_biblioteca`].
+    #[test]
+    fn un_destino_que_no_responde_agota_el_tope_y_no_la_paciencia_del_operador() {
+        let acceso = Acceso {
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            bucket: "cubo-que-no-responde".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(OTRA_PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let empezado = std::time::Instant::now();
+        let error = Repositorio::poner_en_marcha(&acceso, barras_mudas())
+            .expect_err("un destino que no responde no pone nada en marcha");
+        let tardado = empezado.elapsed();
+
+        assert!(
+            tardado < Duration::from_secs(15),
+            "el tope del destino no acotó la espera: tardó {tardado:?} contra un destino que no \
+             responde, y el caso del informe tardaba 38,4 s sin tope"
+        );
+
+        assert!(
+            matches!(error, Error::DestinoNoAlcanzable { .. }),
+            "un tope agotado tiene que llegar como el destino inalcanzable —que es el error que el \
+             borde ya traduce a `502`— y llegó como {error:?}"
+        );
+    }
+
+    /// **Un tope agotado abandona la operación y no espera a que conteste.**
+    ///
+    /// Es la mitad que la prueba anterior **no** puede medir sola: contra el puerto muerto el tope
+    /// casi nunca llega a agotarse —el reintento acotado contesta antes—, así que lo que aquí se
+    /// mide es el tope **en sí**, con una operación que tarda cinco segundos y un tope de
+    /// cincuenta milisegundos. Lo que se afirma es que la espera termina cuando se agota el tope
+    /// —no cuando termina la operación— y que el desenlace es el error tipado del destino, con el
+    /// destino nombrado en su motivo.
+    #[test]
+    fn un_tope_agotado_abandona_la_operacion_y_no_espera_a_que_conteste() {
+        let empezado = std::time::Instant::now();
+        let desenlace = con_tope(
+            "s3://cubo-que-no-contesta",
+            Duration::from_millis(50),
+            || {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            },
+        );
+        let tardado = empezado.elapsed();
+
+        let (destino, motivo) = match desenlace {
+            Err(Error::DestinoNoAlcanzable { destino, motivo }) => (destino, motivo),
+            otro => panic!(
+                "un tope agotado tiene que llegar como `DestinoNoAlcanzable` y llegó como {otro:?}: \
+                 el operador tiene que poder distinguirlo de una passphrase que no abre"
+            ),
+        };
+
+        assert!(
+            tardado < Duration::from_secs(2),
+            "la espera terminó cuando terminó la operación y no cuando se agotó el tope: tardó \
+             {tardado:?} con un tope de 50ms"
+        );
+        assert!(
+            destino.contains("cubo-que-no-contesta"),
+            "el motivo no nombra el destino al que no se llegó: {destino}"
+        );
+        assert!(
+            motivo.contains("50ms"),
+            "el motivo no dice cuál fue el tope que se agotó: {motivo}"
+        );
+    }
+
+    /// **El tope es lo que termina la espera contra un destino que se traga la petición.**
+    ///
+    /// Es la prueba **discriminante** del tope, y la que el caso del puerto cerrado no puede ser:
+    /// contra un puerto donde nadie escucha, un `retry` de uno contesta en torno al segundo y el
+    /// desenlace es el mismo con tope y sin él, así que
+    /// [`un_destino_que_no_responde_agota_el_tope_y_no_la_paciencia_del_operador`] pasaría aunque se
+    /// quitara [`con_tope`] de [`Repositorio::poner_en_marcha`]. Aquí el oyente **acepta** la
+    /// conexión y no contesta: `reqwest`, por debajo de `opendal`, no trae plazo propio, así que sin
+    /// tope la llamada no vuelve —y el oyente cierra sin respuesta a los quince segundos, para que
+    /// una regresión sea un fallo medido y no un cuelgue—, y lo que se afirma es que con el tope la
+    /// espera termina dentro del plazo y en [`Error::DestinoNoAlcanzable`], con el motivo del tope y
+    /// no el de la biblioteca.
+    #[test]
+    fn un_destino_que_se_traga_la_peticion_lo_corta_el_tope_y_no_la_biblioteca() {
+        let acceso = Acceso {
+            endpoint: destino_de_s3_que_se_traga_la_peticion(),
+            bucket: "cubo-que-se-traga-la-peticion".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(OTRA_PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let empezado = std::time::Instant::now();
+        let error = Repositorio::poner_en_marcha(&acceso, barras_mudas())
+            .expect_err("un destino que no contesta no pone nada en marcha");
+        let tardado = empezado.elapsed();
+
+        // Doce segundos: el tope son diez, y el margen es para el arranque del hilo y la carrera del
+        // planificador —sin tope, la primera respuesta del oyente no llega hasta los quince—.
+        assert!(
+            tardado < Duration::from_secs(12),
+            "el tope no cortó la espera: tardó {tardado:?} contra un destino que acepta y no \
+             contesta, con un tope declarado de {TOPE_DEL_DESTINO:?}"
+        );
+
+        let (destino, motivo) = match error {
+            Error::DestinoNoAlcanzable { destino, motivo } => (destino, motivo),
+            otro => panic!(
+                "el tope agotado tiene que llegar como `DestinoNoAlcanzable` y llegó como {otro:?}"
+            ),
+        };
+
+        // El motivo es el del **tope** y no el de la biblioteca: sin tope, la respuesta llegaría a
+        // los quince segundos con el texto de `opendal`, y lo que se mide aquí es que la espera la
+        // cortó Kesto.
+        assert!(
+            motivo.contains("tope"),
+            "el desenlace tiene que ser el del tope de Kesto y no el de la biblioteca: {motivo}"
+        );
+        assert!(
+            destino.contains("cubo-que-se-traga-la-peticion"),
+            "el motivo no nombra el destino al que no se llegó: {destino}"
+        );
+    }
+
+    /// **Las opciones del destino acotan el reintento de la biblioteca.**
+    ///
+    /// El mapa que devuelve [`opciones_de_s3`] es el contrato que viaja hasta la dependencia, y el
+    /// `retry` va dentro por lo mismo que `endpoint` o `bucket`: sin declararlo, `rustic_backend`
+    /// aplica su `DEFAULT_RETRY = 5` —medido, 36,9–38,4 s de retroceso exponencial contra un
+    /// destino que no responde—, y el reintento existe para sobrevivir a un fallo pasajero, no para
+    /// multiplicar por cinco la espera de un operador. Se afirma el valor **literal** a propósito:
+    /// cambiarlo es cambiar cuánto puede tardar el panel, y eso se decide aquí, no en un `use`.
+    #[test]
+    fn las_opciones_del_destino_acotan_el_reintento_de_la_biblioteca() {
+        let acceso = Acceso {
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            bucket: "cubo-que-no-responde".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(OTRA_PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let opciones = opciones_de_s3(&acceso).expect("la fila describe un destino utilizable");
+
+        assert_eq!(
+            opciones.get("retry").map(String::as_str),
+            Some("1"),
+            "el mapa tiene que declarar el reintento acotado —uno—, o la biblioteca aplica sus \
+             cinco reintentos de retroceso exponencial"
         );
     }
 

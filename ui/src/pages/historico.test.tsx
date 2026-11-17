@@ -28,13 +28,16 @@ function montar() {
   const cliente = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0, staleTime: 0 } },
   })
-  return render(
-    <QueryClientProvider client={cliente}>
-      <ProveedorDeEventos>
-        <Historico />
-      </ProveedorDeEventos>
-    </QueryClientProvider>,
-  )
+  return {
+    ...render(
+      <QueryClientProvider client={cliente}>
+        <ProveedorDeEventos>
+          <Historico />
+        </ProveedorDeEventos>
+      </QueryClientProvider>,
+    ),
+    cliente,
+  }
 }
 
 function lote(cantidad: number, desde = 0) {
@@ -153,6 +156,40 @@ describe('pantalla de Histórico', () => {
     expect(
       screen.getByText(/se ha perdido la conexión con el servidor/i),
     ).toBeInTheDocument()
+    unmount()
+  })
+
+  it('al refrescar, la consola de una ejecución que pasa a fallida muestra su error_message', async () => {
+    const usuario = userEvent.setup()
+    let terminada = false
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: [
+          terminada
+            ? ejecucion({
+                id: 'e1',
+                job_id: 'j1',
+                status: 'failed',
+                error_message: 'el repositorio no responde',
+                finished_at: '2026-01-02T03:05:00Z',
+              })
+            : ejecucion({ id: 'e1', job_id: 'j1', status: 'running', finished_at: null }),
+        ],
+      })),
+    )
+
+    const { cliente, unmount } = montar()
+    await screen.findByRole('table', { name: 'Ejecuciones' })
+
+    await usuario.click(screen.getAllByRole('button', { name: 'Ver consola' })[0] as HTMLElement)
+    expect(screen.getByText(/todavía no hay eventos/i)).toBeInTheDocument()
+
+    // La ejecución termina y el refresco trae la fila nueva: la consola debe
+    // pintar el resumen con el `error_message`, no quedarse con la foto vieja.
+    terminada = true
+    await cliente.invalidateQueries()
+    expect(await screen.findByText('el repositorio no responde')).toBeInTheDocument()
     unmount()
   })
 

@@ -73,7 +73,10 @@ use crate::db::entities::{
     Restauraciones, Tareas, Targets,
 };
 use crate::docker::{Cliente, Orden};
-use crate::rustic::{Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
+use crate::rustic::{
+    Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio, ResumenDeSnapshot, TOPE_DEL_DESTINO,
+    con_tope,
+};
 
 use cola::Cola;
 pub use hub::{CAPACIDAD_DEL_HUB, EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor, Hub};
@@ -725,11 +728,23 @@ impl Motor {
     /// el motor no lo sabe: el `404` del listado lo decide el manejador, que es quien puede leer la
     /// fila.
     ///
+    /// # El tope del listado vive aquí
+    ///
+    /// El listado corre bajo [`con_tope`], así que un repositorio que se abre y luego deja de
+    /// contestar no deja al panel cargando sin fin: a los diez segundos —[`TOPE_DEL_DESTINO`]— la
+    /// operación se abandona y el fallo llega como [`Error::DestinoNoAlcanzable`], el mismo que el
+    /// borde ya traduce a `502`. Está **aquí** y no en `Repositorio::listar_snapshots` por una
+    /// razón de propiedad y no de gusto: el tope necesita mover el trabajo a otro hilo, y el
+    /// repositorio de la biblioteca no es `Clone` —su estado de índices no lo es— ni deja sacar el
+    /// backend que lleva dentro, así que lo único portable es el repositorio entero, y quien lo
+    /// posee es este método. El porqué completo, en el rustdoc de `Repositorio::listar_snapshots`.
+    ///
     /// # Errors
     ///
     /// Las mismas dos que [`Motor::abrir_repositorio`], más el fallo del listado en sí —que la
     /// biblioteca no pueda leer los identificadores o resolver una instantánea—, que llega también
-    /// como [`ErrorDelMotor::Repositorio`].
+    /// como [`ErrorDelMotor::Repositorio`], y el tope agotado, que llega por el mismo camino con
+    /// [`Error::DestinoNoAlcanzable`] dentro.
     pub async fn listar_snapshots(
         &self,
         acceso: Acceso,
@@ -746,12 +761,14 @@ impl Motor {
                     }
                 })?;
 
-            repositorio
-                .listar_snapshots(ventana)
-                .map_err(|causa| ErrorDelMotor::Repositorio {
-                    motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
-                    causa,
-                })
+            let destino = acceso.nombre_del_destino();
+            con_tope(&destino, TOPE_DEL_DESTINO, move || {
+                repositorio.listar_snapshots(ventana)
+            })
+            .map_err(|causa| ErrorDelMotor::Repositorio {
+                motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                causa,
+            })
         })
         .await
     }
@@ -831,10 +848,23 @@ impl Motor {
     /// el peor caso el `200` de una restauración llega unos segundos más tarde. Lo que compra es que
     /// ese `200` hable de una copia que existe.
     ///
+    /// # El tope del listado del índice vive aquí
+    ///
+    /// La pregunta es un `list` del índice del repositorio, y corre bajo [`con_tope`] por lo mismo
+    /// que el listado del panel: un destino que se abre y luego se traga la petición no puede dejar
+    /// el `POST /api/v1/snapshots/{id}/restore` colgado sin fin. A los diez segundos
+    /// —[`TOPE_DEL_DESTINO`]— la operación se abandona y el fallo llega como
+    /// [`ErrorDelMotor::Repositorio`] con [`Error::DestinoNoAlcanzable`] dentro, que es el mismo
+    /// desenlace y el mismo `502` del listado. Está aquí y no en
+    /// `Repositorio::tiene_la_instantanea` porque el tope mueve el trabajo a otro hilo y el
+    /// repositorio de la biblioteca no es `Clone`; quien lo posee es este método. El porqué
+    /// completo, en el rustdoc de `Repositorio::tiene_la_instantanea` y en el de [`con_tope`].
+    ///
     /// # Errors
     ///
     /// Las mismas dos que [`Motor::abrir_repositorio`], más el fallo de la lectura en sí —que el
-    /// repositorio no se deje listar—, que llega también como [`ErrorDelMotor::Repositorio`].
+    /// repositorio no se deje listar—, que llega también como [`ErrorDelMotor::Repositorio`], y el
+    /// tope agotado, que llega por el mismo camino con [`Error::DestinoNoAlcanzable`] dentro.
     pub async fn tiene_la_instantanea(
         &self,
         acceso: Acceso,
@@ -854,12 +884,14 @@ impl Motor {
                     }
                 })?;
 
-            repositorio
-                .tiene_la_instantanea(&instantanea)
-                .map_err(|causa| ErrorDelMotor::Repositorio {
-                    motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
-                    causa,
-                })
+            let destino = acceso.nombre_del_destino();
+            con_tope(&destino, TOPE_DEL_DESTINO, move || {
+                repositorio.tiene_la_instantanea(&instantanea)
+            })
+            .map_err(|causa| ErrorDelMotor::Repositorio {
+                motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
+                causa,
+            })
         })
         .await
     }
@@ -1517,8 +1549,8 @@ mod tests {
     use crate::test_support::{
         CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, SEMILLA,
         SEMILLA_CONTENIDO, abridor_local, abrir_local, base_con_clave, destino_de_s3_que_rechaza,
-        directorio_de_prueba, nombre_de_tarea_de_prueba, sembrar_snapshots, snapshot_guardado,
-        volcado_guardado,
+        destino_de_s3_que_se_traga_la_peticion, directorio_de_prueba, nombre_de_tarea_de_prueba,
+        sembrar_snapshots, snapshot_guardado, volcado_guardado,
     };
 
     /// Un plazo generoso para esperar a que una ejecución termine.
@@ -4227,8 +4259,8 @@ mod tests {
     ///
     /// El endpoint es un oyente local que contesta `403` y no un puerto muerto por lo que está
     /// medido en `src/test_support.rs::destino_de_s3_que_rechaza`: contra un puerto donde nadie
-    /// escucha, los cinco reintentos con retroceso exponencial de la biblioteca hacen que el fallo
-    /// tarde entre 41 y 54 segundos, y eso no lo debe pagar cada `cargo test`.
+    /// escucha, el retroceso exponencial de la biblioteca hace que el fallo no sea instantáneo, y
+    /// eso no lo debe pagar cada `cargo test`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abrir_repositorio_de_s3_desde_el_runtime_no_entra_en_panico() {
         let aparato = Aparato::nuevo().await;
@@ -4269,6 +4301,130 @@ mod tests {
         assert!(
             !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
             "el motivo de la fachada publica un secreto del repositorio: {motivo}"
+        );
+    }
+
+    /// **Listar un repositorio de S3 desde el runtime devuelve el fallo tipado y acotado.**
+    ///
+    /// Es la ruta que sirve el `GET /api/v1/snapshots` del panel —la del defecto #100— y la que
+    /// ahora lleva el tope del listado: [`Motor::listar_snapshots`] abre con el abridor de
+    /// producción y, con el repositorio ya en la mano, lo lista bajo [`con_tope`]. Lo que se afirma
+    /// aquí es el desenlace **por la boca de verdad**: un destino inalcanzable llega como
+    /// [`ErrorDelMotor::Repositorio`] con [`Error::DestinoNoAlcanzable`] dentro —que es lo que el
+    /// borde traduce a `502`, sin cambiar el contrato HTTP—, el motivo nombra el destino y no
+    /// publica secretos, y todo ello **acotado**: el defecto medido eran 36,9–38,4 s contra un
+    /// destino que no contesta, y el tope de Kesto son diez segundos, así que treinta es un margen
+    /// de sobra para lo que aquí se mide.
+    ///
+    /// El endpoint es el oyente que rechaza —y no un puerto muerto— por lo mismo que en
+    /// [`abrir_repositorio_de_s3_desde_el_runtime_no_entra_en_panico`]: lo que se mide es el
+    /// desenlace, y el rechazo inmediato no le cuesta segundos a la suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listar_snapshots_de_s3_devuelve_el_fallo_tipado_y_acotado() {
+        const TOPE_DE_LA_PRUEBA: Duration = Duration::from_secs(30);
+
+        let aparato = Aparato::nuevo().await;
+        let endpoint = destino_de_s3_que_rechaza();
+        let repositorio = aparato
+            .dar_de_alta_el_repositorio_con_endpoint("destino-que-rechaza", &endpoint)
+            .await;
+
+        // Los ajustes de **producción**: su abridor es el de S3 (`Repositorio::poner_en_marcha`).
+        let motor = aparato.motor_y_ajustes(Ajustes::nuevos(SOCKET_QUE_NO_EXISTE));
+        let acceso = aparato.acceso_de(&repositorio).await;
+
+        let empezado = Instant::now();
+        let error = motor
+            .listar_snapshots(acceso, 2)
+            .await
+            .expect_err("un destino que rechaza no deja listar nada");
+        let tardado = empezado.elapsed();
+
+        let (causa, motivo) = match error {
+            ErrorDelMotor::Repositorio { causa, motivo } => (causa, motivo),
+            otro => panic!(
+                "el fallo del listado tiene que llegar como `ErrorDelMotor::Repositorio` y llegó \
+                 como {otro:?}"
+            ),
+        };
+
+        assert!(
+            tardado < TOPE_DE_LA_PRUEBA,
+            "el listado del panel no está acotado: tardó {tardado:?} contra un destino que no se \
+             alcanza, y el defecto del informe tardaba 36,9–38,4 s"
+        );
+        assert!(
+            matches!(causa, Error::DestinoNoAlcanzable { .. }),
+            "el listado de un destino inalcanzable tiene que llegar como un fallo de destino —el \
+             que el borde traduce a `502`— y llegó como {causa:?}"
+        );
+        assert!(
+            motivo.contains(&endpoint),
+            "el motivo tiene que nombrar el destino al que no se llegó: {motivo}"
+        );
+        assert!(
+            !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
+            "el motivo del listado publica un secreto del repositorio: {motivo}"
+        );
+    }
+
+    /// **La pregunta por una instantánea también llega acotada y tipada al borde.**
+    ///
+    /// Es la ruta de `POST /api/v1/snapshots/{id}/restore`: pregunta al índice del repositorio si la
+    /// copia está —sin restaurarla— y el `404` depende de esa lectura. La lectura del índice corre
+    /// bajo el tope del destino, igual que el listado del panel, porque un destino que acepta la
+    /// conexión y no contesta no puede dejar la restauración colgada sin fin. Lo que se afirma es el
+    /// desenlace por la boca de verdad: acotado, como [`ErrorDelMotor::Repositorio`] con
+    /// [`Error::DestinoNoAlcanzable`] dentro, sin secretos en el motivo y sin pánico del runtime.
+    ///
+    /// El destino es el oyente que **se traga** la petición y no el que rechaza: es el único
+    /// escenario donde el tope es lo que termina la espera, y por eso la prueba tarda hasta el tope
+    /// —diez segundos— en vez de microsegundos.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tiene_la_instantanea_de_s3_llega_acotada_y_tipada() {
+        let aparato = Aparato::nuevo().await;
+        let endpoint = destino_de_s3_que_se_traga_la_peticion();
+        let repositorio = aparato
+            .dar_de_alta_el_repositorio_con_endpoint("destino-mudo", &endpoint)
+            .await;
+
+        // Los ajustes de **producción**: su abridor es el de S3 y el tope es el de Kesto.
+        let motor = aparato.motor_y_ajustes(Ajustes::nuevos(SOCKET_QUE_NO_EXISTE));
+        let acceso = aparato.acceso_de(&repositorio).await;
+        let instantanea = "0".repeat(64);
+
+        let empezado = Instant::now();
+        let error = motor
+            .tiene_la_instantanea(acceso, instantanea.as_str())
+            .await
+            .expect_err("un destino que no contesta no puede decir si la instantánea está");
+        let tardado = empezado.elapsed();
+
+        assert!(
+            tardado < Duration::from_secs(12),
+            "la pregunta por la instantánea no está acotada: tardó {tardado:?} contra un destino \
+             que acepta y no contesta"
+        );
+
+        let (causa, motivo) = match error {
+            ErrorDelMotor::Repositorio { causa, motivo } => (causa, motivo),
+            otro => panic!(
+                "el tope agotado tiene que llegar como `ErrorDelMotor::Repositorio` y llegó como \
+                 {otro:?}"
+            ),
+        };
+        assert!(
+            matches!(causa, Error::DestinoNoAlcanzable { .. }),
+            "el tope agotado tiene que llegar como un fallo de destino —el que el borde traduce a \
+             `502`— y llegó como {causa:?}"
+        );
+        assert!(
+            motivo.contains(&endpoint),
+            "el motivo tiene que nombrar el destino al que no se llegó: {motivo}"
+        );
+        assert!(
+            !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
+            "el motivo publica un secreto del repositorio: {motivo}"
         );
     }
 

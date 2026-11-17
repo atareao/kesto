@@ -582,3 +582,7 @@ clean:
 distclean: clean
     rm -rf ui/dist ui/node_modules
     -podman image rm {{ image_ref }}:latest {{ image_ref }}:{{ version }}
+
+# Borra los restos de directorios temporales de las pruebas (kesto-prueba-*)
+clean-tmp:
+    bash scripts/clean-tmp.sh

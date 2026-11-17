@@ -129,13 +129,219 @@ impl Drop for DirectorioDePrueba {
     }
 }
 
+/// Prefijo de los temporales del arnés: lo que hay que buscar para saber si una
+/// entrada del directorio temporal es nuestra o de otro.
+const PREFIJO_DE_LA_RAIZ: &str = "kesto-prueba-";
+
+/// Ruta de `/proc`, el pseudo-sistema que delata qué procesos viven.
+const RUTA_DE_PROC: &str = "/proc";
+
+/// ¿Está `/proc` ahí?
+///
+/// El barrido depende por completo de `/proc` para saber qué pid sigue vivo, así
+/// que su ausencia —un SO que no lo monta— no es un detalle: preguntar por un pid
+/// contra un `/proc` que no existe contesta siempre que no, y entonces el barrido
+/// tomaría por muertos —y borraría— los restos de procesos que sí están vivos,
+/// como el de otra corrida concurrente. Se comprueba antes de barrer, y sin él no
+/// se barre nada. Va en su propia función para que una prueba pueda forzar la
+/// decisión: quitar `/proc` no está al alcance de una prueba.
+fn hay_proc() -> bool {
+    Path::new(RUTA_DE_PROC).is_dir()
+}
+
+/// ¿Sigue vivo el proceso `pid`?
+///
+/// Se pregunta por `/proc`, que es la forma de saberlo sin abrir un `kill` ni depender de `libc`.
+/// Quien llame tiene que haber comprobado antes que `/proc` existe —[`hay_proc`]—:
+/// sin él esta pregunta siempre contesta que no, y no porque el proceso haya muerto.
+fn proceso_vivo(pid: u32) -> bool {
+    Path::new(&format!("{RUTA_DE_PROC}/{pid}")).exists()
+}
+
+/// Raíz de los temporales de **esta** ejecución: `<temp>/kesto-prueba-<pid>`.
+///
+/// Una raíz por proceso y un subdirectorio por prueba: así el barrido de
+/// [`recoger_los_restos_de_prueba`] distingue los restos de un proceso muerto de
+/// lo que está usando el que corre.
+///
+/// La limpieza **no** se apoya en el `Drop` de [`DirectorioDePrueba`], y no por
+/// descuido: un `static` que retiene guardas —[`GUARDAS_DEL_ARNES`]— nunca ejecuta
+/// su `Drop`, porque no hay nadie que suelte ese registro al terminar el proceso,
+/// y una muerte abrupta —un `panic` que aborta, un `Ctrl-C`, un `timeout`— tampoco
+/// deja que corra. Por eso el relevo de la limpieza es el barrido al arrancar, que
+/// acota lo que puede quedar en el directorio temporal a, como mucho, la raíz de la
+/// ejecución en curso —el resto de procesos vivos es de otros procesos vivos, y esa
+/// raíz se la lleva su propio barrido—.
+///
+/// El pid, eso sí, se recicla: el resto de una corrida anterior cuyo pid le haya
+/// tocado a un proceso vivo y ajeno se **conserva** —el barrido no puede
+/// distinguirlo de la raíz de ese proceso—, y no se lo lleva nadie. Es
+/// conservador a propósito: el precio es un directorio de más en el temporal, y
+/// el de borrar de más sería matar los temporales de una corrida en curso.
+pub(crate) fn raiz_de_la_ejecucion() -> &'static Path {
+    static RAIZ: OnceLock<PathBuf> = OnceLock::new();
+
+    RAIZ.get_or_init(|| {
+        // El barrido va antes de crear nada y una sola vez por proceso: es el
+        // arranque del arnés el que recoge lo que dejaron las ejecuciones muertas.
+        static BARRIDO: OnceLock<()> = OnceLock::new();
+        BARRIDO.get_or_init(|| {
+            let base = std::env::temp_dir();
+            recoger_los_restos_de_prueba(&base);
+
+            // **Avisa, no bloquea**: un directorio temporal con pocos inodos es la
+            // causa de un fallo en masa, y verlo aquí hace que se persiga donde
+            // está. Pero un directorio lleno también es cosa del entorno, así que
+            // esto nunca falla —y si los inodos no se pueden leer, tampoco habla:
+            // un fallo al medir no puede parecer un fallo del código—.
+            if let Some(aviso) = aviso_de_inodos(inodos_libres(&base), INODOS_LIBRES_MINIMOS) {
+                eprintln!("{aviso}");
+            }
+        });
+
+        let raiz = std::env::temp_dir().join(format!("{PREFIJO_DE_LA_RAIZ}{}", std::process::id()));
+
+        std::fs::create_dir_all(&raiz).expect("la raíz de la ejecución debe crearse");
+
+        raiz
+    })
+}
+
+/// Borra los restos de ejecuciones anteriores que haya en `base`.
+///
+/// Se lleva por delante las entradas `kesto-prueba-<sufijo>` cuyo `<sufijo>` no
+/// sea un pid vivo —o no sea un pid siquiera—. **Sin `/proc` no hace nada**: sin
+/// él no hay forma de saber quién vive, y borrar a ciegas se llevaría por delante
+/// las raíces de procesos vivos ([`hay_proc`]). `base` entra por parámetro para
+/// que las pruebas inyecten una y no toquen el directorio temporal real.
+///
+/// Como en [`raiz_de_la_ejecucion`], esto es lo que limpia en lugar del `Drop`
+/// —que ni un `static` retenido ni una muerte abrupta llegan a ejecutar—; el
+/// barrido solo toca lo que lleva el prefijo del arnés, y los errores de borrado
+/// se ignoran: es cortesía, igual que en el `Drop`, y fallar aquí taparía lo que
+/// la prueba mide de verdad.
+pub(crate) fn recoger_los_restos_de_prueba(base: &Path) {
+    recoger_los_restos(base, hay_proc());
+}
+
+/// El barrido, con la existencia de `/proc` inyectada.
+///
+/// Va aparte solo para que las pruebas puedan forzar la ausencia de `/proc`, que
+/// no se puede provocar de verdad.
+fn recoger_los_restos(base: &Path, hay_proc: bool) {
+    if !hay_proc {
+        return;
+    }
+
+    let Ok(entradas) = std::fs::read_dir(base) else {
+        return;
+    };
+
+    for entrada in entradas.flatten() {
+        let nombre = entrada.file_name();
+        let Some(sufijo) = nombre
+            .to_str()
+            .and_then(|nombre| nombre.strip_prefix(PREFIJO_DE_LA_RAIZ))
+        else {
+            // Todo lo que no lleve el prefijo es de otro: no se toca.
+            continue;
+        };
+
+        let es_resto = match sufijo.parse::<u32>() {
+            Ok(pid) => !proceso_vivo(pid),
+            // Sufijo sin pid: no hay liveness que consultar, así que se borra sin
+            // preguntar. Es el único borrado ajeno que el barrido puede hacer, y
+            // es deliberado: el prefijo `kesto-prueba-` es del arnés, y quien
+            // bautice algo suyo con él —un `kesto-prueba-backup` de un usuario—
+            // lo pierde. Los `<uuid>` que dejaba la versión anterior del arnés
+            // caen por este mismo lado, y esos sí son restos de procesos muertos.
+            Err(_) => true,
+        };
+
+        if es_resto {
+            // Un resto es casi siempre un directorio, y `remove_dir_all` es quien
+            // lo borra entero. Pero una entrada con el prefijo también puede ser
+            // un **fichero** —basta con que alguien lo cree—, y con él
+            // `remove_dir_all` falla: sin el relevo de `remove_file` ese resto no
+            // se recogería nunca, y `rm -rf` de `scripts/clean-tmp.sh` sí lo
+            // borra, así que el barrido dejaría de ir a la par del script.
+            let _ = std::fs::remove_dir_all(entrada.path())
+                .or_else(|_| std::fs::remove_file(entrada.path()));
+        }
+    }
+}
+
 /// Crea el directorio temporal de una prueba.
 pub(crate) fn directorio_de_prueba() -> DirectorioDePrueba {
-    let ruta = std::env::temp_dir().join(format!("kesto-prueba-{}", Uuid::new_v4()));
+    let ruta = raiz_de_la_ejecucion().join(Uuid::new_v4().to_string());
 
-    std::fs::create_dir_all(&ruta).expect("el directorio temporal de la prueba debe crearse");
+    std::fs::create_dir_all(&ruta).expect(
+        "el directorio temporal de la prueba debe crearse; si el directorio temporal se ha \
+         quedado sin inodos, limpia con `just clean-tmp`",
+    );
 
     DirectorioDePrueba { ruta }
+}
+
+/// Inodos libres por debajo de los cuales el arnés avisa.
+///
+/// Un orden de magnitud por debajo de los 1 048 576 inodos de un `tmpfs` —el
+/// defecto de esta máquina—: con ~50 000 libres queda sitio para la batería y
+/// para lo demás, pero ya se ve venir un agotamiento, así que la advertencia
+/// llega antes de que nada falle y sin dar falsos positivos.
+const INODOS_LIBRES_MINIMOS: u64 = 50_000;
+
+/// Lee de la salida de `df -P -i` cuántos inodos quedan libres.
+///
+/// El formato es el de `df -P -i` —una línea de cabecera y una por sistema de
+/// ficheros, con `IFree` en el cuarto campo—, así que se toma la **última línea
+/// no vacía** y de ella el cuarto campo. Devuelve `None` si no hay ninguna línea
+/// de datos o si el campo no es un número.
+fn inodos_libres_de_la_salida(salida: &str) -> Option<u64> {
+    salida
+        .lines()
+        .rev()
+        .find(|linea| !linea.trim().is_empty())
+        .and_then(|linea| linea.split_whitespace().nth(3))
+        .and_then(|campo| campo.parse::<u64>().ok())
+}
+
+/// Inodos libres del sistema de ficheros que contiene `base`, si se pueden leer.
+///
+/// Se pregunta a `df -P -i` en vez de a una caja como `libc`, que no es
+/// dependencia directa del proyecto. `LC_ALL=C` fija el idioma de la salida, que
+/// es lo que hace que el cuarto campo sea siempre el mismo. Cualquier fallo
+/// —el programa no está, contesta con error, la salida no trae el campo— se
+/// traduce en `None`: quien llama no avisa y sigue.
+fn inodos_libres(base: &Path) -> Option<u64> {
+    let salida = std::process::Command::new("df")
+        .args(["-P", "-i"])
+        .arg(base)
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+
+    if !salida.status.success() {
+        return None;
+    }
+
+    inodos_libres_de_la_salida(&String::from_utf8_lossy(&salida.stdout))
+}
+
+/// Aviso, o nada, según lo que quede en el directorio temporal.
+///
+/// Devuelve `Some(mensaje)` solo cuando los inodos libres se conocen —`Some(n)`
+/// y `n < umbral`—; con `None` o con margen de sobra devuelve `None`.
+fn aviso_de_inodos(inodos_libres: Option<u64>, umbral: u64) -> Option<String> {
+    let libres = inodos_libres?;
+
+    (libres < umbral).then(|| {
+        format!(
+            "quedan pocos inodos libres en el directorio temporal ({libres}); \
+             si la batería empieza a fallar de forma masiva, la causa puede ser \
+             ésa: limpia con `just clean-tmp`"
+        )
+    })
 }
 
 /// Un nombre de tarea **distinto en cada llamada**.
@@ -295,9 +501,11 @@ pub(crate) fn abridor_local(
 /// # Por qué un oyente y no un puerto donde no escucha nadie
 ///
 /// Está medido, y es lo que decide la forma: contra un puerto muerto (`http://127.0.0.1:9`) la
-/// biblioteca tarda **entre 41 y 54 segundos** en decirlo, porque `rustic_backend` reintenta cinco
-/// veces con retroceso exponencial y temblor (`DEFAULT_RETRY = 5`); contra este oyente tarda
-/// **825 µs**, porque `opendal` clasifica el `403` como un fallo permanente y no lo reintenta. Lo
+/// biblioteca tarda en decirlo —`rustic_backend` reintenta con retroceso exponencial, y desde el
+/// `retry` acotado que Kesto le declara en las opciones del destino (incidencia #100) ronda el
+/// segundo, frente a los 41–54 segundos que tardaba con su `DEFAULT_RETRY = 5`—; contra este
+/// oyente tarda **825 µs**, porque `opendal` clasifica el `403` como un fallo permanente y no lo
+/// reintenta. Lo
 /// que se mide en estas pruebas es el **desenlace** —que no hay pánico y que el error llega
 /// depurado—, no el reintento, y ese precio no lo debe pagar cada `cargo test`.
 ///
@@ -327,6 +535,53 @@ pub(crate) fn destino_de_s3_que_rechaza() -> String {
             );
 
             let _ = std::io::Write::write_all(&mut flujo, respuesta.as_bytes());
+        }
+    });
+
+    format!("http://127.0.0.1:{puerto}")
+}
+
+/// Un destino de S3 que **acepta** la conexión y **no contesta**.
+///
+/// Es el caso que [`destino_de_s3_que_rechaza`] no cubre, y el del defecto #100: aquí nadie rechaza
+/// —la conexión se establece— y la petición se queda sin respuesta, como un cortafuegos que
+/// descarta en silencio o un servidor colgado. Es el único escenario donde el tope de Kesto
+/// (`TOPE_DEL_DESTINO`) es lo que termina la espera: `reqwest`, por debajo de `opendal`, no trae un
+/// plazo propio, así que sin tope la llamada **no vuelve nunca** y una regresión se vería como un
+/// cuelgue de la suite. Por eso el oyente cierra la conexión sin contestar al cabo de
+/// [`CIERRA_SIN_CONTESTAR`] —más que el tope, a propósito—: sin tope, la prueba termina en un
+/// **fallo medido** —la petición falla tras el cierre, reintenta una vez y la espera pasa del
+/// margen—, no en un cuelgue.
+///
+/// El oyente se queda escuchando hasta que el proceso termina, como el de
+/// [`destino_de_s3_que_rechaza`]: no hay forma de pararlo desde fuera y tampoco hace falta.
+pub(crate) fn destino_de_s3_que_se_traga_la_peticion() -> String {
+    /// Lo que el oyente tarda en soltar la conexión sin haber contestado.
+    ///
+    /// Quince segundos, y no es arbitrario: tiene que ser **mayor** que el tope de Kesto —diez—, o
+    /// el cierre llegaría antes que el tope y la prueba no distinguiría los dos caminos.
+    const CIERRA_SIN_CONTESTAR: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let oyente = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("el oyente local de la prueba se abre en un puerto libre");
+    let puerto = oyente
+        .local_addr()
+        .expect("el oyente local tiene dirección")
+        .port();
+
+    std::thread::spawn(move || {
+        for conexion in oyente.incoming() {
+            let Ok(mut flujo) = conexion else { break };
+
+            // Cada conexión se atiende en su hilo: si no, un reintento del cliente no podría ni
+            // llegar mientras el primero sigue colgado.
+            std::thread::spawn(move || {
+                let mut peticion = [0_u8; 4096];
+                let _ = std::io::Read::read(&mut flujo, &mut peticion);
+                // Ni una palabra de respuesta, y al soltarse el flujo el cliente ve la conexión
+                // cerrada: es lo que hace que una regresión termine en un fallo y no en un cuelgue.
+                std::thread::sleep(CIERRA_SIN_CONTESTAR);
+            });
         }
     });
 
@@ -1800,5 +2055,303 @@ mod tests {
             log.contains(MENSAJE_DE_DEBUG),
             "el registro del callsite de `debug!` no llegó al buffer: {log}"
         );
+    }
+}
+
+/// Las reglas de la recogida de temporales: raíz por ejecución y barrido.
+///
+/// Va aparte del módulo de arriba porque no comparte nada con él: aquí no se
+/// captura registro, se mira el sistema de ficheros.
+#[cfg(test)]
+mod restos {
+    use std::path::{Path, PathBuf};
+
+    use uuid::Uuid;
+
+    use super::{
+        directorio_de_prueba, raiz_de_la_ejecucion, recoger_los_restos,
+        recoger_los_restos_de_prueba,
+    };
+
+    /// Base inyectada del barrido: un directorio propio de la prueba, para que
+    /// el recorrido no borre nada del `/tmp` de nadie.
+    ///
+    /// El nombre no empieza por `kesto-prueba-`, así que un barrido del `/tmp`
+    /// real tampoco lo tomaría por un resto.
+    struct BaseInyectada {
+        ruta: PathBuf,
+    }
+
+    impl BaseInyectada {
+        /// Crea la base vacía.
+        fn nueva() -> Self {
+            let ruta =
+                std::env::temp_dir().join(format!("kesto-base-inyectada-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&ruta).expect("la base inyectada debe crearse");
+
+            Self { ruta }
+        }
+
+        /// Ruta de la base.
+        fn ruta(&self) -> &Path {
+            &self.ruta
+        }
+
+        /// Crea dentro de la base una entrada con el nombre dado y devuelve su ruta.
+        fn crear(&self, nombre: &str) -> PathBuf {
+            let ruta = self.ruta.join(nombre);
+            std::fs::create_dir_all(&ruta).expect("la entrada de la base inyectada debe crearse");
+
+            ruta
+        }
+
+        /// Crea dentro de la base un **fichero** con el nombre dado y devuelve su ruta.
+        fn crear_fichero(&self, nombre: &str) -> PathBuf {
+            let ruta = self.ruta.join(nombre);
+            std::fs::write(&ruta, b"").expect("el fichero de la base inyectada debe crearse");
+
+            ruta
+        }
+    }
+
+    impl Drop for BaseInyectada {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.ruta);
+        }
+    }
+
+    /// Un pid que ya no existe: el de un hijo que se esperó hasta el final.
+    ///
+    /// Se comprueba contra `/proc` antes de darlo por bueno porque un pid puede
+    /// reutilizarse, y entonces la prueba dejaría de medir lo que dice medir. La
+    /// comprobación es de la prueba, no del código bajo prueba: la prueba no
+    /// puede preguntarle al barrido si un pid está vivo, porque el barrido es
+    /// justo lo que se está juzgando.
+    fn pid_muerto() -> u32 {
+        for _ in 0..10 {
+            let mut hijo = std::process::Command::new("true")
+                .spawn()
+                .expect("el hijo de la prueba debe arrancar");
+            let pid = hijo.id();
+            hijo.wait().expect("el hijo de la prueba debe terminar");
+
+            if !Path::new("/proc").join(pid.to_string()).exists() {
+                return pid;
+            }
+        }
+
+        panic!("no se encontró un pid muerto para la prueba");
+    }
+
+    /// La raíz de la ejecución del proceso y la del hijo pidiendo un pid muerto.
+    fn raiz_esperada() -> PathBuf {
+        std::env::temp_dir().join(format!("kesto-prueba-{}", std::process::id()))
+    }
+
+    /// El barrido conserva la raíz del pid vivo y se lleva los restos.
+    ///
+    /// Los dos restos son los dos casos que hay que distinguir: el de un pid
+    /// muerto y el de un sufijo que no es un pid —los `<uuid>` que dejaba el
+    /// arnés anterior a la raíz única, que son siempre de procesos muertos—.
+    #[test]
+    fn recoger_los_restos_conserva_la_raiz_viva_y_borra_los_demas() {
+        let base = BaseInyectada::nueva();
+        let viva = base.crear(&format!("kesto-prueba-{}", std::process::id()));
+        let muerta = base.crear(&format!("kesto-prueba-{}", pid_muerto()));
+        let heredada = base.crear(&format!("kesto-prueba-{}", Uuid::new_v4()));
+
+        recoger_los_restos_de_prueba(base.ruta());
+
+        assert!(
+            viva.exists(),
+            "el barrido borró la raíz del proceso vivo: {}",
+            viva.display()
+        );
+        assert!(
+            !muerta.exists(),
+            "el resto de un pid muerto sobrevivió al barrido: {}",
+            muerta.display()
+        );
+        assert!(
+            !heredada.exists(),
+            "el resto heredado, cuyo sufijo no es un pid, sobrevivió al barrido: {}",
+            heredada.display()
+        );
+    }
+
+    /// El barrido no toca lo que no lleva el prefijo del arnés.
+    ///
+    /// El directorio temporal lo comparte todo el mundo: `otra-cosa-<pid>` lleva
+    /// un pid vivo y pasaría el filtro de liveness, así que lo único que lo
+    /// salva es el prefijo.
+    #[test]
+    fn recoger_los_restos_no_toca_lo_que_no_lleva_el_prefijo() {
+        let base = BaseInyectada::nueva();
+        let ajena = base.crear("no-kesto");
+        let otra = base.crear(&format!("otra-cosa-{}", std::process::id()));
+
+        recoger_los_restos_de_prueba(base.ruta());
+
+        assert!(
+            ajena.exists(),
+            "el barrido borró una entrada ajena: {}",
+            ajena.display()
+        );
+        assert!(
+            otra.exists(),
+            "el barrido borró una entrada que solo se le parece: {}",
+            otra.display()
+        );
+    }
+
+    /// Sin `/proc` no hay liveness que consultar, así que el barrido no actúa.
+    ///
+    /// La decisión entra inyectada —`hay_proc`— porque quitar `/proc` no es algo
+    /// que una prueba pueda hacer: en un SO sin él, `proceso_vivo` diría que
+    /// todo pid está muerto y el barrido se llevaría por delante las raíces de
+    /// procesos vivos, que es justo lo que hay que impedir.
+    #[test]
+    fn recoger_los_restos_no_borra_nada_sin_proc() {
+        let base = BaseInyectada::nueva();
+        let muerta = base.crear(&format!("kesto-prueba-{}", pid_muerto()));
+        let heredada = base.crear(&format!("kesto-prueba-{}", Uuid::new_v4()));
+
+        recoger_los_restos(base.ruta(), false);
+
+        assert!(
+            muerta.exists(),
+            "sin /proc el barrido borró un resto: {}",
+            muerta.display()
+        );
+        assert!(
+            heredada.exists(),
+            "sin /proc el barrido borró un resto heredado: {}",
+            heredada.display()
+        );
+    }
+
+    /// Un resto que es **fichero** se borra igual que si fuera un directorio.
+    ///
+    /// `remove_dir_all` no toca un fichero, y sin el relevo de `remove_file` este
+    /// resto se quedaría para siempre: el `rm -rf` de `scripts/clean-tmp.sh` sí
+    /// lo borra, así que el barrido tiene que hacer lo mismo.
+    #[test]
+    fn recoger_los_restos_borra_un_resto_que_es_fichero() {
+        let base = BaseInyectada::nueva();
+        let fichero = base.crear_fichero(&format!("kesto-prueba-{}", pid_muerto()));
+
+        recoger_los_restos_de_prueba(base.ruta());
+
+        assert!(
+            !fichero.exists(),
+            "el resto que era un fichero sobrevivió al barrido: {}",
+            fichero.display()
+        );
+    }
+
+    /// Una base que no existe no es un fallo: no hay nada que barrer.
+    #[test]
+    fn recoger_los_restos_con_base_inexistente_no_falla() {
+        let base = std::env::temp_dir().join(format!("kesto-no-existe-{}", Uuid::new_v4()));
+
+        assert!(
+            !base.exists(),
+            "la base de la prueba existe de partida: {}",
+            base.display()
+        );
+
+        recoger_los_restos_de_prueba(&base);
+    }
+
+    /// La raíz de la ejecución es la del proceso, y las pruebas cuelgan de ella.
+    #[test]
+    fn directorio_de_prueba_cuelga_de_la_raiz_de_la_ejecucion() {
+        let esperada = raiz_esperada();
+
+        assert_eq!(
+            raiz_de_la_ejecucion(),
+            esperada.as_path(),
+            "la raíz de la ejecución no es la del proceso que corre"
+        );
+
+        let directorio = directorio_de_prueba();
+
+        assert!(
+            directorio.ruta().starts_with(raiz_de_la_ejecucion()),
+            "el directorio de la prueba no cuelga de la raíz: {}",
+            directorio.ruta().display()
+        );
+        assert_eq!(
+            directorio.ruta().parent(),
+            Some(raiz_de_la_ejecucion()),
+            "el directorio de la prueba es una entrada suelta del primer nivel: {}",
+            directorio.ruta().display()
+        );
+    }
+}
+
+/// El aviso de inodos: ni se calla cuando el directorio temporal se agota, ni
+/// bloquea.
+#[cfg(test)]
+mod inodos {
+    use super::{aviso_de_inodos, inodos_libres_de_la_salida};
+
+    /// Salida literal de `df -P -i` en un `/tmp` con `IFree` en el cuarto campo.
+    const SALIDA_CON_DATOS: &str = "Filesystem     Inodes  IUsed   IFree IUse% Mounted on\n\
+                                    tmpfs         1048576  72654  975922    7% /tmp\n";
+
+    /// El parser lee el cuarto campo de la última línea de datos.
+    #[test]
+    fn inodos_libres_de_la_salida_lee_el_cuarto_campo() {
+        assert_eq!(
+            inodos_libres_de_la_salida(SALIDA_CON_DATOS),
+            Some(975_922),
+            "el cuarto campo de `df -P -i` es el de inodos libres"
+        );
+    }
+
+    /// Sin línea de datos no hay número que devolver.
+    #[test]
+    fn inodos_libres_de_la_salida_sin_datos_devuelve_none() {
+        assert_eq!(inodos_libres_de_la_salida(""), None);
+        assert_eq!(
+            inodos_libres_de_la_salida("Filesystem     Inodes  IUsed   IFree IUse% Mounted on\n"),
+            None,
+            "solo con la cabecera no hay inodos libres que leer"
+        );
+    }
+
+    /// Por debajo del umbral se avisa, y el mensaje dice qué hacer.
+    #[test]
+    fn aviso_de_inodos_avisa_por_debajo_del_umbral() {
+        let aviso = aviso_de_inodos(Some(100), 50_000)
+            .expect("por debajo del umbral tiene que haber aviso");
+
+        assert!(
+            aviso.contains("inodos"),
+            "el aviso tiene que decir que quedan pocos inodos: {aviso}"
+        );
+        assert!(
+            aviso.contains("just clean-tmp"),
+            "el aviso tiene que citar la receta que lo limpia: {aviso}"
+        );
+    }
+
+    /// Con margen de sobra no se avisa.
+    #[test]
+    fn aviso_de_inodos_calla_con_margen_de_sobra() {
+        assert_eq!(aviso_de_inodos(Some(975_922), 50_000), None);
+        assert_eq!(
+            aviso_de_inodos(Some(50_000), 50_000),
+            None,
+            "justo en el umbral todavía no se avisa"
+        );
+    }
+
+    /// Sin dato no se avisa: un fallo al leer inodos no puede parecer un falso
+    /// positivo.
+    #[test]
+    fn aviso_de_inodos_calla_cuando_no_se_sabe() {
+        assert_eq!(aviso_de_inodos(None, 50_000), None);
     }
 }

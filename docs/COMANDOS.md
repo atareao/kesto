@@ -23,6 +23,7 @@
 | `just build` · `just run` | Imagen local y contenedor de prueba con el socket de podman montado (abortan mientras no haya `Dockerfile`). |
 | `just bump <patch\|minor\|major>` | `vampus upgrade` + `cargo update --workspace`. La versión vive en tres sitios: `Cargo.toml`, `Cargo.lock` y `.vampus.yml`. |
 | `just pipeline` | Últimos runs del CI en GitHub. |
+| `just clean-tmp` | Borra a mano los restos `/tmp/kesto-prueba-*` que dejan las pruebas: directorios por pid de procesos ya muertos y restos `<uuid>` heredados. El arnés los recoge solo al arrancar (`src/test_support.rs`), pero si `/tmp` se llena de inodos hay que poder limpiar a mano. No toca nada que no lleve el prefijo ni los procesos vivos. |
 
 Los comandos crudos siguen siendo la fuente de verdad del CI y `just check` los encadena en su orden exacto, así que no hay dos listas que mantener.
 
