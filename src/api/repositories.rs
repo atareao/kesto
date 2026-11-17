@@ -26,28 +26,44 @@
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
-use crate::api::{contenido, del_motor_en_el_alta};
-use crate::db::entities::{AltaDeRepositorio, Repositorio};
+use crate::api::{contenido, del_motor, del_motor_en_el_alta};
+use crate::db::entities::{AltaDeRepositorio, Repositorio, SaludDeRepositorio};
 use crate::error::AppError;
 use crate::rustic::{Acceso, PuestaEnMarcha};
 use crate::secret::SecretString;
 use crate::state::AppState;
 
-/// Las cinco rutas del recurso, para colgar de la mitad de negocio.
+/// Las siete rutas del recurso, para colgar de la mitad de negocio.
+///
+/// Las cinco del §5 —listado, alta, lectura, actualización y borrado— más las dos de la
+/// comprobación de salud: la de un repositorio y la de todos. Las dos son `POST` y no `GET` porque
+/// **tienen efecto de escritura** —persisten el desenlace en la fila—, y el §5 reserva `GET` para lo
+/// que no cambia nada; el listado, que sí es una lectura, **no** comprueba nada: sirve lo que ya
+/// quedó anotado.
+///
+/// `/repositories/health` y `/repositories/{id}` conviven porque el segmento fijo gana al de
+/// parámetro: una petición a `/repositories/health` no se lee como un identificador llamado
+/// `health`, y por eso la ruta global no queda detrás del `400` del identificador mal formado.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/repositories", get(listado).post(alta))
         .route(
+            "/api/v1/repositories/health",
+            post(comprobar_salud_de_todos),
+        )
+        .route(
             "/api/v1/repositories/{id}",
             get(leer).put(actualizar).delete(borrar),
         )
+        .route("/api/v1/repositories/{id}/health", post(comprobar_salud))
 }
 
 /// El cuerpo del alta de un repositorio, tal y como llega por el cable.
@@ -80,6 +96,92 @@ pub struct AltaDeRepositorioDelCable {
     pub secret_access_key: Option<SecretString>,
     /// Passphrase del repositorio Rustic; se cifra antes de escribirlo.
     pub passphrase: Option<SecretString>,
+
+    // Los tres campos de salud de la **lectura** se aceptan y se descartan.
+    //
+    // La salud no es un campo editable —la mueve la comprobación, no un formulario—, pero
+    // rechazarlos no es lo que el contrato pide: un cuerpo que los traiga se **ignora**, y por eso
+    // se declaran aquí. Declararlos es lo que deja que `deny_unknown_fields` siga haciendo su
+    // trabajo con las erratas —un campo mal escrito sigue siendo un `400` y no un valor perdido en
+    // silencio— sin que un campo de solo lectura rompa una petición que por lo demás es válida.
+    //
+    // El tipo es el JSON crudo porque el valor no se interpreta: cualquiera vale mientras no se
+    // cuele en la fila, y quien la escribe es `anotar_salud` y nadie más.
+    /// Se acepta y se descarta: la salud no es escribible. Ver arriba.
+    pub health: Option<serde_json::Value>,
+    /// Se acepta y se descarta: la salud no es escribible. Ver arriba.
+    pub health_checked_at: Option<serde_json::Value>,
+    /// Se acepta y se descarta: la salud no es escribible. Ver arriba.
+    pub health_detail: Option<serde_json::Value>,
+}
+
+/// El desenlace de una comprobación de salud, tal y como viaja por el cable.
+///
+/// Son los tres campos que comparten las **tres** respuestas que hablan de salud: el resultado de
+/// `POST /repositories/{id}/health`, cada elemento de `POST /repositories/health` y —por el
+/// `flatten` de [`RepositorioDelCable`]— el propio recurso del listado y de la lectura. Que sean un
+/// solo tipo es el contrato: el desenlace que la comprobación acaba de anotar y el que sirve el
+/// `GET` después son **el mismo** objeto, y un segundo tipo con los mismos tres campos sería un
+/// segundo sitio donde se decide cómo se llama cada estado.
+///
+/// El estado va como **texto** y no como la variante del enum, igual que `target_type` en
+/// `src/api/targets.rs`: el nombre que viaja es el del `CHECK` de la columna —lo que hace la tabla
+/// legible a mano— y quien lo fija es [`texto_de_la_salud`], que es el único sitio de la capa HTTP
+/// donde eso se decide. Un repositorio **nunca comprobado** llega como `desconocido`, que es un
+/// valor del cable más y no un nulo: el panel no tiene una rama especial para «no lo sé».
+#[derive(Debug, Serialize)]
+pub struct SaludComprobadaDelCable {
+    /// El estado persistido: `ok`, `sin_repositorio`, `passphrase`, `inaccesible`, `sin_permiso`
+    /// o `desconocido`.
+    pub health: String,
+    /// Cuándo se comprobó, en RFC3339, o `null` si la fila no guarda ninguna comprobación.
+    pub health_checked_at: Option<String>,
+    /// Motivo acotado y **saneado** de la comprobación, o `null` si no hay nada que contar.
+    pub health_detail: Option<String>,
+}
+
+impl SaludComprobadaDelCable {
+    /// Vuelca los tres campos de salud de una fila en su forma del cable.
+    fn desde(fila: &Repositorio) -> Result<Self, AppError> {
+        Ok(Self {
+            health: texto_de_la_salud(fila.health).to_owned(),
+            health_checked_at: fecha_del_cable(fila.health_checked_at)?,
+            health_detail: fila.health_detail.clone(),
+        })
+    }
+}
+
+/// El nombre del estado de salud en el vocabulario del cable.
+///
+/// Es el único sitio donde el estado de la fila se traduce a lo que viaja, y la **ausencia**
+/// —`None`, la fila que nunca se comprobó— es un valor más: `desconocido`. El `match` es exhaustivo
+/// y sin rama comodín a propósito, como el de [`desenlace`]: una variante nueva lo rompe la
+/// compilación en vez de viajar con un texto inventado.
+fn texto_de_la_salud(salud: Option<SaludDeRepositorio>) -> &'static str {
+    match salud {
+        None => "desconocido",
+        Some(SaludDeRepositorio::Ok) => "ok",
+        Some(SaludDeRepositorio::SinRepositorio) => "sin_repositorio",
+        Some(SaludDeRepositorio::Passphrase) => "passphrase",
+        Some(SaludDeRepositorio::Inaccesible) => "inaccesible",
+        Some(SaludDeRepositorio::SinPermiso) => "sin_permiso",
+    }
+}
+
+/// Formatea una fecha **anulable** de la fila para el cable, o `null` si la columna estaba a nulo.
+///
+/// Las fechas van como cadena porque `time` viaja con `formatting`: el formato lo fija el servidor,
+/// en RFC3339, en vez de dejarlo en manos del serializador. La que no está se sirve como `null` y
+/// no como cadena vacía: «no hay fecha» y «hay una fecha vacía» no son lo mismo, y el panel
+/// distingue un repositorio sin comprobar por el nulo.
+fn fecha_del_cable(fecha: Option<OffsetDateTime>) -> Result<Option<String>, AppError> {
+    fecha
+        .map(|valor| {
+            valor.format(&Rfc3339).map_err(|error| {
+                AppError::Other(format!("la fecha de la fila no se pudo formatear: {error}"))
+            })
+        })
+        .transpose()
 }
 
 /// Un repositorio tal y como viaja por el cable: lo que devuelve la API.
@@ -125,6 +227,14 @@ pub struct RepositorioDelCable {
     pub has_passphrase: bool,
     /// Fecha de alta, en RFC3339.
     pub created_at: String,
+    /// El estado, la fecha y el motivo de la última comprobación de salud, **persistidos**.
+    ///
+    /// Van aplanados en el objeto del recurso —y no bajo una clave propia— porque son campos del
+    /// repositorio como los demás, y su tipo es el **mismo** que devuelven las dos rutas de
+    /// comprobación: lo que el `GET` sirve y lo que la comprobación acaba de anotar son el mismo
+    /// objeto. El listado **no** dispara ninguna comprobación: esto es lo que quedó en la fila.
+    #[serde(flatten)]
+    pub salud: SaludComprobadaDelCable,
 }
 
 impl RepositorioDelCable {
@@ -146,6 +256,7 @@ impl RepositorioDelCable {
             created_at: fila.created_at.format(&Rfc3339).map_err(|error| {
                 AppError::Other(format!("la fecha de la fila no se pudo formatear: {error}"))
             })?,
+            salud: SaludComprobadaDelCable::desde(fila)?,
         })
     }
 }
@@ -163,8 +274,8 @@ impl RepositorioDelCable {
 ///
 /// # Por qué envuelve la vista del repositorio en vez de copiarla
 ///
-/// Porque el alta devuelve **el mismo recurso** que la lectura y el listado y con los mismos nueve
-/// campos: lo único que añade es el desenlace. Un segundo tipo con los nueve campos escritos otra
+/// Porque el alta devuelve **el mismo recurso** que la lectura y el listado y con los mismos
+/// campos: lo único que añade es el desenlace. Un segundo tipo con los campos escritos otra
 /// vez sería un segundo sitio donde se decide qué se publica de un repositorio —el día que un campo
 /// se añada, o que otro cambie de nombre, el que se olvide rompe el contrato en silencio—, y este
 /// fichero ya rechaza esa clase de copia en `contenido` y en la tabla de errores. Con el
@@ -225,6 +336,30 @@ fn acceso_del_alta(alta: &AltaDeRepositorio) -> Acceso {
         access_key_id: alta.access_key_id.clone(),
         secret_access_key: alta.secret_access_key.clone(),
         passphrase: alta.passphrase.clone(),
+    }
+}
+
+/// El acceso al destino de una **fila**: los dos secretos que la capa de acceso acaba de descifrar.
+///
+/// Es la conversión simétrica de [`acceso_del_alta`]: allí los secretos vienen del cuerpo —en un
+/// alta todavía no hay fila—, y aquí de una fila que ya existe y cuyos dos secretos llegan ya en
+/// claro desde la capa de acceso, que es la única que tiene la clave maestra. Este módulo no
+/// descifra nada, y no puede: solo copia a lo que la biblioteca necesita lo que la fila trae, y los
+/// dos siguen siendo [`SecretString`] hasta el final, así que no pueden acabar en un registro ni en
+/// el cuerpo de una respuesta.
+///
+/// La misma conversión existe hoy en `src/api/snapshots.rs` y en `src/engine/ejecucion.rs`, y
+/// ninguna se puede reutilizar sin un salto entre módulos hermanos: el constructor que las
+/// unificaría es un `Acceso::desde(&Repositorio)` del módulo del tipo, y mientras no exista la
+/// copia de seis campos vive junto a cada uso.
+fn acceso_del_repositorio(fila: &Repositorio) -> Acceso {
+    Acceso {
+        endpoint: fila.endpoint.clone(),
+        bucket: fila.bucket.clone(),
+        region: fila.region.clone(),
+        access_key_id: fila.access_key_id.clone(),
+        secret_access_key: fila.secret_access_key.clone(),
+        passphrase: fila.passphrase.clone(),
     }
 }
 
@@ -504,6 +639,12 @@ pub async fn actualizar(
         )?,
         passphrase: resolver_secreto(cuerpo.passphrase, actual.passphrase, "passphrase")?,
         created_at: actual.created_at,
+        // La salud **no** es un campo que el `PUT` edite: se arrastra la que ya tenía la
+        // fila para que la vista que se devuelve diga la verdad, pero quien la escribe es
+        // la comprobación —`actualizar` ni siquiera nombra esas columnas—.
+        health: actual.health,
+        health_checked_at: actual.health_checked_at,
+        health_detail: actual.health_detail,
     };
 
     if !state.db.repositorios.actualizar(&fila).await? {
@@ -548,10 +689,144 @@ pub async fn borrar(
     ))
 }
 
+/// Comprueba la salud de una fila, la **anota** y devuelve el desenlace ya persistido.
+///
+/// Es la mitad común de las dos rutas de comprobación, y su contrato tiene tres piezas que no se
+/// pueden separar:
+///
+/// 1. **Pregunta al destino** con la comprobación del motor, que la saca del runtime de Tokio por
+///    dentro —la biblioteca entra en pánico si se la llama desde dentro de uno— y traduce el
+///    desenlace al vocabulario de la columna. Aquí no se decide qué significa cada desenlace: eso
+///    vive en un solo traductor, en el motor.
+/// 2. **Lo anota en la fila** antes de responder, con [`anotar_salud`](crate::db::entities::Repositorios::anotar_salud),
+///    que es la única sentencia que toca esas tres columnas. La respuesta publica lo que quedó
+///    escrito y no lo que se calculó: así una lectura posterior del recurso dice **lo mismo** que
+///    la comprobación, que es lo que el contrato exige.
+/// 3. **Vuelve a leer la fila** para servir la fecha: `health_checked_at` la pone la base con
+///    `CURRENT_TIMESTAMP`, así que el valor verdadero solo se conoce leyéndolo. Un segundo `SELECT`
+///    sobre una fila que acaba de escribirse es barato y no tiene carrera —nadie más escribe esas
+///    columnas—, y a cambio la fecha que viaja es la del reloj de la fila y no la del proceso.
+///
+/// # El desenlace del destino **no** es un error HTTP
+///
+/// «No hay repositorio», «la passphrase no abre», «el destino no se alcanza» y «abre pero no deja
+/// listar» son lo que la comprobación ha **medido**, no fallos de la petición: viajan como el estado
+/// de la fila y un `200`, y el panel los pinta. Lo único que sale como error es que el hilo que
+/// hablaba con la biblioteca se haya caído, y eso lo traduce [`del_motor`] a un `500`.
+///
+/// # `Ok(None)` es «la fila se borró por el camino»
+///
+/// La comprobación ocurrió —y costó lo suyo—, pero ya no hay dónde anotarla. No es un fallo del
+/// servidor y no se puede inventar un desenlace para una fila que no está: quien llama decide. La
+/// ruta de un repositorio lo cuenta como el mismo `404` de una fila que no existe, y la de todos
+/// **salta** esa fila, porque un repositorio que se borró mientras se comprobaba no convierte en
+/// fallida la comprobación de los demás.
+async fn comprobar_y_anotar(
+    state: &AppState,
+    fila: &Repositorio,
+) -> Result<Option<SaludComprobadaDelCable>, AppError> {
+    let (salud, motivo) = state
+        .motor
+        .comprobar_salud(acceso_del_repositorio(fila))
+        .await
+        .map_err(del_motor)?;
+
+    if !state
+        .db
+        .repositorios
+        .anotar_salud(&fila.id, salud, motivo.as_deref())
+        .await?
+    {
+        return Ok(None);
+    }
+
+    let Some(anotada) = state.db.repositorios.leer(&fila.id).await? else {
+        return Ok(None);
+    };
+
+    Ok(Some(SaludComprobadaDelCable::desde(&anotada)?))
+}
+
+/// `POST /api/v1/repositories/{id}/health` — comprueba un repositorio, lo anota y lo devuelve.
+///
+/// Es una acción con **efecto de escritura** —persiste el desenlace—, y por eso es `POST` y no
+/// `GET`: un `GET` que escribiera rompería lo que un `GET` promete, y el panel lo podría disparar
+/// sin querer. Lo que se pide es «mira **ahora** cómo está este repositorio y déjalo anotado», y
+/// eso no es leer un recurso.
+///
+/// El identificador que no tiene forma de UUID es un `400` que nombra el campo, y una fila que no
+/// está es un `404`, igual que en la lectura: las dos puertas comprueban lo mismo antes de mirar el
+/// destino.
+///
+/// # Errors
+///
+/// `400` — el identificador de la ruta no es un UUID. `404` — no hay fila con ese identificador (ni
+/// la había, ni se borró mientras se comprobaba). `500` — el hilo que hablaba con el repositorio se
+/// cayó, o la base no atendió la anotación. Y el destino que no contesta **no** es un error: llega
+/// como estado `inaccesible` con `200`.
+pub async fn comprobar_salud(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<ApiResponse, AppError> {
+    let uuid = identificador(&id)?;
+
+    let Some(fila) = state.db.repositorios.leer(&uuid).await? else {
+        return Err(repositorio_ausente());
+    };
+
+    let Some(salud) = comprobar_y_anotar(&state, &fila).await? else {
+        return Err(repositorio_ausente());
+    };
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "salud del repositorio comprobada",
+        contenido(&salud)?,
+    ))
+}
+
+/// `POST /api/v1/repositories/health` — comprueba **todos** y devuelve uno por repositorio.
+///
+/// Recorre los repositorios del listado, comprueba y anota cada uno —con el mismo camino que la
+/// ruta de uno solo— y devuelve un elemento por cada fila que seguía existiendo al comprobarla. El
+/// orden es el del listado, que ordena por `created_at` con el identificador de desempate.
+///
+/// # Lo que cuesta, y por qué es una acción explícita
+///
+/// Cada comprobación va bajo el tope del destino —diez segundos—, así que el peor caso es **N ×
+/// diez segundos**: con diez repositorios caídos, casi dos minutos. Es el precio declarado de
+/// comprobar de verdad y por eso esto no lo dispara el panel al cargar: lo pide el operador, con un
+/// botón, y sabe que tarda. Un repositorio que se borre a mitad de la vuelta se salta, y los demás
+/// se comprueban igual.
+///
+/// # Errors
+///
+/// `500` — el hilo que hablaba con un repositorio se cayó, o la base no atendió una anotación. Un
+/// destino que no contesta no es un error: llega como estado `inaccesible` dentro de su elemento.
+pub async fn comprobar_salud_de_todos(
+    State(state): State<AppState>,
+) -> Result<ApiResponse, AppError> {
+    let filas = state.db.repositorios.listar().await?;
+
+    let mut saludes = Vec::with_capacity(filas.len());
+    for fila in &filas {
+        if let Some(salud) = comprobar_y_anotar(&state, fila).await? {
+            saludes.push(salud);
+        }
+    }
+
+    Ok(ApiResponse::new(
+        StatusCode::OK,
+        "salud de los repositorios comprobada",
+        contenido(&saludes)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::http::{StatusCode, header};
     use time::OffsetDateTime;
@@ -559,12 +834,14 @@ mod tests {
     use uuid::Uuid;
 
     use crate::api::api_router;
+    use crate::db::entities::SaludDeRepositorio;
+    use crate::rustic::{Acceso, BarrasDelMotor, LoQueContestaElDestino};
     use crate::state::EstadoDeBase;
     use crate::test_support::{
         OTRA_PASSPHRASE_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, abrir_local, base_con_clave, body_json,
         body_text, capturar_log, config_con_dsn, delete, destino_local_de_prueba,
-        directorio_de_prueba, estado_de_prueba, estado_desarrollo, get, post_crudo, post_json,
-        put_json, sembrar_snapshots,
+        directorio_de_prueba, estado_de_prueba, estado_de_prueba_con_comprobador,
+        estado_desarrollo, get, post, post_crudo, post_json, put_json, sembrar_snapshots,
     };
 
     /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
@@ -1958,6 +2235,527 @@ mod tests {
         assert!(
             !texto.contains(SECRETO_DEL_ALTA_1_31),
             "el error publicó la clave secreta que iba en la petición: {texto}"
+        );
+    }
+
+    // ── La salud por repositorio ─────────────────────────────────────────────────
+    //
+    // `POST /api/v1/repositories/{id}/health` y `POST /api/v1/repositories/health`, más los
+    // tres campos de salud que el recurso sirve aplanados. Estas pruebas montan el estado con
+    // un comprobador **inyectado** en vez del local del arnés: lo que hay que medir es el
+    // camino de la capa HTTP —leer la fila, comprobar, anotar y devolver— y no el backend, así
+    // que el desenlace lo fija la prueba y no habla con ningún destino. El alta sí va contra un
+    // destino local de verdad, porque quien la atiende es el abridor, que no se toca.
+
+    /// El comprobador falso que dice «el destino responde y no tiene repositorio».
+    ///
+    /// Es un estado distinguible del `desconocido` de una fila nunca comprobada, y del `ok` de
+    /// una fila sana sin más: lo que las pruebas de estas rutas afirman es que el desenlace
+    /// **comprobado** queda anotado, y con un estado que también fuera el de una fila sin
+    /// comprobar la afirmación sería más débil.
+    fn comprobador_sin_repositorio(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, crate::rustic::Error> {
+        Ok(LoQueContestaElDestino::SinRepositorio)
+    }
+
+    /// El comprobador falso que dice «abre y lista»: el estado `ok`, sin motivo.
+    fn comprobador_que_abre_y_lista(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, crate::rustic::Error> {
+        Ok(LoQueContestaElDestino::AbreYLista)
+    }
+
+    /// Cuántas veces se ha llamado al comprobador del listado.
+    ///
+    /// Es el instrumento de «el listado no comprueba nada»: un comprobador que solo devolviera
+    /// un desenlace no probaría que **no** se llamó, y un `panic!` dentro se perdería en el hilo
+    /// del motor —`fuera_del_runtime` lo recogería como un trabajo interrumpido y saldría un
+    /// `500`— en vez de fallar la prueba. El contador se lee desde la prueba, que corre en otro
+    /// hilo que el comprobador.
+    static COMPROBACIONES_DEL_LISTADO: AtomicUsize = AtomicUsize::new(0);
+
+    /// El comprobador que **no** debe llamarse: cuenta la llamada y devuelve un desenlace fijo.
+    fn comprobador_que_no_debe_llamarse(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, crate::rustic::Error> {
+        COMPROBACIONES_DEL_LISTADO.fetch_add(1, Ordering::SeqCst);
+
+        Ok(LoQueContestaElDestino::AbreYLista)
+    }
+
+    /// El comprobador que devuelve un estado **distinto por destino**.
+    ///
+    /// Es lo que permite afirmar «un elemento por repositorio y cada estado en su fila» sin
+    /// depender del orden del listado: el estado sale del `endpoint` de la fila —que es
+    /// distinguible por el nombre con el que se dio de alta— y la prueba vuelve a leer cada fila
+    /// por su nombre para comprobar que le tocó el suyo.
+    fn comprobador_segun_el_destino(
+        acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, crate::rustic::Error> {
+        if acceso.endpoint.contains("repo-salud-tres") {
+            Err(crate::rustic::Error::DestinoNoAlcanzable {
+                destino: acceso.nombre_del_destino(),
+                motivo: "prueba: el destino no contesta".to_owned(),
+            })
+        } else if acceso.endpoint.contains("repo-salud-dos") {
+            Ok(LoQueContestaElDestino::SinRepositorio)
+        } else {
+            Ok(LoQueContestaElDestino::AbreYLista)
+        }
+    }
+
+    /// El estado de salud anotado en la fila de ese nombre, leído con SQL directo.
+    ///
+    /// Se lee la **tabla** y no la API porque lo que hay que afirmar es que la comprobación
+    /// dejó el estado escrito: una lectura que pasara por el mismo camino que la escritura
+    /// diría lo mismo sin haber mirado la columna.
+    async fn salud_de_la_fila(pool: &sqlx::SqlitePool, nombre: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT health FROM repositories WHERE name = ?1")
+            .bind(nombre)
+            .fetch_one(pool)
+            .await
+            .expect("la fila del repositorio tiene que estar en la tabla")
+    }
+
+    /// La salud por repositorio — 1: comprobar uno lo persiste y lo devuelve.
+    ///
+    /// Cubre `api-resources`, escenario «Comprobar un repositorio persiste y devuelve su
+    /// estado». Se afirma la ida **y** la vuelta: lo que contesta el `POST` y lo que sirve
+    /// después el `GET`, y que los dos digan lo mismo —estado, fecha y motivo—, que es lo que
+    /// el contrato exige («el estado SHALL quedar persistido y visible en la lectura
+    /// posterior»). El comprobador va inyectado, así que la prueba mide el camino de la capa
+    /// HTTP y no habla con ningún destino.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn comprobar_un_repositorio_persiste_y_devuelve_su_estado() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba_con_comprobador(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+            comprobador_sin_repositorio,
+        );
+        let router = api_router(estado);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-salud-uno"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta tiene que contestar 201 antes de poder comprobar la salud"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let respuesta = post(router.clone(), &format!("/api/v1/repositories/{id}/health")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "la comprobación de un repositorio que existe tiene que contestar 200"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let comprobado = cuerpo["data"].clone();
+
+        assert_eq!(
+            comprobado["health"], "sin_repositorio",
+            "la respuesta tiene que traer el estado que devolvió la comprobación: {cuerpo}"
+        );
+        assert!(
+            comprobado["health_checked_at"].is_string(),
+            "una comprobación recién anotada tiene que traer su fecha: {cuerpo}"
+        );
+        assert!(
+            comprobado["health_detail"].is_string(),
+            "un desenlace que no es `ok` tiene que traer su motivo: {cuerpo}"
+        );
+
+        // Y el `GET` posterior sirve **lo mismo**: la fecha la pone la base, así que solo
+        // comparando las dos respuestas se prueba que la comprobación quedó anotada.
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+        let leido = cuerpo["data"].clone();
+
+        assert_eq!(
+            leido["health"], comprobado["health"],
+            "la lectura posterior no ve el estado que anotó la comprobación: {cuerpo}"
+        );
+        assert_eq!(
+            leido["health_checked_at"], comprobado["health_checked_at"],
+            "la lectura posterior no ve la fecha que anotó la comprobación: {cuerpo}"
+        );
+        assert_eq!(
+            leido["health_detail"], comprobado["health_detail"],
+            "la lectura posterior no ve el motivo que anotó la comprobación: {cuerpo}"
+        );
+    }
+
+    /// La salud por repositorio — 2: el listado sirve el estado sin comprobar nada.
+    ///
+    /// Cubre `api-resources`, escenario «El listado sirve el estado sin comprobar nada». Los
+    /// estados se **anotan por la capa de acceso** y no por la API, que es lo que describe el
+    /// escenario —«varios repositorios con estados de salud anotados»—; y lo que se afirma del
+    /// listado es doble: que sirve el estado y la fecha de cada fila, y que **no** invoca al
+    /// comprobador ni una vez, medido con el contador.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_listado_sirve_el_estado_sin_comprobar_nada() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba_con_comprobador(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+            comprobador_que_no_debe_llamarse,
+        );
+        let router = api_router(estado.clone());
+
+        let mut identificadores = Vec::new();
+        for nombre in ["repo-salud-uno", "repo-salud-dos"] {
+            let respuesta = post_json(
+                router.clone(),
+                "/api/v1/repositories",
+                &cuerpo_de_alta(nombre),
+            )
+            .await;
+
+            assert_eq!(respuesta.status(), StatusCode::CREATED);
+
+            let cuerpo = body_json(respuesta).await;
+            let id = Uuid::parse_str(
+                cuerpo["data"]["id"]
+                    .as_str()
+                    .expect("el alta debe devolver el identificador"),
+            )
+            .expect("el identificador del alta es un UUID");
+
+            identificadores.push(id);
+        }
+
+        estado
+            .db
+            .repositorios
+            .anotar_salud(&identificadores[0], SaludDeRepositorio::Ok, None)
+            .await
+            .expect("la anotación de prueba tiene que escribir la fila");
+
+        estado
+            .db
+            .repositorios
+            .anotar_salud(
+                &identificadores[1],
+                SaludDeRepositorio::SinPermiso,
+                Some("el repositorio abre, pero no deja listar sus instantáneas"),
+            )
+            .await
+            .expect("la anotación de prueba tiene que escribir la fila");
+
+        // El contador se pone a cero **después** del montaje: lo que se afirma es que el listado
+        // no comprueba nada, no que el montaje no lo hiciera.
+        COMPROBACIONES_DEL_LISTADO.store(0, Ordering::SeqCst);
+
+        let respuesta = get(router, "/api/v1/repositories").await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+        let elementos = cuerpo["data"]
+            .as_array()
+            .expect("el listado tiene que traer un array en `data`");
+
+        assert_eq!(
+            elementos.len(),
+            2,
+            "el listado tiene que traer las dos filas: {cuerpo}"
+        );
+
+        for (nombre, esperado) in [("repo-salud-uno", "ok"), ("repo-salud-dos", "sin_permiso")] {
+            let Some(elemento) = elementos.iter().find(|elemento| elemento["name"] == nombre)
+            else {
+                panic!("el listado no trae la fila `{nombre}`: {cuerpo}");
+            };
+
+            assert_eq!(
+                elemento["health"], esperado,
+                "el listado tiene que servir el estado anotado de `{nombre}`: {cuerpo}"
+            );
+            assert!(
+                elemento["health_checked_at"].is_string(),
+                "el listado tiene que servir la fecha de la comprobación de `{nombre}`: {cuerpo}"
+            );
+        }
+
+        assert_eq!(
+            COMPROBACIONES_DEL_LISTADO.load(Ordering::SeqCst),
+            0,
+            "el listado no puede comprobar la salud de ningún repositorio"
+        );
+    }
+
+    /// La salud por repositorio — 3: comprobar todos devuelve un elemento por repositorio.
+    ///
+    /// Cubre `api-resources`, escenario «Comprobar todos devuelve un elemento por repositorio».
+    /// El comprobador devuelve un estado **distinto por destino**, así que los tres elementos
+    /// son distinguibles entre sí y cada uno se puede casar con su fila: se relee la tabla por
+    /// el nombre y se comprueba que a cada repositorio le quedó **el suyo**.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn comprobar_todos_devuelve_un_elemento_por_repositorio() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba_con_comprobador(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+            comprobador_segun_el_destino,
+        );
+        let router = api_router(estado);
+
+        for nombre in ["repo-salud-uno", "repo-salud-dos", "repo-salud-tres"] {
+            let respuesta = post_json(
+                router.clone(),
+                "/api/v1/repositories",
+                &cuerpo_de_alta(nombre),
+            )
+            .await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::CREATED,
+                "las tres altas tienen que contestar 201"
+            );
+        }
+
+        let respuesta = post(router, "/api/v1/repositories/health").await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+        let elementos = cuerpo["data"]
+            .as_array()
+            .expect("la comprobación de todos tiene que traer un array en `data`");
+
+        assert_eq!(
+            elementos.len(),
+            3,
+            "tiene que traer un elemento por repositorio: {cuerpo}"
+        );
+
+        let mut estados: Vec<&str> = elementos
+            .iter()
+            .map(|elemento| {
+                elemento["health"]
+                    .as_str()
+                    .expect("cada elemento tiene que traer su estado como texto")
+            })
+            .collect();
+
+        estados.sort_unstable();
+
+        assert_eq!(
+            estados,
+            vec!["inaccesible", "ok", "sin_repositorio"],
+            "los tres elementos tienen que traer los tres estados que devolvió el comprobador: \
+             {cuerpo}"
+        );
+
+        for (nombre, esperado) in [
+            ("repo-salud-uno", "ok"),
+            ("repo-salud-dos", "sin_repositorio"),
+            ("repo-salud-tres", "inaccesible"),
+        ] {
+            assert_eq!(
+                salud_de_la_fila(&pool, nombre).await.as_deref(),
+                Some(esperado),
+                "el estado de `{nombre}` no quedó anotado en su fila"
+            );
+        }
+    }
+
+    /// La salud por repositorio — 4: no se puede escribir por el alta ni la actualización.
+    ///
+    /// Cubre `api-resources`, escenario «La salud no se puede escribir por el alta ni la
+    /// actualización». El cuerpo que trae los campos de salud **no se rechaza** —la petición es
+    /// válida y los campos se ignoran—, pero la fila no puede quedar con la salud que traía ese
+    /// cuerpo: se afirma primero en el alta, y después en un `PUT` que llega **con la fila ya
+    /// comprobada** en `ok` y con un `health` de mentira, para que la afirmación no se confunda
+    /// con el `desconocido` de una fila nunca comprobada.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn la_salud_no_se_puede_escribir_por_el_alta_ni_la_actualizacion() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba_con_comprobador(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+            comprobador_que_abre_y_lista,
+        );
+        let router = api_router(estado);
+
+        let mut cuerpo = cuerpo_de_alta("repo-salud-alta-ignora");
+        cuerpo["health"] = serde_json::json!("inaccesible");
+        cuerpo["health_checked_at"] = serde_json::json!("2020-01-01T00:00:00Z");
+        cuerpo["health_detail"] = serde_json::json!("mentira del cuerpo");
+
+        let respuesta = post_json(router.clone(), "/api/v1/repositories", &cuerpo).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "un cuerpo con los campos de salud no puede rechazarse: tienen que ignorarse, no \
+             fallar"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador")
+            .to_owned();
+
+        assert_eq!(
+            cuerpo["data"]["health"], "desconocido",
+            "la salud del alta no puede venir del cuerpo: {cuerpo}"
+        );
+
+        // Se comprueba de verdad para dejar la fila en `ok`…
+        let respuesta = post(router.clone(), &format!("/api/v1/repositories/{id}/health")).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["health"], "ok",
+            "la comprobación deja la fila en `ok`: {cuerpo}"
+        );
+
+        // …y ahora un `PUT` que trae la salud por el cuerpo: la fila tiene que quedarse igual.
+        let mut cuerpo = cuerpo_de_alta("repo-salud-put-ignora");
+        cuerpo["health"] = serde_json::json!("inaccesible");
+        cuerpo["health_detail"] = serde_json::json!("mentira del cuerpo");
+
+        let respuesta = put_json(
+            router.clone(),
+            &format!("/api/v1/repositories/{id}"),
+            &cuerpo,
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "la actualización con los campos de salud tiene que aceptarse e ignorarlos"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["health"], "ok",
+            "la actualización no puede escribir la salud por el cuerpo: {cuerpo}"
+        );
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["health"], "ok",
+            "la salud de la fila no puede venir del cuerpo del PUT: {cuerpo}"
+        );
+    }
+
+    /// La salud por repositorio — 5: un repositorio nunca comprobado se sirve «desconocido».
+    ///
+    /// Cubre `api-resources`, escenario «Un repositorio nunca comprobado se sirve como
+    /// desconocido». Recién dado de alta y sin pasar por ninguna comprobación, su lectura tiene
+    /// que traer `health: "desconocido"` y `health_checked_at: null`: el estado es un valor del
+    /// cable más —no un nulo— y la fecha sí es nula, que es como el panel distingue «no lo sé»
+    /// de «se comprobó».
+    #[tokio::test]
+    async fn un_repositorio_nunca_comprobado_se_sirve_como_desconocido_con_fecha_nula() {
+        let router = api_router(estado_desarrollo().await);
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-salud-nunca"),
+        )
+        .await;
+
+        assert_eq!(respuesta.status(), StatusCode::CREATED);
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador")
+            .to_owned();
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["health"], "desconocido",
+            "un repositorio nunca comprobado tiene que servirse como `desconocido`: {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["data"]["health_checked_at"],
+            serde_json::Value::Null,
+            "un repositorio nunca comprobado tiene que servirse con la fecha a nulo: {cuerpo}"
+        );
+    }
+
+    /// La salud por repositorio — el `404` de comprobar una fila que no existe.
+    ///
+    /// Es la mitad del contrato de `POST /{id}/health` que no cubre el escenario de la
+    /// comprobación con éxito: una fila que no está contesta el mismo `404` que la lectura —el
+    /// identificador es un UUID bien formado que no existe, así que lo decide la ausencia de la
+    /// fila y no el rechazo del identificador—, y por la envoltura del §5, para que el panel
+    /// tenga algo que pintar.
+    #[tokio::test]
+    async fn comprobar_la_salud_de_una_fila_inexistente_contesta_404() {
+        let router = api_router(estado_desarrollo().await);
+
+        let id = Uuid::new_v4().to_string();
+
+        let respuesta = post(router, &format!("/api/v1/repositories/{id}/health")).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "comprobar la salud de una fila que no existe tiene que contestar 404; contestó \
+             {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["status"], 404,
+            "la envoltura tiene que repetir el código en `status`: {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 404 tiene que explicar que no hay fila que comprobar: {cuerpo}"
         );
     }
 }

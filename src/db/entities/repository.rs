@@ -17,6 +17,37 @@ use crate::db::DbError;
 use crate::db::crypto::Clave;
 use crate::secret::SecretString;
 
+/// El desenlace de la última comprobación de salud de un repositorio.
+///
+/// Los cinco valores son los del `CHECK` de la columna `repositories.health`, y el
+/// **sexto estado no es una variante**: «desconocido» —la fila que todavía no se ha
+/// comprobado— se representa con la **ausencia** del valor, es decir `None` en el
+/// `Option` que lleva la entidad. Inventar aquí una variante `Desconocido` obligaría
+/// a escribirla en la columna y el `CHECK` la rechazaría: el nulo y el estado no se
+/// confunden.
+///
+/// El texto almacenado es el nombre de la variante en `snake_case` —`ok`,
+/// `sin_repositorio`, `passphrase`, `inaccesible`, `sin_permiso`—, que es lo que el
+/// `CHECK` acepta y lo que hace que la columna sea legible con `sqlite3`. Lo produce
+/// **una sola** derivación, la de `sqlx`; el texto que viaja por el cable lo fija la
+/// capa HTTP, que además distingue el `None` —«desconocido»—, algo que un `Serialize`
+/// de la variante no sabría hacer. Una derivación de `serde` aquí sería un segundo
+/// vocabulario que nadie lee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(rename_all = "snake_case")]
+pub enum SaludDeRepositorio {
+    /// El repositorio contesta y se puede abrir con sus credenciales.
+    Ok,
+    /// El destino no tiene repositorio todavía.
+    SinRepositorio,
+    /// La passphrase no abre el repositorio.
+    Passphrase,
+    /// No se pudo alcanzar el destino.
+    Inaccesible,
+    /// Las credenciales no tienen permiso sobre el cubo.
+    SinPermiso,
+}
+
 /// Fila de `repositories`, con sus dos secretos ya descifrados.
 #[derive(Debug, Clone)]
 pub struct Repositorio {
@@ -38,6 +69,15 @@ pub struct Repositorio {
     pub passphrase: SecretString,
     /// Fecha de alta, en UTC.
     pub created_at: OffsetDateTime,
+    /// Desenlace de la última comprobación de salud; `None` es «desconocido».
+    ///
+    /// No es un campo que el operador edite: lo escribe la comprobación, y ni el alta
+    /// ni la actualización lo tocan.
+    pub health: Option<SaludDeRepositorio>,
+    /// Cuándo se hizo esa comprobación, en UTC; `None` mientras no se haya hecho.
+    pub health_checked_at: Option<OffsetDateTime>,
+    /// Motivo acotado de esa comprobación; `None` si no hay nada que contar.
+    pub health_detail: Option<String>,
 }
 
 /// Los datos de un alta. **Sin `id`**: lo genera la capa de acceso.
@@ -74,8 +114,12 @@ pub struct Repositorios {
 // interpola un valor, ni siquiera para armarla en piezas.
 
 /// Columnas del `SELECT`, en el orden del §3 —el mismo que recorre [`desde_fila`]—.
+///
+/// Las tres últimas —la salud— las añade la `0008` y van **detrás** de `created_at`,
+/// que es donde las dejó el `ALTER TABLE`; van en el `SELECT` porque la entidad las
+/// lleva, y no en el `RETURNING` del alta: la fila que acaba de nacer no tiene salud.
 const SQL_LEER: &str = "SELECT id, name, endpoint, bucket, region, access_key_id, secret_access_key, \
-     passphrase, created_at FROM repositories WHERE id = ?1";
+     passphrase, created_at, health, health_checked_at, health_detail FROM repositories WHERE id = ?1";
 
 /// Listado de todos los repositorios.
 ///
@@ -83,7 +127,8 @@ const SQL_LEER: &str = "SELECT id, name, endpoint, bucket, region, access_key_id
 /// el mismo segundo empatan —`CURRENT_TIMESTAMP` no tiene más resolución— y el orden
 /// entre dos llamadas seguidas dejaría de ser estable. El `id` es el desempate.
 const SQL_LISTAR: &str = "SELECT id, name, endpoint, bucket, region, access_key_id, secret_access_key, \
-     passphrase, created_at FROM repositories ORDER BY created_at, id";
+     passphrase, created_at, health, health_checked_at, health_detail FROM repositories \
+     ORDER BY created_at, id";
 
 /// Alta de un repositorio, devolviendo la fila tal y como quedó.
 ///
@@ -104,6 +149,18 @@ const SQL_ACTUALIZAR: &str = "UPDATE repositories SET name = ?1, endpoint = ?2, 
 
 /// Borrado por identificador.
 const SQL_BORRAR: &str = "DELETE FROM repositories WHERE id = ?1";
+
+/// Anotación del desenlace de una comprobación de salud.
+///
+/// Escribe **solo** las tres columnas de la salud, y es la única sentencia que lo
+/// hace: ni el [`SQL_ALTA`] ni el [`SQL_ACTUALIZAR`] las nombran, así que editar el
+/// repositorio no puede pisar lo que anotó una comprobación.
+///
+/// La fecha la pone la base con `CURRENT_TIMESTAMP` —UTC, como el `created_at` del
+/// §3— y no quien llama: el reloj de la fila es el de la base, y así la comparación
+/// con `created_at` es entre dos fechas del mismo reloj.
+const SQL_ANOTAR_SALUD: &str = "UPDATE repositories SET health = ?1, health_detail = ?2, \
+     health_checked_at = CURRENT_TIMESTAMP WHERE id = ?3";
 
 /// Texto del error cuando falla el **mapeo** de una fila ya traída.
 ///
@@ -152,7 +209,9 @@ impl Repositorios {
             .await
             .map_err(error_de_consulta(SQL_ALTA))?;
 
-        desde_fila(&fila, &self.clave)
+        // El `RETURNING` del alta es el del §3: la fila recién nacida no tiene salud, y el
+        // mapeo la deja en «desconocido» por la puerta que le corresponde.
+        desde_fila_sin_salud(&fila, &self.clave)
     }
 
     /// Lee un repositorio por su identificador: `Ok(None)` si no está.
@@ -235,6 +294,41 @@ impl Repositorios {
 
         Ok(resultado.rows_affected() == 1)
     }
+
+    /// Anota en la fila el desenlace de una comprobación de salud y devuelve si existía.
+    ///
+    /// Escribe el estado, el motivo y la fecha —esta última la pone la base—, y **solo**
+    /// esas tres columnas: los campos mutables del repositorio no se tocan, porque una
+    /// comprobación no edita la configuración. Es el método que la comprobación llama
+    /// después de mirar el destino, así que recibe el desenlace ya resuelto y no vuelve
+    /// a mirarlo.
+    ///
+    /// El motivo es `Option<&str>` y no `Option<String>`: quien llama ya tiene el texto
+    /// —o no tiene ninguno— y aquí solo se enlaza. Un estado `Ok` no tiene motivo, y
+    /// `None` deja la columna a nulo, que es lo que significa «no hay nada que contar».
+    ///
+    /// `false` es «la fila no está», con el mismo trato que [`Repositorios::borrar`] y
+    /// [`Repositorios::actualizar`]: quien comprobó un repositorio que ya se borró no ha
+    /// fallado, se ha quedado sin sitio donde anotarlo.
+    pub async fn anotar_salud(
+        &self,
+        id: &Uuid,
+        salud: SaludDeRepositorio,
+        detalle: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let resultado = sqlx::query(SQL_ANOTAR_SALUD)
+            // El estado va por su tipo de `sqlx`, que es el que conoce el texto de la
+            // columna: el `snake_case` de las variantes es el mismo que el `CHECK` admite,
+            // y así el literal no se repite aquí.
+            .bind(salud)
+            .bind(detalle)
+            .bind(id.hyphenated().to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(error_de_consulta(SQL_ANOTAR_SALUD))?;
+
+        Ok(resultado.rows_affected() == 1)
+    }
 }
 
 /// Envuelve un fallo de `sqlx` con **la misma** sentencia que se ejecutó.
@@ -276,7 +370,33 @@ where
 ///
 /// Es el único sitio del crate que ve el sobre almacenado: el resto de la aplicación
 /// solo conoce valores en claro dentro de un [`SecretString`].
+///
+/// Espera las columnas del `SELECT` de lectura y de listado, salud incluida: es la
+/// puerta de las filas que ya existen. La del alta es [`desde_fila_sin_salud`].
 fn desde_fila(fila: &SqliteRow, clave: &Clave) -> Result<Repositorio, DbError> {
+    Ok(Repositorio {
+        // La salud se lee por el tipo del enum, no por texto suelto: un valor que no sea
+        // uno de los cinco del `CHECK` falla aquí, en el mapeo, en vez de colarse como
+        // un `None` silencioso que diría que la fila no se ha comprobado.
+        health: columna(fila, "health")?,
+        health_checked_at: columna(fila, "health_checked_at")?,
+        health_detail: columna(fila, "health_detail")?,
+        ..desde_fila_sin_salud(fila, clave)?
+    })
+}
+
+/// Mapea una fila **sin** las columnas de la salud, dejando las tres en «desconocido».
+///
+/// Es el mapeo del `RETURNING` del alta, y por eso existe: la fila que acaba de nacer
+/// **no tiene salud** —la escribe una comprobación, y a una fila recién creada no se le
+/// ha hecho ninguna—, así que el `RETURNING` sigue siendo el del §3 y no nombra esas
+/// columnas. Poner el `None` aquí, en la puerta por la que entra esa fila, es lo que
+/// hace que la ausencia sea explícita y no un campo que se rellena por accidente.
+///
+/// La salud se descarta de la fila con el `..` de [`desde_fila`]: un `RETURNING` que
+/// algún día las trajera no cambiaría este desenlace —una fila que se acaba de insertar
+/// no puede traerlas—.
+fn desde_fila_sin_salud(fila: &SqliteRow, clave: &Clave) -> Result<Repositorio, DbError> {
     // El `id` viaja como `TEXT` con guiones, así que la conversión a `Uuid` es del
     // mapeo y no de `sqlx`. Su error **no** es un `sqlx::Error`, y envolverlo en
     // `sqlx::Error::Decode` es lo que lo hace viajar por `DbError::Consulta` con la
@@ -297,6 +417,9 @@ fn desde_fila(fila: &SqliteRow, clave: &Clave) -> Result<Repositorio, DbError> {
         secret_access_key: clave.descifrar(&columna::<String>(fila, "secret_access_key")?)?,
         passphrase: clave.descifrar(&columna::<String>(fila, "passphrase")?)?,
         created_at: columna(fila, "created_at")?,
+        health: None,
+        health_checked_at: None,
+        health_detail: None,
     })
 }
 
@@ -309,7 +432,7 @@ mod tests {
     use time::{OffsetDateTime, PrimitiveDateTime};
     use uuid::Uuid;
 
-    use super::{AltaDeRepositorio, Repositorio, Repositorios};
+    use super::{AltaDeRepositorio, Repositorio, Repositorios, SaludDeRepositorio};
     use crate::db::DbError;
     use crate::db::entities::execution::{AltaDeEjecucion, Ejecuciones, Estado};
     use crate::db::entities::job::{AltaDeTarea, Tareas};
@@ -575,6 +698,332 @@ mod tests {
             .expect("la lectura no puede fallar");
 
         assert!(leido.is_none(), "la fila debía desaparecer: {leido:?}");
+    }
+
+    /// 1.2 (salud por repositorio) — La entidad lee la salud de la fila: «desconocido»
+    /// cuando no se ha comprobado, y el estado, la fecha y el motivo cuando sí.
+    ///
+    /// El «desconocido» es la **ausencia** del estado —`None`, el `NULL` de la columna—, no
+    /// una variante más del enumerado: lo que se afirma es que una fila sin comprobar no
+    /// finge un desenlace. La lectura con salud se escribe por SQL directo porque la
+    /// comprobación no vive en esta capa; lo que se mide aquí es que el mapeo fila→struct
+    /// la traiga, y que el texto almacenado —el del `CHECK`— sea el que corresponde al
+    /// enumerado.
+    #[tokio::test]
+    async fn la_entidad_lee_la_salud_con_y_sin_anotar() {
+        let (_directorio, pool, repositorios) = capa().await;
+
+        let repositorio = repositorios
+            .alta(alta("repo-1-2"))
+            .await
+            .expect("el alta no puede fallar");
+
+        // Recién dada de alta: nadie la ha comprobado, así que no hay estado, ni fecha, ni
+        // motivo. El alta tampoco los escribe.
+        assert_eq!(
+            repositorio.health, None,
+            "una fila recién nacida no puede traer un desenlace de salud"
+        );
+
+        let sin_salud = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila recién dada de alta debe estar");
+
+        assert_eq!(
+            sin_salud.health, None,
+            "sin comprobar, la salud tiene que ser «desconocido», no un estado inventado"
+        );
+        assert_eq!(
+            sin_salud.health_checked_at, None,
+            "no hay fecha sin comprobación"
+        );
+        assert_eq!(
+            sin_salud.health_detail, None,
+            "no hay motivo sin comprobación"
+        );
+
+        // La salud anotada, escrita donde la escribe la comprobación: en las columnas.
+        let almacenada = "2026-05-06 07:08:09";
+
+        sqlx::query(
+            "UPDATE repositories SET health = 'sin_permiso', health_checked_at = ?1, \
+             health_detail = 'el cubo no deja listar' WHERE id = ?2",
+        )
+        .bind(almacenada)
+        .bind(repositorio.id.hyphenated().to_string())
+        .execute(&pool)
+        .await
+        .expect("la anotación directa de la salud no puede fallar");
+
+        let con_salud = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        assert_eq!(
+            con_salud.health,
+            Some(SaludDeRepositorio::SinPermiso),
+            "el estado almacenado no se leyó como su variante"
+        );
+        assert_eq!(
+            con_salud.health_detail.as_deref(),
+            Some("el cubo no deja listar"),
+            "el motivo no llegó a la entidad"
+        );
+
+        // La fecha se descodifica como la fecha UTC que declara el texto, igual que el
+        // `created_at` que puso la base.
+        let esperada = PrimitiveDateTime::parse(
+            almacenada,
+            &format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+        )
+        .expect("el texto almacenado debe ser una fecha")
+        .assume_utc();
+
+        assert_eq!(
+            con_salud.health_checked_at,
+            Some(esperada),
+            "la fecha de la comprobación no es la del texto almacenado: {almacenada}"
+        );
+
+        // Y el listado, que es el otro `SELECT` que nombra las columnas, trae lo mismo.
+        let listado = repositorios
+            .listar()
+            .await
+            .expect("el listado no puede fallar");
+
+        assert_eq!(listado.len(), 1, "el listado tiene que traer la única fila");
+        assert_eq!(
+            listado[0].health,
+            Some(SaludDeRepositorio::SinPermiso),
+            "el listado no trae la salud de la fila"
+        );
+        assert_eq!(
+            listado[0].health_detail.as_deref(),
+            Some("el cubo no deja listar"),
+            "el listado no trae el motivo de la fila"
+        );
+    }
+
+    /// 1.3 (salud por repositorio) — La comprobación anota su desenlace —estado, motivo y
+    /// fecha—, y **editar el repositorio no lo pisa**.
+    ///
+    /// Las dos mitades del contrato: `anotar_salud` escribe las tres columnas de la salud y
+    /// la fecha la pone la base —UTC, como el `created_at`—, y `actualizar`, que reemplaza
+    /// los campos mutables, **no nombra** esas columnas: la salud no es un campo que el
+    /// operador edite. Se afirma llevando la salud incluso dentro de la fila que se pasa a
+    /// `actualizar`, que es el caso en el que una implementación descuidada la reescribiría.
+    #[tokio::test]
+    async fn la_salud_se_anota_y_editar_el_repositorio_no_la_pisa() {
+        let (_directorio, pool, repositorios) = capa().await;
+
+        let repositorio = repositorios
+            .alta(alta("repo-1-3"))
+            .await
+            .expect("el alta no puede fallar");
+
+        assert!(
+            repositorios
+                .anotar_salud(
+                    &repositorio.id,
+                    SaludDeRepositorio::Passphrase,
+                    Some("la passphrase no abre el repositorio"),
+                )
+                .await
+                .expect("anotar la salud no puede fallar"),
+            "la fila existía, así que anotar debe decir que sí"
+        );
+
+        let leido = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        assert_eq!(
+            leido.health,
+            Some(SaludDeRepositorio::Passphrase),
+            "el estado anotado no se leyó de vuelta"
+        );
+        assert_eq!(
+            leido.health_detail.as_deref(),
+            Some("la passphrase no abre el repositorio"),
+            "el motivo anotado no se leyó de vuelta"
+        );
+
+        // Y el texto almacenado es el del `CHECK`, que es el del `snake_case` del enumerado:
+        // la pareja columna/enum se afirma contra el literal, no contra el propio enum.
+        let almacenado: String =
+            sqlx::query_scalar("SELECT health FROM repositories WHERE id = ?1")
+                .bind(repositorio.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("el estado almacenado debe poder leerse");
+
+        assert_eq!(
+            almacenado, "passphrase",
+            "la columna no guarda el texto que el CHECK admite"
+        );
+
+        let fecha = leido
+            .health_checked_at
+            .expect("la anotación tiene que dejar la fecha de la comprobación");
+
+        assert!(
+            fecha.offset().is_utc(),
+            "la fecha la pone la base, en UTC: {fecha}"
+        );
+
+        let fecha_almacenada: String =
+            sqlx::query_scalar("SELECT health_checked_at FROM repositories WHERE id = ?1")
+                .bind(repositorio.id.hyphenated().to_string())
+                .fetch_one(&pool)
+                .await
+                .expect("la fecha almacenada debe poder leerse");
+
+        let esperada = PrimitiveDateTime::parse(
+            &fecha_almacenada,
+            &format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+        )
+        .expect("el texto almacenado debe ser una fecha")
+        .assume_utc();
+
+        assert_eq!(
+            fecha, esperada,
+            "la fecha devuelta no es la que anotó la base: {fecha_almacenada}"
+        );
+
+        // Un desenlace sin motivo lo deja a nulo: `ok` no tiene nada que contar, y el `None`
+        // es lo que lo dice —la cadena vacía diría otra cosa—.
+        assert!(
+            repositorios
+                .anotar_salud(&repositorio.id, SaludDeRepositorio::Ok, None)
+                .await
+                .expect("anotar la salud no puede fallar"),
+            "la fila existía, así que anotar debe decir que sí"
+        );
+
+        let con_ok = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        assert_eq!(con_ok.health, Some(SaludDeRepositorio::Ok));
+        assert_eq!(
+            con_ok.health_detail, None,
+            "un `ok` no tiene motivo, y la columna tiene que quedar a nulo"
+        );
+
+        let fecha_ok = con_ok.health_checked_at;
+
+        // La edición del repositorio, con la salud **dentro** de la fila que se pasa.
+        let mut cambiado = con_ok.clone();
+        cambiado.name = "repo-1-3-editado".to_owned();
+
+        assert!(
+            repositorios
+                .actualizar(&cambiado)
+                .await
+                .expect("la actualización no puede fallar"),
+            "la fila existía, así que la actualización debe decir que sí"
+        );
+
+        let tras_editar = repositorios
+            .leer(&repositorio.id)
+            .await
+            .expect("la lectura no puede fallar")
+            .expect("la fila debe estar");
+
+        assert_eq!(
+            tras_editar.name, "repo-1-3-editado",
+            "la edición no cambió lo que tenía que cambiar"
+        );
+        assert_eq!(
+            tras_editar.health,
+            Some(SaludDeRepositorio::Ok),
+            "la edición pisó el estado de salud"
+        );
+        assert_eq!(
+            tras_editar.health_checked_at, fecha_ok,
+            "la edición pisó la fecha de la comprobación"
+        );
+        assert_eq!(
+            tras_editar.health_detail, None,
+            "la edición escribió un motivo donde no lo había"
+        );
+
+        // Y anotar sobre una fila que no está dice que no, como `actualizar` y `borrar`.
+        assert!(
+            !repositorios
+                .anotar_salud(&Uuid::new_v4(), SaludDeRepositorio::Ok, None)
+                .await
+                .expect("anotar sobre una fila que no existe no es un error"),
+            "anotar sin fila debe decir que no"
+        );
+    }
+
+    /// 1.4 (salud por repositorio) — Los **cinco** estados del `CHECK` van y vuelven por la
+    /// columna: `anotar_salud` escribe el texto y la relectura devuelve la variante.
+    ///
+    /// Es la mitad que las pruebas de arriba no cubrían: allí solo se ejercitaban `passphrase` y
+    /// `ok`, así que una variante cuyo `snake_case` de `sqlx` no coincidiera con el `CHECK`
+    /// —`sin_repositorio`, `inaccesible`, `sin_permiso`— habría pasado la suite. El texto esperado
+    /// se afirma contra el **literal** que el `CHECK` admite, no contra el propio enumerado: si la
+    /// derivación y la columna se separaran, la prueba lo vería.
+    #[tokio::test]
+    async fn los_cinco_estados_de_salud_van_y_vuelven_por_la_columna() {
+        let (_directorio, pool, repositorios) = capa().await;
+
+        let repositorio = repositorios
+            .alta(alta("repo-1-4"))
+            .await
+            .expect("el alta no puede fallar");
+
+        let estados = [
+            (SaludDeRepositorio::Ok, "ok"),
+            (SaludDeRepositorio::SinRepositorio, "sin_repositorio"),
+            (SaludDeRepositorio::Passphrase, "passphrase"),
+            (SaludDeRepositorio::Inaccesible, "inaccesible"),
+            (SaludDeRepositorio::SinPermiso, "sin_permiso"),
+        ];
+
+        for (salud, texto) in estados {
+            assert!(
+                repositorios
+                    .anotar_salud(&repositorio.id, salud, Some("motivo de la comprobación"))
+                    .await
+                    .expect("anotar la salud no puede fallar"),
+                "la fila existía, así que anotar debe decir que sí"
+            );
+
+            let almacenado: String =
+                sqlx::query_scalar("SELECT health FROM repositories WHERE id = ?1")
+                    .bind(repositorio.id.hyphenated().to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .expect("el estado almacenado debe poder leerse");
+
+            assert_eq!(
+                almacenado, texto,
+                "la columna no guarda el texto que el CHECK admite para {salud:?}"
+            );
+
+            let leido = repositorios
+                .leer(&repositorio.id)
+                .await
+                .expect("la lectura no puede fallar")
+                .expect("la fila debe estar");
+
+            assert_eq!(
+                leido.health,
+                Some(salud),
+                "el estado `{texto}` no volvió como su variante"
+            );
+        }
     }
 
     /// 1.24 — Una fila con `created_at` rellenado por `CURRENT_TIMESTAMP` se
@@ -1054,6 +1503,9 @@ mod tests {
                     secret_access_key: secreto(SECRETO_ACCESO),
                     passphrase: secreto(PASSPHRASE),
                     created_at: OffsetDateTime::now_utc(),
+                    health: None,
+                    health_checked_at: None,
+                    health_detail: None,
                 })
                 .await
                 .expect("actualizar una fila que no existe no es un error"),

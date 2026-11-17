@@ -39,7 +39,10 @@ pub use origen::{
     TunelDelVolcado, tunel_del_volcado,
 };
 pub use progreso::{AvisoDeProgreso, BarrasDelMotor};
-pub use repositorio::{Acceso, Copia, CopiaHecha, PuestaEnMarcha, Repositorio, ResumenDeSnapshot};
+pub use repositorio::{
+    Acceso, Copia, CopiaHecha, LoQueContestaElDestino, PuestaEnMarcha, Repositorio,
+    ResumenDeSnapshot, salud_del_repositorio,
+};
 pub use retencion::{InformeDeRetencion, Retencion};
 
 // El tope del destino, que el motor necesita para acotar el **listado**: la apertura lo lleva
@@ -55,3 +58,9 @@ pub(crate) use repositorio::{TOPE_DEL_DESTINO, con_tope};
 // sin uso.
 #[cfg(test)]
 pub(crate) use repositorio::poner_en_marcha_con;
+
+// El gancho de las pruebas para comprobar la salud de un repositorio **local**. Va detrás de
+// `cfg(test)` por la misma razón que el anterior: en producción nadie comprueba contra un
+// directorio del sistema de ficheros, y un reexport sin uso sería un aviso de import.
+#[cfg(test)]
+pub(crate) use repositorio::salud_del_repositorio_con;

@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
 use crate::docker::Cliente;
-use crate::engine::{Ajustes, Dependencias, Motor};
+use crate::engine::{Ajustes, ComprobadorDeSalud, Dependencias, Motor};
 use crate::rustic::BarrasDelMotor;
 use crate::secret::SecretString;
 use crate::state::{AppState, AuthState, EstadoDeBase};
@@ -485,6 +485,28 @@ pub(crate) fn abridor_local(
     barras: BarrasDelMotor,
 ) -> Result<(crate::rustic::Repositorio, crate::rustic::PuestaEnMarcha), crate::rustic::Error> {
     crate::rustic::poner_en_marcha_con(
+        acceso,
+        backends_locales(Path::new(&acceso.endpoint)),
+        barras,
+    )
+}
+
+/// El comprobador de salud del motor, para las pruebas: comprueba un repositorio **local**.
+///
+/// Es el gemelo de [`abridor_local`] en el otro punto de inyección de los ajustes: sin él, las
+/// pruebas de las dos rutas de comprobación del §5 tendrían que hablar con un S3 de verdad —que no
+/// hay—, y lo que hay que medir es el camino de la capa HTTP —leer la fila, comprobar, anotar y
+/// devolver—, no el backend. La ruta del repositorio sale del `endpoint` del `Acceso`, igual que en
+/// el abridor, así que un aparato de prueba solo tiene que escribir esa ruta en la fila.
+///
+/// Llama a [`salud_del_repositorio_con`](crate::rustic::salud_del_repositorio_con) —el gancho de
+/// solo lectura del módulo de la biblioteca, sin tope porque un destino local contesta en el acto—
+/// con los backends locales, y devuelve los hechos tal cual: la traducción a estado es del motor.
+pub(crate) fn comprobador_local(
+    acceso: &crate::rustic::Acceso,
+    barras: BarrasDelMotor,
+) -> Result<crate::rustic::LoQueContestaElDestino, crate::rustic::Error> {
+    crate::rustic::salud_del_repositorio_con(
         acceso,
         backends_locales(Path::new(&acceso.endpoint)),
         barras,
@@ -1019,12 +1041,18 @@ const SOCKET_MUERTO_DEL_MOTOR: &str = "unix:///no/existe/kesto-prueba.sock";
 /// lo que hace que todo esto corra en el CI—. La firma del abridor ya es la que el motor
 /// acepta, así que no hay ninguna adaptación en medio.
 ///
+/// El comprobador de salud entra por **parámetro** y no se fija aquí: el camino normal usa
+/// [`comprobador_local`], y una prueba que necesite medir solo el camino de la capa HTTP
+/// inyecta un desenlace fijo —ver [`estado_de_prueba_con_comprobador`]—.
+///
 /// Es síncrona porque [`Motor::arrancar`] lo es: lo que necesita no es un `await`, sino
 /// estar dentro de un runtime —captura su `Handle`—, y los siete ayudantes ya son `async`,
 /// así que la llamada ocurre dentro. Es el mismo camino que usa el módulo del motor en
 /// `Aparato::motor_con`.
-fn motor_de_pruebas(db: &EstadoDeBase) -> Motor {
-    let ajustes = Ajustes::nuevos(SOCKET_MUERTO_DEL_MOTOR).con_abridor(abridor_local);
+fn motor_de_pruebas(db: &EstadoDeBase, comprobador: ComprobadorDeSalud) -> Motor {
+    let ajustes = Ajustes::nuevos(SOCKET_MUERTO_DEL_MOTOR)
+        .con_abridor(abridor_local)
+        .con_comprobador(comprobador);
     let dependencias = Dependencias {
         repositorios: db.repositorios.clone(),
         targets: db.targets.clone(),
@@ -1047,7 +1075,24 @@ fn motor_de_pruebas(db: &EstadoDeBase) -> Motor {
 /// distinguible— también: una prueba que construyera el estado con otro motor dejaría de
 /// estar midiendo lo que mide la suite.
 pub(crate) fn estado_de_prueba(config: Config, db: EstadoDeBase) -> AppState {
-    let motor = motor_de_pruebas(&db);
+    let motor = motor_de_pruebas(&db, comprobador_local);
+
+    AppState::new(config, db, motor).expect("el estado de prueba se construye")
+}
+
+/// El estado de prueba con un comprobador de salud **inyectado**.
+///
+/// Es el gemelo de [`estado_de_prueba`] en el punto de inyección del comprobador: el camino
+/// normal usa el [`comprobador_local`] del arnés, y una prueba de la capa HTTP que necesite
+/// medir **su** camino —leer la fila, comprobar, anotar y devolver— sin hablar con ningún
+/// destino inyecta aquí un desenlace fijo. El abridor sigue siendo [`abridor_local`], así que
+/// el alta sigue funcionando contra un directorio del sistema de ficheros.
+pub(crate) fn estado_de_prueba_con_comprobador(
+    config: Config,
+    db: EstadoDeBase,
+    comprobador: ComprobadorDeSalud,
+) -> AppState {
+    let motor = motor_de_pruebas(&db, comprobador);
 
     AppState::new(config, db, motor).expect("el estado de prueba se construye")
 }

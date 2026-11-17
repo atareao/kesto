@@ -12,9 +12,15 @@ import {
 import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
+import { IndicadorDeSalud } from '../components/IndicadorDeSalud/IndicadorDeSalud'
 import { ModalDeRepositorio } from '../components/ModalDeRepositorio/ModalDeRepositorio'
 import { ModalDeTarget } from '../components/ModalDeTarget/ModalDeTarget'
-import { useRepositorios, useBorrarRepositorio } from '../hooks/useRepositorios'
+import {
+  useBorrarRepositorio,
+  useComprobarSaludDeRepositorio,
+  useComprobarSaludDeTodos,
+  useRepositorios,
+} from '../hooks/useRepositorios'
 import { useBorrarTarget, useTargets } from '../hooks/useTargets'
 import type { Repository, Target } from '../services/api/types'
 import { mensajeDeError } from '../services/errores'
@@ -69,6 +75,8 @@ export default function Ajustes() {
   const repositorios = useRepositorios()
   const borrarTarget = useBorrarTarget()
   const borrarRepositorio = useBorrarRepositorio()
+  const comprobarSalud = useComprobarSaludDeRepositorio()
+  const comprobarSaludDeTodos = useComprobarSaludDeTodos()
 
   const [modalTarget, setModalTarget] = useState(false)
   const [targetEnEdicion, setTargetEnEdicion] = useState<Target | null>(null)
@@ -112,6 +120,29 @@ export default function Ajustes() {
     try {
       await borrarRepositorio.mutateAsync(repositorio.id)
       setAviso({ tipo: 'success', texto: 'Repositorio borrado.' })
+    } catch (error) {
+      setAviso({ tipo: 'error', texto: mensajeDeError(error) })
+    }
+  }
+
+  /**
+   * Comprueba un repositorio. El estado de carga vive en la mutación —no en un
+   * `useState` compartido—: así se sabe **cuál** repositorio se está comprobando
+   * (`variables`) sin dejar muda al resto de la tabla.
+   */
+  const alComprobarSalud = async (repositorio: Repository) => {
+    try {
+      await comprobarSalud.mutateAsync(repositorio.id)
+      setAviso({ tipo: 'success', texto: `Repositorio «${repositorio.name}» comprobado.` })
+    } catch (error) {
+      setAviso({ tipo: 'error', texto: mensajeDeError(error) })
+    }
+  }
+
+  const alComprobarSaludDeTodos = async () => {
+    try {
+      await comprobarSaludDeTodos.mutateAsync()
+      setAviso({ tipo: 'success', texto: 'Repositorios comprobados.' })
     } catch (error) {
       setAviso({ tipo: 'error', texto: mensajeDeError(error) })
     }
@@ -165,6 +196,19 @@ export default function Ajustes() {
       render: (_valor, repositorio) => credencialesDelRepositorio(repositorio),
     },
     {
+      // La salud se nombra con su texto (`IndicadorDeSalud`): el color del
+      // distintivo es un refuerzo, nunca el único portador del estado.
+      title: 'Salud',
+      key: 'salud',
+      render: (_valor, repositorio) => (
+        <IndicadorDeSalud
+          salud={repositorio.health}
+          detalle={repositorio.health_detail}
+          comprobadoEn={repositorio.health_checked_at}
+        />
+      ),
+    },
+    {
       title: 'Creado',
       key: 'creado',
       render: (_valor, repositorio) => formatearFecha(repositorio.created_at),
@@ -176,6 +220,15 @@ export default function Ajustes() {
         <Space size="small" wrap>
           <Button size="small" onClick={() => abrirEdicionDeRepositorio(repositorio)}>
             Editar
+          </Button>
+          <Button
+            size="small"
+            // Solo la fila que se está comprobando se queda cargando; el resto
+            // de la tabla sigue operable.
+            loading={comprobarSalud.isPending && comprobarSalud.variables === repositorio.id}
+            onClick={() => void alComprobarSalud(repositorio)}
+          >
+            Comprobar
           </Button>
           <Popconfirm
             title="¿Borrar el repositorio?"
@@ -268,9 +321,17 @@ export default function Ajustes() {
         <Typography.Title level={2} style={{ margin: 0 }}>
           Repositorios
         </Typography.Title>
-        <Button type="primary" onClick={abrirAltaDeRepositorio}>
-          Nuevo repositorio
-        </Button>
+        <Space size="small" wrap>
+          <Button
+            onClick={() => void alComprobarSaludDeTodos()}
+            loading={comprobarSaludDeTodos.isPending}
+          >
+            Comprobar todos
+          </Button>
+          <Button type="primary" onClick={abrirAltaDeRepositorio}>
+            Nuevo repositorio
+          </Button>
+        </Space>
       </Space>
 
       {repositorios.error !== null ? (

@@ -1577,6 +1577,201 @@ fn abrir_con(
     Ok((Repositorio { repo, destino }, puesta))
 }
 
+/// El hecho que el destino devuelve cuando se le pregunta por la salud de un repositorio.
+///
+/// Es lo que sale de **mirar** el destino sin inicializarlo, y son dos desenlaces y no los tres de
+/// [`PuestaEnMarcha`] a propósito: aquí no hay `.init()`, así que «no había repositorio» no se
+/// arregla creando uno —se dice y se deja el destino como estaba—. El tercer desenlace de la
+/// puesta en marcha, «existía y no abre», tampoco es un valor de este tipo: es un fallo, y viaja
+/// como [`Error::PassphraseNoAbre`].
+///
+/// **No es la salud persistida.** El vocabulario que la columna guarda y que la API sirve
+/// —`ok`, `sin_repositorio`, `passphrase`, `inaccesible`, `sin_permiso`— vive en
+/// `crate::db::entities::SaludDeRepositorio`, y este módulo **no lo conoce**: traducir estos hechos
+/// y los errores tipados de aquí a aquel vocabulario es trabajo del motor, que es quien tiene la
+/// fila del repositorio. Aquí solo se mide; allí se decide qué estado es.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoQueContestaElDestino {
+    /// El destino responde y **no tiene** repositorio todavía. No se ha creado ninguno.
+    SinRepositorio,
+    /// El destino responde, el repositorio abre con su passphrase y el listado de instantáneas
+    /// ocurre. Es lo único que autoriza a decir «sano».
+    AbreYLista,
+}
+
+/// Comprueba la salud de un repositorio **sin inicializarlo** y dice qué contestó el destino.
+///
+/// Es la operación que el panel pide a demanda, y su contrato entero cabe en una frase: **mira el
+/// destino, no lo cambia**. Por eso **no** pasa por [`Repositorio::poner_en_marcha`], que cuando el
+/// destino no tiene configuración lo **inicializa** —crearía un repositorio vacío donde no lo
+/// hay—; aquí se pregunta por la configuración y, si no está, se devuelve
+/// [`LoQueContestaElDestino::SinRepositorio`] dejando el destino intacto.
+///
+/// La comprobación es **de solo lectura y con la profundidad de la puesta en marcha más el
+/// listado**: pregunta si hay configuración, abre con la passphrase de la fila y **lista las
+/// instantáneas**. Ese último paso es el que distingue «el destino responde» de «el destino es
+/// utilizable»: un cubo alcanzable y con la configuración presente pero sin permiso de **lectura**
+/// abre y no lista, y dárselo por sano sería prometer una copia que no se podría leer después.
+///
+/// # El tope del destino
+///
+/// Igual que la apertura, la comprobación corre bajo [`con_tope`] con [`TOPE_DEL_DESTINO`]: un
+/// destino que acepta la conexión y no contesta se abandona en diez segundos en vez de dejar al
+/// panel esperando sin fin. Un tope agotado llega como [`Error::DestinoNoAlcanzable`], el mismo
+/// error tipado que un destino que rechaza, y por eso se traducen al mismo estado.
+///
+/// # Los tres desenlaces que son fallo, no valor
+///
+/// `Ok` solo cubre los dos hechos de [`LoQueContestaElDestino`]; todo lo demás es un [`Error`]:
+///
+/// - [`Error::AccesoInvalido`] — la fila no describe un destino utilizable (un campo obligatorio
+///   vacío). Se decide antes de hablar con nadie.
+/// - [`Error::DestinoNoAlcanzable`] — el destino no contesta, lo rechaza, no se puede preparar, o
+///   agota el tope.
+/// - [`Error::PassphraseNoAbre`] — hay configuración y ninguna clave del repositorio se deja abrir
+///   con la passphrase de la fila. Se decide por el código de la biblioteca —`is_incorrect_password`
+///   — y no por el texto del mensaje, igual que en [`abrir_con`].
+/// - [`Error::ListadoFallido`] — el repositorio abre pero su contenido no se deja listar; cubre
+///   tanto la lectura del índice como el listado de instantáneas.
+///
+/// Quien traduce errores a estados es el motor, no esto: aquí se devuelven los errores tipados tal
+/// cual, para que la decisión de qué es «inaccesible» y qué es «sin permiso» viva en un solo sitio.
+///
+/// # ⚠️ La biblioteca entra en pánico si se la llama desde dentro de un runtime
+///
+/// La misma advertencia que [`Repositorio::poner_en_marcha`]: con el backend de S3 la biblioteca
+/// construye su **propio** runtime. Aquí la llamada que habla con el destino es la del hilo de
+/// [`con_tope`], así que por **este** camino el pánico no ocurre; lo que **sí** puede entrar en
+/// pánico es [`backends_de_s3`]... que no llama a la biblioteca, solo construye el operador. Quien
+/// llama a esto es el motor, que de todos modos saca el trabajo del runtime antes de llegar aquí.
+///
+/// # Errors
+///
+/// Las cuatro de arriba.
+pub fn salud_del_repositorio(
+    acceso: &Acceso,
+    barras: BarrasDelMotor,
+) -> Result<LoQueContestaElDestino, Error> {
+    // Construir el backend no habla con el destino —es lo que hace `OpenDALBackend::new`, sin
+    // red—, así que se queda fuera del tope y el acceso no tiene que cruzar al hilo.
+    let backends = backends_de_s3(acceso)?;
+    let destino = acceso.nombre_del_destino();
+    let destino_del_hilo = destino.clone();
+    let credenciales = Credentials::Password(acceso.passphrase.expose().to_owned());
+
+    con_tope(&destino, TOPE_DEL_DESTINO, move || {
+        medir_la_salud(credenciales, destino_del_hilo, backends, barras)
+    })
+}
+
+/// El mismo camino de [`salud_del_repositorio`] con unos backends **ya construidos** y sin tope.
+///
+/// Es el gancho de las pruebas —gemelo de [`poner_en_marcha_con`]—: el motor inyecta una función
+/// que lo llama para comprobar la salud de un repositorio **local** sin red ni credenciales. El
+/// tope de producción lo pone [`salud_del_repositorio`], que es la boca que habla con S3; un
+/// destino local contesta en el acto y el tope aquí sería un margen sobre algo que no es el
+/// problema, por la misma razón que en [`poner_en_marcha_con`].
+///
+/// **`pub(crate)` y solo en las pruebas** (`#[cfg(test)]`): no es un modo de funcionamiento, es un
+/// punto de inyección. En un binario de producción nadie lo usa.
+///
+/// # Errors
+///
+/// Las mismas que [`salud_del_repositorio`] salvo el tope.
+#[cfg(test)]
+pub(crate) fn salud_del_repositorio_con(
+    acceso: &Acceso,
+    backends: RepositoryBackends,
+    barras: BarrasDelMotor,
+) -> Result<LoQueContestaElDestino, Error> {
+    acceso.validar()?;
+
+    medir_la_salud(
+        Credentials::Password(acceso.passphrase.expose().to_owned()),
+        acceso.nombre_del_destino(),
+        backends,
+        barras,
+    )
+}
+
+/// Pregunta al destino por la configuración, abre el repositorio si la hay y lista sus instantáneas.
+///
+/// Es el cuerpo de [`salud_del_repositorio`] con lo que hace falta para trabajar suelto en un hilo:
+/// las credenciales ya construidas y el nombre del destino, en vez del [`Acceso`] prestado. Existe
+/// por el tope, como [`abrir_con`].
+///
+/// Lo que **no** hace, y es la diferencia con [`abrir_con`]: **no inicializa** cuando no hay
+/// configuración. Ahí está la mitad de «de solo lectura» que este camino tiene y el de la puesta en
+/// marcha no.
+///
+/// # Errors
+///
+/// Las cuatro de [`salud_del_repositorio`].
+fn medir_la_salud(
+    credenciales: Credentials,
+    destino: String,
+    backends: RepositoryBackends,
+    barras: BarrasDelMotor,
+) -> Result<LoQueContestaElDestino, Error> {
+    let fallo_del_destino = |error: Box<rustic_core::RusticError>| Error::DestinoNoAlcanzable {
+        destino: destino.clone(),
+        motivo: error.display_log(),
+    };
+
+    // La copia del backend **antes** de entregárselo al repositorio: es lo único que queda para
+    // preguntarle al destino, porque `RepositoryBackends` se consume.
+    let configuracion = backends.repository();
+    let repositorio =
+        Repository::new_with_progress(&RepositoryOptions::default(), &backends, barras)
+            .map_err(fallo_del_destino)?;
+
+    // ¿Hay configuración? Se pregunta **sin inicializar**: `.init()` crearía un repositorio donde
+    // no lo hay, que es justo lo que una comprobación no puede hacer.
+    if configuracion
+        .list(FileType::Config)
+        .map_err(fallo_del_destino)?
+        .is_empty()
+    {
+        return Ok(LoQueContestaElDestino::SinRepositorio);
+    }
+
+    // Hay configuración: se abre con la passphrase de la fila. Un fallo que la biblioteca señala
+    // como «password incorrecta» —el código C002, el mismo que distingue [`abrir_con`]— es una
+    // passphrase que no abre; cualquier otro fallo de apertura es un fallo del destino.
+    let abierto = repositorio.open(&credenciales).map_err(|error| {
+        if error.is_incorrect_password() {
+            Error::PassphraseNoAbre {
+                destino: destino.clone(),
+                motivo: error.display_log(),
+            }
+        } else {
+            Error::DestinoNoAlcanzable {
+                destino: destino.clone(),
+                motivo: error.display_log(),
+            }
+        }
+    })?;
+
+    // A partir de aquí el repositorio abre: lo que falle es su **lectura** —el índice primero y las
+    // instantáneas después—, y eso es un destino alcanzable pero inutilizable, no uno inalcanzable.
+    // Se marca como fallo del listado para que el motor lo distinga de «no se alcanza».
+    let fallo_del_listado = |error: Box<rustic_core::RusticError>| Error::ListadoFallido {
+        destino: destino.clone(),
+        motivo: error.display_log(),
+    };
+
+    // El listado, de verdad y hasta el final: `.list()` devuelve un iterador perezoso, así que hay
+    // que recorrerlo para que la lectura ocurra. Es lo que separa «el destino responde» de «el
+    // destino es utilizable», y por eso no vale con pedirlo y no mirarlo.
+    let instantaneas = abierto.to_indexed_ids().map_err(fallo_del_listado)?;
+    instantaneas
+        .list::<SnapshotId>()
+        .map_err(fallo_del_listado)?
+        .count();
+
+    Ok(LoQueContestaElDestino::AbreYLista)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1591,14 +1786,15 @@ mod tests {
     use crate::test_support::{
         AJENA_CONTENIDO, CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, ETIQUETA_AJENA,
         ETIQUETA_SEMBRADA, OTRA_PASSPHRASE_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, SEMILLA_CONTENIDO,
-        acceso_local, backends_locales, barras_mudas, destino_de_s3_que_se_traga_la_peticion,
-        directorio_de_prueba, nodo_del_snapshot, sembrar_snapshot_ajeno, sembrar_snapshots,
-        snapshot_guardado, volcado_guardado,
+        acceso_local, backends_locales, barras_mudas, destino_de_s3_que_rechaza,
+        destino_de_s3_que_se_traga_la_peticion, directorio_de_prueba, nodo_del_snapshot,
+        sembrar_snapshot_ajeno, sembrar_snapshots, snapshot_guardado, volcado_guardado,
     };
 
     use super::{
-        Acceso, Copia, CopiaHecha, ESQUEMA_DE_S3, Error, PuestaEnMarcha, Repositorio,
-        TOPE_DEL_DESTINO, backends_de_s3, con_tope, opciones_de_s3, poner_en_marcha_con,
+        Acceso, Copia, CopiaHecha, ESQUEMA_DE_S3, Error, LoQueContestaElDestino, PuestaEnMarcha,
+        Repositorio, TOPE_DEL_DESTINO, backends_de_s3, con_tope, opciones_de_s3,
+        poner_en_marcha_con, salud_del_repositorio, salud_del_repositorio_con,
     };
 
     /// El plazo de inactividad de los túneles de prueba.
@@ -4089,5 +4285,302 @@ mod tests {
                 "para `{nombre}` se escribió algo en el destino antes de rechazar el volcado"
             );
         }
+    }
+
+    // ── La comprobación de salud: de solo lectura ────────────────────────────
+    //
+    // Cubre `repository`, requisito «La comprobación de salud es una lectura y no crea ni
+    // inicializa el repositorio», con sus cinco escenarios. Los instrumentos son el gancho local
+    // del arnés —un destino del sistema de ficheros— para los desenlaces que dependen del
+    // contenido, y los dos destinos de S3 simulados del arnés —un oyente que rechaza y otro que
+    // se traga la petición— para los dos que dependen de que nadie conteste, que es lo que
+    // permite recorrer el camino de S3 sin red y sin contenedores.
+
+    /// Un destino con un repositorio y una instantánea está **sano**, y se ha listado.
+    #[test]
+    fn un_destino_que_responde_abre_y_lista_esta_sano() {
+        let destino = Destino::nuevo();
+        sembrar_snapshots(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let desenlace = salud_del_repositorio_con(
+            &destino.acceso(PASSPHRASE_DE_PRUEBA),
+            destino.backends(),
+            barras_mudas(),
+        )
+        .expect("un destino sano no puede devolver error");
+
+        assert_eq!(
+            desenlace,
+            LoQueContestaElDestino::AbreYLista,
+            "un destino con repositorio y una instantánea tiene que abrir y listar; salió \
+             {desenlace:?}"
+        );
+    }
+
+    /// Un destino sin configuración **no se inicializa** al comprobarlo.
+    ///
+    /// Es el escenario que distingue esta comprobación de la puesta en marcha: si se reutilizara
+    /// `poner_en_marcha`, el destino quedaría con un repositorio vacío recién creado.
+    #[test]
+    fn la_comprobacion_no_inicializa_un_destino_sin_configuracion() {
+        let destino = Destino::nuevo();
+        std::fs::create_dir_all(&destino.ruta).expect("el destino vacío de la prueba se crea");
+
+        let desenlace = salud_del_repositorio_con(
+            &destino.acceso(PASSPHRASE_DE_PRUEBA),
+            destino.backends(),
+            barras_mudas(),
+        )
+        .expect("un destino alcanzable y vacío no es un error");
+
+        assert_eq!(
+            desenlace,
+            LoQueContestaElDestino::SinRepositorio,
+            "un destino sin configuración tiene que decir que no hay repositorio"
+        );
+        assert!(
+            !destino.tiene_repositorio(),
+            "la comprobación inicializó el destino: hay configuración donde no la había"
+        );
+        assert!(
+            destino.instantanea().is_empty(),
+            "la comprobación escribió algo en un destino que estaba vacío: {:?}",
+            destino.instantanea()
+        );
+    }
+
+    /// Una passphrase que no abre se distingue de un destino inalcanzable.
+    #[test]
+    fn una_passphrase_que_no_abre_es_un_fallo_de_la_passphrase() {
+        let destino = Destino::nuevo();
+        sembrar_snapshots(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        let error = salud_del_repositorio_con(
+            &destino.acceso(OTRA_PASSPHRASE_DE_PRUEBA),
+            destino.backends(),
+            barras_mudas(),
+        )
+        .expect_err("con la passphrase equivocada el repositorio no abre");
+
+        assert!(
+            matches!(error, Error::PassphraseNoAbre { .. }),
+            "la comprobación tiene que distinguir «la passphrase no abre» de «no se alcanza»: \
+             salió {error:?}"
+        );
+    }
+
+    /// Un nombre de fichero de índice que la caché de la biblioteca **no** conoce, a partir de uno
+    /// que sí.
+    ///
+    /// Los nombres de los ficheros de índice son identificadores: 64 dígitos hexadecimales. Cambiar
+    /// el primero por otro distinto da otro identificador **válido** —`Id` se construye decodificando
+    /// el nombre en 32 bytes, y cualquier hex de 64 dígitos vale— y distinto del de siempre, que es
+    /// justo lo que hace falta para que una lectura no pueda servirse de la copia cacheada.
+    fn nombre_de_indice_fresco(nombre: &str) -> String {
+        let mut fresco: Vec<char> = nombre.chars().collect();
+        if let Some(primero) = fresco.first_mut() {
+            *primero = if *primero == '0' { '1' } else { '0' };
+        }
+        fresco.into_iter().collect()
+    }
+
+    /// Un repositorio que **abre pero no lista** no se da por sano.
+    ///
+    /// Cómo, sin red: se deja el destino con su configuración y sus claves legibles —para que
+    /// `open()` funcione— y se ponen en modo `000` los **ficheros** del contenido (`index/`,
+    /// `snapshots/`, `data/`), que es lo que hay que **leer** para listar. Es el desenlace que un
+    /// cubo sin permiso de lectura produce, y hacen falta dos cuidados para reproducirlo, porque sin
+    /// ninguno de los dos sale «sano»:
+    ///
+    /// - **El modo `000` va en los ficheros, no en sus directorios.** El backend local resuelve el
+    ///   listado con un `WalkDir` que se **traga** el error de un directorio ilegible y devuelve lo
+    ///   que pudo reunir —nada—, así que un directorio en modo `000` da «abre y lista cero
+    ///   instantáneas»: el falso «sano» que esta prueba descarta. Un fichero ilegible, en cambio,
+    ///   falla al leerse de verdad.
+    /// - **El índice, además, con un nombre nuevo** ([`nombre_de_indice_fresco`]). La biblioteca
+    ///   cachea en disco los ficheros de índice y de instantánea —son los dos tipos «cacheables»—
+    ///   en una caché **indexada por el identificador del fichero**, y sembrar el destino ya deja
+    ///   ahí una copia del índice: con el nombre de siempre, la lectura del índice se resolvería en
+    ///   la caché, el destino no se llegaría a tocar y el desenlace volvería a ser el falso «sano».
+    ///   Con un nombre que la caché no conoce, la lectura no tiene más remedio que ir al destino,
+    ///   que es donde el listado tiene que leer.
+    ///
+    /// El paso que lee es el índice, y es posterior a `open()`, que no lo toca —la configuración y
+    /// las claves viven en la raíz y en `keys/`, que se quedan legibles—: así el destino responde,
+    /// abre, y el listado falla con el error de permisos. Los permisos se restauran antes de
+    /// afirmar nada, para que el `Drop` de la guarda pueda borrar el directorio.
+    #[test]
+    fn un_repositorio_que_abre_pero_no_lista_no_se_da_por_sano() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let destino = Destino::nuevo();
+        sembrar_snapshots(
+            &destino.ruta,
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+
+        // Los ficheros de los directorios de contenido, todos menos `keys/`: las claves las lee
+        // `open()`, y hacerlas ilegibles llevaría el desenlace a «no se alcanza» en vez de a «abre
+        // y no lista».
+        let mut permisos_originales = Vec::new();
+        let mut hay_indice = false;
+        for entrada in std::fs::read_dir(&destino.ruta).expect("el destino se puede recorrer") {
+            let directorio = entrada.expect("cada entrada del destino se lee").path();
+            if !directorio.is_dir() {
+                continue;
+            }
+
+            let Some(nombre) = directorio.file_name() else {
+                continue;
+            };
+            if nombre == "keys" {
+                continue;
+            }
+            let es_el_indice = nombre == "index";
+
+            for contenido in std::fs::read_dir(&directorio).expect("el contenido se puede recorrer")
+            {
+                let mut fichero = contenido.expect("cada entrada del contenido se lee").path();
+                if !fichero.is_file() {
+                    continue;
+                }
+
+                // Al índice, además de dejarlo ilegible, se le da el nombre nuevo que explica la
+                // cabecera: es lo que impide que la lectura se resuelva en la caché de la
+                // biblioteca sin llegar a tocar el destino.
+                if es_el_indice {
+                    let de_siempre = fichero
+                        .file_name()
+                        .expect("cada fichero del índice tiene nombre")
+                        .to_string_lossy()
+                        .into_owned();
+                    let renombrado = fichero.with_file_name(nombre_de_indice_fresco(&de_siempre));
+                    std::fs::rename(&fichero, &renombrado)
+                        .expect("el fichero del índice se puede renombrar");
+                    fichero = renombrado;
+                    hay_indice = true;
+                }
+
+                let originales = std::fs::metadata(&fichero)
+                    .expect("cada fichero del destino tiene metadatos")
+                    .permissions();
+                let mut sin_permisos = originales.clone();
+                sin_permisos.set_mode(0o000);
+                std::fs::set_permissions(&fichero, sin_permisos)
+                    .expect("los permisos del destino se pueden cambiar");
+                permisos_originales.push((fichero, originales));
+            }
+        }
+        assert!(
+            !permisos_originales.is_empty(),
+            "el destino sembrado tiene que tener ficheros de contenido que hacer ilegibles"
+        );
+        assert!(
+            hay_indice,
+            "el destino sembrado tiene que tener ficheros de índice, que es lo que el listado lee"
+        );
+
+        // La simulación tiene que morder: si el proceso pudiera leer igualmente el fichero —correr
+        // como `root`, por ejemplo—, el modo `000` no provocaría ningún fallo y la prueba daría un
+        // falso «sano». Se comprueba aquí para que el fallo lo diga, no para afirmar el desenlace,
+        // que se afirma más abajo.
+        let (muestra, _) = &permisos_originales[0];
+        assert!(
+            matches!(
+                std::fs::File::open(muestra),
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+            ),
+            "hacer ilegible el contenido del destino no surtió efecto —¿se corre como `root`?—: \
+             sin un fichero que no se deje leer, la simulación no provoca ningún fallo de listado"
+        );
+
+        let resultado = salud_del_repositorio_con(
+            &destino.acceso(PASSPHRASE_DE_PRUEBA),
+            destino.backends(),
+            barras_mudas(),
+        );
+
+        for (camino, originales) in permisos_originales {
+            std::fs::set_permissions(&camino, originales)
+                .expect("los permisos del destino se pueden devolver");
+        }
+
+        let error = resultado.expect_err("un repositorio que no se deja listar no está sano");
+        assert!(
+            matches!(error, Error::ListadoFallido { .. }),
+            "un destino que abre y no lista tiene que distinguirse del que no se alcanza: \
+             salió {error:?}"
+        );
+    }
+
+    /// Un destino que **rechaza** la conexión es un fallo del destino, no una passphrase.
+    #[test]
+    fn un_destino_que_rechaza_es_un_fallo_del_destino() {
+        let acceso = Acceso {
+            endpoint: destino_de_s3_que_rechaza(),
+            bucket: "cubo-que-rechaza".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let error = salud_del_repositorio(&acceso, barras_mudas())
+            .expect_err("un destino que rechaza no se puede comprobar");
+
+        assert!(
+            matches!(error, Error::DestinoNoAlcanzable { .. }),
+            "un destino que rechaza tiene que llegar como destino inalcanzable: salió {error:?}"
+        );
+    }
+
+    /// El tope acota la comprobación contra un destino que **acepta y no contesta**.
+    ///
+    /// Es la misma prueba discriminante que la de la puesta en marcha, y se repite aquí porque el
+    /// camino es otro —esta operación no inicializa— y porque el requisito dice explícitamente que
+    /// un tope agotado en la comprobación tiene que llegar como «el destino no se alcanza» y no
+    /// como un pánico ni como una espera sin fin.
+    #[test]
+    fn un_destino_que_se_traga_la_peticion_lo_corta_el_tope_en_la_comprobacion() {
+        let acceso = Acceso {
+            endpoint: destino_de_s3_que_se_traga_la_peticion(),
+            bucket: "cubo-que-se-traga-la-peticion".to_owned(),
+            region: "eu-south-2".to_owned(),
+            access_key_id: "clave-de-acceso-distinguible".to_owned(),
+            secret_access_key: SecretString::new(CLAVE_SECRETA_DE_PRUEBA.to_owned()),
+            passphrase: SecretString::new(PASSPHRASE_DE_PRUEBA.to_owned()),
+        };
+
+        let empezado = std::time::Instant::now();
+        let error = salud_del_repositorio(&acceso, barras_mudas())
+            .expect_err("un destino que no contesta no se puede comprobar");
+        let tardado = empezado.elapsed();
+
+        assert!(
+            tardado < Duration::from_secs(12),
+            "el tope no cortó la comprobación: tardó {tardado:?} contra un destino que acepta y no \
+             contesta, con un tope declarado de {TOPE_DEL_DESTINO:?}"
+        );
+
+        let Error::DestinoNoAlcanzable { motivo, .. } = error else {
+            panic!("el tope agotado tiene que llegar como `DestinoNoAlcanzable`: llegó {error:?}");
+        };
+        assert!(
+            motivo.contains("tope"),
+            "el desenlace tiene que ser el del tope de Kesto y no el de la biblioteca: {motivo}"
+        );
+        assert!(
+            !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
+            "el motivo del tope publica un secreto: {motivo}"
+        );
     }
 }
