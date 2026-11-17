@@ -1,7 +1,7 @@
 import { Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout/Layout'
 import { SoloConSesion } from './components/SoloConSesion/SoloConSesion'
-import Dashboard from './pages/dashboard'
+import Portada from './pages/portada'
 import Tareas from './pages/tareas'
 import Historico from './pages/historico'
 import Snapshots from './pages/snapshots'
@@ -15,16 +15,18 @@ import NoEncontrada from './pages/noEncontrada'
  * sigue visible también en la pantalla de «no encontrada». El `BrowserRouter`
  * vive en `PanelConTema.tsx`; aquí solo se declaran las rutas.
  *
- * Las pantallas —y la de «no encontrada»— van bajo `SoloConSesion`: en modo
- * `oidc` sin sesión no se renderizan, se va a la pantalla de sesión. La propia
- * pantalla de sesión queda **fuera** de la guarda, o el desvío sería un bucle.
+ * La portada es la ruta índice y queda **fuera** de `SoloConSesion`: en modo
+ * `oidc` sin sesión enseña la portada pública con el botón de entrar. El resto
+ * de pantallas —y la de «no encontrada»— van bajo la guarda: en `oidc` sin
+ * sesión se va a la pantalla de sesión. La propia pantalla de sesión queda
+ * **fuera** de la guarda, o el desvío sería un bucle.
  */
 export default function App() {
   return (
     <Routes>
       <Route element={<Layout />}>
+        <Route index element={<Portada />} />
         <Route element={<SoloConSesion />}>
-          <Route index element={<Dashboard />} />
           <Route path="tareas" element={<Tareas />} />
           <Route path="historico" element={<Historico />} />
           <Route path="snapshots" element={<Snapshots />} />
