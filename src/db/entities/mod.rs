@@ -25,12 +25,14 @@
 //! Todas las consultas van con `sqlx::query` y valores **enlazados**: ninguna
 //! consulta se construye concatenando cadenas, ni siquiera en piezas.
 
+pub mod api_token;
 pub mod execution;
 pub mod job;
 pub mod repository;
 pub mod restauracion;
 pub mod target;
 
+pub use api_token::{AltaDeToken, Scope, TokenDeApi, Tokens, hash_de_token};
 pub use execution::{
     AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, FiltroDeEjecuciones, ObjetivoDeRestauracion,
 };

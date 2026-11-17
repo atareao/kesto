@@ -1465,6 +1465,83 @@ pub(crate) async fn post_with_cookie(router: Router, uri: &str, cookie: &str) ->
     request_with_cookie(router, Method::POST, uri, cookie).await
 }
 
+/// Lanza un `POST` con un cuerpo JSON y la cabecera `Cookie` indicada.
+pub(crate) async fn post_json_with_cookie(
+    router: Router,
+    uri: &str,
+    cuerpo: &serde_json::Value,
+    cookie: &str,
+) -> Response {
+    let peticion = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(cuerpo.to_string()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `DELETE` con la cabecera `Cookie` indicada.
+pub(crate) async fn delete_with_cookie(router: Router, uri: &str, cookie: &str) -> Response {
+    request_with_cookie(router, Method::DELETE, uri, cookie).await
+}
+
+/// Lanza una petición con una cabecera `Authorization: Bearer` ya formada.
+async fn request_with_bearer(router: Router, metodo: Method, uri: &str, token: &str) -> Response {
+    let peticion = Request::builder()
+        .method(metodo)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `GET` con la cabecera `Authorization: Bearer` indicada.
+pub(crate) async fn get_with_bearer(router: Router, uri: &str, token: &str) -> Response {
+    request_with_bearer(router, Method::GET, uri, token).await
+}
+
+/// Lanza un `POST` sin cuerpo con la cabecera `Authorization: Bearer` indicada.
+pub(crate) async fn post_with_bearer(router: Router, uri: &str, token: &str) -> Response {
+    request_with_bearer(router, Method::POST, uri, token).await
+}
+
+/// Lanza un `DELETE` con la cabecera `Authorization: Bearer` indicada.
+pub(crate) async fn delete_with_bearer(router: Router, uri: &str, token: &str) -> Response {
+    request_with_bearer(router, Method::DELETE, uri, token).await
+}
+
+/// Lanza un `POST` con un cuerpo JSON y la cabecera `Authorization: Bearer` indicada.
+pub(crate) async fn post_json_with_bearer(
+    router: Router,
+    uri: &str,
+    cuerpo: &serde_json::Value,
+    token: &str,
+) -> Response {
+    let peticion = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(cuerpo.to_string()))
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
 /// Cuerpo de la respuesta, como texto.
 pub(crate) async fn body_text(response: Response) -> String {
     let bytes = response
