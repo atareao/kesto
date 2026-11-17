@@ -1,7 +1,7 @@
 # verificacion-e2e Specification
 
 ## Purpose
-TBD - created by archiving change bateria-e2e-de-copia-y-restauracion. Update Purpose after archive.
+Esta capability reúne la batería de pruebas de punta a punta que comprueba que la copia y la restauración funcionan de verdad, y no solo que los procesos terminan con éxito. Para cada tipo de origen soportado (MariaDB, PostgreSQL, SQLite y directorio) recorre el ciclo completo —extraer, subir a un almacén S3 real, restaurar y comparar el contenido con el sembrado—, e incluye la restauración hacia un contenedor, la sobrescritura de destinos que ya tienen contenido y la retención y la purga contra ese mismo S3 real. La batería se ejecuta en CI mediante un job dedicado que levanta el motor de contenedores y el S3, y también en local con una única receta reproducible que apunta al socket indicado en `DOCKER_HOST`. Su rasgo definitorio es que falla en voz alta: si falta el motor, el servidor S3 o una imagen, o si el contenido restaurado difiere en una sola fila o fichero, la ejecución se detiene y nombra el problema en lugar de omitir escenarios y dar un falso verde.
 
 ## Requirements
 
