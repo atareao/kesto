@@ -47,6 +47,14 @@ Los planes **se renombran, nunca se borran** (`git mv`). El renombrado al cerrar
 
 ⚠️ **`@plan-writer` escribe `PLAN.md` en la raíz por defecto.** En este repo los planes van a `plans/PLAN-NNN.md`: pásale la ruta de destino explícita y el contenido completo del plan en el prompt.
 
+## Relevo de sesión (`HANDOFF.md`) — regla fija
+
+`HANDOFF.md` en la raíz es el **relevo local de la sesión**: se escribe y se actualiza en disco, pero **NUNCA se versiona**.
+
+- Está en `.gitignore`; no lo añadas con `git add` ni lo metas en un PR.
+- Un `git rm --cached` **no basta** para conservarlo: si el borrado ya está fusionado, el siguiente `git pull` elimina el fichero del working tree. Si desaparece, recréalo localmente.
+- El estado del proyecto va en ficheros **versionados** (`plans/`, `docs/`, `openspec/`); el handoff solo sirve para retomar la sesión.
+
 ## Layout (SRS §7 — respétalo)
 
 ```text
