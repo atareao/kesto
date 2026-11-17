@@ -22,6 +22,11 @@ export function repositorio(campos: Partial<Repository> & { id: string }): Repos
     access_key_id: 'AKIA',
     has_secret_access_key: true,
     has_passphrase: true,
+    // Sin comprobar: el defecto del contrato es «desconocido» con la fecha a
+    // nulo, así que quien afirme salud la pasa en `campos`.
+    health: 'desconocido',
+    health_checked_at: null,
+    health_detail: null,
     created_at: '2026-01-01T00:00:00Z',
     ...campos,
   }

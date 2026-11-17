@@ -70,12 +70,12 @@ use uuid::Uuid;
 use crate::db::DbError;
 use crate::db::entities::{
     AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, ObjetivoDeRestauracion, Repositorios,
-    Restauraciones, Tareas, Targets,
+    Restauraciones, SaludDeRepositorio, Tareas, Targets,
 };
 use crate::docker::{Cliente, Orden};
 use crate::rustic::{
-    Acceso, BarrasDelMotor, PuestaEnMarcha, Repositorio, ResumenDeSnapshot, TOPE_DEL_DESTINO,
-    con_tope,
+    Acceso, BarrasDelMotor, LoQueContestaElDestino, PuestaEnMarcha, Repositorio, ResumenDeSnapshot,
+    TOPE_DEL_DESTINO, con_tope, salud_del_repositorio,
 };
 
 use cola::Cola;
@@ -132,6 +132,25 @@ const ESPERA_DE_PARADA: Duration = Duration::from_secs(5);
 pub type AbridorDeRepositorios =
     fn(&Acceso, BarrasDelMotor) -> Result<(Repositorio, PuestaEnMarcha), crate::rustic::Error>;
 
+/// Cómo se comprueba la salud de un repositorio a partir de su fila.
+///
+/// Es el punto de inyección **gemelo** de [`AbridorDeRepositorios`], y existe por la misma razón:
+/// sin él, la prueba de la comprobación de salud tendría que hablar con un S3 de verdad —que no
+/// hay— o medir los desenlaces contra un destino local, cuando lo que la capa HTTP necesita medir
+/// es **su** camino —leer la fila, comprobar, anotar y devolver—. Con él, una prueba inyecta una
+/// función que devuelve cada desenlace **sin hablar con nadie**.
+///
+/// Es una **función** y no un cierre, por lo mismo que el abridor: un puntero a función no captura
+/// nada, así que lo que se inyecta no puede llevar dentro credenciales ni una ruta que no se vea en
+/// el sitio donde se inyectó.
+///
+/// El valor por defecto es [`salud_del_repositorio`], la primitiva de solo lectura del módulo de la
+/// biblioteca; lo que devuelve son los **hechos** del destino
+/// ([`LoQueContestaElDestino`] o un error tipado), y quien los traduce al vocabulario de la columna
+/// es el motor —ver [`Motor::comprobar_salud`]—, que es el único que conoce la fila.
+pub type ComprobadorDeSalud =
+    fn(&Acceso, BarrasDelMotor) -> Result<LoQueContestaElDestino, crate::rustic::Error>;
+
 /// Los ajustes del motor: con qué habla y cuánto espera.
 ///
 /// Los dos plazos van aquí y no son constantes sueltas por la misma razón que el abridor: son lo
@@ -147,6 +166,9 @@ pub struct Ajustes {
     pub espera_de_parada: Duration,
     /// Cómo se abre un repositorio: el de S3 en producción, el local en las pruebas.
     pub abridor: AbridorDeRepositorios,
+    /// Cómo se comprueba la salud de un repositorio: la primitiva de solo lectura en producción, un
+    /// desenlace inyectado en las pruebas.
+    pub comprobador: ComprobadorDeSalud,
 }
 
 impl Ajustes {
@@ -162,12 +184,19 @@ impl Ajustes {
             espera_del_motor: ESPERA_DEL_MOTOR,
             espera_de_parada: ESPERA_DE_PARADA,
             abridor: Repositorio::poner_en_marcha,
+            comprobador: salud_del_repositorio,
         }
     }
 
     /// Los mismos ajustes con otro abridor de repositorios.
     pub fn con_abridor(mut self, abridor: AbridorDeRepositorios) -> Self {
         self.abridor = abridor;
+        self
+    }
+
+    /// Los mismos ajustes con otro comprobador de salud.
+    pub fn con_comprobador(mut self, comprobador: ComprobadorDeSalud) -> Self {
+        self.comprobador = comprobador;
         self
     }
 }
@@ -710,6 +739,47 @@ impl Motor {
                     motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
                     causa,
                 })
+        })
+        .await
+    }
+
+    /// Comprueba la salud de un repositorio, **fuera del runtime de Tokio**, y la traduce a estado.
+    ///
+    /// Es la mitad que la capa HTTP necesita para las dos rutas de comprobación del §5: pregunta al
+    /// destino con la primitiva de solo lectura —[`salud_del_repositorio`], que **no inicializa** el
+    /// repositorio— y devuelve el desenlace ya en el vocabulario que la columna
+    /// `repositories.health` guarda y que la API sirve, con un motivo acotado o sin él.
+    ///
+    /// # Los desenlaces del destino llegan como **estado**, nunca como error HTTP
+    ///
+    /// «No hay repositorio», «la passphrase no abre», «el destino no se alcanza» y «abre pero no
+    /// deja listar» **no son fallos de la petición**: son lo que la comprobación ha medido, y por eso
+    /// viajan como [`SaludDeRepositorio`] y no como un código de error. Quien pidió la comprobación
+    /// quiere saber **cómo está** el repositorio, y un `502` no se lo diría. Lo único que sale como
+    /// error es que el hilo que hablaba con la biblioteca se haya caído
+    /// ([`ErrorDelMotor::TrabajoInterrumpido`]), que no es un desenlace del destino.
+    ///
+    /// # Por qué el comprobador es el inyectado
+    ///
+    /// Por lo mismo que en [`Motor::abrir_repositorio`]: un despliegue comprueba contra S3 y una
+    /// prueba inyecta el desenlace, así que la capa HTTP no necesita saber cómo se comprueba un
+    /// repositorio y no puede equivocarse de runtime —la restricción del pánico se cumple aquí, una
+    /// vez, y no en cada manejador—.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorDelMotor::TrabajoInterrumpido`] si el hilo que comprobaba se cae.
+    pub async fn comprobar_salud(
+        &self,
+        acceso: Acceso,
+    ) -> Result<(SaludDeRepositorio, Option<String>), ErrorDelMotor> {
+        let comprobador = self.0.contexto.ajustes.comprobador;
+
+        fuera_del_runtime(move || {
+            Ok(traducir_la_salud(comprobador(
+                &acceso,
+                BarrasDelMotor::mudas(),
+            )))
         })
         .await
     }
@@ -1404,6 +1474,71 @@ fn candado<T>(candado: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Traduce el desenlace de la comprobación de salud al estado que se persiste y su motivo.
+///
+/// Es el **único** sitio donde los hechos de la biblioteca —[`LoQueContestaElDestino`] y sus errores
+/// tipados— se convierten en el vocabulario de la columna (`SaludDeRepositorio`), y el único donde
+/// se decide el motivo que se guarda y se sirve. Que sea uno solo es el contrato: dos traductores
+/// serían dos verdades sobre qué significa cada desenlace.
+///
+/// # El motivo es propio y **no** el de la dependencia
+///
+/// El texto de cada estado es una constante de este módulo y **no** el `motivo` del error de la
+/// biblioteca. No es un descuido: el motivo de la dependencia interpola contexto de la ejecución
+/// —la URL del destino y lo que dijera el backend— y esto se guarda en una columna que el panel
+/// muestra y se sirve por la API, así que un texto que viene de fuera se trata como tal. Un texto
+/// propio y fijo por estado no puede filtrar nada, y el operador no pierde nada que pueda usar: lo
+/// que necesita saber es **qué** pasó, y el estado ya lo dice.
+///
+/// # Por qué el acceso inválido es «inaccesible»
+///
+/// [`crate::rustic::Error::AccesoInvalido`] es una fila que no describe un destino utilizable —un
+/// campo obligatorio vacío—, así que la comprobación ni siquiera llega a hablar con el destino. De
+/// los cinco estados, [`SaludDeRepositorio::Inaccesible`] es el que corresponde: el repositorio no
+/// se alcanza, y el motivo nombra el **campo** que falta para que el operador pueda corregirlo —el
+/// nombre del campo sale de la fila, no de la petición, y no lleva ningún valor—.
+///
+/// # La rama final
+///
+/// El comprobador es un puntero a función, así que el tipo no puede acotar el `match` a los cuatro
+/// errores que [`salud_del_repositorio`] promete devolver: cualquier otra variante de
+/// [`crate::rustic::Error`] que llegara —hoy ninguna, y una nueva mañana— cae en la última rama y se
+/// trata como «no se pudo comprobar». Se prefiere eso a inventar un estado: un desenlace que la
+/// comprobación no sabe interpretar es, para el operador, un destino que no se pudo comprobar.
+fn traducir_la_salud(
+    desenlace: Result<LoQueContestaElDestino, crate::rustic::Error>,
+) -> (SaludDeRepositorio, Option<String>) {
+    match desenlace {
+        Ok(LoQueContestaElDestino::AbreYLista) => (SaludDeRepositorio::Ok, None),
+        Ok(LoQueContestaElDestino::SinRepositorio) => (
+            SaludDeRepositorio::SinRepositorio,
+            Some("el destino responde, pero todavía no tiene repositorio".to_owned()),
+        ),
+        Err(crate::rustic::Error::DestinoNoAlcanzable { .. }) => (
+            SaludDeRepositorio::Inaccesible,
+            Some("no se alcanza el destino".to_owned()),
+        ),
+        Err(crate::rustic::Error::PassphraseNoAbre { .. }) => (
+            SaludDeRepositorio::Passphrase,
+            Some("la passphrase no abre el repositorio".to_owned()),
+        ),
+        Err(crate::rustic::Error::ListadoFallido { .. }) => (
+            SaludDeRepositorio::SinPermiso,
+            Some("el repositorio abre, pero no deja listar sus instantáneas".to_owned()),
+        ),
+        Err(crate::rustic::Error::AccesoInvalido { campo }) => (
+            SaludDeRepositorio::Inaccesible,
+            Some(format!(
+                "la fila del repositorio no es utilizable: `{campo}` está sin informar"
+            )),
+        ),
+        Err(_) => (
+            SaludDeRepositorio::Inaccesible,
+            Some("no se ha podido comprobar el destino".to_owned()),
+        ),
+    }
+}
+
 /// Corre un trabajo **fuera del runtime** y devuelve su desenlace.
 ///
 /// Es la pieza que sostiene las dos operaciones de la fachada, y su forma está **medida**, no
@@ -1536,15 +1671,17 @@ mod tests {
     use super::hub::{EventoDeEjecucion, EventoDeRestauracion, EventoDelMotor};
     use super::restauracion::destino_del_objetivo;
     use super::{
-        Ajustes, Dependencias, ErrorDelMotor, FASE_FALLIDA, FASE_RESTAURANDO, FASE_TERMINADA,
-        Motor, ejecucion, normalizar_el_destino,
+        Ajustes, ComprobadorDeSalud, Dependencias, ErrorDelMotor, FASE_FALLIDA, FASE_RESTAURANDO,
+        FASE_TERMINADA, Motor, ejecucion, normalizar_el_destino,
     };
     use crate::db::entities::{
         AltaDeRepositorio, AltaDeRestauracion, AltaDeTarea, AltaDeTarget, Ejecucion, Ejecuciones,
-        Estado, ObjetivoDeRestauracion, Repositorios, Restauracion, Restauraciones, Tareas,
-        Targets, TipoDeTarget,
+        Estado, ObjetivoDeRestauracion, Repositorios, Restauracion, Restauraciones,
+        SaludDeRepositorio, Tareas, Targets, TipoDeTarget,
     };
-    use crate::rustic::{Acceso, BarrasDelMotor, Error, PuestaEnMarcha, Repositorio};
+    use crate::rustic::{
+        Acceso, BarrasDelMotor, Error, LoQueContestaElDestino, PuestaEnMarcha, Repositorio,
+    };
     use crate::secret::SecretString;
     use crate::test_support::{
         CLAVE_SECRETA_DE_PRUEBA, DirectorioDePrueba, PASSPHRASE_DE_PRUEBA, SEMILLA,
@@ -4426,6 +4563,238 @@ mod tests {
             !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
             "el motivo publica un secreto del repositorio: {motivo}"
         );
+    }
+
+    // ── La salud por repositorio ─────────────────────────────────────────────
+
+    // Los comprobadores inyectados de la traducción: cada uno devuelve **un** desenlace de la
+    // biblioteca sin hablar con nadie, que es justo lo que el punto de inyección existe para
+    // permitir. Son funciones y no cierres porque el tipo es un puntero a función: uno que
+    // capturara no podría llevar dentro lo que devuelve.
+
+    /// El destino contesta y el repositorio se abre y se deja listar.
+    fn comprobador_que_abre_y_lista(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Ok(LoQueContestaElDestino::AbreYLista)
+    }
+
+    /// El destino contesta, pero todavía no tiene repositorio.
+    fn comprobador_sin_repositorio(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Ok(LoQueContestaElDestino::SinRepositorio)
+    }
+
+    /// El destino no se alcanza: el fallo llega **tipado**, con su destino y su motivo.
+    fn comprobador_que_no_alcanza(
+        acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Err(Error::DestinoNoAlcanzable {
+            destino: acceso.endpoint.clone(),
+            motivo: "el comprobador de esta prueba no llega".to_owned(),
+        })
+    }
+
+    /// El repositorio existe y la passphrase no lo abre.
+    fn comprobador_con_passphrase_que_no_abre(
+        acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Err(Error::PassphraseNoAbre {
+            destino: acceso.endpoint.clone(),
+            motivo: "no suitable key found".to_owned(),
+        })
+    }
+
+    /// El repositorio abre, pero no deja listar sus instantáneas.
+    fn comprobador_con_listado_fallido(
+        acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Err(Error::ListadoFallido {
+            destino: acceso.endpoint.clone(),
+            motivo: "access denied".to_owned(),
+        })
+    }
+
+    /// La fila no describe un destino utilizable: un campo obligatorio sin informar.
+    fn comprobador_con_acceso_invalido(
+        _acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Err(Error::AccesoInvalido {
+            campo: "bucket".to_owned(),
+        })
+    }
+
+    /// Un texto crudo de la dependencia con **credenciales y una ruta sensible** dentro.
+    ///
+    /// Es el instrumento de la prueba del saneado: lo que la biblioteca dice de un destino que
+    /// falla interpola la URL, la credencial y lo que contestara el backend, y nada de eso puede
+    /// acabar en una columna que el panel muestra y la API sirve.
+    const TEXTO_CRUDO_DE_LA_DEPENDENCIA: &str = "AccessDenied: la firma X-Amz-Signature=no-es-un-secreto-válido \
+         y la passphrase de /srv/kesto/secretos/llave-maestra.pem no vale";
+
+    /// Un comprobador cuyo fallo **sí** lleva el secreto y la ruta sensible en su texto.
+    ///
+    /// Es el que hace exigente la prueba del motivo: el desenlace de la dependencia lleva dentro
+    /// el secreto de acceso, la passphrase y una ruta sensible, así que si el traductor publicara
+    /// el motivo de fuera —o lo compusiera con él— la prueba lo vería. El `destino` también es el
+    /// `endpoint` de la fila, que no tiene por qué salir en el motivo traducido.
+    fn comprobador_cuyo_texto_filtra(
+        acceso: &Acceso,
+        _barras: BarrasDelMotor,
+    ) -> Result<LoQueContestaElDestino, Error> {
+        Err(Error::DestinoNoAlcanzable {
+            destino: acceso.endpoint.clone(),
+            motivo: format!(
+                "{TEXTO_CRUDO_DE_LA_DEPENDENCIA} (clave: {}, passphrase: {})",
+                acceso.secret_access_key.expose(),
+                acceso.passphrase.expose()
+            ),
+        })
+    }
+
+    /// **Cada desenlace del destino se traduce a su estado, y el motivo es el de Kesto.**
+    ///
+    /// Es la mitad que la auditoría echaba en falta: [`Motor::comprobar_salud`] y
+    /// `traducir_la_salud` son el **único** sitio donde los hechos de la biblioteca se convierten
+    /// en el vocabulario de la columna, y hasta ahora ninguna prueba recorría el mapeo completo.
+    /// Los seis casos son los cuatro errores que la primitiva promete, los dos hechos del `Ok`, y
+    /// el acceso inválido —que no es un fallo de petición sino un destino inutilizable—.
+    ///
+    /// El motivo se afirma con el **fragmento** que tiene que nombrar, no con el literal entero:
+    /// lo que importa es que el estado viaje con un motivo propio y útil, y que el `ok` —el único
+    /// desenlace sin nada que contar— llegue sin él.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cada_desenlace_del_destino_se_traduce_a_su_estado() {
+        let aparato = Aparato::nuevo().await;
+
+        let casos: [(ComprobadorDeSalud, SaludDeRepositorio, Option<&str>); 6] = [
+            (comprobador_que_abre_y_lista, SaludDeRepositorio::Ok, None),
+            (
+                comprobador_sin_repositorio,
+                SaludDeRepositorio::SinRepositorio,
+                Some("no tiene repositorio"),
+            ),
+            (
+                comprobador_que_no_alcanza,
+                SaludDeRepositorio::Inaccesible,
+                Some("no se alcanza"),
+            ),
+            (
+                comprobador_con_passphrase_que_no_abre,
+                SaludDeRepositorio::Passphrase,
+                Some("passphrase no abre"),
+            ),
+            (
+                comprobador_con_listado_fallido,
+                SaludDeRepositorio::SinPermiso,
+                Some("no deja listar"),
+            ),
+            (
+                comprobador_con_acceso_invalido,
+                SaludDeRepositorio::Inaccesible,
+                Some("bucket"),
+            ),
+        ];
+
+        for (comprobador, esperado, fragmento) in casos {
+            let motor = aparato.motor_y_ajustes(
+                Ajustes::nuevos(SOCKET_QUE_NO_EXISTE).con_comprobador(comprobador),
+            );
+            let acceso = aparato.acceso_de(&aparato.repositorio).await;
+
+            let (salud, motivo) = motor.comprobar_salud(acceso).await.expect(
+                "un desenlace del destino no es un fallo del motor: la comprobación no se cae",
+            );
+
+            assert_eq!(
+                salud, esperado,
+                "el desenlace del destino no se tradujo al estado documentado: {salud:?}"
+            );
+
+            match fragmento {
+                None => assert!(
+                    motivo.is_none(),
+                    "un `ok` no tiene nada que contar, y el motivo tiene que ser `None`: {motivo:?}"
+                ),
+                Some(texto) => {
+                    let motivo =
+                        motivo.expect("un estado que no es `ok` tiene que traer su motivo");
+
+                    assert!(
+                        motivo.contains(texto),
+                        "el motivo del estado {salud:?} no nombra `{texto}`: {motivo}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **El motivo de la salud no lleva credenciales ni el texto crudo de la dependencia.**
+    ///
+    /// Es el requisito de seguridad del traductor: el motivo de la biblioteca interpola el destino
+    /// y lo que contestara el backend, y esto se guarda en `repositories.health_detail` —que el
+    /// panel muestra y la API sirve—, así que un texto de fuera se trata como tal. Lo que se
+    /// afirma es que el motivo traducido es **propio y fijo**: no aparece la credencial, ni la
+    /// passphrase, ni la ruta sensible, ni el texto de la dependencia.
+    ///
+    /// Es exigente a propósito: la prueba comprueba **primero** que el fallo de la dependencia sí
+    /// lleva todo eso —con el `Display` del error, que es lo que `motivo_de_la_biblioteca` leería—,
+    /// así que queda demostrado que el saneado es del traductor y no que el caso no se dé.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_motivo_de_la_salud_no_lleva_credenciales_ni_el_texto_de_la_dependencia() {
+        const RUTA_SENSIBLE: &str = "/srv/kesto/secretos/llave-maestra.pem";
+
+        let aparato = Aparato::nuevo().await;
+        let acceso = aparato.acceso_de(&aparato.repositorio).await;
+
+        // El texto crudo de la dependencia, tal y como saldría de la biblioteca.
+        let crudo = comprobador_cuyo_texto_filtra(&acceso, BarrasDelMotor::mudas())
+            .expect_err("el comprobador de esta prueba siempre falla")
+            .to_string();
+
+        for filtrado in [CLAVE_SECRETA_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, RUTA_SENSIBLE] {
+            assert!(
+                crudo.contains(filtrado),
+                "el fallo de la dependencia tiene que llevar `{filtrado}` para que la prueba mida \
+                 el saneado y no un caso que no se da: {crudo}"
+            );
+        }
+
+        let motor = aparato.motor_y_ajustes(
+            Ajustes::nuevos(SOCKET_QUE_NO_EXISTE).con_comprobador(comprobador_cuyo_texto_filtra),
+        );
+
+        let (salud, motivo) = motor
+            .comprobar_salud(acceso)
+            .await
+            .expect("un desenlace del destino no es un fallo del motor");
+
+        assert_eq!(
+            salud,
+            SaludDeRepositorio::Inaccesible,
+            "un destino que no se alcanza tiene que llegar como `inaccesible`"
+        );
+
+        let motivo = motivo.expect("un estado que no es `ok` tiene que traer su motivo");
+
+        for filtrado in [
+            CLAVE_SECRETA_DE_PRUEBA,
+            PASSPHRASE_DE_PRUEBA,
+            RUTA_SENSIBLE,
+            TEXTO_CRUDO_DE_LA_DEPENDENCIA,
+        ] {
+            assert!(
+                !motivo.contains(filtrado),
+                "el motivo de la salud publica lo que dijo la dependencia (`{filtrado}`): {motivo}"
+            );
+        }
     }
 
     // ── El pánico del hilo de trabajo ────────────────────────────────────────
