@@ -66,6 +66,38 @@ export interface AltaTarget {
 
 // ─── Repositorios ────────────────────────────────────────────────────────────
 
+/**
+ * Estado de salud de un repositorio. Es el `CHECK` de `repositories.health`
+ * (§3) y el vocabulario que sirve la API: el panel **no** inventa ninguno más.
+ *
+ * Un repositorio que nunca se ha comprobado llega como «desconocido», nunca
+ * como sano: el panel no puede deducir salud de algo que no se ha consultado.
+ */
+export type SaludDeRepositorio =
+  | 'ok'
+  | 'sin_repositorio'
+  | 'passphrase'
+  | 'inaccesible'
+  | 'sin_permiso'
+  | 'desconocido'
+
+/**
+ * Lectura: desenlace de `POST /api/v1/repositories/{id}/health` y del
+ * equivalente global, que comprueba todos y devuelve un elemento por
+ * repositorio.
+ *
+ * Son los tres campos de salud **ya persistidos**: la comprobación anota el
+ * desenlace en la fila antes de responder, así que esto y lo que sirve el
+ * listado después es lo mismo.
+ */
+export interface SaludComprobada {
+  health: SaludDeRepositorio
+  /** RFC3339, en UTC. */
+  health_checked_at: string | null
+  /** Motivo acotado y saneado de la dependencia; `null` si no hay nada que contar. */
+  health_detail: string | null
+}
+
 /** Lectura: `GET /api/v1/repositories` y `GET /api/v1/repositories/{id}`. */
 export interface Repository {
   id: string
@@ -78,6 +110,16 @@ export interface Repository {
   has_secret_access_key: boolean
   /** Igual que el anterior: la passphrase del repositorio solo se lee como booleano. */
   has_passphrase: boolean
+  /**
+   * Salud **persistida** de la fila, derivada del almacén. **No es escribible**:
+   * el alta y la actualización la ignoran, y solo la mueve la comprobación. Un
+   * repositorio nunca comprobado llega como «desconocido».
+   */
+  health: SaludDeRepositorio
+  /** RFC3339, en UTC, de la última comprobación; `null` si nunca se comprobó. */
+  health_checked_at: string | null
+  /** Motivo acotado y saneado de la última comprobación; `null` si no hay. */
+  health_detail: string | null
   /** RFC3339, en UTC. */
   created_at: string
 }

@@ -298,7 +298,8 @@ mod tests {
     /// valor por defecto— contra el §3, no solo el nombre: el escenario pide «las
     /// columnas, los tipos y los valores por defecto». Lo que se compara es el
     /// esquema que dejan **todas** las migraciones: el §3 más lo que añaden la `0003`
-    /// (`db_path`) y la `0005` (`backup_jobs.name`).
+    /// (`db_path`), la `0005` (`backup_jobs.name`) y la `0008` (la salud de
+    /// `repositories`).
     #[tokio::test]
     async fn las_cuatro_tablas_tienen_las_columnas_del_srs() {
         let (_directorio, pool) = base_migrada().await;
@@ -318,6 +319,13 @@ mod tests {
                     columna("secret_access_key", "TEXT", true, None),
                     columna("passphrase", "TEXT", true, None),
                     columna("created_at", "DATETIME", true, Some("CURRENT_TIMESTAMP")),
+                    // Las tres columnas de salud las añade la `0008` (issue #111): van
+                    // **detrás** de `created_at`, que es donde las deja el `ALTER
+                    // TABLE ... ADD COLUMN`, y las tres son anulables y sin valor por
+                    // defecto —el `NULL` de `health` es el estado «desconocido»—.
+                    columna("health", "TEXT", false, None),
+                    columna("health_checked_at", "DATETIME", false, None),
+                    columna("health_detail", "TEXT", false, None),
                 ],
             ),
             (
@@ -467,6 +475,152 @@ mod tests {
             sin_nombre, 2,
             "las tareas anteriores al change tienen que quedar con `name` a NULL"
         );
+
+        pool.close().await;
+    }
+
+    /// 1.1 (db — salud por repositorio) — La `0008` añade las tres columnas de salud a
+    /// `repositories`, con su `CHECK`, y **no toca las filas** que ya había.
+    ///
+    /// Es el mismo patrón que la 1.1 de la `0005`: se parte del estado de una instalación anterior a
+    /// este change —la base llevada hasta la `0007`— y **con una fila dentro**, y se aplica el
+    /// migrador sobre ella. Lo que se mide no es que el directorio tenga un fichero más: es que la
+    /// fila siga ahí con sus valores intactos y su salud a `NULL` —el «desconocido»—, que las tres
+    /// columnas queden declaradas con su tipo y su anulabilidad, y que el `CHECK` del enumerado esté
+    /// **en la base**: los cinco estados del contrato entran y un sexto no.
+    #[tokio::test]
+    async fn la_0008_anade_la_salud_sin_tocar_las_filas() {
+        let (_directorio, pool) = base_hasta(7).await;
+
+        // Una instalación anterior a este change, con su fila: es la que tiene que sobrevivir. Los
+        // secretos van como texto suelto —el sobre cifrado no le importa a esta prueba—, pero
+        // distinguible por columna, para que una copia con las columnas cruzadas no pase por buena.
+        sqlx::query(
+            "INSERT INTO repositories (id, name, endpoint, bucket, region, access_key_id, \
+             secret_access_key, passphrase, created_at) \
+             VALUES ('11111111-1111-1111-1111-111111111111', 'repo-de-antes', \
+             'https://s3.example.test/antes', 'cubo-de-antes', 'eu-west-1', 'AKIA-DE-ANTES', \
+             'sobre-del-secreto', 'sobre-de-la-passphrase', '2026-01-02 03:04:05')",
+        )
+        .execute(&pool)
+        .await
+        .expect("la fila anterior a la migración tiene que entrar");
+
+        let antes = columnas_de(&pool, "repositories").await;
+
+        for columna in ["health", "health_checked_at", "health_detail"] {
+            assert!(
+                !antes.iter().any(|declarada| declarada == columna),
+                "`{columna}` no puede existir antes de la `0008`: {antes:?}"
+            );
+        }
+
+        // La migración, sobre esa misma base con la fila dentro.
+        super::aplicar(&pool, &super::migrador())
+            .await
+            .expect("la 0008 tiene que aplicarse sobre una base llevada hasta la 0007");
+
+        // 1. Las tres columnas, declaradas como contrato: texto y fecha, y las tres anulables y sin
+        // valor por defecto —una fila anterior entra sin que nadie escriba la salud—.
+        let declaradas = columnas_completas_de(&pool, "repositories").await;
+
+        for (nombre, tipo, obligatoria) in [
+            ("health", "TEXT", false),
+            ("health_checked_at", "DATETIME", false),
+            ("health_detail", "TEXT", false),
+        ] {
+            let declarada = declaradas
+                .iter()
+                .find(|columna| columna.nombre == nombre)
+                .unwrap_or_else(|| panic!("la `0008` no dejó la columna `{nombre}`"));
+
+            assert_eq!(declarada.tipo, tipo, "`{nombre}` no es de tipo {tipo}");
+            assert!(
+                declarada.obligatoria == obligatoria,
+                "`{nombre}` tiene que admitir NULL: el «desconocido» es un estado válido"
+            );
+            assert_eq!(
+                declarada.por_defecto, None,
+                "`{nombre}` NO tiene valor por defecto: la salud no se inventa por omisión"
+            );
+        }
+
+        // 2. La fila de antes sigue ahí, con sus valores intactos y la salud a nulo.
+        let fila = sqlx::query(
+            "SELECT name, endpoint, bucket, region, access_key_id, secret_access_key, passphrase, \
+             created_at, health, health_checked_at, health_detail FROM repositories WHERE id = ?1",
+        )
+        .bind("11111111-1111-1111-1111-111111111111")
+        .fetch_one(&pool)
+        .await
+        .expect("la fila anterior tiene que seguir ahí tras la migración");
+
+        for (columna, esperado) in [
+            ("name", "repo-de-antes"),
+            ("endpoint", "https://s3.example.test/antes"),
+            ("bucket", "cubo-de-antes"),
+            ("region", "eu-west-1"),
+            ("access_key_id", "AKIA-DE-ANTES"),
+            ("secret_access_key", "sobre-del-secreto"),
+            ("passphrase", "sobre-de-la-passphrase"),
+            ("created_at", "2026-01-02 03:04:05"),
+        ] {
+            let valor: String = fila
+                .try_get(columna)
+                .unwrap_or_else(|error| panic!("`{columna}` tiene que poder leerse: {error}"));
+
+            assert_eq!(valor, esperado, "la migración tocó `{columna}`");
+        }
+
+        for columna in ["health", "health_checked_at", "health_detail"] {
+            let valor: Option<String> = fila
+                .try_get(columna)
+                .unwrap_or_else(|error| panic!("`{columna}` tiene que poder leerse: {error}"));
+
+            assert_eq!(
+                valor, None,
+                "la fila anterior a la `0008` tiene que quedar en «desconocido», no en `{columna}`"
+            );
+        }
+
+        // 3. El `CHECK` está **en la base**: los cinco estados entran y un sexto no, sin que nadie
+        // los valide antes. Es el contrato que la capa de acceso escribe —el nombre de la variante
+        // en snake_case—, y aquí se fija con los literales, que son los del texto almacenado.
+        for estado in [
+            "ok",
+            "sin_repositorio",
+            "passphrase",
+            "inaccesible",
+            "sin_permiso",
+        ] {
+            sqlx::query("UPDATE repositories SET health = ?1 WHERE id = ?2")
+                .bind(estado)
+                .bind("11111111-1111-1111-1111-111111111111")
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("`{estado}` tiene que entrar en el CHECK: {error}"));
+        }
+
+        let fuera_de_enum =
+            sqlx::query("UPDATE repositories SET health = 'desconocido' WHERE id = ?1")
+                .bind("11111111-1111-1111-1111-111111111111")
+                .execute(&pool)
+                .await
+                .expect_err("'desconocido' NO es un valor del enumerado: en la fila es NULL");
+
+        assert!(
+            fuera_de_enum
+                .to_string()
+                .contains("CHECK constraint failed"),
+            "el rechazo tiene que venir del CHECK de la base, no de otra cosa: {fuera_de_enum}"
+        );
+
+        // Y el `NULL` del «desconocido» sí pasa: es lo que deja a la fila sin comprobar todavía.
+        sqlx::query("UPDATE repositories SET health = NULL WHERE id = ?1")
+            .bind("11111111-1111-1111-1111-111111111111")
+            .execute(&pool)
+            .await
+            .expect("el NULL del «desconocido» tiene que entrar en el CHECK");
 
         pool.close().await;
     }

@@ -256,3 +256,183 @@ describe('pantalla de Ajustes', () => {
     unmount()
   })
 })
+
+/**
+ * La salud es **por repositorio**: la columna la nombra con su texto —el color
+ * no es el único portador— y trae la fecha de la última comprobación; la fila
+ * ofrece comprobar ese repositorio y la sección, comprobar todos.
+ */
+describe('pantalla de Ajustes — salud por repositorio', () => {
+  function filaDe(nombre: string): HTMLElement {
+    const fila = screen.getByText(nombre).closest('tr')
+    if (fila === null) throw new Error(`no hay fila para ${nombre}`)
+    return fila as HTMLElement
+  }
+
+  it('pinta el estado con su texto y la fecha de cada repositorio', async () => {
+    instalarFetchFalso(
+      manejadorCon({
+        'GET /api/v1/repositories': () => ({
+          status: 200,
+          data: [
+            repositorio({
+              id: 'r1',
+              name: 's3-uno',
+              health: 'ok',
+              health_checked_at: '2026-01-02T03:04:05Z',
+            }),
+            repositorio({ id: 'r2', name: 's3-dos', health: 'desconocido' }),
+          ],
+        }),
+      }),
+    )
+
+    const { unmount } = montar()
+
+    const tabla = await screen.findByRole('table', { name: 'Repositorios' })
+    // El texto acompaña al color en los dos estados.
+    expect(within(filaDe('s3-uno')).getByText('Correcto')).toBeInTheDocument()
+    expect(within(filaDe('s3-uno')).getByText(/última comprobación/i)).toHaveTextContent('2026')
+    // Sin comprobar: «Desconocido» con el guion del panel en la fecha.
+    expect(within(filaDe('s3-dos')).getByText('Desconocido')).toBeInTheDocument()
+    expect(within(filaDe('s3-dos')).getByText(/última comprobación/i)).toHaveTextContent('—')
+    expect(tabla).toBeInTheDocument()
+    unmount()
+  })
+
+  it('comprobar un repositorio pide su comprobación y el indicador refleja el estado devuelto', async () => {
+    const usuario = userEvent.setup()
+    const comprobado = repositorio({
+      id: 'r1',
+      // El mismo nombre: comprobar un repositorio no lo renombra, y así la fila
+      // se localiza igual antes y después del refresco.
+      name: 's3',
+      health: 'inaccesible',
+      health_checked_at: '2026-01-02T03:04:05Z',
+      health_detail: 'el destino no responde',
+    })
+    let listado = [REPO]
+    const fetch = instalarFetchFalso(
+      manejadorCon({
+        'GET /api/v1/repositories': () => ({ status: 200, data: listado }),
+        'POST /api/v1/repositories/r1/health': () => {
+          listado = [comprobado]
+          return {
+            status: 200,
+            data: {
+              health: 'inaccesible',
+              health_checked_at: '2026-01-02T03:04:05Z',
+              health_detail: 'el destino no responde',
+            },
+          }
+        },
+      }),
+    )
+
+    const { unmount } = montar()
+
+    await screen.findByRole('table', { name: 'Repositorios' })
+    await usuario.click(within(filaDe('s3')).getByRole('button', { name: 'Comprobar' }))
+
+    await waitFor(() => {
+      expect(fetch.a('/api/v1/repositories/r1/health')).toHaveLength(1)
+    })
+    expect(await within(filaDe('s3')).findByText('Inaccesible')).toBeInTheDocument()
+    expect(within(filaDe('s3')).getByText('el destino no responde')).toBeInTheDocument()
+    unmount()
+  })
+
+  it('el botón global comprueba todos los repositorios', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(
+      manejadorCon({
+        'POST /api/v1/repositories/health': () => ({
+          status: 200,
+          data: [{ health: 'ok', health_checked_at: '2026-01-02T03:04:05Z', health_detail: null }],
+        }),
+      }),
+    )
+
+    const { unmount } = montar()
+
+    await screen.findByRole('table', { name: 'Repositorios' })
+    await usuario.click(screen.getByRole('button', { name: 'Comprobar todos' }))
+
+    await waitFor(() => {
+      expect(fetch.a('/api/v1/repositories/health')).toHaveLength(1)
+    })
+    expect(fetch.a('/api/v1/repositories/health')[0]?.method).toBe('POST')
+    unmount()
+  })
+
+  it('una comprobación en curso no bloquea el resto de la tabla', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(
+      manejadorCon({
+        'GET /api/v1/repositories': () => ({
+          status: 200,
+          data: [repositorio({ id: 'r1', name: 's3-uno' }), repositorio({ id: 'r2', name: 's3-dos' })],
+        }),
+        // La comprobación de `s3-uno` no termina: lo que se mira pasa en curso.
+        'POST /api/v1/repositories/r1/health': () => new Promise<RespuestaSimulada>(() => {}),
+      }),
+    )
+
+    const { unmount } = montar()
+
+    await screen.findByRole('table', { name: 'Repositorios' })
+    await usuario.click(within(filaDe('s3-uno')).getByRole('button', { name: 'Comprobar' }))
+
+    // La fila que se está comprobando lo anuncia: el botón queda cargando
+    // (Antd le añade al nombre accesible el del icono, por eso se busca por
+    // coincidencia parcial)…
+    await waitFor(() => {
+      expect(within(filaDe('s3-uno')).getByRole('button', { name: /comprobar/i })).toHaveClass(
+        'ant-btn-loading',
+      )
+    })
+    // …y la otra fila sigue intacta y operable.
+    expect(within(filaDe('s3-dos')).getByText(/última comprobación/i)).toBeInTheDocument()
+    expect(within(filaDe('s3-dos')).getByRole('button', { name: 'Editar' })).toBeEnabled()
+    unmount()
+  })
+
+  it('mientras comprueba, la fila conserva el estado persistido: el panel no adelanta un desenlace', async () => {
+    const usuario = userEvent.setup()
+    const persistido = repositorio({
+      id: 'r1',
+      name: 's3-uno',
+      health: 'sin_permiso',
+      health_checked_at: '2026-01-02T03:04:05Z',
+      health_detail: 'faltan permisos de lectura',
+    })
+    instalarFetchFalso(
+      manejadorCon({
+        'GET /api/v1/repositories': () => ({ status: 200, data: [persistido] }),
+        // La comprobación nunca llega a responder: lo que se afirma es el
+        // estado que se enseña **durante** la espera.
+        'POST /api/v1/repositories/r1/health': () => new Promise<RespuestaSimulada>(() => {}),
+      }),
+    )
+
+    const { unmount } = montar()
+
+    await screen.findByRole('table', { name: 'Repositorios' })
+    expect(within(filaDe('s3-uno')).getByText('Sin permiso de lectura')).toBeInTheDocument()
+
+    await usuario.click(within(filaDe('s3-uno')).getByRole('button', { name: 'Comprobar' }))
+    await waitFor(() => {
+      expect(within(filaDe('s3-uno')).getByRole('button', { name: /comprobar/i })).toHaveClass(
+        'ant-btn-loading',
+      )
+    })
+
+    // Sigue lo **persistido**: ni un «Correcto» optimista ni un estado en blanco.
+    const fila = filaDe('s3-uno')
+    expect(within(fila).getByText('Sin permiso de lectura')).toBeInTheDocument()
+    expect(within(fila).getByText('faltan permisos de lectura')).toBeInTheDocument()
+    expect(within(fila).getByText(/última comprobación/i)).toHaveTextContent('2026')
+    expect(within(fila).queryByText('Correcto')).not.toBeInTheDocument()
+    unmount()
+  })
+})

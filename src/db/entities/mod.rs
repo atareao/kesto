@@ -35,7 +35,7 @@ pub use execution::{
     AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, FiltroDeEjecuciones, ObjetivoDeRestauracion,
 };
 pub use job::{AltaDeTarea, Tarea, Tareas};
-pub use repository::{AltaDeRepositorio, Repositorio, Repositorios};
+pub use repository::{AltaDeRepositorio, Repositorio, Repositorios, SaludDeRepositorio};
 pub use restauracion::{
     AltaDeRestauracion, FiltroDeRestauraciones, PaginaDeRestauraciones, Restauracion,
     RestauracionListada, Restauraciones,

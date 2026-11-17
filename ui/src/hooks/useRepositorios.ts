@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   actualizarRepositorio,
   borrarRepositorio,
+  comprobarSaludDeRepositorio,
+  comprobarSaludDeTodos,
   crearRepositorio,
   listarRepositorios,
 } from '../api/repositorios'
@@ -47,5 +49,37 @@ export function useBorrarRepositorio() {
       void cliente.invalidateQueries({ queryKey: claves.repositorios })
       void cliente.invalidateQueries({ queryKey: claves.tareas })
     },
+  })
+}
+
+/**
+ * Comprobación de salud de **un** repositorio.
+ *
+ * El desenlace lo persiste el backend antes de responder, así que al terminar se
+ * invalida el listado y el indicador enseña lo que quedó anotado en la fila, sin
+ * que el panel se invente un estado optimista. El `isPending` es de esta
+ * mutación y de nadie más: la comprobación de una fila no bloquea
+ * la tabla, y `variables` dice **cuál** se está comprobando.
+ *
+ * Un fallo no invalida nada: si la petición no llegó, el listado sigue siendo la
+ * última verdad conocida y el error se enseña como aviso.
+ */
+export function useComprobarSaludDeRepositorio() {
+  const cliente = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => comprobarSaludDeRepositorio(id),
+    onSuccess: () => cliente.invalidateQueries({ queryKey: claves.repositorios }),
+  })
+}
+
+/**
+ * Comprobación de salud de **todos** los repositorios. Igual que la anterior,
+ * invalida el listado al terminar para que cada fila refleje su desenlace.
+ */
+export function useComprobarSaludDeTodos() {
+  const cliente = useQueryClient()
+  return useMutation({
+    mutationFn: () => comprobarSaludDeTodos(),
+    onSuccess: () => cliente.invalidateQueries({ queryKey: claves.repositorios }),
   })
 }

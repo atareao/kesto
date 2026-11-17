@@ -106,6 +106,11 @@ describe('tipos del cable', () => {
       access_key_id: 'AKIA',
       has_secret_access_key: true,
       has_passphrase: true,
+      // La salud es de la **fila**, no del cuerpo: viaja en la lectura y no se
+      // admite en el alta ni en la actualización.
+      health: 'ok',
+      health_checked_at: '2026-01-02T03:04:05Z',
+      health_detail: null,
       created_at: '2026-01-02T03:04:05Z',
     }
 

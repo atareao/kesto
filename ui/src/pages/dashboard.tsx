@@ -1,5 +1,6 @@
 import { Flex, Typography } from 'antd'
 import { ProgresoEnVivo } from '../components/ProgresoEnVivo/ProgresoEnVivo'
+import { SaludDeRepositorios } from '../components/SaludDeRepositorios/SaludDeRepositorios'
 import { TablaDeTareasEnCurso } from '../components/TablaDeTareasEnCurso/TablaDeTareasEnCurso'
 import { TarjetasDeResumen } from '../components/TarjetasDeResumen/TarjetasDeResumen'
 
@@ -23,6 +24,17 @@ export default function Dashboard() {
         </Typography.Title>
 
         <TarjetasDeResumen />
+
+        <Flex vertical gap={12}>
+          <Typography.Title level={2} style={{ margin: 0 }}>
+            Repositorios
+          </Typography.Title>
+          {/*
+            La salud que se enseña es la **persistida**: este listado solo lee el
+            recurso y no comprueba nada contra los destinos.
+          */}
+          <SaludDeRepositorios />
+        </Flex>
 
         <Flex vertical gap={12}>
           <Typography.Title level={2} style={{ margin: 0 }}>
