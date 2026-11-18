@@ -111,7 +111,7 @@ export function TarjetasDeResumen() {
             {espacio.cargando ? (
               // El estado de carga tiene que ser anunciable, no un esqueleto
               // mudo: `role="status"` con un texto `sr-only` es el mismo patrón
-              // que usa el resto del panel (p. ej. la pantalla de sesión).
+              // que usa el resto del panel.
               <div role="status" aria-busy="true">
                 <span className="sr-only">Cargando el espacio consumido en S3…</span>
                 <Skeleton active paragraph={{ rows: 1 }} title={{ width: '60%' }} />

@@ -4,8 +4,8 @@
  * La capa de sesión del §3.4 no puede depender de que cada pantalla recuerde
  * tratar un `401`: un `401` de **cualquier** petición significa «la sesión ya no
  * vale». Aquí se reacciona una sola vez y en un solo sitio: se descarta la caché
- * de la sesión, su relectura da `401` y la guarda (`SoloConSesion`) lleva al
- * usuario a la pantalla de sesión.
+ * de la sesión, su relectura da `401` y la guarda (`SoloConSesion`) devuelve al
+ * visitante a la portada pública en `/`.
  *
  * El `401` de la **propia** sesión se deja pasar sin invalidarla otra vez: eso
  * sería releerla en bucle, y la spec lo prohíbe explícitamente.

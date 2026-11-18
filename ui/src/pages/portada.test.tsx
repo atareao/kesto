@@ -1,9 +1,11 @@
 import { render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ProveedorDeTema } from '../services/tema'
+import { CLAVE_DE_TEMA } from '../services/useTema'
 import { instalarFetchFalso } from '../../tests/fetchDePrueba'
 import type { ManejadorDeFetch, RespuestaSimulada } from '../../tests/fetchDePrueba'
 import Portada from './portada'
+import emblema from '../assets/kesto-emblema.png'
 
 vi.mock('./dashboard', () => ({
   default: () => <div data-testid="dashboard-de-prueba">Dashboard</div>,
@@ -40,10 +42,15 @@ function manejador({
 function montar({
   modo = 'oidc',
   sesion = 'sin',
+  tema,
 }: {
   modo?: ModoDePrueba
   sesion?: EstadoDeSesion
+  tema?: 'claro' | 'oscuro'
 } = {}) {
+  // El tema lo lee `ProveedorDeTema` al montar: se fija antes de renderizar.
+  if (tema !== undefined) window.localStorage.setItem(CLAVE_DE_TEMA, tema)
+
   const fetch = instalarFetchFalso(manejador({ modo, sesion }))
   const cliente = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0, staleTime: 0 } },
@@ -60,6 +67,7 @@ function montar({
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  window.localStorage.clear()
 })
 
 describe('Portada', () => {
@@ -81,6 +89,34 @@ describe('Portada', () => {
     const entrar = await screen.findByRole('link', { name: /entrar/i })
     expect(entrar).toHaveAttribute('href', '/api/v1/auth/login')
     expect(fetch.llamadas).toHaveLength(2)
+  })
+
+  it('muestra el logo de la marca y el nombre «Kesto»', async () => {
+    montar({ modo: 'oidc', sesion: 'sin' })
+
+    expect(await screen.findByTestId('logo-de-la-portada')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Kesto' })).toBeInTheDocument()
+  })
+
+  it('el logo es un único asset, el mismo con el tema claro y con el oscuro', async () => {
+    const claro = montar({ modo: 'oidc', sesion: 'sin', tema: 'claro' })
+    const srcClaro = (await screen.findByTestId('logo-de-la-portada')).getAttribute('src')
+    claro.unmount()
+
+    montar({ modo: 'oidc', sesion: 'sin', tema: 'oscuro' })
+    const srcOscuro = (await screen.findByTestId('logo-de-la-portada')).getAttribute('src')
+
+    // El `src` es el del asset declarado en el código: sin variantes por tema.
+    expect(srcClaro).toBe(emblema)
+    expect(srcOscuro).toBe(srcClaro)
+  })
+
+  it('declara el tamaño intrínseco del logo para no provocar saltos de diseño', async () => {
+    montar({ modo: 'oidc', sesion: 'sin' })
+
+    const logo = await screen.findByTestId('logo-de-la-portada')
+    expect(logo).toHaveAttribute('width', '256')
+    expect(logo).toHaveAttribute('height', '225')
   })
 
   it('en modo disabled entra directa al panel y no pinta la portada', async () => {
