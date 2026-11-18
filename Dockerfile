@@ -77,6 +77,8 @@ RUN --mount=type=secret,id=actions_cache_url \
     export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)"; \
     export SCCACHE_GHA_ENABLED="$([ -n "${ACTIONS_CACHE_URL}" ] && echo true || echo false)"; \
     find src -type f -exec touch {} +; \
+    mkdir -p kesto-mcp/src; \
+    echo '' > kesto-mcp/src/lib.rs; \
     cargo build --release --locked
 
 # ── Etapa 3: runtime mínimo ────────────────────────────────────────────────
