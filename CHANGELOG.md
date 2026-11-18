@@ -1,4 +1,26 @@
 # Changelog
+## [0.13.0] - 2026-11-18
+
+### Documentation
+
+- Cerrar purpose de verificacion-e2e y actualizar estado del repositorio
+- *(openspec)* Propuesta y plan de la portada pública (#118)
+- *(openspec)* Propuesta y plan del MCP y tokens de API (#119)
+- *(mcp)* Documentar el servidor MCP y cerrar tareas de la fase 2 (#119)
+
+### Features
+
+- *(ui)* Portada pública para visitantes sin sesión (#118)
+- *(api)* Tokens de API con scopes para el servidor MCP (#119)
+- *(mcp)* Servidor MCP (crate kesto-mcp) sobre rmcp (#119)
+
+### Miscellaneous Tasks
+
+- Ignorar artefactos de LocalAI ajenos al proyecto
+- *(plans)* Añadir PLAN-028 de limpieza del repositorio
+- Ignorar backends/ de LocalAI
+- *(plans)* Cerrar PLAN-028
+- *(openspec)* Archivar portada y MCP y cerrar PLAN-029/030
 ## [0.12.0] - 2026-11-17
 
 ### Documentation
@@ -13,6 +35,7 @@
 ### Miscellaneous Tasks
 
 - Sacar HANDOFF.md del control de versiones
+- Release v0.12.0
 ## [0.11.0] - 2026-11-17
 
 ### Documentation
