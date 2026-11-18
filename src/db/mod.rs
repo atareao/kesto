@@ -201,6 +201,17 @@ pub enum DbError {
         campo: &'static str,
     },
 
+    /// Se intentó guardar un token **sin ningún scope**.
+    ///
+    /// El `CHECK` del DDL solo admite `read`, `run` o `read,run`, así que el texto vacío que
+    /// saldría de un conjunto sin scopes lo rechazaría la base; esta guarda lo rechaza **antes**
+    /// de llegar a la sentencia, en el punto donde el error habla del campo y no de la tabla. Un
+    /// token sin permisos no significa nada: no habría nada que pudiera hacer.
+    ///
+    /// El mensaje nombra el **campo**, nunca el valor.
+    #[error("un token sin scopes no se guarda: `scopes` no puede quedar vacío")]
+    ScopesVacios,
+
     /// El cifrado en reposo falló al cifrar o al descifrar un secreto.
     ///
     /// Es transparente sobre [`crate::db::crypto::ErrorDeCifrado`] y lleva su

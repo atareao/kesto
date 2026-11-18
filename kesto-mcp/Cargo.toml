@@ -1,0 +1,51 @@
+[package]
+name = "kesto-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Servidor MCP de Kesto: deja a un agente leer el estado de las copias y lanzar una, hablando con la API por HTTP."
+license = "MIT"
+publish = false
+
+[dependencies]
+# `rmcp` 3.5.1 es el SDK oficial del protocolo. Sus features por defecto —`base64`,
+# `macros`, `server`— traen los macros `#[tool]`/`#[tool_router]`/`#[tool_handler]` y el
+# aparato de servidor (`schemars` para los esquemas de entrada). A eso se le suman los dos
+# transportes del change: `transport-io` para `stdio` (el defecto) y
+# `transport-streamable-http-server` para el HTTP de larga duración.
+#
+# NO se encienden `transport-child-process` ni `which-command`: arrastran `process-wrap` y
+# `which`, que no están en la caché local, y este crate no lanza subprocesos —el transporte
+# de subproceso es del lado **cliente**, y aquí solo se implementa el servidor—.
+#
+# NO se enciende ningún feature que arrastre el `reqwest` propio de `rmcp` (0.13.x): el
+# cliente HTTP de la API de Kesto usa el `reqwest` 0.12 que ya viaja en el árbol del
+# paquete raíz, para no meter un segundo `reqwest` en el `Cargo.lock`.
+rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
+# `axum` sirve el servicio de `Streamable HTTP` (que es un `Service` de tower) y no añade
+# ningún crate nuevo a la caché: es el mismo 0.8.9 que ya usa el paquete raíz.
+axum = { version = "0.8", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+# `CancellationToken` para el cierre ordenado del transporte HTTP; `rmcp` ya depende de
+# `tokio-util` 0.7, así que declararlo aquí no lo duplica.
+tokio-util = { version = "0.7", features = ["rt"] }
+# El cliente de la API de Kesto. `rustls-tls` y no el TLS por defecto, por el mismo motivo
+# que en el paquete raíz: mantiene OpenSSL fuera del árbol.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `http` para leer `http::request::Parts`, que es el tipo que `rmcp` inyecta en las
+# extensiones de cada petición del transporte HTTP: de ahí sale la cabecera
+# `Authorization` de la petición, que manda sobre el token del entorno.
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `schemars` 1.x, el mismo mayor que `rmcp` 3.5.1 usa para sus esquemas: declararlo con el
+# mayor equivocado dejaría el `JsonSchema` de los parámetros sin cumplir el bound de `rmcp`.
+schemars = "1"
+thiserror = "2"
+zeroize = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# API falsa de Kesto: `wiremock` 0.6.5 ya está en la caché porque el paquete raíz lo usa
+# para el proveedor OIDC falso.
+wiremock = "0.6.5"

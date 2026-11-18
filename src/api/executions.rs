@@ -65,6 +65,8 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FiltrosDelCable {
+    /// Ejecución concreta por la que filtrar.
+    pub id: Option<String>,
     /// Tarea por la que filtrar.
     pub job_id: Option<String>,
     /// Estado por el que filtrar.
@@ -78,14 +80,23 @@ pub struct FiltrosDelCable {
 impl FiltrosDelCable {
     /// Valida los parámetros de la consulta y los convierte en el filtro de la capa de acceso.
     ///
-    /// Todo lo que no encaja contesta `400` **nombrando el campo**: un `job_id` que no es un
-    /// UUID, un `status` que no es uno de los cuatro, un `limit` fuera de `1..=200` o un
-    /// `offset` negativo. El mensaje dice el rango cuando el campo lo tiene y **nunca** repite
+    /// Todo lo que no encaja contesta `400` **nombrando el campo**: un `id` o un `job_id` que
+    /// no son un UUID, un `status` que no es uno de los cuatro, un `limit` fuera de `1..=200` o
+    /// un `offset` negativo. El mensaje dice el rango cuando el campo lo tiene y **nunca** repite
     /// el valor: la regla de la casa es que un `400` diga qué campo está mal, no lo que traía.
     ///
     /// Un `limit` fuera de rango **no se recorta**: recortarlo dejaría a quien pidió creyendo
     /// que ha recibido lo que pidió.
     fn validar(self) -> Result<FiltroDeEjecuciones, AppError> {
+        let id = match self.id.as_deref() {
+            Some(valor) => Some(Uuid::parse_str(valor).map_err(|_| {
+                AppError::InvalidInput(
+                    "el campo `id` de la consulta no tiene la forma de un UUID".to_owned(),
+                )
+            })?),
+            None => None,
+        };
+
         let job_id = match self.job_id.as_deref() {
             Some(valor) => Some(Uuid::parse_str(valor).map_err(|_| {
                 AppError::InvalidInput(
@@ -126,6 +137,7 @@ impl FiltrosDelCable {
         };
 
         Ok(FiltroDeEjecuciones {
+            id,
             job_id,
             status,
             limite,
@@ -548,6 +560,80 @@ mod tests {
 
         assert_eq!(filas.len(), 1, "de la tarea A solo una terminó bien");
         assert_eq!(filas[0]["status"], "success", "y es la satisfactoria");
+    }
+
+    #[tokio::test]
+    async fn el_filtro_por_id_resuelve_una_ejecucion_y_su_ausencia_no_es_error() {
+        // api-resources: «El filtro por id devuelve una sola ejecución» y «Un id válido sin fila
+        // devuelve el listado vacío».
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+        let primera = sembrar_ejecucion(&estado, tarea, Estado::Success, base, 1000).await;
+        sembrar_ejecucion(
+            &estado,
+            tarea,
+            Estado::Failed,
+            base + Duration::seconds(10),
+            2000,
+        )
+        .await;
+
+        let respuesta = get(
+            api_router(estado.clone()),
+            &format!("/api/v1/executions?id={primera}"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(status, StatusCode::OK, "el filtro por id contesta {status}");
+
+        let filas = cuerpo["data"].as_array().expect("el listado es un array");
+
+        assert_eq!(filas.len(), 1, "el `id` resuelve una sola ejecución");
+        assert_eq!(filas[0]["id"], primera.hyphenated().to_string());
+
+        // Un identificador válido sin fila devuelve el listado vacío, no un 404.
+        let respuesta = get(
+            api_router(estado.clone()),
+            &format!("/api/v1/executions?id={}", Uuid::new_v4()),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "un id sin fila no es un error: contesta {status}"
+        );
+        assert!(
+            cuerpo["data"]
+                .as_array()
+                .is_some_and(|filas| filas.is_empty()),
+            "un id válido sin fila tiene que devolver el listado vacío: {cuerpo}"
+        );
+
+        // Y con forma inválida, un `400` que nombra el campo y no repite el valor.
+        let respuesta = get(api_router(estado), "/api/v1/executions?id=no-es-un-uuid").await;
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un id inválido contesta {status}"
+        );
+        assert!(
+            texto.contains("id"),
+            "el 400 tiene que nombrar el campo: {texto}"
+        );
+        assert!(
+            !texto.contains("no-es-un-uuid"),
+            "el 400 no puede repetir el valor: {texto}"
+        );
     }
 
     #[tokio::test]

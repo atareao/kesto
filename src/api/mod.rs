@@ -11,6 +11,7 @@ pub mod response;
 pub mod restorations;
 pub mod snapshots;
 pub mod targets;
+pub mod tokens;
 
 #[cfg(test)]
 mod secretos;
@@ -28,7 +29,7 @@ use crate::api::response::Data;
 use crate::auth::middleware;
 use crate::engine::ErrorDelMotor;
 use crate::error::AppError;
-use crate::state::{AppState, AuthState};
+use crate::state::AppState;
 
 /// Deja constancia de que una petición se atendió, sin su cuerpo.
 ///
@@ -86,7 +87,7 @@ pub fn api_router(state: AppState) -> Router {
 
     let router = match &state.auth {
         // Con proveedor, el flujo de entrada es público y el resto, protegido.
-        Some(auth) => {
+        Some(_) => {
             public = public
                 .route("/api/v1/auth/login", get(auth::login))
                 .route("/api/v1/auth/callback", get(auth::callback));
@@ -103,6 +104,11 @@ pub fn api_router(state: AppState) -> Router {
                 .merge(targets::router())
                 .merge(jobs::router())
                 .merge(executions::router())
+                // La gestión de credenciales de máquina: emite, lista y revoca tokens de API. Va
+                // en esta mitad —y no en el alcance de un token— porque **ningún token puede
+                // administrar tokens**: un token que pudiera emitir otro sería una vía de
+                // escalada. La sesión sí puede.
+                .merge(tokens::router())
                 // El explorador de instantáneas, como los tres recursos y no como el stream: su
                 // respuesta lleva la envoltura, así que lo único que tiene que llegarle es el
                 // *gate* de sesión, que es de esta mitad. No entra en la lista blanca.
@@ -119,7 +125,7 @@ pub fn api_router(state: AppState) -> Router {
                 // traza, que es la que deja constancia de que alguien se conectó.
                 .merge(events::router());
 
-            public.merge(protected_router(negocio, auth))
+            public.merge(protected_router(negocio, &state))
         }
         // En desarrollo no se monta la mitad protegida —no hay proveedor, así que
         // `/api/v1/auth/*` **no** se declara y contesta el `404` de la envoltura en vez
@@ -132,6 +138,10 @@ pub fn api_router(state: AppState) -> Router {
             .merge(targets::router())
             .merge(jobs::router())
             .merge(executions::router())
+            // La gestión de tokens, como los recursos: sin capa que montar queda abierta, que es
+            // lo que el modo de desarrollo significa —y es útil para emitir un token con el que
+            // probar el camino `Bearer` sin levantar un proveedor de identidad—.
+            .merge(tokens::router())
             // Y el explorador, igual: en este modo no hay ninguna capa que montar, así que queda
             // abierto como el resto —es lo que el modo de desarrollo significa— y el panel puede
             // explorar un repositorio sin un proveedor de identidad.
@@ -182,7 +192,7 @@ pub fn api_router(state: AppState) -> Router {
 /// colgar el *gate* sobre una ruta ficticia **por el mismo camino** que la
 /// producción, sin deformar el router de producción, que la llama con las que
 /// existan.
-pub fn protected_router<S>(routes: Router<S>, auth: &AuthState) -> Router<S>
+pub fn protected_router<S>(routes: Router<S>, estado: &AppState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -223,7 +233,7 @@ where
         // que lo pisó, así que su verde no dice nada del orden.
         .method_not_allowed_fallback(metodo_no_permitido)
         .route_layer(axum::middleware::from_fn_with_state(
-            auth.clone(),
+            estado.clone(),
             middleware::gate,
         ))
 }
@@ -452,9 +462,9 @@ mod tests {
     use super::{api_router, protected_router};
     use crate::api::response::{ApiResponse, Data};
     use crate::test_support::{
-        auth_oidc, body_json, body_text, cookie_de_sesion, estado_con_base, estado_desarrollo,
-        estado_oidc, get, get_with_cookie, header_text, lookup_from, post, post_with_cookie,
-        router_desarrollo, router_oidc,
+        body_json, body_text, cookie_de_sesion, estado_con_base, estado_desarrollo, estado_oidc,
+        get, get_with_cookie, header_text, lookup_from, post, post_with_cookie, router_desarrollo,
+        router_oidc,
     };
 
     use crate::config::Config;
@@ -608,7 +618,7 @@ mod tests {
 
         let eventos = protected_router(
             Router::new().route("/api/v1/events", axum::routing::get(negocio)),
-            &auth_oidc().await,
+            &estado_oidc().await,
         );
 
         let sin_cookie = get(eventos.clone(), "/api/v1/events").await;
@@ -640,7 +650,7 @@ mod tests {
         // estará la de verdad.
         let negocio_router = protected_router(
             Router::new().route("/api/v1/targets", axum::routing::get(negocio)),
-            &auth_oidc().await,
+            &estado_oidc().await,
         );
 
         let sin_cookie = get(negocio_router.clone(), "/api/v1/targets").await;

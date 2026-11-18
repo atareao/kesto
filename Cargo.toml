@@ -1,3 +1,13 @@
+# El repositorio es un workspace desde el change `mcp`: el binario y el panel viven en la
+# raíz —el paquete `kesto` sigue siendo el paquete raíz— y el servidor MCP vive en su propio
+# crate, `kesto-mcp`, porque su ciclo de vida no es el mismo: habla con la API por HTTP y no
+# comparte ninguna dependencia pesada con el motor. `resolver = "3"` es el que casa con
+# `edition = "2024"` (el v2 por defecto resolvería features-distintas-por-destino como si
+# fueran el mismo destino).
+[workspace]
+members = ["kesto-mcp"]
+resolver = "3"
+
 [package]
 name = "kesto"
 version = "0.12.0"
