@@ -44,14 +44,14 @@ export default function Portada() {
     <Flex vertical align="center" justify="center" gap={16} style={{ minHeight: '60vh' }}>
       {/* Un único emblema, con fondo transparente: se lee en claro y en oscuro.
           `alt=""` porque el nombre «Kesto» va justo debajo como texto. El par
-          `width`/`height` declara la proporción del asset (256×225) para que el
+          `width`/`height` declara la proporción del asset (256×256, cuadrado) para que el
           hueco se reserve antes de cargar: sin él, el logo empujaría el texto. */}
       <img
         data-testid="logo-de-la-portada"
         src={emblema}
         alt=""
         width={256}
-        height={225}
+        height={256}
         style={{ width: 128, height: 'auto' }}
       />
       <Typography.Title level={1} style={{ margin: 0 }}>
