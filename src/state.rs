@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::auth::oidc::Discovery;
 use crate::config::{AuthMode, Config, ConfigError, OidcSettings};
 use crate::db::crypto::Clave;
-use crate::db::entities::{Ejecuciones, Repositorios, Restauraciones, Tareas, Targets};
+use crate::db::entities::{Ejecuciones, Repositorios, Restauraciones, Tareas, Targets, Tokens};
 use crate::engine::Motor;
 use crate::secret::SecretString;
 
@@ -180,7 +180,7 @@ impl AuthState {
     }
 }
 
-/// El estado de base: el pool, la clave de cifrado y las **cuatro** capas de acceso.
+/// El estado de base: el pool, la clave de cifrado y las capas de acceso.
 ///
 /// Se construye **una sola vez**, al arrancar, y viaja dentro de [`AppState`] como
 /// campo **no opcional**: un Kesto sin base de datos no es un estado válido —sin base
@@ -189,7 +189,7 @@ impl AuthState {
 /// necesita ser asíncrona: quien abre la base y aplica el esquema es `src/main.rs` (y
 /// el arnés de pruebas), no el constructor del estado.
 ///
-/// Las cuatro capas se construyen sobre **este** pool y **esta** clave, y no sobre
+/// Las capas se construyen sobre **este** pool y **esta** clave, y no sobre
 /// otras: abrir un segundo pool sobre el mismo fichero no falla al abrirse —SQLite
 /// admite varias conexiones y WAL tolera que las dos lean y escriban— y el daño
 /// aparece más tarde y de forma intermitente, como una fila que una petición acaba de
@@ -198,7 +198,7 @@ impl AuthState {
 /// fijan en las opciones del pool que se abre aquí y en ningún otro sitio; un pool
 /// abierto por otro camino tendría que acordarse de fijarlos.
 ///
-/// Las cuatro capas van tras un [`Arc`] porque el estado **se clona en cada petición**
+/// Las capas van tras un [`Arc`] porque el estado **se clona en cada petición**
 /// y las capas no son clonables: clonar el estado no vuelve a construir ninguna, solo
 /// copia el puntero. La clave también va en un `Arc` porque es el material de cifrado
 /// del proceso, y cada capa que lo necesita recibe **el mismo**.
@@ -218,10 +218,16 @@ pub struct EstadoDeBase {
     pub ejecuciones: Arc<Ejecuciones>,
     /// La capa de acceso de `restore_executions`.
     pub restauraciones: Arc<Restauraciones>,
+    /// La capa de acceso de `api_tokens`.
+    ///
+    /// Es la única que **no** recibe la clave: `api_tokens` no tiene ninguna columna de secreto
+    /// que descifrar —guarda el hash, no el token—, y pasarle una clave que no usa sugeriría que
+    /// ahí se cifra algo.
+    pub tokens: Arc<Tokens>,
 }
 
 impl EstadoDeBase {
-    /// Construye las cuatro capas sobre el pool y la clave **dados**.
+    /// Construye las capas sobre el pool y la clave **dados**.
     ///
     /// `Tareas` no recibe la clave: `backup_jobs` no tiene ninguna columna de secreto, y
     /// pasarle una clave que no se usa sugeriría que ahí se cifra algo. `Ejecuciones` sí, y no
@@ -235,6 +241,7 @@ impl EstadoDeBase {
             tareas: Arc::new(Tareas::nuevo(pool.clone())),
             ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
             restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
+            tokens: Arc::new(Tokens::nuevo(pool.clone())),
             pool,
             clave,
         }
@@ -248,7 +255,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Estado de la autenticación: `None` cuando no se monta ninguna capa.
     pub auth: Option<AuthState>,
-    /// El estado de base: el pool, la clave y las cuatro capas de acceso.
+    /// El estado de base: el pool, la clave y las capas de acceso.
     ///
     /// **No** es un `Option`, y no es un detalle de estilo: un estado sin base
     /// declararía válido un Kesto sin base de datos, y no lo es. El tipo lo dice, así

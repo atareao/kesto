@@ -25,13 +25,25 @@ function Ubicacion() {
   return <span data-testid="ubicacion">{pathname}</span>
 }
 
-function montar(entrada = '/') {
+type ModoDePrueba = 'disabled' | 'oidc'
+type EstadoDeSesion = 'con' | 'sin'
+
+function montar(
+  entrada = '/',
+  { modo = 'disabled', sesion = 'sin' }: { modo?: ModoDePrueba; sesion?: EstadoDeSesion } = {},
+) {
   const cliente = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0, staleTime: 0 } },
   })
   instalarFetchFalso(({ ruta }) => {
     if (ruta === '/api/v1/health') {
-      return { status: 200, data: { version: '0.1.0', auth_mode: 'disabled' } }
+      return { status: 200, data: { version: '0.1.0', auth_mode: modo } }
+    }
+    if (ruta === '/api/v1/auth/session') {
+      if (sesion === 'con') {
+        return { status: 200, data: { sub: 'ana', email: 'ana@example.org' } }
+      }
+      return { status: 401, message: 'no hay sesión' }
     }
     throw new Error(`ruta inesperada: ${ruta}`)
   })
@@ -109,5 +121,58 @@ describe('rutas del panel', () => {
     expect(nav).toBeInTheDocument()
     // Las seis pantallas más la de sesión siguen alcanzables.
     expect(within(nav).getAllByRole('link')).toHaveLength(7)
+  })
+})
+
+describe('ruta índice', () => {
+  it('en modo oidc sin sesión enseña la portada pública', async () => {
+    montar('/', { modo: 'oidc', sesion: 'sin' })
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Kesto' })).toBeInTheDocument()
+    expect(screen.getByText(/copias de seguridad/i)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /entrar/i })).toHaveAttribute(
+      'href',
+      '/api/v1/auth/login',
+    )
+    expect(screen.queryByRole('heading', { level: 1, name: 'Dashboard' })).not.toBeInTheDocument()
+  })
+
+  it('en modo disabled entra directa al panel', async () => {
+    montar('/', { modo: 'disabled' })
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Dashboard' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Kesto' })).not.toBeInTheDocument()
+  })
+
+  it('en modo oidc con sesión entra al panel', async () => {
+    montar('/', { modo: 'oidc', sesion: 'con' })
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Dashboard' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Kesto' })).not.toBeInTheDocument()
+  })
+})
+
+describe('ruta de sesión', () => {
+  it('en modo disabled avisa de que no hay capa de sesión', async () => {
+    montar('/sesion', { modo: 'disabled' })
+
+    expect(await screen.findByText(/modo de desarrollo/i)).toBeInTheDocument()
+  })
+
+  it('en modo oidc sin sesión ofrece entrar', async () => {
+    montar('/sesion', { modo: 'oidc', sesion: 'sin' })
+
+    expect(await screen.findByText(/no hay sesión/i)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /entrar/i })).toHaveAttribute(
+      'href',
+      '/api/v1/auth/login',
+    )
+  })
+
+  it('en modo oidc con sesión muestra la identidad', async () => {
+    montar('/sesion', { modo: 'oidc', sesion: 'con' })
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sesión' })).toBeInTheDocument()
+    expect(screen.getByText('ana@example.org')).toBeInTheDocument()
   })
 })

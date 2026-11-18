@@ -131,12 +131,18 @@ pub struct Ejecuciones {
 
 /// Los filtros y la ventana del listado de `job_executions`.
 ///
-/// Los dos filtros son **opcionales y ausentes por defecto**, y la ventana llega siempre
+/// Los filtros son **opcionales y ausentes por defecto**, y la ventana llega siempre
 /// informada: el valor por defecto y el tope son del contrato HTTP, así que quien los decide es
 /// el manejador —que es quien conoce `limit`— y la capa de acceso no tiene que saber que
 /// existen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FiltroDeEjecuciones {
+    /// Ejecución concreta por la que filtrar; `None` no filtra.
+    ///
+    /// Existe para resolver **una** ejecución sin estrenar una ruta de detalle: el recurso sigue
+    /// siendo de solo lectura y su superficie no crece. Un identificador válido que no case
+    /// devuelve el listado vacío, como cualquier otro filtro.
+    pub id: Option<Uuid>,
     /// Tarea por la que filtrar; `None` no filtra.
     pub job_id: Option<Uuid>,
     /// Estado por el que filtrar; `None` no filtra.
@@ -226,9 +232,9 @@ const SQL_LISTAR: &str = "SELECT id, job_id, status, snapshot_id, bytes_processe
 
 /// Listado filtrado y paginado, con el orden del contrato.
 ///
-/// El `WHERE` se escribe **una sola vez** y con los dos filtros dentro de la misma sentencia:
-/// `?1 IS NULL OR job_id = ?1` no filtra cuando el filtro no llega, así que la consulta es una
-/// cadena **estática** y los cuatro valores van enlazados. Componerla en piezas según los
+/// El `WHERE` se escribe **una sola vez** y con los tres filtros dentro de la misma sentencia:
+/// `?1 IS NULL OR id = ?1` no filtra cuando el filtro no llega, así que la consulta es una
+/// cadena **estática** y los cinco valores van enlazados. Componerla en piezas según los
 /// filtros presentes sería construir una consulta concatenando, que es lo que la auditoría de
 /// este change prohíbe.
 ///
@@ -238,8 +244,8 @@ const SQL_LISTAR: &str = "SELECT id, job_id, status, snapshot_id, bytes_processe
 /// descendente es el del contrato: lo último primero, que es lo que el panel pinta.
 const SQL_LISTAR_FILTRADO: &str = "SELECT id, job_id, status, snapshot_id, bytes_processed, \
      bytes_uploaded, error_message, started_at, finished_at FROM job_executions \
-     WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR status = ?2) \
-     ORDER BY started_at DESC, id LIMIT ?3 OFFSET ?4";
+     WHERE (?1 IS NULL OR id = ?1) AND (?2 IS NULL OR job_id = ?2) AND (?3 IS NULL OR status = ?3) \
+     ORDER BY started_at DESC, id LIMIT ?4 OFFSET ?5";
 
 /// Alta de una ejecución, devolviendo la fila tal y como quedó.
 ///
@@ -442,6 +448,7 @@ impl Ejecuciones {
         filtro: &FiltroDeEjecuciones,
     ) -> Result<Vec<Ejecucion>, DbError> {
         let filas = sqlx::query(SQL_LISTAR_FILTRADO)
+            .bind(filtro.id.map(|id| id.hyphenated().to_string()))
             .bind(filtro.job_id.map(|id| id.hyphenated().to_string()))
             .bind(filtro.status.map(Estado::texto))
             .bind(filtro.limite)
@@ -1184,6 +1191,7 @@ mod tests {
         }
 
         let sin_filtros = FiltroDeEjecuciones {
+            id: None,
             job_id: None,
             status: None,
             limite: 50,
@@ -1242,6 +1250,7 @@ mod tests {
         // El filtro por estado acota.
         let solo_fallidas = ejecuciones
             .listar_filtrado(&FiltroDeEjecuciones {
+                id: None,
                 job_id: None,
                 status: Some(Estado::Failed),
                 limite: 50,
@@ -1259,6 +1268,7 @@ mod tests {
         // Un `job_id` que no es el de las filas no devuelve ninguna: el filtro no se ignora.
         let de_otra_tarea = ejecuciones
             .listar_filtrado(&FiltroDeEjecuciones {
+                id: None,
                 job_id: Some(Uuid::new_v4()),
                 status: None,
                 limite: 50,
@@ -1275,6 +1285,7 @@ mod tests {
         // La ventana se aplica: saltar una devuelve la segunda del orden.
         let segunda = ejecuciones
             .listar_filtrado(&FiltroDeEjecuciones {
+                id: None,
                 job_id: None,
                 status: None,
                 limite: 1,
@@ -1291,6 +1302,67 @@ mod tests {
         assert_eq!(
             segunda[0].id, todas[1].id,
             "saltar una tiene que dar la segunda del orden"
+        );
+
+        // El filtro por identificador resuelve **una** ejecución: es lo que el servidor MCP usa
+        // para resolver una ejecución concreta sin estrenar una ruta de detalle.
+        let solo_una = ejecuciones
+            .listar_filtrado(&FiltroDeEjecuciones {
+                id: Some(identificadores[0]),
+                job_id: None,
+                status: None,
+                limite: 50,
+                desplazamiento: 0,
+            })
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(
+            solo_una.len(),
+            1,
+            "el filtro por identificador tiene que acotar a una fila"
+        );
+        assert_eq!(solo_una[0].id, identificadores[0]);
+
+        // Y se combina con los otros dos: el mismo `id` con la tarea y el estado de su propia
+        // fila sigue devolviendo esa fila.
+        let la_de_ese_id = todas
+            .iter()
+            .find(|fila| fila.id == identificadores[0])
+            .expect("la ejecución dada de alta tiene que estar en el listado");
+
+        let combinado = ejecuciones
+            .listar_filtrado(&FiltroDeEjecuciones {
+                id: Some(identificadores[0]),
+                job_id: Some(la_de_ese_id.job_id),
+                status: Some(la_de_ese_id.status),
+                limite: 50,
+                desplazamiento: 0,
+            })
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(
+            combinado.len(),
+            1,
+            "el `id` tiene que combinarse con `job_id` y `status`"
+        );
+
+        // Un identificador válido que no está devuelve el listado vacío, no un error.
+        let inexistente = ejecuciones
+            .listar_filtrado(&FiltroDeEjecuciones {
+                id: Some(Uuid::new_v4()),
+                job_id: None,
+                status: None,
+                limite: 50,
+                desplazamiento: 0,
+            })
+            .await
+            .expect("un identificador sin fila no puede ser un error");
+
+        assert!(
+            inexistente.is_empty(),
+            "un `id` válido sin fila tiene que devolver el listado vacío"
         );
 
         // La guarda del directorio temporal sigue viva hasta aquí: si se soltara antes, la base

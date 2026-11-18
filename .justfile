@@ -55,13 +55,17 @@ fmt:
 fmt-fix:
     cargo fmt --all
 
-# Clippy con cero warnings, con los mismos flags que el CI
+# Clippy con cero warnings, con los mismos flags que el CI.
+#
+# `--workspace` no es adorno desde que el repositorio es un workspace: sin él, Cargo se
+# queda en el paquete raíz y el crate `kesto-mcp` —que es justo el que habla con la API por
+# HTTP— no se miraría nunca.
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
-# Tests unitarios (#[cfg(test)]) y de integración (tests/)
+# Tests unitarios (#[cfg(test)]) y de integración (tests/) de todo el workspace.
 test:
-    cargo test --locked
+    cargo test --locked --workspace
 
 # Pruebas de los scripts de `scripts/` (guard de `latest`, estructura del release)
 scripts-test:

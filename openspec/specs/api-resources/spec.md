@@ -248,7 +248,9 @@ El porqué de las dos mitades: la capa de acceso ya rechaza el vacío al escribi
 
 ### Requirement: El listado de ejecuciones lleva filtros, paginación acotada y orden estable
 
-`GET /api/v1/executions` SHALL admitir los filtros `job_id` y `status`, y la paginación `limit` y `offset`.
+`GET /api/v1/executions` SHALL admitir los filtros `id`, `job_id` y `status`, y la paginación `limit` y `offset`.
+
+El filtro `id` SHALL ser opcional y SHALL devolver, como mucho, la fila con ese identificador. Existe para que el servidor MCP pueda resolver una ejecución concreta —la herramienta `get_execution`— sin estrenar una ruta de detalle: el recurso sigue siendo de solo lectura y su superficie no crece. Un `id` con forma inválida SHALL contestar `400`; un `id` válido sin fila SHALL devolver el listado vacío, como cualquier otro filtro que no case.
 
 `limit` SHALL tener `50` como valor por defecto y **`200` de tope**, y un valor fuera de rango —por encima del tope o negativo— o no numérico SHALL contestar `400`. El tope existe porque el histórico es la tabla que más crece de las cuatro —una fila por intento de copia— y el panel pinta una página: sin tope, un `limit` grande materializaría la tabla entera en memoria y ocuparía una de las cinco conexiones del pool mientras el motor quiere escribir. Un valor fuera de rango es una petición mal formada, así que se contesta `400` y no se recorta en silencio: recortar dejaría al cliente creyendo que ha recibido lo que pidió.
 
@@ -271,6 +273,23 @@ Cada fila SHALL llevar además **`job_name`** (anulable): el nombre de la tarea 
 - **WHEN** se pide el listado con `job_id` y con `status`
 - **THEN** cada llamada SHALL devolver solo las filas que cumplen su filtro
 - **AND** los dos filtros SHALL poder usarse a la vez
+
+#### Scenario: El filtro por id devuelve una sola ejecución
+- **GIVEN** ejecuciones de dos tareas distintas
+- **WHEN** se pide el listado con el `id` de una de ellas
+- **THEN** SHALL devolver solo esa fila
+- **AND** SHALL poder combinarse con `job_id` y `status`
+
+#### Scenario: Un id válido sin fila devuelve el listado vacío
+- **GIVEN** el router con una sesión válida y un identificador que no existe
+- **WHEN** se pide el listado con `id`
+- **THEN** SHALL contestar `200` con una lista vacía
+- **AND** NO SHALL contestar `404`
+
+#### Scenario: Un id con forma inválida contesta 400
+- **GIVEN** el router con una sesión válida
+- **WHEN** se pide el listado con `id=no-es-un-uuid`
+- **THEN** SHALL contestar `400` con la envoltura
 
 #### Scenario: limit acota y offset avanza
 - **GIVEN** un histórico con más de una fila

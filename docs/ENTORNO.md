@@ -29,6 +29,21 @@
 - ⚠️ Y el `compose` del §8 **tal cual está publicado no arranca**: su bloque `environment` trae `RUST_LOG`, `DATABASE_URL` y `BIND_ADDRESS`, pero **falta `KESTO_MASTER_KEY`**, que es obligatoria siempre, así que el contenedor muere en el arranque nombrando la variable —Kesto es el orquestador de las copias y no arranca con una configuración incompleta—. Y aun añadiéndola queda decidir el modo: ese mismo `compose` no trae ninguna de las tres `OIDC_*`, de modo que arrancaría `Disabled`, **sin capa de autenticación y con todo `/api/v1/*` abierto en el 8080** —el modo de desarrollo de más abajo, que no es para un despliegue expuesto—. El §8 es un punto de partida, no un despliegue listo.
 
 
+## Servidor MCP (`kesto-mcp`)
+
+> Variables del **binario `kesto-mcp`**, que es un proceso aparte del servidor Kesto: no las mezcles con las de arriba. Todas se leen al arrancar y ninguna se escribe en el código ni en un fichero versionado. Detalle en `docs/FEATURE-030-mcp.md`.
+
+| Variable | Obligatoria | Valor por defecto | Para qué |
+|---|---|---|---|
+| `KESTO_URL` | **sí** | — | URL base de la API de Kesto. Ausente o vacía → **error de arranque** que nombra la variable. Se recorta y pierde la barra final |
+| `KESTO_API_TOKEN` | no | — | Token por defecto cuando la petición no trae `Authorization: Bearer`. Un valor vacío o en blanco se trata como **ausente**, no como error |
+| `KESTO_MCP_BIND_ADDRESS` | no | `127.0.0.1:8931` | Dirección del transporte HTTP (solo con `--transport http`). El defecto es bucle local a propósito |
+| `KESTO_MCP_ALLOWED_HOSTS` | no | los del SDK (bucle local) | Hosts admitidos por HTTP, separados por comas (solo con `--transport http`) |
+| `RUST_LOG` | no | `info` | Nivel de registro (va a **stderr**). A diferencia del servidor Kesto, un `RUST_LOG` ilegible **no** impide arrancar: cae al nivel por defecto |
+
+- El transporte se elige con argumentos, no con variables: `--transport <stdio|http>` (defecto `stdio`) y `--bind <dirección>` —que **sustituye** a `KESTO_MCP_BIND_ADDRESS` y **solo** vale con `--transport http`—.
+- El token nunca aparece en el registro, en los errores ni en la salida del servidor. En `stdio` no hay cabecera, así que manda `KESTO_API_TOKEN`; en HTTP, la cabecera `Authorization: Bearer` de la petición manda sobre el entorno.
+
 ## Entorno de desarrollo (verificado en esta máquina)
 
 | Herramienta | Estado |

@@ -43,6 +43,15 @@ pub enum AppError {
     #[error("{0}")]
     Unauthorized(String),
 
+    /// La credencial es válida pero no alcanza lo que se pide: es un `403`.
+    ///
+    /// Nace con los tokens de API (`mcp`): un token con scope `read` no puede disparar una copia,
+    /// y ninguno puede restaurar ni borrar. No es un `401` —la credencial es correcta y lo que
+    /// falla es su alcance—, así que el motivo se explica: nombra el permiso que falta, nunca el
+    /// token.
+    #[error("{0}")]
+    Forbidden(String),
+
     /// La petición es correcta pero la operación no se puede cumplir en esta versión: es un `422`.
     ///
     /// Nace con la restauración de instantáneas: restaurar un target de base de datos es una
@@ -127,6 +136,12 @@ impl IntoResponse for AppError {
             Self::MethodNotAllowed(motivo) => (StatusCode::METHOD_NOT_ALLOWED, motivo),
             // Al cliente que no ha entrado se le explica el motivo, como en el 400.
             Self::Unauthorized(motivo) => (StatusCode::UNAUTHORIZED, motivo),
+            // Y al que ha entrado pero no alcanza, también: el `403` nombra el permiso que falta y
+            // su motivo es lo único que le permite saber qué pedir. Se traza a `debug` como el 400.
+            Self::Forbidden(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición fuera del alcance de la credencial");
+                (StatusCode::FORBIDDEN, motivo)
+            }
             // Y al que choca con el estado actual del recurso, también: el `409` es un rechazo de
             // la petición y su motivo —«ya hay una ejecución en curso»— es lo único que le permite
             // saber qué hacer. Se traza a `debug` igual que el `400`.
