@@ -1,4 +1,10 @@
 # Changelog
+## [0.13.1] - 2026-11-18
+
+### Bug Fixes
+
+- *(docker)* Cargar el workspace completo en el build de la imagen
+- *(docker)* Crear src dummy del miembro en la capa final
 ## [0.13.0] - 2026-11-18
 
 ### Documentation
@@ -21,6 +27,7 @@
 - Ignorar backends/ de LocalAI
 - *(plans)* Cerrar PLAN-028
 - *(openspec)* Archivar portada y MCP y cerrar PLAN-029/030
+- Release v0.13.0
 ## [0.12.0] - 2026-11-17
 
 ### Documentation
