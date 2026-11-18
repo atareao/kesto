@@ -62,9 +62,14 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-26.04
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-26.04-arm
+          # TODO(#129): arm64 pausado temporalmente, hasta que la versión actual
+          # esté estable en producción. Mientras siga comentado, los tags de la
+          # imagen (X.Y.Z, X.Y, latest) son manifests SOLO amd64 y un `pull` en
+          # ARM falla. Al reactivar: descomentar estas tres líneas y verificar que
+          # el job `manifest` vuelve a ensamblar amd64 + arm64 (ver issue #129).
+          # - arch: arm64
+          #   platform: linux/arm64
+          #   runner: ubuntu-26.04-arm
     runs-on: ${{ matrix.runner }}
     concurrency:
       group: release-image-${{ matrix.arch }}
