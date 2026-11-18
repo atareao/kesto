@@ -37,6 +37,15 @@ describe('index.html declara la identidad de marca', () => {
     expect(MANIFIESTO).toMatch(/"theme_color":\s*"#0D1B2A"/i)
     expect(MANIFIESTO).toMatch(/"background_color":\s*"#0D1B2A"/i)
   })
+
+  it('mantiene el copy alineado con la identidad de producto', () => {
+    expect(INDICE).toMatch(
+      /<meta[^>]+property="og:title"[^>]+content="[^"]*Backup Orchestrator[^"]*"/i,
+    )
+    expect(INDICE).toMatch(/<meta[^>]+name="description"[^>]+content="[^"]*\S[^"]*"/i)
+    expect(MANIFIESTO).not.toMatch(/Data Security/i)
+    expect(MANIFIESTO).toMatch(/"description":\s*"[^"]*copias de seguridad[^"]*"/i)
+  })
 })
 
 describe('los assets de marca se sirven desde public/', () => {

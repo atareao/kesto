@@ -1,7 +1,7 @@
 {
   "name": "Kesto",
   "short_name": "Kesto",
-  "description": "Backups & Data Security",
+  "description": "Orquestador de copias de seguridad de bases de datos y volúmenes a S3, dentro de un contenedor.",
   "icons": [
     {
       "src": "/android-chrome-192x192.png",
