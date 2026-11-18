@@ -50,5 +50,5 @@
 
 ## 7. Documentación y cierre
 
-- [ ] 7.1 `docs/FEATURE-030-mcp.md` con herramientas, variables de entorno y ejemplo de configuración para opencode/Claude Desktop → verificación: revisión.
-- [ ] 7.2 `just check-all` en verde y renombrar el plan a `plans/PLAN-030-COMPLETED.md` → verificación: `just check-all`.
+- [x] 7.1 `docs/FEATURE-030-mcp.md` con herramientas, variables de entorno y ejemplo de configuración para opencode/Claude Desktop → verificación: revisión.
+- [x] 7.2 `just check-all` en verde y renombrar el plan a `plans/PLAN-030-COMPLETED.md` → verificación: `just check-all`.
