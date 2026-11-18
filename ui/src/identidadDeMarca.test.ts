@@ -51,6 +51,7 @@ describe('los assets de marca se sirven desde public/', () => {
     'android-chrome-512x512.png',
     'maskable-icon-512x512.png',
     'mstile-150x150.png',
+    'icon.svg',
     'site.webmanifest',
     'og-image-dark.png',
   ])('existe public/%s', (ruta) => {
