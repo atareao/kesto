@@ -12,9 +12,9 @@ import { ProveedorDeTema } from '../../services/tema'
  * La capa de sesión que exige la spec (§3.4):
  *
  * - `openspec/changes/ui-panel/specs/ui/spec.md:246` — sin sesión, al cargar el
- *   panel en modo `oidc`, se ofrece entrar.
- * - `:60` — un `401` de una petición cualquiera devuelve al usuario a la pantalla
- *   de sesión.
+ *   panel en modo `oidc`, se ofrece entrar desde la portada pública.
+ * - `:60` — un `401` de una petición cualquiera devuelve al visitante a la
+ *   portada pública en `/`.
  *
  * Se monta `App` entero (rutas y layout incluidos): es la integración lo que
  * estas pruebas afirman, no el detalle de la guarda.
@@ -59,7 +59,7 @@ afterEach(() => {
 })
 
 describe('capa de sesión en las rutas', () => {
-  it('en modo oidc sin sesión, cargar el panel lleva a la pantalla de sesión', async () => {
+  it('en modo oidc sin sesión, cargar el panel lleva a la portada pública', async () => {
     const fetch = instalarFetchFalso(({ ruta }) => {
       if (ruta === '/api/v1/health') return { status: 200, data: SALUD_OIDC }
       if (ruta === '/api/v1/auth/session') return { status: 401, message: 'no hay sesión' }
@@ -78,7 +78,7 @@ describe('capa de sesión en las rutas', () => {
     expect(fetch.a('/api/v1/auth/session')).toHaveLength(1)
   })
 
-  it('un 401 de una petición cualquiera devuelve a la pantalla de sesión', async () => {
+  it('un 401 de una petición cualquiera devuelve a la portada pública', async () => {
     // La sesión vale al cargar; el servidor la invalida al contestar el listado.
     let sesionValida = true
     const fetch = instalarFetchFalso(({ ruta }) => {
@@ -102,7 +102,7 @@ describe('capa de sesión en las rutas', () => {
     // Primero se pinta la pantalla protegida con la sesión todavía válida.
     expect(await screen.findByRole('heading', { level: 1, name: 'Tareas' })).toBeInTheDocument()
 
-    // El 401 del listado descarta la caché de sesión y devuelve a la de sesión.
+    // El 401 del listado descarta la caché de sesión y devuelve a la portada.
     expect(await screen.findByRole('link', { name: /entrar/i })).toHaveAttribute(
       'href',
       '/api/v1/auth/login',

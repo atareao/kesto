@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { BrowserRouter } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
-import { ConfigProvider } from 'antd'
+import { App as AntApp, ConfigProvider } from 'antd'
 import App from '../../App'
 import { crearClienteDeConsultas } from '../../services/clienteDeConsultas'
 import { ProveedorDeEventos } from '../../services/events'
@@ -15,6 +15,9 @@ import { temaDeAntd, useTema } from '../../services/useTema'
  * El `ConfigProvider` de Antd vive **dentro** de `ProveedorDeTema` porque
  * necesita `useTema()` para leer el modo activo y reconstruir el `ThemeConfig`
  * cuando cambia. El cliente de consultas se crea una sola vez por montaje.
+ *
+ * El `App` de Antd envuelve el árbol de rutas para que los avisos se pidan con
+ * `App.useApp()`: así el mensaje del cierre de sesión fallido hereda el tema.
  */
 export function PanelConTema() {
   const { modo } = useTema()
@@ -23,11 +26,13 @@ export function PanelConTema() {
   return (
     <ConfigProvider theme={temaDeAntd(modo)}>
       <QueryClientProvider client={cliente}>
-        <ProveedorDeEventos>
-          <BrowserRouter>
-            <App />
-          </BrowserRouter>
-        </ProveedorDeEventos>
+        <AntApp>
+          <ProveedorDeEventos>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </ProveedorDeEventos>
+        </AntApp>
       </QueryClientProvider>
     </ConfigProvider>
   )
