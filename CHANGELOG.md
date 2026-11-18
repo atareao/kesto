@@ -1,10 +1,19 @@
 # Changelog
+## [0.14.0] - 2026-11-18
+
+### Features
+
+- *(ui)* Portada pública con logo y barra lateral solo con sesión
 ## [0.13.1] - 2026-11-18
 
 ### Bug Fixes
 
 - *(docker)* Cargar el workspace completo en el build de la imagen
 - *(docker)* Crear src dummy del miembro en la capa final
+
+### Miscellaneous Tasks
+
+- Release v0.13.1
 ## [0.13.0] - 2026-11-18
 
 ### Documentation
