@@ -51,6 +51,7 @@ ENV RUSTC_WRAPPER=sccache \
 # Caché de dependencias: se compilan las dependencias contra un `main.rs` vacío,
 # de modo que esta capa se reutiliza mientras Cargo.toml/Cargo.lock no cambien.
 COPY Cargo.toml Cargo.lock ./
+COPY kesto-mcp/Cargo.toml ./kesto-mcp/Cargo.toml
 RUN --mount=type=secret,id=actions_cache_url \
     --mount=type=secret,id=actions_runtime_token \
     set -eux; \
@@ -59,13 +60,16 @@ RUN --mount=type=secret,id=actions_cache_url \
     export SCCACHE_GHA_ENABLED="$([ -n "${ACTIONS_CACHE_URL}" ] && echo true || echo false)"; \
     mkdir -p src; \
     echo 'fn main() {}' > src/main.rs; \
+    mkdir -p kesto-mcp/src; \
+    echo '' > kesto-mcp/src/lib.rs; \
     cargo build --release --locked; \
-    rm -rf src
+    rm -rf src kesto-mcp/src
 
 # `migrations/` es imprescindible: `sqlx::migrate!()` (src/db/migrate.rs) lee
 # el directorio en tiempo de compilación y lo incrusta en el binario.
 COPY src/ ./src/
 COPY migrations/ ./migrations/
+COPY kesto-mcp/Cargo.toml ./kesto-mcp/Cargo.toml
 RUN --mount=type=secret,id=actions_cache_url \
     --mount=type=secret,id=actions_runtime_token \
     set -eux; \
