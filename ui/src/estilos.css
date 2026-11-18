@@ -87,9 +87,11 @@ main:focus {
   flex-direction: column;
 }
 
-/* El conmutador a la izquierda y el plegado a la derecha. */
+/* El conmutador a la izquierda y el plegado a la derecha. El `wrap` deja que la
+   identidad de la sesión ocupe su propia línea, encima de los mandos. */
 .pie-del-panel {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -97,7 +99,19 @@ main:focus {
   margin-top: auto;
 }
 
-/* Plegada, la barra mide 80 px: los dos mandos pasan a una columna centrada. */
+/* Identidad de la sesión: línea propia, correo truncado si no cabe. */
+.identidad-de-la-sesion {
+  flex-basis: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+/* Plegada, la barra mide 80 px: los mandos pasan a una columna centrada. */
 .ant-layout-sider-collapsed .pie-del-panel {
   flex-direction: column;
   align-items: center;

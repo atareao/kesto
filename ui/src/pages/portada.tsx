@@ -2,6 +2,7 @@ import { Alert, Button, Flex, Typography } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { useSesion } from '../services/session'
 import Dashboard from './dashboard'
+import emblema from '../assets/kesto-emblema.png'
 
 /**
  * Portada pública (§6): la primera pantalla que ve quien no tiene sesión.
@@ -10,7 +11,8 @@ import Dashboard from './dashboard'
  * toca enseñar el panel o la portada:
  *
  * - `disabled` o `oidc` con sesión → panel.
- * - `oidc` sin sesión → portada con el botón de entrar.
+ * - `oidc` sin sesión → portada con la marca de Kesto y el botón de entrar, que
+ *   navega a `/api/v1/auth/login` (la redirección la hace el servidor).
  * - Mientras `/health` o la sesión no contestan → carga.
  * - Si `/health` falla → error.
  *
@@ -40,6 +42,18 @@ export default function Portada() {
 
   return (
     <Flex vertical align="center" justify="center" gap={16} style={{ minHeight: '60vh' }}>
+      {/* Un único emblema, con fondo transparente: se lee en claro y en oscuro.
+          `alt=""` porque el nombre «Kesto» va justo debajo como texto. El par
+          `width`/`height` declara la proporción del asset (256×225) para que el
+          hueco se reserve antes de cargar: sin él, el logo empujaría el texto. */}
+      <img
+        data-testid="logo-de-la-portada"
+        src={emblema}
+        alt=""
+        width={256}
+        height={225}
+        style={{ width: 128, height: 'auto' }}
+      />
       <Typography.Title level={1} style={{ margin: 0 }}>
         Kesto
       </Typography.Title>

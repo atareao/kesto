@@ -79,8 +79,8 @@ export function useSesion(): EstadoDeSesion {
     // Un `401` es una respuesta, no un fallo pasajero: ni se reintenta en la
     // consulta…
     retry: false,
-    // …ni al montar otro observador. Sin esto, el desvío a `/sesion` desmonta la
-    // guarda y monta la pantalla, y la relectura volvía a pedir la sesión: dos
+    // …ni al montar otro observador. Sin esto, el desvío a `/` desmonta la
+    // guarda y monta la portada, y la relectura volvía a pedir la sesión: dos
     // peticiones donde la spec quiere una. Un `401` es definitivo hasta que algo
     // lo invalide (`refrescar`, la salida o el `401` de `clienteDeConsultas`).
     retryOnMount: false,
