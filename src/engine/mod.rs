@@ -784,13 +784,24 @@ impl Motor {
         .await
     }
 
-    /// Lista las instantáneas de un repositorio, **fuera del runtime de Tokio**, hasta `ventana`.
+    /// Lista las instantáneas de un repositorio, **fuera del runtime de Tokio**, hasta `guarda`.
     ///
     /// Es la otra mitad que la capa HTTP necesita: el explorador del §5 lee los snapshots del
     /// **repositorio** y no del histórico de ejecuciones, así que hay que abrirlo y preguntarle.
     /// Abre y suelta el repositorio en la misma llamada —por lo mismo que
     /// [`Motor::abrir_repositorio`]— y devuelve las instantáneas ya resueltas y ordenadas de la más
     /// reciente a la más antigua.
+    ///
+    /// # `guarda` es un tope de **enumeración**, no una página
+    ///
+    /// El número acota cuántas instantáneas se enumeran y se resuelven, porque el identificador de
+    /// una instantánea es el nombre de un fichero y no lleva fecha: ordenar exige resolver, y
+    /// resolver todo sin freno sería un coste sin cota en un repositorio patológico. El motor
+    /// **corta** en `guarda` y devuelve lo enumerado —no hay una página ni un `offset` aquí: eso lo
+    /// decide la capa HTTP recortando el resultado—, de modo que quien cuente lo que devuelve el
+    /// motor obtiene un total exacto mientras la enumeración no toque la guarda, y un total que
+    /// **puede quedar corto** si la toca. Quien llama es quien conoce el valor de la guarda y puede
+    /// distinguir los dos casos por el tamaño del resultado.
     ///
     /// Un repositorio que todavía no existe se **inicializa**, que es lo que hace la puesta en
     /// marcha: la lista sale vacía y el destino queda creado. No se rechaza aquí porque quien
@@ -818,7 +829,7 @@ impl Motor {
     pub async fn listar_snapshots(
         &self,
         acceso: Acceso,
-        ventana: usize,
+        guarda: usize,
     ) -> Result<Vec<ResumenDeSnapshot>, ErrorDelMotor> {
         let abridor = self.0.contexto.ajustes.abridor;
 
@@ -833,7 +844,7 @@ impl Motor {
 
             let destino = acceso.nombre_del_destino();
             con_tope(&destino, TOPE_DEL_DESTINO, move || {
-                repositorio.listar_snapshots(ventana)
+                repositorio.listar_snapshots(guarda)
             })
             .map_err(|causa| ErrorDelMotor::Repositorio {
                 motivo: ejecucion::motivo_de_la_biblioteca(&causa.to_string(), &acceso),
@@ -3703,22 +3714,22 @@ mod tests {
         );
     }
 
-    /// **`listar_snapshots` lee del repositorio y respeta la ventana.**
+    /// **`listar_snapshots` lee del repositorio y respeta la guarda.**
     ///
     /// Es la otra mitad que necesita la capa HTTP —el explorador del §5 lee del **repositorio**, no
-    /// del histórico de ejecuciones—, y lo que fija es que sale de ahí y que la ventana acota.
+    /// del histórico de ejecuciones—, y lo que fija es que sale de ahí y que la guarda acota.
     ///
     /// Las dos cosas se afirman en **una sola** llamada, y no es un ahorro de líneas: en el
     /// repositorio hay tres instantáneas sembradas y en `job_executions` no hay **ninguna** fila,
     /// así que pedir dos y recibir dos dice a la vez que la lista sale del repositorio —de la base
-    /// habría salido vacía— y que la ventana acota. Y los resúmenes traen lo que el panel pinta.
+    /// habría salido vacía— y que la guarda acota. Y los resúmenes traen lo que el panel pinta.
     ///
     /// Se pide una sola vez porque cada llamada abre y cierra un repositorio, y abrirlo cuesta
     /// segundos: medido, `init` y `open` tardan **6,4 s** cada uno en la compilación de pruebas —es
     /// el coste de derivar la clave del repositorio—, y una prueba que llama dos veces paga dos
     /// veces por lo mismo.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn listar_snapshots_lee_del_repositorio_y_respeta_la_ventana() {
+    async fn listar_snapshots_lee_del_repositorio_y_respeta_la_guarda() {
         let aparato = Aparato::nuevo().await;
         sembrar_snapshots(
             &aparato.destino,
@@ -3740,7 +3751,7 @@ mod tests {
             devueltas.len(),
             2,
             "el repositorio tiene tres instantáneas y `job_executions` está vacía: pedir dos y \
-             recibir {} dice a la vez que la ventana acota y de dónde sale la lista",
+             recibir {} dice a la vez que la guarda acota y de dónde sale la lista",
             devueltas.len()
         );
 
