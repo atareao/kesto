@@ -98,7 +98,11 @@ async fn list_snapshots_devuelve_las_instantaneas_del_repositorio() {
         "/api/v1/snapshots",
         "repository_id",
         REPOSITORIO,
-        vec![json!({"id": "snap-1", "time": "2026-01-01T03:00:00Z"})],
+        json!({
+            "snapshots": [{"id": "snap-1", "time": "2026-01-01T03:00:00Z"}],
+            "total": 1,
+            "truncated": false,
+        }),
     )
     .await;
 
@@ -111,21 +115,23 @@ async fn list_snapshots_devuelve_las_instantaneas_del_repositorio() {
         )
         .await;
 
-    let filas = datos(&mensaje)
+    let filas = datos(&mensaje)["snapshots"]
         .as_array()
-        .expect("data es una lista")
+        .expect("el listado trae `snapshots` como lista")
         .clone();
 
     assert_eq!(filas[0]["id"], "snap-1");
 
     let consultas = consultas(&mock).await;
+    let consulta = consultas
+        .iter()
+        .find(|consulta| consulta.contains(&format!("repository_id={REPOSITORIO}")))
+        .unwrap_or_else(|| panic!("no llegó la consulta del listado: {consultas:?}"));
 
-    assert!(
-        consultas
-            .iter()
-            .any(|consulta| consulta.contains(&format!("repository_id={REPOSITORIO}"))),
-        "la API tiene que haber recibido el repositorio elegido: {consultas:?}"
-    );
+    // La entrada de `list_snapshots` no expone `limit`, así que la herramienta tiene que
+    // mandar el tope válido por su cuenta: sin él la API aplicaría su defecto (50) y el MCP
+    // dejaría de ver las instantáneas que veía antes de que el listado paginara.
+    assert!(consulta.contains("limit=200"), "{consulta}");
 }
 
 #[tokio::test]
@@ -133,14 +139,15 @@ async fn list_executions_respeta_los_filtros() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/executions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(envoltura(vec![json!({
+        .respond_with(ResponseTemplate::new(200).set_body_json(envoltura(json!({
+            "executions": [{
                 "id": EJECUCION,
                 "job_id": TAREA,
                 "status": "success",
                 "bytes_sent": 1024,
-            })])),
-        )
+            }],
+            "total": 1,
+        }))))
         .mount(&mock)
         .await;
 
@@ -153,9 +160,9 @@ async fn list_executions_respeta_los_filtros() {
         )
         .await;
 
-    let filas = datos(&mensaje)
+    let filas = datos(&mensaje)["executions"]
         .as_array()
-        .expect("data es una lista")
+        .expect("el histórico trae `executions` como lista")
         .clone();
 
     assert_eq!(filas.len(), 1);
@@ -179,7 +186,10 @@ async fn get_execution_devuelve_una_ejecucion_concreta() {
         "/api/v1/executions",
         "id",
         EJECUCION,
-        vec![json!({"id": EJECUCION, "status": "failed", "error": "timeout"})],
+        json!({
+            "executions": [{"id": EJECUCION, "status": "failed", "error": "timeout"}],
+            "total": 1,
+        }),
     )
     .await;
 
@@ -188,9 +198,9 @@ async fn get_execution_devuelve_una_ejecucion_concreta() {
         .llamar("get_execution", json!({"id": EJECUCION}), None)
         .await;
 
-    let filas = datos(&mensaje)
+    let filas = datos(&mensaje)["executions"]
         .as_array()
-        .expect("data es una lista")
+        .expect("el histórico trae `executions` como lista")
         .clone();
 
     assert_eq!(filas[0]["status"], "failed");
@@ -199,7 +209,12 @@ async fn get_execution_devuelve_una_ejecucion_concreta() {
 #[tokio::test]
 async fn get_execution_con_un_identificador_inexistente_no_devuelve_una_lista_vacia() {
     let mock = MockServer::start().await;
-    montar_lectura(&mock, "/api/v1/executions", json!([])).await;
+    montar_lectura(
+        &mock,
+        "/api/v1/executions",
+        json!({"executions": [], "total": 0}),
+    )
+    .await;
 
     let sesion = Sesion::abrir(&mock.uri(), Some(TOKEN)).await;
     let mensaje = sesion

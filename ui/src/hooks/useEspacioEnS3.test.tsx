@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { renderHook, waitFor } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { instalarFetchFalso } from '../../tests/fetchDePrueba'
 import { repositorio, snapshot } from '../../tests/fixtures'
@@ -25,7 +25,7 @@ function envolver(cliente: QueryClient) {
 
 /** La lista de instantáneas de un repositorio, con los bytes que se le digan. */
 function listado(bytes: number, id: string) {
-  return { status: 200, data: { snapshots: [snapshot({ id, bytes })], truncated: false } }
+  return { status: 200, data: { snapshots: [snapshot({ id, bytes })], total: 1, truncated: false } }
 }
 
 beforeEach(() => {
@@ -58,13 +58,16 @@ describe('useEspacioEnS3', () => {
     expect(result.current.cargando).toBe(false)
 
     // El recorte va **en la consulta** que depende del S3: una sola tentativa,
-    // no las cuatro del `retry: 3` de fábrica.
-    expect(cliente.getQueryCache().find({ queryKey: claves.snapshots('caido') })?.options.retry).toBe(
-      REINTENTOS_DE_S3,
-    )
+    // no las cuatro del `retry: 3` de fábrica. La clave lleva el `limit: 200`
+    // del `queryFn`, así que se busca con ese filtro.
+    expect(
+      cliente.getQueryCache().find({ queryKey: claves.snapshots('caido', { limit: 200 }) })?.options
+        .retry,
+    ).toBe(REINTENTOS_DE_S3)
     // Y el sano sí resolvió: su información no se pierde con el fallo del otro.
     expect(
-      cliente.getQueryCache().find({ queryKey: claves.snapshots('sano') })?.state.data,
+      cliente.getQueryCache().find({ queryKey: claves.snapshots('sano', { limit: 200 }) })?.state
+        .data,
     ).toBeDefined()
   })
 
@@ -88,10 +91,33 @@ describe('useEspacioEnS3', () => {
     expect(result.current.cargando).toBe(false)
   })
 
-  it('un listado recortado basta para que la cifra sea un mínimo, sin caídos', async () => {
+  it('un listado que no cubre el total basta para que la cifra sea un mínimo, sin caídos', async () => {
     instalarFetchFalso(() => ({
       status: 200,
-      data: { snapshots: [snapshot({ id: 's1', bytes: 1024 })], truncated: true },
+      data: { snapshots: [snapshot({ id: 's1', bytes: 1024 })], total: 500, truncated: false },
+    }))
+
+    const cliente = clienteDeFabrica()
+    const { result } = renderHook(() => useEspacioEnS3([repositorio({ id: 'r1' })]), {
+      wrapper: envolver(cliente),
+    })
+
+    await waitFor(() => expect(result.current.bytes).toBe(1024))
+
+    // Se leyeron menos instantáneas que las que el repositorio tiene: la suma es
+    // parcial. Ni se piden más páginas ni se recorta en cliente: se declara el
+    // mínimo con `snapshots.length < total`.
+    expect(result.current.esMinimo).toBe(true)
+    expect(result.current.repositoriosCaidos).toEqual([])
+  })
+
+  it('un listado truncado con la página completa también declara la cifra como mínimo', async () => {
+    instalarFetchFalso(() => ({
+      status: 200,
+      // La página cabe entera —`snapshots.length === total`— pero el backend
+      // declara que hay más: `truncated` es la señal explícita. Sin mirarla, la
+      // suma se presentaría como total y estaría mintiendo.
+      data: { snapshots: [snapshot({ id: 's1', bytes: 1024 })], total: 1, truncated: true },
     }))
 
     const cliente = clienteDeFabrica()
@@ -103,6 +129,27 @@ describe('useEspacioEnS3', () => {
 
     expect(result.current.esMinimo).toBe(true)
     expect(result.current.repositoriosCaidos).toEqual([])
+  })
+
+  it('reintentar invalida la clave con su limit: 200 (prefijo de array)', async () => {
+    const fetch = instalarFetchFalso(() => listado(1024, 's1'))
+
+    const cliente = clienteDeFabrica()
+    const { result } = renderHook(() => useEspacioEnS3([repositorio({ id: 'r1' })]), {
+      wrapper: envolver(cliente),
+    })
+
+    await waitFor(() => expect(result.current.bytes).toBe(1024))
+    expect(
+      cliente.getQueryCache().find({ queryKey: claves.snapshots('r1', { limit: 200 }) }),
+    ).toBeDefined()
+    const antes = fetch.a('/api/v1/snapshots').length
+
+    // El `reintentar` invalida por prefijo `['snapshots', id]`, que alcanza la
+    // clave completa de aquí (`['snapshots', id, { limit: 200 }]`).
+    act(() => result.current.reintentar())
+
+    await waitFor(() => expect(fetch.a('/api/v1/snapshots').length).toBeGreaterThan(antes))
   })
 
   it('no cambia la política de reintento global del cliente', () => {

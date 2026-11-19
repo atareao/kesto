@@ -4,6 +4,12 @@ import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { ConsolaDeEjecucion } from '../components/ConsolaDeEjecucion/ConsolaDeEjecucion'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
+import type { CambioDePagina } from '../components/Paginador/Paginador'
+import {
+  Paginador,
+  TAMANO_DE_PAGINA_POR_DEFECTO,
+  TEXTO_DE_PAGINA_VACIA,
+} from '../components/Paginador/Paginador'
 import { useEjecuciones } from '../hooks/useEjecuciones'
 import { useTareas } from '../hooks/useTareas'
 import type { Estado, Execution } from '../services/api/types'
@@ -11,36 +17,36 @@ import { colorDeEstado, etiquetaDeEstado } from '../services/estados'
 import { mensajeDeError } from '../services/errores'
 import { formatearBytes, formatearDuracion, formatearFecha, formatearUuid } from '../services/format'
 
-/** Filas por página. El contrato admite de 1 a 200; 20 llena una pantalla. */
-export const TAMANO_DE_PAGINA = 20
-
 const ESTADOS: readonly Estado[] = ['pending', 'running', 'success', 'failed']
 
 /**
  * Histórico (§6): ejecuciones paginadas, con filtros por tarea y estado, y la
  * consola en vivo de la ejecución elegida.
  *
- * La paginación es por `limit`/`offset` y no por páginas numeradas: la API no
- * publica un total. Por eso «Siguiente» se apaga cuando la página llega
- * incompleta —la heurística de «no hay más» que el contrato permite— y
- * «Anterior» cuando ya se está en la primera.
+ * La paginación es **del servidor**: el paginador de Antd se alimenta del `total`
+ * que publica la API y cada cambio de página o de tamaño se traduce en un
+ * `limit`/`offset` con el que se pide la página de verdad. No se recorta en
+ * cliente: el número de páginas sale del `total` del backend, no del tamaño de
+ * la lista recibida. Al cambiar un filtro se vuelve a la primera página, porque
+ * un `offset` heredado sobre un resultado acotado daría una página vacía.
  */
 export default function Historico() {
   const [jobId, setJobId] = useState<string | undefined>(undefined)
   const [estado, setEstado] = useState<Estado | undefined>(undefined)
-  const [offset, setOffset] = useState(0)
+  const [pagina, setPagina] = useState(1)
+  const [tamanoDePagina, setTamanoDePagina] = useState(TAMANO_DE_PAGINA_POR_DEFECTO)
   const [seleccionadaId, setSeleccionadaId] = useState<string | null>(null)
 
   const tareas = useTareas()
   const ejecuciones = useEjecuciones({
     job_id: jobId,
     status: estado,
-    limit: TAMANO_DE_PAGINA,
-    offset,
+    limit: tamanoDePagina,
+    offset: (pagina - 1) * tamanoDePagina,
   })
 
-  const datos = ejecuciones.data ?? []
-  const haySiguiente = datos.length === TAMANO_DE_PAGINA
+  const datos = ejecuciones.data?.executions ?? []
+  const total = ejecuciones.data?.total ?? 0
 
   // Solo se guarda el id: la fila se **deriva** de los datos vivos para que un
   // refresco traiga el `status`/`error_message` actuales. Congelar la fila al
@@ -109,12 +115,21 @@ export default function Historico() {
 
   const cambiarTarea = (valor: string | undefined) => {
     setJobId(valor)
-    setOffset(0)
+    setPagina(1)
   }
 
   const cambiarEstado = (valor: Estado | undefined) => {
     setEstado(valor)
-    setOffset(0)
+    setPagina(1)
+  }
+
+  /**
+   * El paginador ya decidió a qué página ir —y, al cambiar el tamaño, vuelve a
+   * la primera—: aquí solo se guardan las dos cifras y el `offset` se deriva.
+   */
+  const cambiarPagina = (cambio: CambioDePagina) => {
+    setPagina(cambio.pagina)
+    setTamanoDePagina(cambio.tamanoDePagina)
   }
 
   return (
@@ -152,36 +167,38 @@ export default function Historico() {
         />
       ) : ejecuciones.isPending ? (
         <Cargando />
-      ) : datos.length === 0 ? (
-        <Empty description="No hay ejecuciones para estos filtros" />
       ) : (
         <>
-          <Table<Execution>
-            aria-label="Ejecuciones"
-            rowKey="id"
-            columns={columnas}
-            dataSource={datos}
-            pagination={false}
-            size="small"
-          />
+          {datos.length === 0 ? (
+            <Empty
+              description={
+                pagina > 1 ? TEXTO_DE_PAGINA_VACIA : 'No hay ejecuciones para estos filtros'
+              }
+            />
+          ) : (
+            <Table<Execution>
+              aria-label="Ejecuciones"
+              rowKey="id"
+              columns={columnas}
+              dataSource={datos}
+              pagination={false}
+              size="small"
+            />
+          )}
 
-          <Space style={{ marginTop: 16 }}>
-            <Button
-              onClick={() => setOffset((previo) => Math.max(0, previo - TAMANO_DE_PAGINA))}
-              disabled={offset === 0}
-            >
-              Anterior
-            </Button>
-            <Button
-              onClick={() => setOffset((previo) => previo + TAMANO_DE_PAGINA)}
-              disabled={!haySiguiente}
-            >
-              Siguiente
-            </Button>
-            <Typography.Text type="secondary">
-              Página {Math.floor(offset / TAMANO_DE_PAGINA) + 1}
-            </Typography.Text>
-          </Space>
+          {/* El paginador va **fuera** del vacío: si la página encoge y esta
+              queda sin filas, sigue a la vista y el operador puede volver a la
+              primera. Se pinta cuando la API declara algo que paginar **o**
+              cuando el operador está fuera de la primera página y la purga dejó
+              el conjunto a cero: sin él no tendría control para retroceder. */}
+          {total > 0 || pagina > 1 ? (
+            <Paginador
+              total={total}
+              pagina={pagina}
+              tamanoDePagina={tamanoDePagina}
+              onCambiar={cambiarPagina}
+            />
+          ) : null}
         </>
       )}
 

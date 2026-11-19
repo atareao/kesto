@@ -8,6 +8,8 @@ import type {
   Execution,
   Health,
   Job,
+  ListadoDeEjecuciones,
+  ListadoDeSnapshots,
   Repository,
   Sesion,
   Snapshot,
@@ -212,5 +214,17 @@ describe('tipos del cable', () => {
       'u@example.org',
       null,
     ])
+  })
+
+  it('los listados paginados traen su página, su total y el aviso de recorte', () => {
+    // Candado del contrato de paginación: ejecuciones y snapshots envuelven la
+    // página con un `total` ajeno a `limit`/`offset`, y snapshots añade
+    // `truncated`. Si el backend deja el listado en array pelado, esto no
+    // compila.
+    const ejecuciones: ListadoDeEjecuciones = { executions: [], total: 120 }
+    const snapshots: ListadoDeSnapshots = { snapshots: [], total: 45, truncated: false }
+
+    expect([ejecuciones.total, ejecuciones.executions.length]).toEqual([120, 0])
+    expect([snapshots.total, snapshots.truncated, snapshots.snapshots.length]).toEqual([45, false, 0])
   })
 })

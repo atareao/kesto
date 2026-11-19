@@ -65,7 +65,10 @@ const manejadorBase: ManejadorDeFetch = ({ ruta, url }) => {
     }
   }
   if (ruta === '/api/v1/executions') {
-    return { status: 200, data: [ejecucion({ id: 'e1', job_id: 'j1', status: 'success' })] }
+    return {
+      status: 200,
+      data: { executions: [ejecucion({ id: 'e1', job_id: 'j1', status: 'success' })], total: 1 },
+    }
   }
   if (ruta === '/api/v1/snapshots') {
     const id = new URL(url, 'http://localhost').searchParams.get('repository_id')
@@ -73,7 +76,8 @@ const manejadorBase: ManejadorDeFetch = ({ ruta, url }) => {
       status: 200,
       data: {
         snapshots: [snapshot({ id: `s-${id}`, bytes: 4 * 1024 })],
-        truncated: id === 'r2',
+        truncated: false,
+        total: id === 'r2' ? 500 : 1,
       },
     }
   }

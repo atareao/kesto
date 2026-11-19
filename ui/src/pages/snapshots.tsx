@@ -3,6 +3,12 @@ import { Alert, Button, Checkbox, Empty, Input, Modal, Select, Space, Table, Typ
 import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
+import type { CambioDePagina } from '../components/Paginador/Paginador'
+import {
+  Paginador,
+  TAMANO_DE_PAGINA_POR_DEFECTO,
+  TEXTO_DE_PAGINA_VACIA,
+} from '../components/Paginador/Paginador'
 import { useRepositorios } from '../hooks/useRepositorios'
 import { useRestaurarSnapshot, useSnapshots } from '../hooks/useSnapshots'
 import type { EventoDeRestauracion, Snapshot, TipoDeTarget } from '../services/api/types'
@@ -278,6 +284,9 @@ function esperaDeRestauracion(enCurso: EnCurso): string {
 export default function Snapshots() {
   const repositorios = useRepositorios()
   const [seleccionado, setSeleccionado] = useState<string | null>(null)
+  /** Página pedida al servidor, contada desde 1, y su tamaño. */
+  const [pagina, setPagina] = useState(1)
+  const [tamanoDePagina, setTamanoDePagina] = useState(TAMANO_DE_PAGINA_POR_DEFECTO)
   const [aviso, setAviso] = useState<Aviso | null>(null)
   const [enCurso, setEnCurso] = useState<EnCurso | null>(null)
   /** El aviso de progreso se puede cerrar: una operación larga no debe tapar la tabla. */
@@ -297,7 +306,14 @@ export default function Snapshots() {
   // Sin elección explícita, se usa el primero: una pantalla que obliga a elegir
   // cuando solo hay un repositorio es un paso de más.
   const repositoryId = seleccionado ?? repositorios.data?.[0]?.id ?? null
-  const snapshots = useSnapshots(repositoryId)
+  // La paginación es **del servidor**: el paginador se alimenta del `total` que
+  // publica la API y cada cambio de página o de tamaño se traduce en el
+  // `limit`/`offset` con el que se pide la página de verdad, nunca recortando en
+  // cliente una lista ya recibida.
+  const snapshots = useSnapshots(repositoryId, {
+    limit: tamanoDePagina,
+    offset: (pagina - 1) * tamanoDePagina,
+  })
 
   // El avance llega por SSE (`restore_progress`), no por una recarga del
   // listado. El hook se suscribe desde el montaje y no lo suelta entre
@@ -464,6 +480,15 @@ export default function Snapshots() {
     setProgresoOculto(true)
   }
 
+  /**
+   * El paginador ya decidió a qué página ir —y, al cambiar el tamaño, vuelve a
+   * la primera—: aquí solo se guardan las dos cifras y el `offset` se deriva.
+   */
+  const cambiarPagina = (cambio: CambioDePagina) => {
+    setPagina(cambio.pagina)
+    setTamanoDePagina(cambio.tamanoDePagina)
+  }
+
   const columnas: TableProps<Snapshot>['columns'] = [
     {
       title: 'Identificador',
@@ -599,7 +624,11 @@ export default function Snapshots() {
               aria-label="Repositorio"
               style={{ minWidth: 220 }}
               value={repositoryId ?? undefined}
-              onChange={(valor: string) => setSeleccionado(valor)}
+              onChange={(valor: string) => {
+                setSeleccionado(valor)
+                // Otro repositorio es otro listado: la página heredada no vale.
+                setPagina(1)
+              }}
               options={(repositorios.data ?? []).map((repositorio) => ({
                 value: repositorio.id,
                 label: repositorio.name,
@@ -657,7 +686,13 @@ export default function Snapshots() {
               )}
 
               {(snapshots.data?.snapshots ?? []).length === 0 ? (
-                <Empty description="No hay instantáneas en este repositorio" />
+                <Empty
+                  description={
+                    pagina > 1
+                      ? TEXTO_DE_PAGINA_VACIA
+                      : 'No hay instantáneas en este repositorio'
+                  }
+                />
               ) : (
                 <Table<Snapshot>
                   aria-label="Snapshots del repositorio"
@@ -668,6 +703,21 @@ export default function Snapshots() {
                   size="small"
                 />
               )}
+
+              {/* El paginador va **fuera** del vacío: si la página encoge y la
+                  actual queda sin filas, sigue a la vista y el operador puede
+                  volver a la primera. Se pinta cuando la API declara algo que
+                  paginar **o** cuando el operador está fuera de la primera
+                  página y la purga dejó el conjunto a cero: sin él no tendría
+                  control para retroceder. */}
+              {(snapshots.data?.total ?? 0) > 0 || pagina > 1 ? (
+                <Paginador
+                  total={snapshots.data?.total ?? 0}
+                  pagina={pagina}
+                  tamanoDePagina={tamanoDePagina}
+                  onCambiar={cambiarPagina}
+                />
+              ) : null}
             </>
           )}
         </>

@@ -29,6 +29,21 @@ estado de los repositorios, los targets, las tareas y el histórico de ejecucion
 copia cuando toca y comprueba la salud de un repositorio. No restaura instantáneas, no borra \
 recursos y no edita nada: este servidor no expone esas operaciones.";
 
+/// El tope de página que `GET /api/v1/snapshots` acepta: `1..=200`.
+///
+/// `list_snapshots` **no** expone `limit` en su entrada —el consumidor de esta herramienta no
+/// pide páginas, ve la ventana entera—, así que sin este valor fijo la API aplicaría su
+/// defecto (`LIMITE_POR_DEFECTO`, 50) y el MCP dejaría de ver las instantáneas que sí veía
+/// antes de que el listado pasara a paginar. Se pide el máximo válido a propósito: restaurar
+/// el comportamiento previo es el objetivo, y la paginación del lado del agente —que el
+/// agente pueda pedir offset— es un cambio aparte y fuera de alcance.
+///
+/// Es una copia deliberada de `LIMITE_MAXIMO` de `src/api/snapshots.rs`: ese valor vive en el
+/// paquete raíz `kesto`, que es un **binario sin `lib.rs`**, y un binario no es enlazable como
+/// dependencia, así que este crate no puede importarlo. Si el tope del backend cambia, esta
+/// constante hay que acompañarlo a mano.
+const LIMITE_DE_SNAPSHOTS: i64 = 200;
+
 /// El servidor MCP de Kesto.
 #[derive(Debug, Clone)]
 pub struct KestoMcp {
@@ -180,7 +195,12 @@ impl KestoMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(peticion): Parameters<PorRepositorio>,
     ) -> CallToolResult {
-        let consulta = [("repository_id", peticion.repository_id)];
+        // `limit` viaja fijo al tope válido porque la entrada de la herramienta no lo expone
+        // y su defecto dejaría fuera instantáneas que antes llegaban. Ver `LIMITE_DE_SNAPSHOTS`.
+        let consulta = [
+            ("repository_id", peticion.repository_id),
+            ("limit", LIMITE_DE_SNAPSHOTS.to_string()),
+        ];
 
         self.leer(&ctx, "/api/v1/snapshots", &consulta).await
     }
@@ -230,9 +250,10 @@ impl KestoMcp {
         let resultado = self.leer(&ctx, "/api/v1/executions", &consulta).await;
 
         // La API no tiene `GET /executions/{id}`: el histórico se filtra por `id`, y un
-        // identificador que no está devuelve **una lista vacía**, no un `404`. Devolverla
-        // tal cual haría creer al agente que la ejecución existe y no tiene filas, así que
-        // aquí se convierte en un error de herramienta con el identificador nombrado.
+        // identificador que no está devuelve una envoltura con `executions` **vacío**, no un
+        // `404`. Devolverla tal cual haría creer al agente que la ejecución existe y no tiene
+        // filas, así que aquí se convierte en un error de herramienta con el identificador
+        // nombrado.
         if resultado.is_error != Some(true) && filas_vacias(&resultado) {
             let error = ApiError::RespuestaDeLaApi {
                 status: 404,
@@ -351,12 +372,17 @@ fn error_de_herramienta(error: &ApiError) -> CallToolResult {
     }))
 }
 
-/// ¿La respuesta de la API trae la lista de filas vacía?
+/// ¿La respuesta es la **envoltura del histórico** con las ejecuciones vacías?
+///
+/// Desde que el listado dejó de ser un array pelado, `data` es `{executions, total}`: «vacío» es que
+/// `executions` sea una lista vacía. Un cuerpo sin esa clave —otro recurso, o un error— **no** cuenta
+/// como vacío: convertir eso en «esa ejecución no existe» mandaría a buscar el fallo donde no está.
 fn filas_vacias(resultado: &CallToolResult) -> bool {
     resultado
         .structured_content
         .as_ref()
         .and_then(|cuerpo| cuerpo.get("data"))
+        .and_then(|data| data.get("executions"))
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty)
 }
@@ -425,13 +451,21 @@ mod tests {
     }
 
     #[test]
-    fn una_lista_vacia_se_reconoce() {
-        let vacia = CallToolResult::structured(serde_json::json!({"data": []}));
-        let con_filas = CallToolResult::structured(serde_json::json!({"data": [{"id": "x"}]}));
+    fn una_lista_de_ejecuciones_vacia_se_reconoce() {
+        let vacia =
+            CallToolResult::structured(serde_json::json!({"data": {"executions": [], "total": 0}}));
+        let con_filas = CallToolResult::structured(
+            serde_json::json!({"data": {"executions": [{"id": "x"}], "total": 1}}),
+        );
         let sin_datos = CallToolResult::structured(serde_json::json!({"message": "hola"}));
+        let array_pelado = CallToolResult::structured(serde_json::json!({"data": []}));
 
         assert!(filas_vacias(&vacia));
         assert!(!filas_vacias(&con_filas));
         assert!(!filas_vacias(&sin_datos));
+        assert!(
+            !filas_vacias(&array_pelado),
+            "el histórico ya no viaja como array pelado: un `data` que no sea la envoltura no es vacío"
+        );
     }
 }

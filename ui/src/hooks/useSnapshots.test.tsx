@@ -60,4 +60,30 @@ describe('useSnapshots', () => {
     expect(result.current.isPending).toBe(true)
     expect(result.current.isError).toBe(false)
   })
+
+  it('propaga limit y offset y devuelve la página con total y el aviso de recorte', async () => {
+    const fetch = instalarFetchFalso(() => ({
+      status: 200,
+      data: { snapshots: [{ id: 'a'.repeat(64) }], total: 45, truncated: true },
+    }))
+
+    const cliente = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0, staleTime: 0 } },
+    })
+    const { result } = renderHook(() => useSnapshots('r1', { limit: 10, offset: 10 }), {
+      wrapper: envolver(cliente),
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+    // La paginación viaja a la API junto al repositorio.
+    const peticion = fetch.a('/api/v1/snapshots')[0]
+    expect(peticion?.url).toContain('repository_id=r1')
+    expect(peticion?.url).toContain('limit=10')
+    expect(peticion?.url).toContain('offset=10')
+
+    // El total —ajeno a limit/offset— y el recorte los publica la respuesta.
+    expect(result.current.data?.total).toBe(45)
+    expect(result.current.data?.truncated).toBe(true)
+  })
 })
