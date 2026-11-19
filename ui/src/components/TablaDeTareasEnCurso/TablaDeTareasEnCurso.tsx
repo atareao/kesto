@@ -55,7 +55,7 @@ export function TablaDeTareasEnCurso() {
   const ejecuciones = useEjecuciones({ limit: 200 })
   const { ejecuciones: eventos } = useEventStream()
 
-  const ultimas = ultimasPorTarea(ejecuciones.data ?? [])
+  const ultimas = ultimasPorTarea(ejecuciones.data?.executions ?? [])
   const porTarea = eventosPorTarea(eventos)
 
   const filas: FilaDeTarea[] = (tareas.data ?? [])

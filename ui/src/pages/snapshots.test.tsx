@@ -10,7 +10,6 @@ import {
   instalarEventSourceFalso,
 } from '../../tests/eventosDePrueba'
 import { repositorio, snapshot } from '../../tests/fixtures'
-import { claves } from '../hooks/claves'
 import { REINTENTOS_DE_S3 } from '../hooks/useSnapshots'
 import { ProveedorDeEventos } from '../services/events'
 import { NOMBRE_DEL_EVENTO_DE_RESTAURACION } from '../services/useEventStream'
@@ -84,6 +83,7 @@ describe('pantalla de Snapshots', () => {
         status: 200,
         data: {
           snapshots: [snapshot({ id: HEX, label: null, files: 12, bytes: 2048 })],
+          total: 1,
           truncated: true,
         },
       })),
@@ -113,6 +113,8 @@ describe('pantalla de Snapshots', () => {
           status: 200,
           data: {
             snapshots: [snapshot({ id: id === 'r2' ? 'b'.repeat(64) : HEX })],
+            // Con 25 instantáneas hay tres páginas: se puede salir de la primera.
+            total: 25,
             truncated: false,
           },
         }
@@ -122,12 +124,57 @@ describe('pantalla de Snapshots', () => {
     const { unmount } = montar()
     await esperarLaTabla()
 
+    // Salir de la página 1 antes del cambio: sin esto, un `offset` heredado en 0
+    // pasaría la prueba sin demostrar que el repositorio nuevo empieza en 0.
+    await usuario.click(screen.getByTitle('2'))
+    await waitFor(() => {
+      expect(
+        fetch
+          .a('/api/v1/snapshots')
+          .some(
+            (llamada) =>
+              llamada.url.includes('repository_id=r1') && llamada.url.includes('offset=10'),
+          ),
+      ).toBe(true)
+    })
+
     await usuario.click(screen.getByRole('combobox', { name: 'Repositorio' }))
     await usuario.click(await screen.findByTitle('glacier'))
 
     await waitFor(() => {
+      const alNuevoRepositorio = fetch
+        .a('/api/v1/snapshots')
+        .filter((llamada) => llamada.url.includes('repository_id=r2'))
+      expect(alNuevoRepositorio.at(-1)?.url).toContain('offset=0')
+    })
+    unmount()
+  })
+
+  it('el paginador se alimenta del total y pide la página al servidor', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: { snapshots: [snapshot({ id: HEX })], total: 45, truncated: false },
+      })),
+    )
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+
+    // 45 instantáneas a 10 por página son 5 páginas, y el total sale de la API.
+    expect(screen.getByText('45 elementos')).toBeInTheDocument()
+    expect(screen.getByTitle('5')).toBeInTheDocument()
+
+    const primera = fetch.a('/api/v1/snapshots')[0]
+    expect(primera?.url).toContain('limit=10')
+    expect(primera?.url).toContain('offset=0')
+
+    // Cambiar de página pide **esa** página al servidor, no recorta en cliente.
+    await usuario.click(screen.getByTitle('2'))
+    await waitFor(() => {
       expect(
-        fetch.a('/api/v1/snapshots').some((llamada) => llamada.url.includes('repository_id=r2')),
+        fetch.a('/api/v1/snapshots').some((llamada) => llamada.url.includes('offset=10')),
       ).toBe(true)
     })
     unmount()
@@ -137,7 +184,7 @@ describe('pantalla de Snapshots', () => {
     instalarFetchFalso(
       manejadorCon(() => ({
         status: 200,
-        data: { snapshots: [], truncated: false },
+        data: { snapshots: [], total: 0, truncated: false },
       })),
     )
 
@@ -153,7 +200,7 @@ describe('pantalla de Snapshots', () => {
   })
 
   it('sin repositorios enseña un estado vacío con su explicación', async () => {
-    instalarFetchFalso(manejadorCon(() => ({ status: 200, data: { snapshots: [], truncated: false } }), []))
+    instalarFetchFalso(manejadorCon(() => ({ status: 200, data: { snapshots: [], total: 0, truncated: false } }), []))
 
     const { unmount } = montar()
 
@@ -211,9 +258,14 @@ describe('pantalla de Snapshots', () => {
     ).toBeInTheDocument()
     expect(screen.queryByTestId('cargando')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Reintentar' })).toBeInTheDocument()
-    expect(cliente.getQueryCache().find({ queryKey: claves.snapshots('r1') })?.options.retry).toBe(
-      REINTENTOS_DE_S3,
-    )
+    // La clave de esta consulta ya no es `['snapshots', id]`: el listado es
+    // paginado y los filtros —`limit`/`offset`— viajan dentro de la clave. Se
+    // busca por la raíz, que es lo que identifica a la consulta del listado.
+    const consultaDeSnapshots = cliente
+      .getQueryCache()
+      .getAll()
+      .find((consulta) => consulta.queryKey[0] === 'snapshots')
+    expect(consultaDeSnapshots?.options.retry).toBe(REINTENTOS_DE_S3)
     // Acotado: una sola tentativa, no las cuatro del `retry: 3` de fábrica.
     expect(fetch.a('/api/v1/snapshots')).toHaveLength(1)
     unmount()
@@ -232,6 +284,7 @@ describe('pantalla de Snapshots', () => {
             snapshot({ id: HEX, label: 'j1', job_name: 'copia nocturna' }),
             snapshot({ id: OTRO_HEX, label: 'j9', job_name: null }),
           ],
+          total: 2,
           truncated: false,
         },
       })),
@@ -303,13 +356,13 @@ describe('pantalla de Snapshots — restaurar', () => {
   /** El listado con una sola instantánea; `campos` decide si es restaurable. */
   const listadoConUna = (campos: Partial<Snapshot> = {}): ManejadorDeFetch => () => ({
     status: 200,
-    data: { snapshots: [snapshot({ id: HEX, ...campos })], truncated: false },
+    data: { snapshots: [snapshot({ id: HEX, ...campos })], total: 1, truncated: false },
   })
 
   /** El listado con dos instantáneas restaurables, para probar la exclusión. */
   const listadoConDos = (): ManejadorDeFetch => () => ({
     status: 200,
-    data: { snapshots: [snapshot({ id: HEX }), snapshot({ id: OTRO_HEX })], truncated: false },
+    data: { snapshots: [snapshot({ id: HEX }), snapshot({ id: OTRO_HEX })], total: 2, truncated: false },
   })
 
   /** El listado con una instantánea de un target de **base de datos**. */

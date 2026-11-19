@@ -188,7 +188,7 @@ export interface EjecucionEncolada {
 // ─── Ejecuciones ─────────────────────────────────────────────────────────────
 
 /**
- * Lectura: `GET /api/v1/executions?job_id=&status=&limit=&offset=`.
+ * Lectura: una fila de `GET /api/v1/executions`.
  *
  * `limit` va de 1 a 200 (50 por defecto) y `offset` no puede ser negativo: fuera
  * de rango, el backend contesta `400` **nombrando el campo**.
@@ -212,6 +212,19 @@ export interface Execution {
   started_at: string
   /** RFC3339, en UTC, o `null` si todavía no ha terminado. */
   finished_at: string | null
+}
+
+/**
+ * `GET /api/v1/executions?job_id=&status=&limit=&offset=` (**200**).
+ *
+ * Trae la página y el **total** de filas que cumplen los filtros: el total es
+ * **ajeno** a `limit`/`offset`, así que con él el panel pinta el número de
+ * páginas sin una segunda llamada ni una heurística. Es la misma envoltura que
+ * el listado de restauraciones (`ListadoDeRestauraciones`).
+ */
+export interface ListadoDeEjecuciones {
+  executions: Execution[]
+  total: number
 }
 
 // ─── Snapshots ───────────────────────────────────────────────────────────────
@@ -251,10 +264,20 @@ export interface Snapshot {
   target_type: TipoDeTarget | null
 }
 
-/** `GET /api/v1/snapshots?repository_id=<uuid>` cuando no se pide un snapshot. */
+/** `GET /api/v1/snapshots?repository_id=<uuid>&limit=&offset=`. */
 export interface ListadoDeSnapshots {
   snapshots: Snapshot[]
-  /** `true` si el repositorio tenía más snapshots de los que se devolvieron. */
+  /**
+   * Número **total** de instantáneas del repositorio, **ajeno** a `limit`/
+   * `offset`: es lo que alimenta el paginador sin paginar en cliente. Es exacto
+   * salvo que `truncated` sea `true`.
+   */
+  total: number
+  /**
+   * `true` si se tocó la guarda de seguridad alta al enumerar el repositorio: la
+   * lista puede ser incompleta y `total` un mínimo. En el caso normal va a
+   * `false`.
+   */
   truncated: boolean
 }
 

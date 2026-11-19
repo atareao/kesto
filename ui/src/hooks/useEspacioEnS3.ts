@@ -16,11 +16,11 @@ export interface EspacioEnS3 {
   /** Suma de los `bytes` de las instantáneas que **sí** se pudieron leer. */
   bytes: number
   /**
-   * ¿La cifra es un **mínimo**? Es `true` cuando algún listado vino recortado
-   * (`truncated`) **o** cuando algún repositorio no se pudo leer: en los dos
-   * casos la suma es parcial y presentarla como total sería mentir. Es la
-   * **única** expresión de «mínimo»: el consumidor no vuelve a combinar
-   * condiciones.
+   * ¿La cifra es un **mínimo**? Es `true` cuando algún repositorio tiene más
+   * instantáneas que las que se contaron —`truncated`, o `snapshots.length <
+   * total`— **o** cuando algún repositorio no se pudo leer: en los dos casos la
+   * suma es parcial y presentarla como total sería mentir. Es la **única**
+   * expresión de «mínimo»: el consumidor no vuelve a combinar condiciones.
    */
   esMinimo: boolean
   /**
@@ -60,14 +60,20 @@ export function useEspacioEnS3(repositorios: readonly Repository[]): EspacioEnS3
   const cliente = useQueryClient()
   const consultas = useQueries({
     queries: repositorios.map((repositorio) => ({
-      queryKey: claves.snapshots(repositorio.id),
-      queryFn: ({ signal }: { signal: AbortSignal }) => listarSnapshots(repositorio.id, signal),
+      // La clave registra el `limit` que pide el `queryFn`, no un objeto vacío:
+      // si no, la caché diría que la misma entrada es un listado cualquiera y
+      // dos `limit` distintos compartirían clave.
+      queryKey: claves.snapshots(repositorio.id, { limit: 200 }),
+      // Se pide el tope del contrato (200) de una vez: este resumen suma los
+      // `bytes` de **todas** las instantáneas que puede leer, no una página.
+      queryFn: ({ signal }: { signal: AbortSignal }) =>
+        listarSnapshots(repositorio.id, { limit: 200 }, signal),
       retry: REINTENTOS_DE_S3,
     })),
   })
 
   let bytes = 0
-  let truncado = false
+  let parcial = false
   let cargando = false
   const repositoriosCaidos: string[] = []
 
@@ -83,20 +89,35 @@ export function useEspacioEnS3(repositorios: readonly Repository[]): EspacioEnS3
 
     if (consulta.data === undefined) return
 
-    truncado = truncado || consulta.data.truncated
+    // Si la página recibida no cubre todo el repositorio, la suma es parcial:
+    // hay más instantáneas de las que se han podido leer. No se piden más —eso
+    // sería paginar— ni se pide un segundo listado: se declara el mínimo.
+    //
+    // `truncated` es la señal **explícita** del backend y se mira aparte: la
+    // comparación por sí sola presupone que la guarda del listado sigue por
+    // encima del `limit: 200` de aquí. Con una página completa y
+    // `truncated: true` —`snapshots.length === total`— la comparación no ve
+    // nada, y la bandera significa exactamente eso: «la suma es parcial, la
+    // cifra es un mínimo».
+    parcial =
+      parcial ||
+      consulta.data.truncated ||
+      consulta.data.snapshots.length < consulta.data.total
     for (const instantanea of consulta.data.snapshots) bytes += instantanea.bytes
   })
 
   return {
     bytes,
-    // Una sola expresión de «mínimo»: recorte del listado **o** repositorio
-    // ilegible. En los dos casos la suma es parcial, nunca el total.
-    esMinimo: truncado || repositoriosCaidos.length > 0,
+    // Una sola expresión de «mínimo»: el listado no cubre el total **o** un
+    // repositorio ilegible. En los dos casos la suma es parcial, nunca el total.
+    esMinimo: parcial || repositoriosCaidos.length > 0,
     repositoriosCaidos,
     cargando,
     reintentar: () => {
       for (const repositorio of repositorios) {
-        void cliente.invalidateQueries({ queryKey: claves.snapshots(repositorio.id) })
+        // Prefijo de array, no la clave completa: así alcanza cualquier variante
+        // de filtros de ese repositorio —incluida la del `limit: 200` de aquí—.
+        void cliente.invalidateQueries({ queryKey: ['snapshots', repositorio.id] })
       }
     },
   }

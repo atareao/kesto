@@ -4,8 +4,10 @@ import type { FiltrosDeEjecuciones } from '../api/ejecuciones'
 import { claves } from './claves'
 
 /**
- * Ejecuciones, opcionalmente filtradas. `filtros` forma parte de la clave: dos
- * pantallas con filtros distintos no comparten la misma entrada de caché.
+ * Ejecuciones, opcionalmente filtradas y paginadas. `filtros` —con su `limit` y
+ * su `offset`— forma parte de la clave: dos páginas o dos filtros distintos no
+ * comparten la misma entrada de caché. El resultado trae la página en
+ * `data.executions` y el total en `data.total`.
  */
 export function useEjecuciones(filtros: FiltrosDeEjecuciones = {}) {
   return useQuery({

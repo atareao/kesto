@@ -1,5 +1,5 @@
 import { peticion } from '../services/api/client'
-import type { Estado, Execution } from '../services/api/types'
+import type { Estado, ListadoDeEjecuciones } from '../services/api/types'
 
 /**
  * Filtros de `GET /api/v1/executions`. `limit` va de 1 a 200 (50 por defecto) y
@@ -12,12 +12,17 @@ export interface FiltrosDeEjecuciones {
   offset?: number
 }
 
-/** `GET /api/v1/executions`, en orden de más reciente a más antigua. */
+/**
+ * `GET /api/v1/executions`, en orden de más reciente a más antigua.
+ *
+ * Devuelve la página **y** el `total` de filas que casan con los filtros —ajeno
+ * a `limit`/`offset`—, que es lo que alimenta el paginador.
+ */
 export function listarEjecuciones(
   filtros: FiltrosDeEjecuciones = {},
   signal?: AbortSignal,
-): Promise<Execution[]> {
-  return peticion<Execution[]>('/executions', {
+): Promise<ListadoDeEjecuciones> {
+  return peticion<ListadoDeEjecuciones>('/executions', {
     consulta: {
       job_id: filtros.job_id,
       status: filtros.status,

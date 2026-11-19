@@ -11,11 +11,14 @@ import { NOMBRE_DEL_EVENTO } from '../services/useEventStream'
 import { instalarFetchFalso } from '../../tests/fetchDePrueba'
 import type { ManejadorDeFetch, RespuestaSimulada } from '../../tests/fetchDePrueba'
 import { ejecucion, tarea } from '../../tests/fixtures'
+import {
+  TAMANO_DE_PAGINA_POR_DEFECTO as TAMANO,
+  TEXTO_DE_PAGINA_VACIA,
+} from '../components/Paginador/Paginador'
 import Historico from './historico'
 
 type Usuario = ReturnType<typeof userEvent.setup>
 
-const TAMANO = 20
 const J1 = tarea({
   id: 'j1',
   target_id: 't1',
@@ -46,6 +49,16 @@ function lote(cantidad: number, desde = 0) {
   )
 }
 
+/**
+ * La página que devuelve el servidor: las filas de `lote` envueltas en el
+ * listado con su `total`, que es de donde sale el número de páginas del
+ * paginador. El panel **no** recorta en cliente, así que el total es dato de la
+ * respuesta, no el tamaño de la lista.
+ */
+function sobre(executions: ReturnType<typeof lote>, total: number): RespuestaSimulada {
+  return { status: 200, data: { executions, total } }
+}
+
 /** Rutas comunes a todas las pruebas: las tareas que etiquetan el filtro. */
 function manejadorCon(sobreEjecuciones: ManejadorDeFetch): ManejadorDeFetch {
   return (llamada) => {
@@ -69,48 +82,71 @@ afterEach(() => {
 })
 
 describe('pantalla de Histórico', () => {
-  it('pide limit y offset, y deshabilita «Siguiente» al final', async () => {
+  it('el paginador se alimenta del total y pide la página al servidor', async () => {
     const usuario = userEvent.setup()
-    const fetch = instalarFetchFalso(
-      manejadorCon(({ url }) => {
-        const offset = Number(new URL(url, 'http://localhost').searchParams.get('offset') ?? 0)
-        return { status: 200, data: offset === 0 ? lote(TAMANO) : lote(5, TAMANO) }
-      }),
-    )
+    const fetch = instalarFetchFalso(manejadorCon(() => sobre(lote(TAMANO), 120)))
 
     const { unmount } = montar()
-
     await screen.findByRole('table', { name: 'Ejecuciones' })
 
+    // El total sale de la API: 120 ejecuciones a 10 por página son 12 páginas.
     const primera = fetch.a('/api/v1/executions')[0]
     expect(primera?.url).toContain(`limit=${TAMANO}`)
     expect(primera?.url).toContain('offset=0')
+    expect(screen.getByText('120 elementos')).toBeInTheDocument()
+    expect(screen.getByTitle('12')).toBeInTheDocument()
 
-    const siguiente = screen.getByRole('button', { name: 'Siguiente' })
-    expect(siguiente).toBeEnabled()
-
-    await usuario.click(siguiente)
-
+    // Cambiar de página pide **esa** página al servidor, no recorta en cliente.
+    await usuario.click(screen.getByTitle('3'))
     await waitFor(() => {
       expect(
         fetch.a('/api/v1/executions').some((llamada) => llamada.url.includes('offset=20')),
       ).toBe(true)
     })
+    unmount()
+  })
+
+  it('cambiar el tamaño de página pide la primera con el nuevo limit', async () => {
+    const usuario = userEvent.setup()
+    const fetch = instalarFetchFalso(manejadorCon(() => sobre(lote(TAMANO), 120)))
+
+    const { unmount } = montar()
+    await screen.findByRole('table', { name: 'Ejecuciones' })
+
+    await usuario.click(screen.getByTitle('3'))
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Siguiente' })).toBeDisabled()
+      expect(
+        fetch.a('/api/v1/executions').some((llamada) => llamada.url.includes('offset=20')),
+      ).toBe(true)
     })
-    expect(screen.getByRole('button', { name: 'Anterior' })).toBeEnabled()
+
+    await usuario.click(screen.getByRole('combobox', { name: 'Filas por página' }))
+    await usuario.click(await screen.findByTitle('50 por página'))
+
+    await waitFor(() => {
+      const ultima = fetch.a('/api/v1/executions').at(-1)
+      expect(ultima?.url).toContain('limit=50')
+      // Otro tamaño es otra rejilla: se vuelve a la primera, no se hereda la 3.
+      expect(ultima?.url).toContain('offset=0')
+    })
     unmount()
   })
 
   it('los filtros viajan en la consulta y vuelven a la primera página', async () => {
     const usuario = userEvent.setup()
-    const fetch = instalarFetchFalso(
-      manejadorCon(() => ({ status: 200, data: lote(3) })),
-    )
+    const fetch = instalarFetchFalso(manejadorCon(() => sobre(lote(3), 25)))
 
     const { unmount } = montar()
     await screen.findByRole('table', { name: 'Ejecuciones' })
+
+    // Primero se sale de la primera página: sin ese `offset` heredado, exigir
+    // `offset=0` después no demostraría que el filtro reinicia la paginación.
+    await usuario.click(screen.getByTitle('2'))
+    await waitFor(() => {
+      expect(
+        fetch.a('/api/v1/executions').some((llamada) => llamada.url.includes('offset=10')),
+      ).toBe(true)
+    })
 
     await elegir(usuario, 'Tarea', 'copia nocturna')
     await waitFor(() => {
@@ -129,10 +165,12 @@ describe('pantalla de Histórico', () => {
   it('la consola solo recibe los eventos de la ejecución elegida y avisa si el stream cae', async () => {
     const usuario = userEvent.setup()
     instalarFetchFalso(
-      manejadorCon(() => ({
-        status: 200,
-        data: [ejecucion({ id: 'e1', job_id: 'j1' }), ejecucion({ id: 'e2', job_id: 'j1' })],
-      })),
+      manejadorCon(() =>
+        sobre(
+          [ejecucion({ id: 'e1', job_id: 'j1' }), ejecucion({ id: 'e2', job_id: 'j1' })],
+          2,
+        ),
+      ),
     )
 
     const { unmount } = montar()
@@ -163,20 +201,22 @@ describe('pantalla de Histórico', () => {
     const usuario = userEvent.setup()
     let terminada = false
     instalarFetchFalso(
-      manejadorCon(() => ({
-        status: 200,
-        data: [
-          terminada
-            ? ejecucion({
-                id: 'e1',
-                job_id: 'j1',
-                status: 'failed',
-                error_message: 'el repositorio no responde',
-                finished_at: '2026-01-02T03:05:00Z',
-              })
-            : ejecucion({ id: 'e1', job_id: 'j1', status: 'running', finished_at: null }),
-        ],
-      })),
+      manejadorCon(() =>
+        sobre(
+          [
+            terminada
+              ? ejecucion({
+                  id: 'e1',
+                  job_id: 'j1',
+                  status: 'failed',
+                  error_message: 'el repositorio no responde',
+                  finished_at: '2026-01-02T03:05:00Z',
+                })
+              : ejecucion({ id: 'e1', job_id: 'j1', status: 'running', finished_at: null }),
+          ],
+          1,
+        ),
+      ),
     )
 
     const { cliente, unmount } = montar()
@@ -194,7 +234,7 @@ describe('pantalla de Histórico', () => {
   })
 
   it('sin ejecuciones enseña un estado vacío, no una tabla vacía', async () => {
-    instalarFetchFalso(manejadorCon(() => ({ status: 200, data: [] })))
+    instalarFetchFalso(manejadorCon(() => sobre([], 0)))
 
     const { unmount } = montar()
 
@@ -202,6 +242,40 @@ describe('pantalla de Histórico', () => {
       await screen.findByText('No hay ejecuciones para estos filtros'),
     ).toBeInTheDocument()
     expect(screen.queryByRole('table', { name: 'Ejecuciones' })).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('si la retención purga el listado estando en una página alta, el paginador sigue ahí para volver a la primera', async () => {
+    const usuario = userEvent.setup()
+    let purgado = false
+    const fetch = instalarFetchFalso(
+      manejadorCon(() => (purgado ? sobre([], 0) : sobre(lote(TAMANO), 120))),
+    )
+
+    const { cliente, unmount } = montar()
+    await screen.findByRole('table', { name: 'Ejecuciones' })
+
+    // El operador se va a la página 2: eso pide **su** `offset` al servidor.
+    await usuario.click(screen.getByTitle('2'))
+    await waitFor(() => {
+      expect(
+        fetch.a('/api/v1/executions').some((llamada) => llamada.url.includes(`offset=${TAMANO}`)),
+      ).toBe(true)
+    })
+
+    // La purga/retención vacía el conjunto mientras sigue ahí: el `total` cae a
+    // cero y la página se queda sin filas, pero la actual sigue siendo la 2.
+    purgado = true
+    await cliente.invalidateQueries()
+    expect(await screen.findByText(TEXTO_DE_PAGINA_VACIA)).toBeInTheDocument()
+
+    // Sin `total > 0`, ¿dónde queda el control de vuelta? El paginador se pinta
+    // igual porque hay una página que abandonar; sin él, el operador quedaría
+    // encerrado en una página vacía.
+    await usuario.click(screen.getByTitle('1'))
+    await waitFor(() => {
+      expect(fetch.a('/api/v1/executions').at(-1)?.url).toContain('offset=0')
+    })
     unmount()
   })
 
@@ -239,25 +313,27 @@ describe('pantalla de Histórico', () => {
 describe('tabla de ejecuciones', () => {
   it('pinta la duración de las terminadas y «en curso» para las vivas', async () => {
     instalarFetchFalso(
-      manejadorCon(() => ({
-        status: 200,
-        data: [
-          ejecucion({
-            id: 'e1',
-            job_id: 'j1',
-            status: 'success',
-            started_at: '2026-01-02T03:00:00Z',
-            finished_at: '2026-01-02T03:05:00Z',
-          }),
-          ejecucion({
-            id: 'e2',
-            job_id: 'j1',
-            status: 'running',
-            started_at: '2026-01-02T03:00:00Z',
-            finished_at: null,
-          }),
-        ],
-      })),
+      manejadorCon(() =>
+        sobre(
+          [
+            ejecucion({
+              id: 'e1',
+              job_id: 'j1',
+              status: 'success',
+              started_at: '2026-01-02T03:00:00Z',
+              finished_at: '2026-01-02T03:05:00Z',
+            }),
+            ejecucion({
+              id: 'e2',
+              job_id: 'j1',
+              status: 'running',
+              started_at: '2026-01-02T03:00:00Z',
+              finished_at: null,
+            }),
+          ],
+          2,
+        ),
+      ),
     )
 
     const { unmount } = montar()
@@ -272,7 +348,7 @@ describe('tabla de ejecuciones', () => {
 describe('nombre de la tarea en el Histórico', () => {
   it('el filtro «Tarea» etiqueta las opciones con el nombre de la tarea, no con el del target', async () => {
     const usuario = userEvent.setup()
-    const fetch = instalarFetchFalso(manejadorCon(() => ({ status: 200, data: lote(2) })))
+    const fetch = instalarFetchFalso(manejadorCon(() => sobre(lote(2), 2)))
 
     const { unmount } = montar()
     await screen.findByRole('table', { name: 'Ejecuciones' })
@@ -293,13 +369,15 @@ describe('nombre de la tarea en el Histórico', () => {
 
   it('la tabla muestra una columna «Tarea» con el `job_name` y el identificador cuando no hay nombre', async () => {
     instalarFetchFalso(
-      manejadorCon(() => ({
-        status: 200,
-        data: [
-          ejecucion({ id: 'e1', job_id: 'j1', job_name: 'copia nocturna' }),
-          ejecucion({ id: 'e2', job_id: 'j2', job_name: null }),
-        ],
-      })),
+      manejadorCon(() =>
+        sobre(
+          [
+            ejecucion({ id: 'e1', job_id: 'j1', job_name: 'copia nocturna' }),
+            ejecucion({ id: 'e2', job_id: 'j2', job_name: null }),
+          ],
+          2,
+        ),
+      ),
     )
 
     const { unmount } = montar()

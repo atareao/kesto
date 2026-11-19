@@ -21,9 +21,10 @@ function nombrarRepositorios(nombres: readonly string[]): string {
  *
  * El espacio es la suma de los `bytes` de las instantáneas de **todos** los
  * repositorios. La cifra se presenta como **mínimo** —«al menos»— cuando algún
- * listado vuelve recortado (`truncated`) **o** cuando algún repositorio no se
- * pudo leer: en los dos casos la suma es parcial y darla como total sería
- * mentir con un número.
+ * repositorio tiene más instantáneas que las que se contaron
+ * (`snapshots.length < total`) **o** cuando algún repositorio no se pudo leer:
+ * en los dos casos la suma es parcial y darla como total sería mentir con un
+ * número.
  *
  * El resumen **no es todo-o-nada**: el fallo de un repositorio no borra la
  * información de los demás. Las cifras que no dependen del S3 se siguen

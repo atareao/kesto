@@ -57,7 +57,10 @@ beforeEach(() => {
       }
     }
     if (ruta === '/api/v1/executions') {
-      return { status: 200, data: [ejecucion({ id: 'e1', job_id: 'j1', status: 'success' })] }
+      return {
+        status: 200,
+        data: { executions: [ejecucion({ id: 'e1', job_id: 'j1', status: 'success' })], total: 1 },
+      }
     }
     throw new Error(`ruta inesperada: ${ruta}`)
   })
@@ -125,7 +128,7 @@ describe('TablaDeTareasEnCurso', () => {
           ],
         }
       }
-      if (ruta === '/api/v1/executions') return { status: 200, data: [] }
+      if (ruta === '/api/v1/executions') return { status: 200, data: { executions: [], total: 0 } }
       throw new Error(`ruta inesperada: ${ruta}`)
     })
 

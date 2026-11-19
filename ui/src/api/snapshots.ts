@@ -2,18 +2,34 @@ import { peticion } from '../services/api/client'
 import type { ListadoDeSnapshots, Restauracion } from '../services/api/types'
 
 /**
- * `GET /api/v1/snapshots?repository_id=<uuid>`.
+ * Paginación de `GET /api/v1/snapshots`. `limit` va de 1 a 200 (50 por defecto
+ * en el backend) y `offset` no puede ser negativo: fuera de rango el backend
+ * contesta `400`. El panel manda su tamaño de página explícito.
+ */
+export interface FiltrosDeSnapshots {
+  limit?: number
+  offset?: number
+}
+
+/**
+ * `GET /api/v1/snapshots?repository_id=<uuid>&limit=&offset=`.
  *
- * `truncated` es `true` cuando el repositorio tenía más instantáneas de las que
- * devolvió la respuesta: quien sume `bytes` tiene que presentar la cifra como
- * mínimo, no como total.
+ * Devuelve la página **y** el `total` de instantáneas del repositorio (ajeno a
+ * `limit`/`offset`), que es lo que alimenta el paginador. `truncated` avisa de
+ * que la enumeración tocó la guarda de seguridad alta: quien sume `bytes` tiene
+ * que presentar la cifra como mínimo, no como total.
  */
 export function listarSnapshots(
   repositoryId: string,
+  filtros: FiltrosDeSnapshots = {},
   signal?: AbortSignal,
 ): Promise<ListadoDeSnapshots> {
   return peticion<ListadoDeSnapshots>('/snapshots', {
-    consulta: { repository_id: repositoryId },
+    consulta: {
+      repository_id: repositoryId,
+      limit: filtros.limit,
+      offset: filtros.offset,
+    },
     signal,
   })
 }
