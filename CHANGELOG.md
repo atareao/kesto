@@ -1,4 +1,30 @@
 # Changelog
+## [0.16.0] - 2026-11-19
+
+### Bug Fixes
+
+- *(mcp)* Lee la envoltura de ejecuciones al listar
+- *(mcp)* Fija limit=200 al listar instantáneas
+
+### Documentation
+
+- *(feature-032)* El emblema sale del badge de logo-portada.svg
+- *(spec)* Propone la paginación con total en los tres listados
+- *(openspec)* Marca hechas las tareas 1.1-1.3
+- *(plan)* Añade el PLAN-033 de la paginación
+- *(feature)* Documenta la paginación y sus decisiones
+- *(openspec)* Archiva el change de paginación
+
+### Features
+
+- *(ui)* El emblema de la portada usa el badge de logo-portada.svg
+- *(api)* [**breaking**] Envuelve el listado de ejecuciones en {executions, total}
+- *(ui)* Pagina los tres listados contra el servidor
+- *(api)* [**breaking**] Pagina el listado de instantáneas con total exacto
+
+### Testing
+
+- *(api)* Asevera el total del filtro por id
 ## [0.15.0] - 2026-11-19
 
 ### Bug Fixes
@@ -19,6 +45,7 @@
 - Elimina del .gitignore las entradas de artefactos LocalAI
 - *(ci)* Pausa temporalmente el build arm64 de la imagen
 - *(ui)* Alinea el copy de la web con la tagline del lockup
+- Release v0.15.0
 ## [0.14.0] - 2026-11-18
 
 ### Features
