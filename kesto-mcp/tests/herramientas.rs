@@ -98,7 +98,11 @@ async fn list_snapshots_devuelve_las_instantaneas_del_repositorio() {
         "/api/v1/snapshots",
         "repository_id",
         REPOSITORIO,
-        vec![json!({"id": "snap-1", "time": "2026-01-01T03:00:00Z"})],
+        json!({
+            "snapshots": [{"id": "snap-1", "time": "2026-01-01T03:00:00Z"}],
+            "total": 1,
+            "truncated": false,
+        }),
     )
     .await;
 
@@ -111,21 +115,23 @@ async fn list_snapshots_devuelve_las_instantaneas_del_repositorio() {
         )
         .await;
 
-    let filas = datos(&mensaje)
+    let filas = datos(&mensaje)["snapshots"]
         .as_array()
-        .expect("data es una lista")
+        .expect("el listado trae `snapshots` como lista")
         .clone();
 
     assert_eq!(filas[0]["id"], "snap-1");
 
     let consultas = consultas(&mock).await;
+    let consulta = consultas
+        .iter()
+        .find(|consulta| consulta.contains(&format!("repository_id={REPOSITORIO}")))
+        .unwrap_or_else(|| panic!("no llegó la consulta del listado: {consultas:?}"));
 
-    assert!(
-        consultas
-            .iter()
-            .any(|consulta| consulta.contains(&format!("repository_id={REPOSITORIO}"))),
-        "la API tiene que haber recibido el repositorio elegido: {consultas:?}"
-    );
+    // La entrada de `list_snapshots` no expone `limit`, así que la herramienta tiene que
+    // mandar el tope válido por su cuenta: sin él la API aplicaría su defecto (50) y el MCP
+    // dejaría de ver las instantáneas que veía antes de que el listado paginara.
+    assert!(consulta.contains("limit=200"), "{consulta}");
 }
 
 #[tokio::test]

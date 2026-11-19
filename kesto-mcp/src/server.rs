@@ -29,6 +29,21 @@ estado de los repositorios, los targets, las tareas y el histórico de ejecucion
 copia cuando toca y comprueba la salud de un repositorio. No restaura instantáneas, no borra \
 recursos y no edita nada: este servidor no expone esas operaciones.";
 
+/// El tope de página que `GET /api/v1/snapshots` acepta: `1..=200`.
+///
+/// `list_snapshots` **no** expone `limit` en su entrada —el consumidor de esta herramienta no
+/// pide páginas, ve la ventana entera—, así que sin este valor fijo la API aplicaría su
+/// defecto (`LIMITE_POR_DEFECTO`, 50) y el MCP dejaría de ver las instantáneas que sí veía
+/// antes de que el listado pasara a paginar. Se pide el máximo válido a propósito: restaurar
+/// el comportamiento previo es el objetivo, y la paginación del lado del agente —que el
+/// agente pueda pedir offset— es un cambio aparte y fuera de alcance.
+///
+/// Es una copia deliberada de `LIMITE_MAXIMO` de `src/api/snapshots.rs`: ese valor vive en el
+/// paquete raíz `kesto`, que es un **binario sin `lib.rs`**, y un binario no es enlazable como
+/// dependencia, así que este crate no puede importarlo. Si el tope del backend cambia, esta
+/// constante hay que acompañarlo a mano.
+const LIMITE_DE_SNAPSHOTS: i64 = 200;
+
 /// El servidor MCP de Kesto.
 #[derive(Debug, Clone)]
 pub struct KestoMcp {
@@ -180,7 +195,12 @@ impl KestoMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(peticion): Parameters<PorRepositorio>,
     ) -> CallToolResult {
-        let consulta = [("repository_id", peticion.repository_id)];
+        // `limit` viaja fijo al tope válido porque la entrada de la herramienta no lo expone
+        // y su defecto dejaría fuera instantáneas que antes llegaban. Ver `LIMITE_DE_SNAPSHOTS`.
+        let consulta = [
+            ("repository_id", peticion.repository_id),
+            ("limit", LIMITE_DE_SNAPSHOTS.to_string()),
+        ];
 
         self.leer(&ctx, "/api/v1/snapshots", &consulta).await
     }
