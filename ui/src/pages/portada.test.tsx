@@ -116,7 +116,7 @@ describe('Portada', () => {
 
     const logo = await screen.findByTestId('logo-de-la-portada')
     expect(logo).toHaveAttribute('width', '256')
-    expect(logo).toHaveAttribute('height', '225')
+    expect(logo).toHaveAttribute('height', '256')
   })
 
   it('en modo disabled entra directa al panel y no pinta la portada', async () => {
