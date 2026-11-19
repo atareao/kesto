@@ -626,6 +626,11 @@ mod tests {
         assert_eq!(filas.len(), 1, "el `id` resuelve una sola ejecución");
         assert_eq!(filas[0]["id"], primera.hyphenated().to_string());
 
+        assert_eq!(
+            cuerpo["data"]["total"], 1,
+            "el `id` acota también el total, que es el de las filas que casan: {cuerpo}"
+        );
+
         // Un identificador válido sin fila devuelve el listado vacío, no un 404.
         let respuesta = get(
             api_router(estado.clone()),
@@ -645,6 +650,11 @@ mod tests {
                 .as_array()
                 .is_some_and(|filas| filas.is_empty()),
             "un id válido sin fila tiene que devolver el listado vacío: {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["total"], 0,
+            "un id válido sin fila deja el total a cero, no a uno: {cuerpo}"
         );
 
         // Y con forma inválida, un `400` que nombra el campo y no repite el valor.
