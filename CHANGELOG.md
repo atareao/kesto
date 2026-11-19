@@ -1,9 +1,33 @@
 # Changelog
+## [0.15.0] - 2026-11-19
+
+### Bug Fixes
+
+- *(ci)* El guard de release.yml acepta el arco arm64 pausado
+
+### Documentation
+
+- *(feature-032)* Documenta la migración de identidad visual
+- *(plan-032)* Cierra el plan como completado
+
+### Features
+
+- *(ui)* Migra la identidad visual al cubo K oscuro/naranja
+
+### Miscellaneous Tasks
+
+- Elimina del .gitignore las entradas de artefactos LocalAI
+- *(ci)* Pausa temporalmente el build arm64 de la imagen
+- *(ui)* Alinea el copy de la web con la tagline del lockup
 ## [0.14.0] - 2026-11-18
 
 ### Features
 
 - *(ui)* Portada pública con logo y barra lateral solo con sesión
+
+### Miscellaneous Tasks
+
+- Release v0.14.0
 ## [0.13.1] - 2026-11-18
 
 ### Bug Fixes
