@@ -2,9 +2,9 @@
 
 ## 1. Backend: ejecuciones con envoltura y total
 
-- [ ] 1.1 Escribir en `src/api/executions.rs` los tests que exigen la envoltura: el listado sin filtros trae `executions` y `total`; `total` refleja el acotado por `status`/`job_id`; `total` no cambia con `limit`/`offset`. Verificado con `cargo test ejecuciones` (deben fallar: RED).
-- [ ] 1.2 Cambiar el DTO de respuesta de `src/api/executions.rs` a `{executions, total}`, calculando `total` con un conteo bajo los mismos filtros que la página. Verificado con `cargo test ejecuciones` (GREEN).
-- [ ] 1.3 Adaptar el resto de tests del fichero y el consumo del listado en `tests/e2e/arnes.rs`. Verificado con `cargo test` y `just check`.
+- [x] 1.1 Escribir en `src/api/executions.rs` los tests que exigen la envoltura: el listado sin filtros trae `executions` y `total`; `total` refleja el acotado por `status`/`job_id`; `total` no cambia con `limit`/`offset`. Verificado con `cargo test ejecuciones` (deben fallar: RED).
+- [x] 1.2 Cambiar el DTO de respuesta de `src/api/executions.rs` a `{executions, total}`, calculando `total` con un conteo bajo los mismos filtros que la página. Verificado con `cargo test ejecuciones` (GREEN).
+- [x] 1.3 Adaptar el resto de tests del fichero y el consumo del listado en `tests/e2e/arnes.rs`. Verificado con `cargo test` y `just check`.
 
 ## 2. Backend: snapshots con limit, offset y total exacto
 
