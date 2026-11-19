@@ -230,9 +230,10 @@ impl KestoMcp {
         let resultado = self.leer(&ctx, "/api/v1/executions", &consulta).await;
 
         // La API no tiene `GET /executions/{id}`: el histórico se filtra por `id`, y un
-        // identificador que no está devuelve **una lista vacía**, no un `404`. Devolverla
-        // tal cual haría creer al agente que la ejecución existe y no tiene filas, así que
-        // aquí se convierte en un error de herramienta con el identificador nombrado.
+        // identificador que no está devuelve una envoltura con `executions` **vacío**, no un
+        // `404`. Devolverla tal cual haría creer al agente que la ejecución existe y no tiene
+        // filas, así que aquí se convierte en un error de herramienta con el identificador
+        // nombrado.
         if resultado.is_error != Some(true) && filas_vacias(&resultado) {
             let error = ApiError::RespuestaDeLaApi {
                 status: 404,
@@ -351,12 +352,17 @@ fn error_de_herramienta(error: &ApiError) -> CallToolResult {
     }))
 }
 
-/// ¿La respuesta de la API trae la lista de filas vacía?
+/// ¿La respuesta es la **envoltura del histórico** con las ejecuciones vacías?
+///
+/// Desde que el listado dejó de ser un array pelado, `data` es `{executions, total}`: «vacío» es que
+/// `executions` sea una lista vacía. Un cuerpo sin esa clave —otro recurso, o un error— **no** cuenta
+/// como vacío: convertir eso en «esa ejecución no existe» mandaría a buscar el fallo donde no está.
 fn filas_vacias(resultado: &CallToolResult) -> bool {
     resultado
         .structured_content
         .as_ref()
         .and_then(|cuerpo| cuerpo.get("data"))
+        .and_then(|data| data.get("executions"))
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty)
 }
@@ -425,13 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn una_lista_vacia_se_reconoce() {
-        let vacia = CallToolResult::structured(serde_json::json!({"data": []}));
-        let con_filas = CallToolResult::structured(serde_json::json!({"data": [{"id": "x"}]}));
+    fn una_lista_de_ejecuciones_vacia_se_reconoce() {
+        let vacia =
+            CallToolResult::structured(serde_json::json!({"data": {"executions": [], "total": 0}}));
+        let con_filas = CallToolResult::structured(
+            serde_json::json!({"data": {"executions": [{"id": "x"}], "total": 1}}),
+        );
         let sin_datos = CallToolResult::structured(serde_json::json!({"message": "hola"}));
+        let array_pelado = CallToolResult::structured(serde_json::json!({"data": []}));
 
         assert!(filas_vacias(&vacia));
         assert!(!filas_vacias(&con_filas));
         assert!(!filas_vacias(&sin_datos));
+        assert!(
+            !filas_vacias(&array_pelado),
+            "el histórico ya no viaja como array pelado: un `data` que no sea la envoltura no es vacío"
+        );
     }
 }
