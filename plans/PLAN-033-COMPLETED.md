@@ -1,6 +1,6 @@
 # PLAN-033 — Paginación con total en Histórico, Snapshots y Restauraciones
 
-- **Issue**: [#140](https://github.com/Lorenzo/kesto/issues/140) — «✨ Paginador con total en Histórico, Snapshots y Restauraciones».
+- **Issue**: [#140](https://github.com/atareao/kesto/issues/140) — «✨ Paginador con total en Histórico, Snapshots y Restauraciones».
 - **Change de OpenSpec**: `openspec/changes/paginacion-de-listados/` (APROBADO por el usuario; deltas en `specs/{api-resources,repository,ui}/spec.md`).
 - **Rama**: `feature/paginacion-de-listados` (base `development`, commit previo `a3230ed` solo con los artefactos del change).
 - **Protocolo**: SDD ya cerrado → TDD (RED → GREEN → REFACTOR) con `just check` como puerta local.

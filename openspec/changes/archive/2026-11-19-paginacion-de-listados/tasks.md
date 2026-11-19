@@ -25,5 +25,5 @@
 
 ## 5. Integración y documentación
 
-- [ ] 5.1 Repasar el e2e de backend y pasar `just check-all` (fmt, clippy, test, scripts-test, ui-check). Verificado en verde.
-- [ ] 5.2 Escribir `docs/FEATURE-033-paginacion-de-listados.md` y cerrar `plans/PLAN-033.md`. Verificado por su presencia y contenido.
+- [x] 5.1 Repasar el e2e de backend y pasar `just check-all` (fmt, clippy, test, scripts-test, ui-check). Verificado en verde.
+- [x] 5.2 Escribir `docs/FEATURE-033-paginacion-de-listados.md` y cerrar `plans/PLAN-033.md`. Verificado por su presencia y contenido.
