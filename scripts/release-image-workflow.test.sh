@@ -17,12 +17,33 @@ ok()  { echo "OK   $*"; }
 bad() { echo "FAIL $*"; fail=1; }
 
 # 1. Matriz con runners nativos por arquitectura (nada de emulación).
+#    amd64 es obligatorio. arm64 admite dos estados legítimos: ACTIVO (entrada
+#    presente, runner nativo `ubuntu-26.04-arm`) o PAUSADO (issue #129: las tres
+#    líneas siguen ahí comentadas y el workflow lleva el TODO). Cualquier otra
+#    cosa —falta la entrada, o se construye arm64 en un runner x64— es fallo.
+amd64_nativo=0
+arm_nativo=0
+arm_pausado=0
+if grep -qE '^[[:space:]]*runner: ubuntu-26\.04$' "${wf}"; then
+  amd64_nativo=1
+fi
+if grep -qE '^[[:space:]]*runner: ubuntu-26\.04-arm$' "${wf}"; then
+  arm_nativo=1
+elif grep -qE '^[[:space:]]*#[[:space:]]*runner: ubuntu-26\.04-arm$' "${wf}" \
+     && grep -q 'TODO(#129)' "${wf}"; then
+  arm_pausado=1
+fi
+
 if grep -qE '^[[:space:]]*matrix:' "${wf}" \
-   && grep -qE '^[[:space:]]*runner: ubuntu-26\.04$' "${wf}" \
-   && grep -qE '^[[:space:]]*runner: ubuntu-26\.04-arm$' "${wf}"; then
-  ok "matriz con runners nativos amd64 (ubuntu-26.04) y arm64 (ubuntu-26.04-arm)"
+   && [ "${amd64_nativo}" = 1 ] \
+   && { [ "${arm_nativo}" = 1 ] || [ "${arm_pausado}" = 1 ]; }; then
+  if [ "${arm_pausado}" = 1 ]; then
+    ok "matriz amd64 nativa (ubuntu-26.04) y arm64 PAUSADO con TODO(#129)"
+  else
+    ok "matriz con runners nativos amd64 (ubuntu-26.04) y arm64 (ubuntu-26.04-arm)"
+  fi
 else
-  bad "release.yml no declara la matriz {ubuntu-26.04, ubuntu-26.04-arm}"
+  bad "release.yml no declara la matriz amd64 + arm64 (activo en ubuntu-26.04-arm o pausado con TODO(#129))"
 fi
 
 # 2. Cada arquitectura publica por digest.
