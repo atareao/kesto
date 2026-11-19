@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::api::contenido;
 use crate::api::extract::Query;
 use crate::api::response::ApiResponse;
-use crate::db::entities::{Ejecucion, Estado, FiltroDeEjecuciones};
+use crate::db::entities::{Ejecucion, Estado, FiltroDeEjecuciones, PaginaDeEjecuciones};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -232,10 +232,25 @@ fn formatear(fecha: time::OffsetDateTime) -> Result<String, AppError> {
     })
 }
 
+/// El `data` del listado: las filas y el total.
+///
+/// Es un objeto y no un array pelado porque el contrato publica **una página acotada con el
+/// total** —igual que el listado de restauraciones—: un array no tiene dónde llevar el total, y el
+/// total es lo que permite al panel pintar el número de elementos y el de páginas sin una segunda
+/// llamada ni una heurística. Las filas y su total salen de los **mismos filtros**, así que no
+/// pueden acotar por cosas distintas, y el total es ajeno a `limit` y a `offset`.
+#[derive(Debug, Serialize)]
+struct ListadoDelCable {
+    /// Las ejecuciones de la ventana, de la más reciente a la más antigua.
+    executions: Vec<EjecucionDelCable>,
+    /// Cuántas filas cumplen los filtros en total, sin aplicar la ventana.
+    total: i64,
+}
+
 /// `GET /api/v1/executions` — el histórico, con filtros y ventana.
 ///
 /// Una tabla sin filas es un listado de cero elementos, **no** un recurso ausente: contesta
-/// `200` con un array vacío, como los otros tres recursos.
+/// `200` con una envoltura de cero filas y su total a cero.
 ///
 /// # El nombre de la tarea de cada fila
 ///
@@ -257,7 +272,8 @@ pub async fn listado(
 ) -> Result<ApiResponse, AppError> {
     let filtro = filtros.validar()?;
 
-    let filas = estado.db.ejecuciones.listar_filtrado(&filtro).await?;
+    let PaginaDeEjecuciones { filas, total } =
+        estado.db.ejecuciones.listar_filtrado(&filtro).await?;
 
     let tareas: Vec<Uuid> = filas.iter().map(|fila| fila.job_id).collect();
 
@@ -271,7 +287,10 @@ pub async fn listado(
     Ok(ApiResponse::new(
         StatusCode::OK,
         "ejecuciones listadas",
-        contenido(&vistas)?,
+        contenido(&ListadoDelCable {
+            executions: vistas,
+            total,
+        })?,
     ))
 }
 
@@ -437,11 +456,15 @@ mod tests {
             "el listado contesta {status}: {cuerpo}"
         );
 
-        let filas = cuerpo["data"]
+        let filas = cuerpo["data"]["executions"]
             .as_array()
-            .expect("el listado tiene que llegar como un array");
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 3, "sin filtros salen las tres filas");
+        assert_eq!(
+            cuerpo["data"]["total"], 3,
+            "y la envoltura trae el total de las filas que casan: {cuerpo}"
+        );
 
         for clave in [
             "bytes_processed",
@@ -511,7 +534,9 @@ mod tests {
             "el filtro por tarea contesta {status}"
         );
 
-        let filas = cuerpo["data"].as_array().expect("el listado es un array");
+        let filas = cuerpo["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 2, "la tarea A tiene dos ejecuciones");
 
@@ -537,7 +562,9 @@ mod tests {
             "el filtro por estado contesta {status}"
         );
 
-        let filas = cuerpo["data"].as_array().expect("el listado es un array");
+        let filas = cuerpo["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "solo una ejecución falló");
         assert_eq!(filas[0]["status"], "failed", "y es la fallida");
@@ -556,7 +583,9 @@ mod tests {
             "los dos filtros juntos contestan {status}"
         );
 
-        let filas = cuerpo["data"].as_array().expect("el listado es un array");
+        let filas = cuerpo["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "de la tarea A solo una terminó bien");
         assert_eq!(filas[0]["status"], "success", "y es la satisfactoria");
@@ -590,7 +619,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "el filtro por id contesta {status}");
 
-        let filas = cuerpo["data"].as_array().expect("el listado es un array");
+        let filas = cuerpo["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "el `id` resuelve una sola ejecución");
         assert_eq!(filas[0]["id"], primera.hyphenated().to_string());
@@ -610,7 +641,7 @@ mod tests {
             "un id sin fila no es un error: contesta {status}"
         );
         assert!(
-            cuerpo["data"]
+            cuerpo["data"]["executions"]
                 .as_array()
                 .is_some_and(|filas| filas.is_empty()),
             "un id válido sin fila tiene que devolver el listado vacío: {cuerpo}"
@@ -662,7 +693,9 @@ mod tests {
 
         let primera =
             body_json(get(api_router(estado.clone()), "/api/v1/executions?limit=1").await).await;
-        let filas = primera["data"].as_array().expect("el listado es un array");
+        let filas = primera["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "`limit=1` tiene que devolver una sola fila");
 
@@ -679,7 +712,9 @@ mod tests {
             .await,
         )
         .await;
-        let filas = segunda["data"].as_array().expect("el listado es un array");
+        let filas = segunda["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "`limit=1&offset=1` devuelve una sola fila");
 
@@ -694,7 +729,9 @@ mod tests {
         );
 
         let dos = body_json(get(api_router(estado), "/api/v1/executions?limit=2").await).await;
-        let filas = dos["data"].as_array().expect("el listado es un array");
+        let filas = dos["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 2, "`limit=2` tiene que devolver dos filas");
     }
@@ -770,7 +807,9 @@ mod tests {
         for _ in 0..2 {
             let cuerpo =
                 body_json(get(api_router(estado.clone()), "/api/v1/executions").await).await;
-            let filas = cuerpo["data"].as_array().expect("el listado es un array");
+            let filas = cuerpo["data"]["executions"]
+                .as_array()
+                .expect("el listado tiene que traer `executions` como array");
 
             assert_eq!(filas.len(), 2, "las dos filas empatadas tienen que salir");
 
@@ -817,7 +856,7 @@ mod tests {
         sembrar_ejecucion(&estado, tarea, Estado::Success, inicio, 1000).await;
 
         let cuerpo = body_json(get(api_router(estado), "/api/v1/executions").await).await;
-        let fila = &cuerpo["data"][0];
+        let fila = &cuerpo["data"]["executions"][0];
 
         let empezada = fila["started_at"]
             .as_str()
@@ -994,9 +1033,9 @@ mod tests {
             "el listado contesta {status}: {cuerpo}"
         );
 
-        let filas = cuerpo["data"]
+        let filas = cuerpo["data"]["executions"]
             .as_array()
-            .expect("el listado tiene que llegar como un array");
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "la fila sembrada tiene que salir: {cuerpo}");
 
@@ -1029,15 +1068,212 @@ mod tests {
             "el listado contesta {status}: {cuerpo}"
         );
 
-        let filas = cuerpo["data"]
+        let filas = cuerpo["data"]["executions"]
             .as_array()
-            .expect("el listado tiene que llegar como un array");
+            .expect("el listado tiene que traer `executions` como array");
 
         assert_eq!(filas.len(), 1, "la fila sembrada tiene que salir: {cuerpo}");
 
         assert_eq!(
             filas[0]["job_name"], "copia nocturna",
             "la fila tiene que publicar el nombre de su tarea: {cuerpo}"
+        );
+    }
+
+    /// `api-resources` del change: el listado sin filtros viaja como **envoltura** `{executions,
+    /// total}` y no como array pelado.
+    ///
+    /// Es el cambio de contrato del change: un array no tiene dónde llevar el total, y el total es
+    /// lo que permite al panel saber cuántas páginas hay sin pedirlas todas. Se mide **la forma**
+    /// —`data` es un objeto con las dos claves, no un array— y luego el valor del total, que sin
+    /// filtros es el de todas las filas.
+    #[tokio::test]
+    async fn el_listado_sin_filtros_trae_la_envoltura_con_las_ejecuciones_y_su_total() {
+        // api-resources: «El listado sin filtros devuelve las ejecuciones con sus métricas».
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        for (desplazamiento, procesados) in [(0_i64, 1000_i64), (10, 2000), (20, 3000)].into_iter()
+        {
+            sembrar_ejecucion(
+                &estado,
+                tarea,
+                Estado::Success,
+                base + Duration::seconds(desplazamiento),
+                procesados,
+            )
+            .await;
+        }
+
+        let respuesta = get(api_router(estado), "/api/v1/executions").await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado contesta {status}: {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]["executions"].as_array().unwrap_or_else(|| {
+            panic!("el listado tiene que traer `executions` como array: {cuerpo}")
+        });
+
+        assert_eq!(filas.len(), 3, "sin filtros salen las tres filas");
+
+        assert_eq!(
+            cuerpo["data"]["total"], 3,
+            "el total tiene que ser el de las filas que casan: {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["data"].as_array().is_none(),
+            "el listado ya no puede ser un array pelado: {cuerpo}"
+        );
+    }
+
+    /// El total **refleja el acotado** de los filtros: cuenta lo que casa, no la tabla entera.
+    ///
+    /// Sin esto el panel pintaría el número de todas las filas aunque el filtro dejara fuera casi
+    /// todas, y el paginador prometería páginas que no existen.
+    #[tokio::test]
+    async fn el_total_de_las_ejecuciones_refleja_el_acotado_por_status_y_por_job_id() {
+        // api-resources: «El total refleja el acotado por los filtros».
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea_a = sembrar_tarea(&estado).await;
+        let tarea_b = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        sembrar_ejecucion(&estado, tarea_a, Estado::Success, base, 1000).await;
+        sembrar_ejecucion(
+            &estado,
+            tarea_a,
+            Estado::Failed,
+            base + Duration::seconds(10),
+            2000,
+        )
+        .await;
+        sembrar_ejecucion(
+            &estado,
+            tarea_b,
+            Estado::Success,
+            base + Duration::seconds(20),
+            3000,
+        )
+        .await;
+
+        let respuesta = get(
+            api_router(estado.clone()),
+            "/api/v1/executions?status=failed",
+        )
+        .await;
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["total"], 1,
+            "el total tiene que ser el de las fallidas, no el de todas: {cuerpo}"
+        );
+
+        let respuesta = get(
+            api_router(estado.clone()),
+            &format!("/api/v1/executions?job_id={tarea_a}"),
+        )
+        .await;
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["total"], 2,
+            "el total por tarea cuenta solo las de esa tarea: {cuerpo}"
+        );
+
+        let respuesta = get(
+            api_router(estado),
+            &format!("/api/v1/executions?job_id={tarea_b}&status=success"),
+        )
+        .await;
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["total"], 1,
+            "los dos filtros juntos acotan el total: {cuerpo}"
+        );
+    }
+
+    /// El total es **ajeno a la ventana**: `limit` y `offset` acotan la página, no la cuenta.
+    ///
+    /// Es lo que el paginador necesita: dos páginas distintas de la misma consulta tienen que
+    /// informar el mismo total, y ese total es el de todas las filas que casan.
+    #[tokio::test]
+    async fn el_total_de_las_ejecuciones_no_lo_cambian_limit_ni_offset() {
+        // api-resources: «El total no lo cambian limit ni offset».
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        for (desplazamiento, procesados) in [
+            (0_i64, 1000_i64),
+            (10, 2000),
+            (20, 3000),
+            (30, 4000),
+            (40, 5000),
+        ]
+        .into_iter()
+        {
+            sembrar_ejecucion(
+                &estado,
+                tarea,
+                Estado::Success,
+                base + Duration::seconds(desplazamiento),
+                procesados,
+            )
+            .await;
+        }
+
+        let primera = body_json(
+            get(
+                api_router(estado.clone()),
+                "/api/v1/executions?limit=2&offset=0",
+            )
+            .await,
+        )
+        .await;
+        let segunda = body_json(
+            get(
+                api_router(estado.clone()),
+                "/api/v1/executions?limit=2&offset=2",
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            primera["data"]["total"], 5,
+            "la primera página tiene que informar el total de las cinco: {primera}"
+        );
+        assert_eq!(
+            segunda["data"]["total"], 5,
+            "la segunda página informa el mismo total: {segunda}"
+        );
+
+        assert_eq!(
+            primera["data"]["executions"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            2,
+            "la primera página trae dos filas: {primera}"
+        );
+        assert_eq!(
+            segunda["data"]["executions"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            2,
+            "y la segunda, otras dos: {segunda}"
         );
     }
 }
