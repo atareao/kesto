@@ -14,6 +14,7 @@ la imagen de Open Graph desde el arte nuevo, para que no convivan dos identidade
 |---|---|---|
 | Icono | `assets/icono-3000.svg` | 3000×3000, transparente; idéntico a `assets/public/assets/icon.svg` y `assets/docs/assets/logo.svg` |
 | Lockup | `assets/logo.svg` | 956×441: cubo + «KESTO» gris + «BACKUP ORCHESTRATOR» naranja |
+| Emblema de portada | `assets/logo-portada.svg` | 512×512: cubo K sobre badge circular naranja con borde blanco; transparente fuera del círculo. Es el arte del emblema de la portada (sin plato) |
 
 `assets/public/assets/` es la copia publicable del set nuevo; `assets/docs/assets/` ya estaba
 generada del arte nuevo y no se toca.
@@ -78,10 +79,11 @@ magick -size 1200x630 xc:'#0D1B2A' /tmp/lockup.png -gravity center -composite ui
 
 # Arte del panel
 rsvg-convert -w 128 -h 128 "$SRC" -o ui/src/assets/kesto-icon.png
+# el plato blanco al 10 % solo se aplica ya a kesto-icon-dark.png
 rsvg-convert -w 128 -h 128 "$SRC" -o /tmp/icon-128.png
 magick -size 128x128 xc:none -fill 'rgba(255,255,255,0.10)' -draw 'roundrectangle 0,0,127,127,16,16' /tmp/icon-128.png -gravity center -composite ui/src/assets/kesto-icon-dark.png
-rsvg-convert -w 512 -h 512 "$SRC" -o /tmp/icon-512.png
-magick -size 512x512 xc:none -fill 'rgba(255,255,255,0.10)' -draw 'roundrectangle 0,0,511,511,64,64' /tmp/icon-512.png -gravity center -composite ui/src/assets/kesto-emblema.png
+# emblema de la portada: badge circular naranja y opaco, sin plato añadido
+rsvg-convert -w 512 -h 512 assets/logo-portada.svg -o ui/src/assets/kesto-emblema.png
 ```
 
 ## Decisiones
@@ -89,7 +91,9 @@ magick -size 512x512 xc:none -fill 'rgba(255,255,255,0.10)' -draw 'roundrectangl
 - **Plato claro al 10 % en el arte oscuro dentro del panel.** El cubo nuevo es oscuro: sobre el
   `Sider` oscuro y sobre la portada (fondo `#0D1B2A`) se fundiría con el fondo. Un plato blanco
   al 10 % se ve solo sobre fondo oscuro y es invisible sobre fondo claro, así que el mismo
-  asset sirve en los dos temas.
+  asset sirve en los dos temas. Se mantiene solo para `kesto-icon-dark` (el cubo sin fondo sobre
+  el `Sider` oscuro); el emblema de la portada ya no lo necesita porque su badge circular naranja
+  contrasta tanto sobre fondo claro como sobre oscuro.
 - **`apple-touch-icon`, `maskable` y `mstile` opacos**: iOS, Android y Windows no respetan la
   transparencia en estos formatos; se aplanan sobre el color de fondo correspondiente.
 - **Tamaños 4×/2×**: los iconos del lateral se pintan a 32×32 CSS (se generan a 128) y el
