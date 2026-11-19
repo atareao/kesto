@@ -43,12 +43,21 @@
 //! la capa de acceso —la única que tiene la clave maestra—. El alta de un repositorio los toma del
 //! cuerpo de la petición porque en un alta todavía no hay fila; aquí sí la hay, y es de donde salen.
 //!
-//! # La ventana acota el número, y `truncated` dice que puede haber más
+//! # La página la acota `limit`, el total es exacto y `truncated` es la guarda
 //!
-//! La ventana —[`LA_VENTANA`]— no es una comodidad del panel: listar es la lectura más cara de la
-//! API, porque hay que abrir el repositorio y recorrer su índice, y el formato del repositorio lo
-//! hace además inevitable —el identificador de una instantánea es el nombre de un fichero y no
-//! lleva fecha, así que acotar **antes** de resolver es la única forma de no recorrerlo entero—.
+//! El listado admite `limit` y `offset`, con el mismo defecto (`50`) y el mismo tope (`200`) que el
+//! resto de listados, y devuelve una **envoltura** con `snapshots`, `total` y `truncated`. El total
+//! es **exacto** y no el tamaño de la página: para saberlo hay que **enumerar** el repositorio
+//! entero, y enumerarlo es la lectura más cara de la API —hay que abrir el repositorio y recorrer
+//! su índice—, porque el formato del repositorio lo hace además inevitable: el identificador de una
+//! instantánea es el nombre de un fichero y no lleva fecha, así que resolver para ordenar exige
+//! recorrerlo. Ése es el precio de un paginador que no mienta sobre cuántas páginas hay, y `limit`
+//! acota **lo que se devuelve** —la página— y no lo que se enumera para contar.
+//!
+//! Enumerar sin freno sería un coste sin cota, así que la enumeración se topa en [`LA_GUARDA`]: una
+//! guarda **alta**, muy por encima del tope de una página, que en el caso normal —decenas o cientos
+//! de copias— no se toca y deja el total exacto. Cuando se toca, `truncated` lo dice y el total
+//! puede quedar corto.
 //!
 //! La consecuencia, que hay que leer junto al campo: el subconjunto devuelto **no** tiene por qué
 //! ser el de las instantáneas más recientes. Lo que se garantiza es el orden de lo que se devuelve
@@ -98,20 +107,30 @@ use crate::error::AppError;
 use crate::rustic::{Acceso, ResumenDeSnapshot};
 use crate::state::AppState;
 
-/// Cuántas instantáneas devuelve el explorador como mucho.
+/// Cuántas instantáneas devuelve un listado que no informa `limit`.
 ///
-/// Es la misma ventana que la del histórico de ejecuciones, y por el mismo motivo: listar es la
-/// lectura más cara de la API —hay que abrir el repositorio y recorrer su índice—, así que el
-/// número no es una comodidad del panel sino una cota del servidor. Dos ventanas distintas para dos
-/// listados del mismo panel serían dos números que se desincronizan.
+/// Cincuenta y no todas: el panel pinta una página, y es el mismo defecto que el del resto de
+/// listados —un listado sin `limit` no puede materializarse entero—.
+pub const LIMITE_POR_DEFECTO: i64 = 50;
+
+/// El tope de `limit`.
 ///
-/// El RED de este change declara por su cuenta una constante con **este mismo nombre y este mismo
-/// valor** —`LA_VENTANA`, al principio de su bloque de pruebas—, y las dos quedan atadas por la
-/// prueba de la ventana: siembra una instantánea **más** que la ventana y exige que vuelvan
-/// exactamente las de la ventana, así que un número distinto en cualquiera de los dos lados la pone
-/// roja. No se comparte la constante porque el RED está escrito y no se toca; lo que se comparte es
-/// la medición.
-pub const LA_VENTANA: usize = 200;
+/// El mismo que el del resto de listados y por el mismo motivo: listar es la lectura más cara de la
+/// API —hay que abrir el repositorio y recorrer su índice—, así que una página no puede crecer sin
+/// freno. Un `limit` por encima de este tope **no se recorta en silencio**: contesta `400`.
+pub const LIMITE_MAXIMO: i64 = 200;
+
+/// El tope alto de la **enumeración** que sostiene el `total` exacto.
+///
+/// No es una página ni un defecto de `limit`: es la guarda de seguridad que acota lo que cuesta
+/// contar. El total exacto exige enumerar el repositorio entero, y enumerar sin freno sería un
+/// coste sin cota en un repositorio patológico, así que la enumeración se corta aquí —muy por
+/// encima del tope de una página, [`LIMITE_MAXIMO`], para que el caso normal no lo note— y, cuando
+/// se corta, la respuesta lo avisa con `truncated` y el total puede quedar corto.
+///
+/// Cinco páginas del tope: bastante para que ningún paginador razonable lo alcance, poco para que
+/// el peor caso tenga un final.
+pub const LA_GUARDA: usize = 1_000;
 
 /// Las rutas del explorador: el listado de un repositorio y la restauración de una instantánea.
 ///
@@ -140,11 +159,56 @@ pub fn router() -> Router<AppState> {
 /// cuando lo que ha hecho es una errata, y el listado que vuelve es el de ninguno. El rechazo sale
 /// por la envoltura como cualquier otro parámetro que no se puede interpretar, y ni el nombre ni el
 /// valor del campo que sobra viajan al cliente.
+///
+/// `limit` y `offset` son la **paginación**, con el mismo defecto y el mismo tope que el resto de
+/// listados, y se validan en [`ConsultaDelCable::paginacion`]: un `limit` fuera de rango contesta
+/// `400` —no se recorta en silencio— y un `offset` negativo también. Un `limit` que no es un número
+/// no llega hasta aquí: lo rechaza el extractor, y por eso `limit` es `Option<i64>` y no una cadena
+/// que este módulo tenga que interpretar.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsultaDelCable {
     /// El repositorio cuyas instantáneas se listan.
     pub repository_id: Option<String>,
+    /// Cuántas instantáneas devolver como mucho.
+    pub limit: Option<i64>,
+    /// Cuántas instantáneas saltar.
+    pub offset: Option<i64>,
+}
+
+impl ConsultaDelCable {
+    /// Valida la paginación y la resuelve a sus dos números, o contesta `400` nombrando el campo.
+    ///
+    /// Es el mismo reparto que el del histórico y el de restauraciones: `50` de defecto, `200` de
+    /// tope y un `limit` fuera de `1..=200` o un `offset` negativo son una petición mal formada
+    /// —`400`— y **no** se recortan: recortar el `limit` dejaría a quien pidió creyendo que ha
+    /// recibido lo que pidió. El mensaje nombra el campo y nunca repite su valor.
+    ///
+    /// Se valida **antes** de resolver la fila del repositorio y, sobre todo, antes de abrir el
+    /// almacenamiento: un parámetro mal formado no puede costar una lectura.
+    fn paginacion(&self) -> Result<(i64, i64), AppError> {
+        let limite = match self.limit {
+            Some(valor) if !(1..=LIMITE_MAXIMO).contains(&valor) => {
+                return Err(AppError::InvalidInput(format!(
+                    "el campo `limit` de la consulta tiene que ser un número entre 1 y {LIMITE_MAXIMO}"
+                )));
+            }
+            Some(valor) => valor,
+            None => LIMITE_POR_DEFECTO,
+        };
+
+        let desplazamiento = match self.offset {
+            Some(valor) if valor < 0 => {
+                return Err(AppError::InvalidInput(
+                    "el campo `offset` de la consulta no puede ser negativo".to_owned(),
+                ));
+            }
+            Some(valor) => valor,
+            None => 0,
+        };
+
+        Ok((limite, desplazamiento))
+    }
 }
 
 /// El cuerpo de la petición de restauración, tal y como llega por el cable.
@@ -206,7 +270,7 @@ pub struct CuerpoDeLaRestauracion {
 /// **qué** destino abrir y su ausencia es un `404` **antes** de tocar el almacenamiento, así que un
 /// repositorio inventado no crea nada en ninguna parte.
 ///
-/// # Los tres rechazos, y por qué son ésos
+/// # Los rechazos, y por qué son ésos
 ///
 /// * **`400` si falta `repository_id`, nombrando el parámetro**: un explorador mira **un**
 ///   repositorio cada vez, y la ruta no tiene un recurso al que colgarse, así que el repositorio
@@ -217,18 +281,24 @@ pub struct CuerpoDeLaRestauracion {
 ///   el camino —una errata de teclado no es un recurso ausente—, y aquí importa además por coste:
 ///   resolver el listado abre el repositorio, que es la operación más cara de la API, así que un
 ///   identificador que no puede corresponder a ninguna fila no debe llegar hasta ahí.
+/// * **`400` si `limit` o `offset` están fuera de rango**: un `limit` mayor que el tope, negativo o
+///   cero, o un `offset` negativo, son una petición mal formada —no se recortan en silencio—, y se
+///   validan **antes** de resolver la fila para que no cuesten una lectura ni, menos aún, una
+///   apertura. El reparto es el mismo que el del histórico y el de restauraciones.
 /// * **`404` si el repositorio no existe**: la fila la resuelve este manejador, que es el único que
 ///   puede leerla —el motor no sabe de la base—, y sin fila no hay destino que abrir. Se contesta
 ///   antes de tocar el almacenamiento, así que un repositorio inventado no cuesta una apertura.
 ///
-/// # La ventana y `truncated`
+/// # La página, el total exacto y `truncated`
 ///
-/// La ventana la aplica el motor —que acota los identificadores **antes** de resolverlos, porque
-/// resolver es una lectura por instantánea— y aquí solo se lee si se ha llenado. `truncated`
-/// significa **«el listado se ha recortado»** y **no** promete que los 200 que devuelve sean **los
-/// más recientes**: la ventana acota el **número**, no el orden de antigüedad, y lo único que se
-/// garantiza es el orden de lo que devuelve. El campo lo dice palabra por palabra en la vista del
-/// cable, que es donde lo lee quien construye el panel.
+/// El motor enumera el listado del repositorio y lo acota en [`LA_GUARDA`] —que acota los
+/// identificadores **antes** de resolverlos, porque resolver es una lectura por instantánea—; aquí
+/// se **cuenta** lo enumerado para el `total` exacto y se recorta la **página** con `offset` y
+/// `limit`: el tope de `limit` acota lo que se devuelve, no lo que se enumera para contar. Y se lee
+/// si la guarda se ha tocado: `truncated` significa **«el listado se ha recortado»** y **no**
+/// promete que los devueltos sean **los más recientes** —la guarda acota el **número**, no el orden
+/// de antigüedad, y lo único que se garantiza es el orden de lo que devuelve—. El campo lo dice
+/// palabra por palabra en la vista del cable, que es donde lo lee quien construye el panel.
 ///
 /// # El target de cada elemento lo resuelve este manejador
 ///
@@ -241,40 +311,59 @@ pub struct CuerpoDeLaRestauracion {
 ///
 /// # Errors
 ///
-/// Un `400` de [`AppError::InvalidInput`] para el parámetro que falta o que no es un UUID, un `404`
-/// de [`AppError::NotFound`] para la fila que no está, lo que devuelva la traducción del motor si el
-/// repositorio no se puede listar, y un `500` de [`AppError::Database`] si la fila del repositorio no
-/// se puede leer o si los objetivos de sus instantáneas no se pueden resolver.
+/// Un `400` de [`AppError::InvalidInput`] para el parámetro que falta, que no es un UUID o para la
+/// paginación fuera de rango, un `404` de [`AppError::NotFound`] para la fila que no está, lo que
+/// devuelva la traducción del motor si el repositorio no se puede listar, y un `500` de
+/// [`AppError::Database`] si la fila del repositorio no se puede leer o si los objetivos de sus
+/// instantáneas no se pueden resolver.
 pub async fn listado(
     State(estado): State<AppState>,
     Query(consulta): Query<ConsultaDelCable>,
 ) -> Result<ApiResponse, AppError> {
+    // La paginación se valida **antes** de tocar la fila y el almacenamiento: un `limit` fuera de
+    // rango es una petición mal formada y no puede costar ni una lectura ni una apertura.
+    let (limite, desplazamiento) = consulta.paginacion()?;
+
     let fila = repositorio_del_explorador(&estado, consulta).await?;
 
     // El listado, por la fachada del motor y **nunca** por `Repositorio::listar_snapshots`: con el
     // backend de S3 la biblioteca construye su propio runtime, y llamarla desde dentro del de Tokio
     // —que es donde corre un manejador— entra en pánico. El porqué entero, en el encabezado.
+    //
+    // Se le pasa la **guarda** y no una página: lo que hace falta es la lista entera para contar el
+    // total exacto, no solo la página que se va a devolver.
     let instantaneas = estado
         .motor
-        .listar_snapshots(acceso_del_repositorio(&fila), LA_VENTANA)
+        .listar_snapshots(acceso_del_repositorio(&fila), LA_GUARDA)
         .await
         .map_err(del_motor)?;
 
-    // La ventana ya la aplicó el motor, así que aquí solo se mira si se ha llenado: una ventana
-    // llena y el silencio serían indistinguibles de «esto es todo». Ver el rustdoc del campo.
-    let truncated = instantaneas.len() >= LA_VENTANA;
+    // El total es lo enumerado, **no** lo que se devuelve: es lo que permite al paginador del panel
+    // pintar el número de páginas sin una segunda llamada. La conversión no puede fallar en la
+    // práctica —un `Vec` de `usize` cabe en un `i64` en cualquier máquina de 64 bits—, y si
+    // fallara por el camino, saturar es mejor que truncar el número que promete cuántos hay.
+    let total = i64::try_from(instantaneas.len()).unwrap_or(i64::MAX);
+
+    // La guarda acota la enumeración, así que si se ha tocado el total puede quedar corto: una
+    // guarda llena y el silencio serían indistinguibles de «esto es todo». Ver el rustdoc del campo.
+    let truncated = instantaneas.len() >= LA_GUARDA;
+
+    // La **página** se recorta sobre lo enumerado y ya ordenado —de la más reciente a la más
+    // antigua—: `limit` acota lo que se devuelve y `offset` avanza. Un `offset` que se pasa del
+    // final da una página vacía, que es una lectura legítima de un listado.
+    let pagina = pagina(&instantaneas, desplazamiento, limite);
 
     // El target de cada instantánea lo resuelve **este** manejador y no el motor: el motor lista lo
     // que hay en el almacenamiento y no lee la base —no sabe de ella—, y el vínculo
     // `instantánea → ejecución → tarea → target` solo existe ahí. Va después de listar y no antes
     // porque los identificadores que hay que resolver son los que ha devuelto el listado.
     //
-    // Una sola lectura para todo el lote: resolver los 200 identificadores de la ventana de uno en
-    // uno serían 200 consultas para pintar una pantalla.
-    let identificadores: Vec<String> = instantaneas
-        .iter()
-        .map(|resumen| resumen.id.clone())
-        .collect();
+    // Y sobre la **página** y no sobre el listado entero: del repositorio se resolvieron todas para
+    // contar el total, pero los vínculos solo hacen falta para los elementos que se devuelven.
+    //
+    // Una sola lectura para todo el lote: resolver los identificadores de la página de uno en uno
+    // serían tantas consultas como elementos para pintar una pantalla.
+    let identificadores: Vec<String> = pagina.iter().map(|resumen| resumen.id.clone()).collect();
 
     let objetivos = estado
         .db
@@ -293,13 +382,36 @@ pub async fn listado(
 
     // La vista se compone antes de envolverla porque formatear una fecha puede fallar: ese fallo es
     // un `500` con la causa al registro, y no una respuesta a la que le falte un elemento.
-    let vista = ListadoDelCable::desde(&instantaneas, &objetivos, &nombres, truncated)?;
+    let vista = ListadoDelCable::desde(pagina, total, &objetivos, &nombres, truncated)?;
 
     Ok(ApiResponse::new(
         StatusCode::OK,
         "instantáneas listadas",
         contenido(&vista)?,
     ))
+}
+
+/// La página que se devuelve: `desplazamiento` elementos descartados y, después, como mucho `limite`.
+///
+/// Los dos números vienen ya validados por [`ConsultaDelCable::paginacion`] —`limite` en `1..=200` y
+/// `desplazamiento` no negativo—, así que aquí no hay nada que rechazar: un desplazamiento que se
+/// pasa del final da una página vacía, que es un listado de cero elementos y no un recurso ausente.
+///
+/// El recorte se hace **después** de ordenar —el motor devuelve la lista ordenada de la más reciente
+/// a la más antigua—, de modo que el desempate y el orden son los de la lista entera y dos páginas
+/// consecutivas no pueden solaparse.
+fn pagina(
+    instantaneas: &[ResumenDeSnapshot],
+    desplazamiento: i64,
+    limite: i64,
+) -> &[ResumenDeSnapshot] {
+    let inicio = usize::try_from(desplazamiento).unwrap_or(usize::MAX);
+    let cuantas = usize::try_from(limite).unwrap_or(0);
+
+    match instantaneas.get(inicio..) {
+        Some(resto) => &resto[..resto.len().min(cuantas)],
+        None => &[],
+    }
 }
 
 /// `POST /api/v1/snapshots/{id}/restore` — restaurar una instantánea sobre el target que la copió.
@@ -657,40 +769,47 @@ fn acceso_del_repositorio(fila: &Repositorio) -> Acceso {
     }
 }
 
-/// El `data` del listado: los elementos, y si la ventana se ha llenado.
+/// El `data` del listado: la página, el total exacto y si la guarda se ha tocado.
 ///
-/// Es un objeto y no un array pelado como el listado del histórico, y no por gusto de forma: allí el
-/// cliente controla la ventana con `limit` y `offset` y puede deducir que hay más, y aquí solo manda
-/// `repository_id`, así que la respuesta tiene que decir por sí misma que el listado se ha
-/// recortado. Un array pelado no tiene dónde decirlo.
+/// Es un objeto y no un array pelado porque la respuesta tiene que llevar el **total** y el aviso de
+/// recorte, y un array no tiene dónde. El total es lo que permite al paginador del panel pintar el
+/// número de elementos y el de páginas sin una segunda llamada ni una heurística, y `truncated` es
+/// la guarda de la enumeración que lo sostiene.
 #[derive(Debug, Serialize)]
 struct ListadoDelCable {
-    /// Las instantáneas del repositorio, ordenadas de la más reciente a la más antigua.
+    /// Las instantáneas de la página, ordenadas de la más reciente a la más antigua.
     snapshots: Vec<SnapshotDelCable>,
-    /// Si el listado se ha recortado: la ventana se ha llenado y **puede** haber más.
+    /// Cuántas instantáneas tiene el repositorio en total, **sin** aplicar `limit` ni `offset`.
     ///
-    /// Significa **«el listado se ha recortado»**, y **no** promete que los 200 que lo acompañan
-    /// sean **los más recientes**: la ventana acota el **número**, no el orden de antigüedad —el
-    /// identificador de una instantánea es el nombre de un fichero y no lleva fecha, así que hay que
-    /// acotar antes de resolver, y acotar antes de resolver implica que el subconjunto devuelto no
-    /// tiene por qué ser el de las últimas—. Lo único que se garantiza es el **orden** de lo que
-    /// devuelve: de la más reciente a la más antigua.
+    /// Es exacto salvo que la guarda se haya tocado —ver `truncated`—, y en ese caso puede quedar
+    /// corto. Es ajeno a la página: dos peticiones con distinto `offset` informan el mismo total.
+    total: i64,
+    /// Si la enumeración se ha topado con la guarda y el `total` **puede** quedar corto.
     ///
-    /// Y llenar la ventana se informa como «puede haber más» aunque eso no se pueda distinguir de
-    /// «hay exactamente esta ventana»: lo que **no** se puede hacer es lo contrario —devolver la
-    /// ventana llena y callarse—, porque entonces «lleno» y «esto es todo» se leerían igual y quien
-    /// mire el panel creería que el repositorio tiene exactamente esas instantáneas y ninguna más.
-    /// Distinguir los dos casos exigiría resolver una instantánea de más, y resolver es justamente
-    /// la lectura cara que la ventana existe para acotar: de los dos errores posibles —decir «puede
-    /// haber más» cuando no lo hay, o decir «esto es todo» cuando no lo es— se elige el que no
-    /// esconde copias.
+    /// Significa **«el listado se ha recortado»**, y **no** promete que los devueltos sean **los más
+    /// recientes**: la guarda acota el **número**, no el orden de antigüedad —el identificador de
+    /// una instantánea es el nombre de un fichero y no lleva fecha, así que hay que acotar antes de
+    /// resolver, y acotar antes de resolver implica que el subconjunto devuelto no tiene por qué ser
+    /// el de las últimas—. Lo único que se garantiza es el **orden** de lo que devuelve: de la más
+    /// reciente a la más antigua.
+    ///
+    /// Y tocar la guarda se informa como «puede haber más» aunque eso no se pueda distinguir de «hay
+    /// exactamente esta guarda»: lo que **no** se puede hacer es lo contrario —devolver la lista
+    /// llena y callarse—, porque entonces «lleno» y «esto es todo» se leerían igual y quien mire el
+    /// panel creería que el repositorio tiene exactamente esas instantáneas y ninguna más. Distinguir
+    /// los dos casos exigiría resolver una instantánea de más, y resolver es justamente la lectura
+    /// cara que la guarda existe para acotar: de los dos errores posibles —decir «puede haber más»
+    /// cuando no lo hay, o decir «esto es todo» cuando no lo es— se elige el que no esconde copias.
     truncated: bool,
 }
 
 impl ListadoDelCable {
-    /// Vuelca las instantáneas del motor en la vista del cable, casando cada una con su objetivo.
+    /// Vuelca la **página** del motor en la vista del cable, casando cada una con su objetivo.
     ///
     /// Puede fallar porque formatear una fecha es falible: ver [`SnapshotDelCable::desde`].
+    ///
+    /// La `pagina` es solo lo que se devuelve —el total lo trae `total`, ya contado por quien
+    /// llama—, así que aquí no se cuenta nada: solo se vuelca.
     ///
     /// El `objetivos` lo trae **quien llama** —el manejador, de la capa de datos— y no el motor, que
     /// no lee la base: aquí solo se casa por el identificador de la instantánea, y la que no esté en
@@ -702,18 +821,20 @@ impl ListadoDelCable {
     /// `job_id` con el que casar y sale con `job_name` a `null` sin consultar el mapa —no hay tarea
     /// cuyo nombre pedir—, y una cuya tarea no esté en el mapa sale igual: `null`.
     fn desde(
-        instantaneas: &[ResumenDeSnapshot],
+        pagina: &[ResumenDeSnapshot],
+        total: i64,
         objetivos: &HashMap<String, ObjetivoDeRestauracion>,
         nombres: &HashMap<Uuid, String>,
         truncated: bool,
     ) -> Result<Self, AppError> {
-        let snapshots = instantaneas
+        let snapshots = pagina
             .iter()
             .map(|resumen| SnapshotDelCable::desde(resumen, objetivos.get(&resumen.id), nombres))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
             snapshots,
+            total,
             truncated,
         })
     }
@@ -724,10 +845,10 @@ impl ListadoDelCable {
 /// # Estos nombres son un **añadido al SRS**
 ///
 /// El §5 describe esta ruta con cuatro palabras —«Explorador de snapshots en el almacenamiento
-/// S3»— y **no** publica el JSON de su respuesta, así que los nombres de estos seis campos y los dos
-/// de la respuesta los fija el RED de este change, igual que en su día se añadieron las tres rutas
-/// de `api-endpoints` y como el alta de un repositorio añadió `data.outcome`. Son vocabulario del
-/// cable, en el inglés del resto del §5 —que publica `execution_id`, `bytes_processed` y
+/// S3»— y **no** publica el JSON de su respuesta, así que los nombres de estos seis campos y los
+/// tres de la respuesta los fija el RED de este change, igual que en su día se añadieron las tres
+/// rutas de `api-endpoints` y como el alta de un repositorio añadió `data.outcome`. Son vocabulario
+/// del cable, en el inglés del resto del §5 —que publica `execution_id`, `bytes_processed` y
 /// `current_action`—, mientras que lo que se pinta se queda en español. Quedan listados en el
 /// documento de la feature, que es donde se leen las incorporaciones al SRS.
 ///
@@ -878,11 +999,14 @@ mod tests {
     /// rechazo del identificador, que es otro caso y tiene su propia prueba.
     const UN_UUID: &str = "00000000-0000-4000-8000-000000000000";
 
-    /// La ventana del listado, la misma que la del histórico de ejecuciones.
-    ///
-    /// Es la lectura más cara del change —hay que abrir el repositorio y recorrer su índice—, así que
-    /// el número no es una comodidad del panel sino una cota del servidor.
-    const LA_VENTANA: usize = 200;
+    // El tope alto de la enumeración y el defecto y tope de la página, **tomados de producción**.
+    //
+    // No se duplican: el RED los importa de `super` para que un cambio de número en producción no
+    // deje a la prueba midiendo otra cosa. Lo que la prueba de la guarda sí ata por su cuenta es que
+    // se siembre **una instantánea más** que la guarda, para que la enumeración se tope y `truncated`
+    // pueda ponerse rojo si no lo dice.
+    use super::{LA_GUARDA, LIMITE_MAXIMO, LIMITE_POR_DEFECTO};
+    use super::{ResumenDeSnapshot, pagina};
 
     /// El cuerpo del alta de un repositorio cuyo destino es la ruta **local** dada.
     ///
@@ -1195,11 +1319,11 @@ mod tests {
     /// si alguien ha leído el almacenamiento. Las dos sembradas cubren lo otro: que las copias de Kesto
     /// están, cada una con la etiqueta con la que se identificó su tarea.
     ///
-    /// Y dos cosas más, que son las dos mitades que la prueba de la ventana **no** puede medir por
+    /// Y dos cosas más, que son las dos mitades que la prueba de la guarda **no** puede medir por
     /// estar en el otro extremo del contrato: el **orden** de la más reciente a la más antigua —lo
     /// único que el explorador garantiza del subconjunto que devuelve—, comprobado sobre la
     /// secuencia entera de fechas, y `truncated: false` con un listado que cabe entero, porque allí
-    /// la ventana se llena y el campo es `true`.
+    /// la guarda se llena y el campo es `true`.
     ///
     /// Y una tercera, que es la mitad **sin** vínculo del contrato ampliado: aquí el histórico está
     /// vacío —el repositorio se siembra con la biblioteca y ninguna copia de Kesto ha corrido—, así
@@ -1295,13 +1419,13 @@ mod tests {
              un listado desordenado enseña las copias al revés"
         );
 
-        // Y el listado está por debajo de la ventana, así que **no** viene recortado: si el número
+        // Y el listado está por debajo de la guarda, así que **no** viene recortado: si el número
         // cabe, decir que hay más sería mentir sobre el contenido del repositorio. Es la mitad que
-        // el otro caso —la ventana llena— no puede medir: allí `truncated` es `true` y un campo
+        // el otro caso —la guarda llena— no puede medir: allí `truncated` es `true` y un campo
         // cableado a `true` pasaría la suite entera.
         assert_eq!(
             cuerpo["data"]["truncated"], false,
-            "un listado por debajo de la ventana no puede venir recortado: {cuerpo}"
+            "un listado por debajo de la guarda no puede venir recortado: {cuerpo}"
         );
 
         let identificadores: Vec<&str> = listado
@@ -1638,36 +1762,233 @@ mod tests {
         }
     }
 
-    /// 1.29e — El listado va acotado a la ventana e indica que hay más.
+    /// 2.1 — El listado pagina con `limit`/`offset` y publica el `total` exacto.
     ///
-    /// Cubre `repository`, escenario «El listado va acotado». La ventana no es una comodidad del panel:
-    /// listar es la lectura más cara del change —abrir el repositorio y recorrer su índice—, y el
-    /// formato del repositorio lo hace además inevitable, porque el identificador de una instantánea es
-    /// el nombre de un fichero y no lleva fecha, así que acotar antes de resolver es la única forma de
-    /// no recorrerlo entero. Y quien pregunta tiene que poder saber que hay más sin volver a preguntar:
-    /// la ventana llena y el silencio serían indistinguibles de «esto es todo».
+    /// Cubre `repository`, escenarios «El total es exacto y la página va acotada por limit» y
+    /// «offset avanza por las páginas». El total es lo que permite al paginador del panel pintar el
+    /// número de páginas sin una segunda llamada, así que tiene que ser el de **todas** las
+    /// instantáneas y no el de la página: con doce en el repositorio y una página de diez, el total
+    /// sigue siendo doce en las dos páginas, y `limit` acota la página y no lo que se cuenta.
     ///
-    /// Se siembran **una más** que la ventana, y no muchas más, porque con una sola de sobra ya se
-    /// distingue «acotado» de «completo», y cada instantánea de más es un fichero más que el índice del
-    /// repositorio tiene que escribir y leer en cada corrida del CI.
+    /// Y `truncated` es `false`: la enumeración no toca la guarda —doce está muy por debajo—, que es
+    /// el caso normal que el panel pinta como lista completa.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn el_listado_esta_acotado_a_la_ventana_e_indica_que_hay_mas() {
+    async fn el_listado_pagina_con_limit_y_offset_y_publica_el_total_exacto() {
         let router = router_desarrollo().await;
 
         let destino = directorio_de_prueba();
         let ruta = destino.ruta().to_string_lossy().into_owned();
 
-        // Una fecha distinta por instantánea, generadas y no escritas a mano: dos instantáneas con la
-        // misma fecha son indistinguibles en el orden del listado, y el número de fechas es lo que
-        // decide cuántas hay.
-        let fechas: Vec<String> = (0..=LA_VENTANA)
-            .map(|indice| format!("2026-01-{:02}T{:02}:00:00Z", 1 + indice / 24, indice % 24))
+        // Doce fechas distintas y válidas: con una página de diez, el total (doce) y el tamaño de la
+        // página (diez) se distinguen sin ambigüedad, y la segunda página trae los dos que sobran.
+        let fechas: Vec<String> = (0..12)
+            .map(|indice| format!("2026-01-01T{:02}:{:02}:00Z", indice / 60, indice % 60))
             .collect();
         let referencias: Vec<&str> = fechas.iter().map(String::as_str).collect();
 
         sembrar_snapshots(destino.ruta(), PASSPHRASE_DE_PRUEBA, &referencias);
 
-        let repositorio = alta_de_repositorio(&router, "explorador-1-29e", &ruta).await;
+        let repositorio = alta_de_repositorio(&router, "explorador-2-pagina", &ruta).await;
+
+        // Los identificadores de una respuesta, en el orden en que llegan.
+        let identificadores = |cuerpo: &serde_json::Value| -> Vec<String> {
+            cuerpo["data"]["snapshots"]
+                .as_array()
+                .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"))
+                .iter()
+                .filter_map(|elemento| elemento["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // La primera página: diez elementos, y el total de las doce.
+        let respuesta = get(
+            router.clone(),
+            &format!("/api/v1/snapshots?repository_id={repositorio}&limit=10"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado paginado tiene que contestar 200, y contestó {status} con {cuerpo}"
+        );
+
+        let primera = identificadores(&cuerpo);
+
+        assert_eq!(
+            primera.len(),
+            10,
+            "una página de diez no puede traer {} elementos: {cuerpo}",
+            primera.len()
+        );
+
+        assert_eq!(
+            cuerpo["data"]["total"], 12,
+            "el total tiene que ser el de todas las instantáneas y no el de la página: {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["truncated"], false,
+            "con doce instantáneas no se toca la guarda y la lista es completa: {cuerpo}"
+        );
+
+        // La segunda página: los dos que sobran, y el mismo total.
+        let respuesta = get(
+            router,
+            &format!("/api/v1/snapshots?repository_id={repositorio}&limit=10&offset=10"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "la segunda página tiene que contestar 200, y contestó {status} con {cuerpo}"
+        );
+
+        let segunda = identificadores(&cuerpo);
+
+        assert_eq!(
+            segunda.len(),
+            2,
+            "la segunda página de doce con diez por página trae dos: {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["total"], 12,
+            "el total no lo cambia el `offset`, es el de todas las instantáneas: {cuerpo}"
+        );
+
+        assert!(
+            segunda.iter().all(|id| !primera.contains(id)),
+            "las dos páginas no pueden solaparse: la primera trajo {primera:?} y la segunda \
+             {segunda:?}"
+        );
+
+        assert_eq!(
+            primera.len() + segunda.len(),
+            fechas.len(),
+            "entre las dos páginas tienen que salir las doce, sin repetir ninguna: {primera:?} y \
+             {segunda:?}"
+        );
+    }
+
+    /// 2.2 — Un `limit` fuera de rango o no numérico contesta `400` en el listado de instantáneas.
+    ///
+    /// Cubre `repository`, escenario «Un limit fuera de rango contesta 400». Es el mismo reparto que
+    /// el del histórico y el de restauraciones: un parámetro mal formado no se recorta en silencio, y
+    /// se valida **antes** de tocar el repositorio para que no cueste una apertura. `limit=abc` lo
+    /// rechaza el extractor de la consulta —el tipo no encaja— y los otros cuatro los rechaza la
+    /// validación del propio módulo; las cinco salen por la envoltura con un `400`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_limit_fuera_de_rango_o_no_numerico_contesta_400_en_el_listado_de_instantaneas() {
+        let router = router_desarrollo().await;
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+
+        // El repositorio **existe**: así el único motivo para contestar `400` es la paginación, y no
+        // un `404` por una fila ausente.
+        let repositorio = alta_de_repositorio(&router, "explorador-2-400", &ruta).await;
+
+        let casos = [
+            format!(
+                "/api/v1/snapshots?repository_id={repositorio}&limit={}",
+                LIMITE_MAXIMO + 1
+            ),
+            format!("/api/v1/snapshots?repository_id={repositorio}&limit=0"),
+            format!("/api/v1/snapshots?repository_id={repositorio}&limit=-1"),
+            format!("/api/v1/snapshots?repository_id={repositorio}&limit=abc"),
+            format!("/api/v1/snapshots?repository_id={repositorio}&offset=-1"),
+        ];
+
+        for url in &casos {
+            let respuesta = get(router.clone(), url).await;
+            let status = respuesta.status();
+            let cuerpo = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "`{url}` tiene que contestar 400 y contestó {status}: {cuerpo}"
+            );
+
+            assert_eq!(
+                cuerpo["status"], 400,
+                "la envoltura del 400 de `{url}`: {cuerpo}"
+            );
+        }
+
+        // Y el motivo nombra el campo cuando lo que falla es el rango: un `400` que no diga cuál es
+        // el parámetro mal formado no se puede arreglar sin leer el código.
+        let respuesta = get(
+            router,
+            &format!(
+                "/api/v1/snapshots?repository_id={repositorio}&limit={}",
+                LIMITE_MAXIMO + 1
+            ),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "el motivo del 400: {cuerpo}"
+        );
+
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|motivo| motivo.contains("limit")),
+            "el 400 del rango tiene que nombrar el campo `limit`, y llegó {cuerpo}"
+        );
+    }
+
+    /// 2.3 — El listado se topa con la guarda e indica que puede haber más.
+    ///
+    /// Cubre `repository`, escenario «El listado va acotado» en su mitad de recorte. La guarda no es
+    /// una comodidad del panel: el total exacto exige enumerar el repositorio entero —abrir el
+    /// repositorio y recorrer su índice—, y el formato lo hace además inevitable, porque el
+    /// identificador de una instantánea es el nombre de un fichero y no lleva fecha, así que acotar
+    /// antes de resolver es la única forma de no recorrerlo sin freno. Y quien pregunta tiene que
+    /// poder saber que hay más sin volver a preguntar: la guarda tocada y el silencio serían
+    /// indistinguibles de «esto es todo».
+    ///
+    /// Se siembra **una instantánea más** que la guarda, y no muchas más, porque con una sola de
+    /// sobra ya se distingue «acotado» de «completo», y cada instantánea de más es un fichero más que
+    /// el índice del repositorio tiene que escribir y leer en cada corrida del CI. Y con la guarda
+    /// tocada el `total` **puede quedar corto** —es lo que `truncated` avisa—, así que se afirma que
+    /// es el de lo enumerado y no el de la página.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_listado_se_topa_con_la_guarda_e_indica_que_puede_haber_mas() {
+        let router = router_desarrollo().await;
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+
+        // Una fecha distinta por instantánea, con resolución de segundo para que mil y una quepan en
+        // un día: dos instantáneas con la misma fecha son indistinguibles en el orden del listado, y
+        // el número de fechas es lo que decide cuántas hay.
+        let fechas: Vec<String> = (0..=LA_GUARDA)
+            .map(|indice| {
+                format!(
+                    "2026-01-01T{:02}:{:02}:{:02}Z",
+                    indice / 3_600,
+                    (indice / 60) % 60,
+                    indice % 60
+                )
+            })
+            .collect();
+        let referencias: Vec<&str> = fechas.iter().map(String::as_str).collect();
+
+        sembrar_snapshots(destino.ruta(), PASSPHRASE_DE_PRUEBA, &referencias);
+
+        let repositorio = alta_de_repositorio(&router, "explorador-2-guarda", &ruta).await;
 
         let respuesta = get(
             router,
@@ -1681,31 +2002,35 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::OK,
-            "el listado tiene que contestar 200 aunque tenga más instantáneas que la ventana; contestó \
+            "el listado tiene que contestar 200 aunque tenga más instantáneas que la guarda; contestó \
          {status} con {cuerpo}"
         );
 
-        let listado = cuerpo["data"]["snapshots"]
-            .as_array()
-            .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
+        let listado = cuerpo["data"]["snapshots"].as_array().unwrap_or_else(|| {
+            panic!("el listado tiene que traer sus elementos en `data.snapshots`: {cuerpo}")
+        });
 
-        assert!(
-            listado.len() <= LA_VENTANA,
-            "el listado devolvió {} elementos y no puede superar la ventana de {LA_VENTANA}: {cuerpo}",
+        // La página la acota `limit`, no la guarda: sin `limit`, el defecto del servidor.
+        assert_eq!(
+            listado.len(),
+            LIMITE_POR_DEFECTO as usize,
+            "sin `limit` la página es la del defecto del servidor —{LIMITE_POR_DEFECTO}—, y llegaron \
+             {}: {cuerpo}",
             listado.len()
         );
 
+        // El total es el de lo enumerado: con la guarda tocada puede quedar corto, y es justo lo que
+        // `truncated` avisa.
         assert_eq!(
-            listado.len(),
-            LA_VENTANA,
-            "el repositorio tiene {} instantáneas y la ventana de {LA_VENTANA} tiene que llenarse: \
-         {cuerpo}",
-            fechas.len()
+            cuerpo["data"]["total"], LA_GUARDA,
+            "con la guarda tocada, el total es el de lo enumerado —{LA_GUARDA}— y no el de la página: \
+             {cuerpo}"
         );
 
         assert_eq!(
             cuerpo["data"]["truncated"], true,
-            "con más instantáneas que la ventana, la respuesta tiene que decir que hay más: {cuerpo}"
+            "con más instantáneas que la guarda, la respuesta tiene que decir que puede haber más: \
+             {cuerpo}"
         );
     }
 
@@ -2707,5 +3032,86 @@ mod tests {
              el del snapshot, y `{}` sigue ahí",
             obsoleto.display()
         );
+    }
+
+    // --- El troceado de la página, en unidad ---
+    //
+    // [`pagina`] es segura por construcción —traduce a `usize` con `unwrap_or` y recorta con `get`,
+    // así que un desplazamiento fuera de rango da `None` y nunca un `panic`—, pero hasta ahora esa
+    // seguridad no la fijaba ninguna prueba: el resto del módulo la mide de refilón, a través del
+    // listado y contra un repositorio sembrado. Estas pruebas la atan caso por caso y sin base ni
+    // red, que es como corresponde a una función pura: no necesita el panel ni el almacenamiento
+    // para medirse.
+
+    /// Una instantánea mínima para trocear: lo único que importa es que sea distinguible.
+    fn instantanea_para_trocear(n: usize) -> ResumenDeSnapshot {
+        ResumenDeSnapshot {
+            id: format!("instantanea-{n}"),
+            fecha: OffsetDateTime::UNIX_EPOCH,
+            rutas: Vec::new(),
+            etiqueta: None,
+            ficheros: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Una lista de `cuantas` instantáneas distinguibles, en el orden en que se troceará.
+    fn instantaneas_para_trocear(cuantas: usize) -> Vec<ResumenDeSnapshot> {
+        (0..cuantas).map(instantanea_para_trocear).collect()
+    }
+
+    /// Un `offset` más allá del final da página **vacía**, y no un `panic` ni un recurso ausente.
+    #[test]
+    fn un_offset_mas_alla_del_final_da_una_pagina_vacia() {
+        let instantaneas = instantaneas_para_trocear(3);
+
+        assert!(pagina(&instantaneas, 4, 10).is_empty());
+    }
+
+    /// El `offset` del tope de `i64` no desborda: da página vacía, no un `panic`.
+    #[test]
+    fn un_offset_del_tope_de_i64_no_desborda_y_da_una_pagina_vacia() {
+        let instantaneas = instantaneas_para_trocear(3);
+
+        assert!(pagina(&instantaneas, i64::MAX, 10).is_empty());
+    }
+
+    /// `limit = 1` devuelve una sola fila, ni dos ni ninguna.
+    #[test]
+    fn un_limite_de_uno_devuelve_una_sola_fila() {
+        let instantaneas = instantaneas_para_trocear(3);
+
+        assert_eq!(pagina(&instantaneas, 0, 1).len(), 1);
+    }
+
+    /// `limit` en el tope devuelve todo lo que haya y nunca más de `LIMITE_MAXIMO`.
+    #[test]
+    fn un_limite_del_tope_devuelve_todo_lo_que_hay_sin_excederse() {
+        let pocas = instantaneas_para_trocear(3);
+        let muchas = instantaneas_para_trocear(LIMITE_MAXIMO as usize + 5);
+
+        assert_eq!(pagina(&pocas, 0, LIMITE_MAXIMO).len(), pocas.len());
+        assert_eq!(
+            pagina(&muchas, 0, LIMITE_MAXIMO).len(),
+            LIMITE_MAXIMO as usize
+        );
+    }
+
+    /// Una lista vacía da página vacía con cualquier `offset`/`limit` válidos.
+    #[test]
+    fn una_lista_vacia_da_una_pagina_vacia() {
+        assert!(pagina(&[], 0, LIMITE_POR_DEFECTO).is_empty());
+        assert!(pagina(&[], 7, 1).is_empty());
+    }
+
+    /// Un `offset` intermedio salta las filas anteriores y conserva el orden de la lista.
+    #[test]
+    fn un_offset_intermedio_salta_las_filas_anteriores_y_conserva_el_orden() {
+        let instantaneas = instantaneas_para_trocear(5);
+
+        let trozo = pagina(&instantaneas, 2, 2);
+        let identificadores: Vec<&str> = trozo.iter().map(|resumen| resumen.id.as_str()).collect();
+
+        assert_eq!(identificadores, vec!["instantanea-2", "instantanea-3"]);
     }
 }

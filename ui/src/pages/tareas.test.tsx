@@ -44,7 +44,7 @@ describe('pantalla de Tareas', () => {
       if (ruta === '/api/v1/jobs' && method === 'GET') return { status: 200, data: [J1] }
       if (ruta === '/api/v1/targets') return { status: 200, data: TARGETS }
       if (ruta === '/api/v1/repositories') return { status: 200, data: REPOSITORIOS }
-      if (ruta === '/api/v1/executions') return { status: 200, data: [] }
+      if (ruta === '/api/v1/executions') return { status: 200, data: { executions: [], total: 0 } }
       if (ruta === '/api/v1/jobs/j1/run' && method === 'POST') {
         return { status: 202, data: { id: 'e1', job_id: 'j1', status: 'pending' } }
       }

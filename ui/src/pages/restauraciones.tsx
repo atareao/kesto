@@ -3,15 +3,18 @@ import { Badge, Button, Empty, Select, Space, Table, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
+import type { CambioDePagina } from '../components/Paginador/Paginador'
+import {
+  Paginador,
+  TAMANO_DE_PAGINA_POR_DEFECTO,
+  TEXTO_DE_PAGINA_VACIA,
+} from '../components/Paginador/Paginador'
 import { useRestauraciones } from '../hooks/useRestauraciones'
 import { useTargets } from '../hooks/useTargets'
 import type { Estado, RestauracionRegistrada } from '../services/api/types'
 import { colorDeEstado, etiquetaDeEstado } from '../services/estados'
 import { mensajeDeError } from '../services/errores'
 import { formatearFecha, formatearUuid, SIN_VALOR } from '../services/format'
-
-/** Filas por página. El contrato admite de 1 a 200; 20 llena una pantalla. */
-export const TAMANO_DE_PAGINA = 20
 
 const ESTADOS: readonly Estado[] = ['pending', 'running', 'success', 'failed']
 
@@ -35,9 +38,10 @@ function nombreDelTarget(fila: RestauracionRegistrada): string {
  * listado se refresca sin recargar la página (`useRestauraciones` programa el
  * refresco) y, además, se puede forzar con «Actualizar».
  *
- * La paginación es por `limit`/`offset`. A diferencia del histórico de
- * ejecuciones, aquí la respuesta **sí** trae el total, así que «Siguiente» se
- * apaga con el total y no con la heurística de «página incompleta».
+ * La paginación es **del servidor**: el paginador de Antd se alimenta del `total`
+ * de la respuesta y cada cambio de página o de tamaño se traduce en un
+ * `limit`/`offset` con el que se pide la página de verdad. No se recorta en
+ * cliente, y al cambiar un filtro se vuelve a la primera página.
  *
  * El filtro por target se elige en un selector cuyas opciones vienen del catálogo
  * (`GET /api/v1/targets`) y viaja a la API como `target_id`. El elegido vive en
@@ -48,20 +52,20 @@ function nombreDelTarget(fila: RestauracionRegistrada): string {
 export default function Restauraciones() {
   const [estado, setEstado] = useState<Estado | undefined>(undefined)
   const [targetId, setTargetId] = useState<string | undefined>(undefined)
-  const [offset, setOffset] = useState(0)
+  const [pagina, setPagina] = useState(1)
+  const [tamanoDePagina, setTamanoDePagina] = useState(TAMANO_DE_PAGINA_POR_DEFECTO)
 
   const targets = useTargets()
 
   const restauraciones = useRestauraciones({
     status: estado,
     target_id: targetId,
-    limit: TAMANO_DE_PAGINA,
-    offset,
+    limit: tamanoDePagina,
+    offset: (pagina - 1) * tamanoDePagina,
   })
 
   const datos = restauraciones.data?.restorations ?? []
   const total = restauraciones.data?.total ?? 0
-  const haySiguiente = offset + datos.length < total
 
   const columnas: TableProps<RestauracionRegistrada>['columns'] = [
     {
@@ -119,12 +123,21 @@ export default function Restauraciones() {
 
   const cambiarEstado = (valor: Estado | undefined) => {
     setEstado(valor)
-    setOffset(0)
+    setPagina(1)
   }
 
   const cambiarTarget = (valor: string | undefined) => {
     setTargetId(valor)
-    setOffset(0)
+    setPagina(1)
+  }
+
+  /**
+   * El paginador ya decidió a qué página ir —y, al cambiar el tamaño, vuelve a
+   * la primera—: aquí solo se guardan las dos cifras y el `offset` se deriva.
+   */
+  const cambiarPagina = (cambio: CambioDePagina) => {
+    setPagina(cambio.pagina)
+    setTamanoDePagina(cambio.tamanoDePagina)
   }
 
   return (
@@ -168,36 +181,38 @@ export default function Restauraciones() {
         />
       ) : restauraciones.isPending ? (
         <Cargando />
-      ) : datos.length === 0 ? (
-        <Empty description="No hay restauraciones para estos filtros" />
       ) : (
         <>
-          <Table<RestauracionRegistrada>
-            aria-label="Restauraciones"
-            rowKey="id"
-            columns={columnas}
-            dataSource={datos}
-            pagination={false}
-            size="small"
-          />
+          {datos.length === 0 ? (
+            <Empty
+              description={
+                pagina > 1 ? TEXTO_DE_PAGINA_VACIA : 'No hay restauraciones para estos filtros'
+              }
+            />
+          ) : (
+            <Table<RestauracionRegistrada>
+              aria-label="Restauraciones"
+              rowKey="id"
+              columns={columnas}
+              dataSource={datos}
+              pagination={false}
+              size="small"
+            />
+          )}
 
-          <Space style={{ marginTop: 16 }}>
-            <Button
-              onClick={() => setOffset((previo) => Math.max(0, previo - TAMANO_DE_PAGINA))}
-              disabled={offset === 0}
-            >
-              Anterior
-            </Button>
-            <Button
-              onClick={() => setOffset((previo) => previo + TAMANO_DE_PAGINA)}
-              disabled={!haySiguiente}
-            >
-              Siguiente
-            </Button>
-            <Typography.Text type="secondary">
-              Página {Math.floor(offset / TAMANO_DE_PAGINA) + 1} de {Math.max(1, Math.ceil(total / TAMANO_DE_PAGINA))}
-            </Typography.Text>
-          </Space>
+          {/* El paginador va **fuera** del vacío: si la página encoge y esta
+              queda sin filas, sigue a la vista y el operador puede volver a la
+              primera. Se pinta cuando la API declara algo que paginar **o**
+              cuando el operador está fuera de la primera página y la purga dejó
+              el conjunto a cero: sin él no tendría control para retroceder. */}
+          {total > 0 || pagina > 1 ? (
+            <Paginador
+              total={total}
+              pagina={pagina}
+              tamanoDePagina={tamanoDePagina}
+              onCambiar={cambiarPagina}
+            />
+          ) : null}
         </>
       )}
     </section>

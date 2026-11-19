@@ -35,6 +35,7 @@ pub mod target;
 pub use api_token::{AltaDeToken, Scope, TokenDeApi, Tokens, hash_de_token};
 pub use execution::{
     AltaDeEjecucion, Ejecucion, Ejecuciones, Estado, FiltroDeEjecuciones, ObjetivoDeRestauracion,
+    PaginaDeEjecuciones,
 };
 pub use job::{AltaDeTarea, Tarea, Tareas};
 pub use repository::{AltaDeRepositorio, Repositorio, Repositorios, SaludDeRepositorio};

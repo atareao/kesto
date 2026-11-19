@@ -153,6 +153,24 @@ pub struct FiltroDeEjecuciones {
     pub desplazamiento: i64,
 }
 
+/// Una página del histórico de copias **con el total** de lo que casa con el filtro.
+///
+/// Es la hermana de [`PaginaDeRestauraciones`](crate::db::entities::PaginaDeRestauraciones) y existe
+/// por la misma razón: un listado sin total no deja al panel saber cuántas páginas hay sin pedirlas
+/// todas. Viajan **juntos** porque salen de los mismos filtros —pedir el total aparte sería un total
+/// que puede olvidarse o pedirse con otros filtros—, y el total cuenta **todas** las filas que
+/// cumplen el filtro, no las de la ventana.
+///
+/// [`FiltroDeEjecuciones::limite`] y [`FiltroDeEjecuciones::desplazamiento`] acotan **las filas**,
+/// nunca el total: es lo que la ventana promete.
+#[derive(Debug, Clone)]
+pub struct PaginaDeEjecuciones {
+    /// Las filas de la ventana, en el orden del contrato.
+    pub filas: Vec<Ejecucion>,
+    /// Cuántas filas cumplen el filtro en total, sin aplicar la ventana.
+    pub total: i64,
+}
+
 /// El target sobre el que se restaura una instantánea, resuelto por la ejecución que la anotó.
 ///
 /// Es lo que la restauración necesita saber y lo que el §3 **sí** permite resolver: una
@@ -246,6 +264,27 @@ const SQL_LISTAR_FILTRADO: &str = "SELECT id, job_id, status, snapshot_id, bytes
      bytes_uploaded, error_message, started_at, finished_at FROM job_executions \
      WHERE (?1 IS NULL OR id = ?1) AND (?2 IS NULL OR job_id = ?2) AND (?3 IS NULL OR status = ?3) \
      ORDER BY started_at DESC, id LIMIT ?4 OFFSET ?5";
+
+/// Cuenta las ejecuciones que cumplen el filtro, sin ventana: es el **total** del listado.
+///
+/// Es la hermana de [`SQL_LISTAR_FILTRADO`] y comparte su `WHERE` entero —los mismos tres filtros,
+/// escritos una sola vez cada uno dentro de una cadena estática—, para que la página y el total no
+/// puedan acotar por cosas distintas. No lleva `LIMIT` ni `OFFSET`: el total es lo que la ventana
+/// **no** puede cambiar.
+const SQL_CONTAR_FILTRADO: &str = "SELECT COUNT(*) FROM job_executions \
+     WHERE (?1 IS NULL OR id = ?1) AND (?2 IS NULL OR job_id = ?2) AND (?3 IS NULL OR status = ?3)";
+
+/// El texto con el que viaja un fallo al **abrir** la transacción del listado.
+///
+/// No es una consulta, pero [`DbError::Consulta`] es el sitio del fallo de acceso y su texto es
+/// `&'static str`, así que la garantía de que nada interpolado llega al registro se mantiene: estos
+/// dos pasos del listado se informan como lo que son, sin estrenar una variante para un fallo que ya
+/// tiene sitio.
+const CONSULTA_ABRIR_TRANSACCION: &str = "BEGIN de la transacción del listado de job_executions";
+
+/// El texto con el que viaja un fallo al **cerrar** la transacción del listado: ver
+/// [`CONSULTA_ABRIR_TRANSACCION`].
+const CONSULTA_CERRAR_TRANSACCION: &str = "COMMIT de la transacción del listado de job_executions";
 
 /// Alta de una ejecución, devolviendo la fila tal y como quedó.
 ///
@@ -438,26 +477,55 @@ impl Ejecuciones {
         filas.iter().map(desde_fila).collect()
     }
 
-    /// Lista las ejecuciones que cumplen el filtro, en el orden del contrato.
+    /// Lista las ejecuciones que cumplen el filtro, en el orden del contrato, **con el total**.
     ///
     /// La ventana es obligatoria —llega ya resuelta— porque el histórico es la tabla que más
     /// crece: sin tope, un listado materializaría la tabla entera en memoria y ocuparía una de
     /// las conexiones del pool mientras el motor quiere escribir.
+    ///
+    /// Son **dos** lecturas y no una: la página la resuelve [`SQL_LISTAR_FILTRADO`] y el total
+    /// [`SQL_CONTAR_FILTRADO`], que es la única forma de saber cuántas hay sin traerlas. Las dos van
+    /// con los mismos filtros y en la **misma transacción**: sin ella el motor podría escribir entre
+    /// la página y la cuenta, y el total diría un número que la página no sostiene. Las dos son
+    /// lecturas, así que la transacción no bloquea a nadie mientras dura.
     pub async fn listar_filtrado(
         &self,
         filtro: &FiltroDeEjecuciones,
-    ) -> Result<Vec<Ejecucion>, DbError> {
+    ) -> Result<PaginaDeEjecuciones, DbError> {
+        let mut transaccion = self
+            .pool
+            .begin()
+            .await
+            .map_err(error_de_consulta(CONSULTA_ABRIR_TRANSACCION))?;
+
         let filas = sqlx::query(SQL_LISTAR_FILTRADO)
             .bind(filtro.id.map(|id| id.hyphenated().to_string()))
             .bind(filtro.job_id.map(|id| id.hyphenated().to_string()))
             .bind(filtro.status.map(Estado::texto))
             .bind(filtro.limite)
             .bind(filtro.desplazamiento)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *transaccion)
             .await
             .map_err(error_de_consulta(SQL_LISTAR_FILTRADO))?;
 
-        filas.iter().map(desde_fila).collect()
+        // La cuenta va con los **mismos tres filtros** que la página y **sin ventana**: el total es
+        // lo que la ventana no puede cambiar.
+        let total = sqlx::query_scalar(SQL_CONTAR_FILTRADO)
+            .bind(filtro.id.map(|id| id.hyphenated().to_string()))
+            .bind(filtro.job_id.map(|id| id.hyphenated().to_string()))
+            .bind(filtro.status.map(Estado::texto))
+            .fetch_one(&mut *transaccion)
+            .await
+            .map_err(error_de_consulta(SQL_CONTAR_FILTRADO))?;
+
+        transaccion
+            .commit()
+            .await
+            .map_err(error_de_consulta(CONSULTA_CERRAR_TRANSACCION))?;
+
+        let filas = filas.iter().map(desde_fila).collect::<Result<_, _>>()?;
+
+        Ok(PaginaDeEjecuciones { filas, total })
     }
 
     /// Resuelve el target sobre el que restaurar una instantánea, o `None` si no hay vínculo.
@@ -1199,10 +1267,17 @@ mod tests {
         };
 
         // Sin filtros: las tres, la más reciente primero.
-        let todas = ejecuciones
+        let pagina = ejecuciones
             .listar_filtrado(&sin_filtros)
             .await
             .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(
+            pagina.total, 3,
+            "sin filtros, el total es el de todas las filas, no el de la ventana"
+        );
+
+        let todas = pagina.filas;
 
         assert_eq!(
             todas.len(),
@@ -1260,9 +1335,13 @@ mod tests {
             .expect("el listado filtrado no puede fallar");
 
         assert_eq!(
-            solo_fallidas.len(),
+            solo_fallidas.filas.len(),
             1,
             "el filtro por estado tiene que acotar"
+        );
+        assert_eq!(
+            solo_fallidas.total, 1,
+            "y el total tiene que contar solo las que casan: las fallidas, no las tres"
         );
 
         // Un `job_id` que no es el de las filas no devuelve ninguna: el filtro no se ignora.
@@ -1278,8 +1357,12 @@ mod tests {
             .expect("el listado filtrado no puede fallar");
 
         assert!(
-            de_otra_tarea.is_empty(),
+            de_otra_tarea.filas.is_empty(),
             "un filtro por una tarea sin ejecuciones no puede devolver filas"
+        );
+        assert_eq!(
+            de_otra_tarea.total, 0,
+            "y su total es cero, no el de la tabla entera"
         );
 
         // La ventana se aplica: saltar una devuelve la segunda del orden.
@@ -1292,7 +1375,8 @@ mod tests {
                 desplazamiento: 1,
             })
             .await
-            .expect("el listado filtrado no puede fallar");
+            .expect("el listado filtrado no puede fallar")
+            .filas;
 
         assert_eq!(
             segunda.len(),
@@ -1315,7 +1399,8 @@ mod tests {
                 desplazamiento: 0,
             })
             .await
-            .expect("el listado filtrado no puede fallar");
+            .expect("el listado filtrado no puede fallar")
+            .filas;
 
         assert_eq!(
             solo_una.len(),
@@ -1340,7 +1425,8 @@ mod tests {
                 desplazamiento: 0,
             })
             .await
-            .expect("el listado filtrado no puede fallar");
+            .expect("el listado filtrado no puede fallar")
+            .filas;
 
         assert_eq!(
             combinado.len(),
@@ -1358,7 +1444,8 @@ mod tests {
                 desplazamiento: 0,
             })
             .await
-            .expect("un identificador sin fila no puede ser un error");
+            .expect("un identificador sin fila no puede ser un error")
+            .filas;
 
         assert!(
             inexistente.is_empty(),

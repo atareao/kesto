@@ -1208,7 +1208,7 @@ impl Kesto {
                 )
                 .await;
 
-            if let Some(fila) = filas
+            if let Some(fila) = filas["executions"]
                 .as_array()
                 .and_then(|filas| filas.iter().find(|fila| fila["id"] == ejecucion))
             {

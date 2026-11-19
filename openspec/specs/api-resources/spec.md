@@ -248,11 +248,13 @@ El porqué de las dos mitades: la capa de acceso ya rechaza el vacío al escribi
 
 ### Requirement: El listado de ejecuciones lleva filtros, paginación acotada y orden estable
 
-`GET /api/v1/executions` SHALL admitir los filtros `id`, `job_id` y `status`, y la paginación `limit` y `offset`.
+`GET /api/v1/executions` SHALL admitir los filtros `id`, `job_id` y `status`, y la paginación `limit` y `offset`. La respuesta SHALL ser una **envoltura** con `executions` —el array de filas— y `total` —el número de filas que casan con los filtros—, como ya hace el listado de restauraciones.
 
 El filtro `id` SHALL ser opcional y SHALL devolver, como mucho, la fila con ese identificador. Existe para que el servidor MCP pueda resolver una ejecución concreta —la herramienta `get_execution`— sin estrenar una ruta de detalle: el recurso sigue siendo de solo lectura y su superficie no crece. Un `id` con forma inválida SHALL contestar `400`; un `id` válido sin fila SHALL devolver el listado vacío, como cualquier otro filtro que no case.
 
-`limit` SHALL tener `50` como valor por defecto y **`200` de tope**, y un valor fuera de rango —por encima del tope o negativo— o no numérico SHALL contestar `400`. El tope existe porque el histórico es la tabla que más crece de las cuatro —una fila por intento de copia— y el panel pinta una página: sin tope, un `limit` grande materializaría la tabla entera en memoria y ocuparía una de las cinco conexiones del pool mientras el motor quiere escribir. Un valor fuera de rango es una petición mal formada, así que se contesta `400` y no se recorta en silencio: recortar dejaría al cliente creyendo que ha recibido lo que pidió.
+`limit` SHALL tener `50` como valor por defecto y **`200` de tope**, y un valor fuera de rango —por encima del tope o negativo— o no numérico SHALL contestar `400`. El tope existe porque el histórico es la tabla que más crece de las cuatro —una fila por intento de copia— y el panel pinta una página: sin tope, un `limit` grande materializaría la tabla entera en memoria y ocuparía una de las cinco conexiones del pool mientras el motor quiere escribir. Un valor fuera de rango es una petición mal formada, así que se contesta `400` y no se recorta en silencio.
+
+`total` SHALL contar **todas** las filas que satisfacen los filtros de la petición, no solo las de la página devuelta, y NO SHALL verse afectado por `limit` ni por `offset`. Es lo que permite al panel pintar el número total de elementos y el número de páginas sin una segunda llamada ni una heurística.
 
 El orden SHALL ser `started_at DESC, id`, y el `id` desempata porque las ejecuciones del **mismo segundo** empatan —un lote de tareas disparado por el mismo tick de cron arranca a la vez, y `CURRENT_TIMESTAMP` no tiene más resolución— y el orden tiene que ser **estable** entre dos llamadas: sin desempate, dos peticiones seguidas con el mismo `offset` pueden devolver una fila repetida y saltarse otra, y el panel paginaría de forma visiblemente rota.
 
@@ -265,14 +267,26 @@ Cada fila SHALL llevar además **`job_name`** (anulable): el nombre de la tarea 
 #### Scenario: El listado sin filtros devuelve las ejecuciones con sus métricas
 - **GIVEN** tres ejecuciones dadas de alta
 - **WHEN** se pide el listado sin filtros
-- **THEN** SHALL contestar `200` con las tres filas
-- **AND** cada fila SHALL traer `bytes_processed`, `bytes_uploaded`, `started_at`, `finished_at` y `job_name`
+- **THEN** SHALL contestar `200` con la envoltura
+- **AND** `executions` SHALL traer las tres filas y cada una SHALL traer `bytes_processed`, `bytes_uploaded`, `started_at`, `finished_at` y `job_name`
+- **AND** `total` SHALL valer `3`
 
 #### Scenario: Los filtros por job_id y por status acotan el listado
 - **GIVEN** ejecuciones de dos tareas distintas, con estados distintos
 - **WHEN** se pide el listado con `job_id` y con `status`
 - **THEN** cada llamada SHALL devolver solo las filas que cumplen su filtro
 - **AND** los dos filtros SHALL poder usarse a la vez
+
+#### Scenario: El total refleja el acotado por los filtros
+- **GIVEN** ejecuciones de dos tareas con estados distintos
+- **WHEN** se pide el listado con `status=failed`
+- **THEN** `total` SHALL ser el número de ejecuciones fallidas, no el de todas
+
+#### Scenario: El total no lo cambian limit ni offset
+- **GIVEN** cinco ejecuciones
+- **WHEN** se piden dos páginas con `limit=2` y distinto `offset`
+- **THEN** las dos respuestas SHALL traer `total` igual a `5`
+- **AND** cada una SHALL traer dos filas
 
 #### Scenario: El filtro por id devuelve una sola ejecución
 - **GIVEN** ejecuciones de dos tareas distintas
@@ -283,7 +297,7 @@ Cada fila SHALL llevar además **`job_name`** (anulable): el nombre de la tarea 
 #### Scenario: Un id válido sin fila devuelve el listado vacío
 - **GIVEN** el router con una sesión válida y un identificador que no existe
 - **WHEN** se pide el listado con `id`
-- **THEN** SHALL contestar `200` con una lista vacía
+- **THEN** SHALL contestar `200` con `executions` vacío
 - **AND** NO SHALL contestar `404`
 
 #### Scenario: Un id con forma inválida contesta 400

@@ -11,7 +11,8 @@ import {
 } from '../hooks/useRestauraciones'
 import type { Estado, ListadoDeRestauraciones, Target } from '../services/api/types'
 import { formatearFecha } from '../services/format'
-import Restauraciones, { TAMANO_DE_PAGINA } from './restauraciones'
+import { TAMANO_DE_PAGINA_POR_DEFECTO as TAMANO_DE_PAGINA } from '../components/Paginador/Paginador'
+import Restauraciones from './restauraciones'
 
 const HEX = '0123456789abcdef'.repeat(4)
 
@@ -159,7 +160,7 @@ describe('pantalla de Restauraciones', () => {
 
     // Primero se sale de la primera página: sin ese `offset` heredado, exigir
     // `offset=0` después no demostraría que el filtro reinicia la paginación.
-    await usuario.click(screen.getByRole('button', { name: 'Siguiente' }))
+    await usuario.click(screen.getByTitle('2'))
     await waitFor(() => {
       expect(
         fetch
@@ -210,24 +211,20 @@ describe('pantalla de Restauraciones', () => {
     unmount()
   })
 
-  it('pagina con el total: «Siguiente» se apaga en la última página', async () => {
+  it('pagina con el total: la última página se ofrece y no hay una de más', async () => {
     const usuario = userEvent.setup()
     const fetch = instalarFetchFalso(
-      manejadorCon(({ url }) => {
-        const offset = Number(new URL(url, 'http://localhost').searchParams.get('offset') ?? 0)
-        return offset === 0
-          ? pagina(lote(TAMANO_DE_PAGINA), TAMANO_DE_PAGINA + 5)
-          : pagina(lote(5, TAMANO_DE_PAGINA), TAMANO_DE_PAGINA + 5)
-      }),
+      manejadorCon(() => pagina(lote(TAMANO_DE_PAGINA), TAMANO_DE_PAGINA + 5)),
     )
 
     const { unmount } = montar()
     await esperarLaTabla()
 
-    const siguiente = screen.getByRole('button', { name: 'Siguiente' })
-    expect(siguiente).toBeEnabled()
+    // 15 restauraciones a 10 por página son 2: existe «2» y no existe «3».
+    expect(screen.getByTitle('2')).toBeInTheDocument()
+    expect(screen.queryByTitle('3')).not.toBeInTheDocument()
 
-    await usuario.click(siguiente)
+    await usuario.click(screen.getByTitle('2'))
 
     await waitFor(() => {
       expect(
@@ -236,11 +233,6 @@ describe('pantalla de Restauraciones', () => {
           .some((llamada) => llamada.url.includes(`offset=${TAMANO_DE_PAGINA}`)),
       ).toBe(true)
     })
-    // En la última página —`offset` + filas ya no llega al total— se apaga.
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Siguiente' })).toBeDisabled()
-    })
-    expect(screen.getByRole('button', { name: 'Anterior' })).toBeEnabled()
     unmount()
   })
 
@@ -357,8 +349,9 @@ describe('filtro por target en Restauraciones', () => {
 
     const { unmount } = montar()
     await esperarLaTabla()
-    // Con las dos páginas del listado completo.
-    expect(screen.getByText(/Página 1 de 2/)).toBeInTheDocument()
+    // El listado completo trae dos páginas: 20 filas a 10 por página.
+    expect(screen.getByText(`${TAMANO_DE_PAGINA * 2} elementos`)).toBeInTheDocument()
+    expect(screen.getByTitle('2')).toBeInTheDocument()
 
     await elegirTarget(usuario, 'facturación')
 
@@ -372,8 +365,9 @@ describe('filtro por target en Restauraciones', () => {
       expect(within(tabla).getByText('facturación')).toBeInTheDocument()
       expect(within(tabla).queryByText('web')).not.toBeInTheDocument()
     })
-    // El total ya no es el del listado completo: solo hay una página.
-    expect(await screen.findByText(/Página 1 de 1/)).toBeInTheDocument()
+    // El total ya no es el del listado completo: una sola página.
+    expect(await screen.findByText('1 elemento')).toBeInTheDocument()
+    expect(screen.queryByTitle('2')).not.toBeInTheDocument()
     unmount()
   })
 
@@ -386,7 +380,7 @@ describe('filtro por target en Restauraciones', () => {
     const { unmount } = montar()
     await esperarLaTabla()
 
-    await usuario.click(screen.getByRole('button', { name: 'Siguiente' }))
+    await usuario.click(screen.getByTitle('2'))
     await waitFor(() => {
       expect(
         fetch

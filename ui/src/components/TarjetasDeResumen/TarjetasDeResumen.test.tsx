@@ -44,7 +44,7 @@ describe('TarjetasDeResumen', () => {
               id === 'r1'
                 ? [snapshot({ id: 's1', bytes: 3 * 1024 })]
                 : [snapshot({ id: 's2', bytes: 5 * 1024 })],
-            truncated: false,
+            total: 1,
           },
         }
       }
@@ -71,7 +71,8 @@ describe('TarjetasDeResumen', () => {
           status: 200,
           data: {
             snapshots: [snapshot({ id: `s-${id}`, bytes: 1024 })],
-            truncated: id === 'r2',
+            truncated: false,
+            total: id === 'r2' ? 500 : 1,
           },
         }
       }
@@ -109,7 +110,7 @@ describe('TarjetasDeResumen — un repositorio caído no colapsa el resumen', ()
       if (ruta === '/api/v1/snapshots') {
         const id = new URL(url, 'http://localhost').searchParams.get('repository_id')
         if (id === 'r2') return { status: 503, message: 'el repositorio no responde' }
-        return { status: 200, data: { snapshots: [snapshot({ id: 's1', bytes: 2048 })], truncated: false } }
+        return { status: 200, data: { snapshots: [snapshot({ id: 's1', bytes: 2048 })], total: 1, truncated: false } }
       }
       throw new Error(`ruta inesperada: ${ruta}`)
     })
@@ -161,7 +162,7 @@ describe('TarjetasDeResumen — un repositorio caído no colapsa el resumen', ()
       }
       if (ruta === '/api/v1/jobs') return { status: 200, data: [] }
       if (ruta === '/api/v1/snapshots') {
-        return { status: 200, data: { snapshots: [snapshot({ id: 's1', bytes: 1024 })], truncated: false } }
+        return { status: 200, data: { snapshots: [snapshot({ id: 's1', bytes: 1024 })], total: 1, truncated: false } }
       }
       throw new Error(`ruta inesperada: ${ruta}`)
     })

@@ -1,5 +1,6 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { listarSnapshots, restaurarSnapshot } from '../api/snapshots'
+import type { FiltrosDeSnapshots } from '../api/snapshots'
 import { claves } from './claves'
 
 /**
@@ -23,12 +24,21 @@ import { claves } from './claves'
 export const REINTENTOS_DE_S3 = false
 
 /**
- * Instantáneas de un repositorio. Se pide solo cuando hay `repositoryId`: una
- * pantalla que todavía no lo conoce no dispara una petición vacía.
+ * Instantáneas de un repositorio, paginadas con `limit`/`offset`. Se pide solo
+ * cuando hay `repositoryId`: una pantalla que todavía no lo conoce no dispara
+ * una petición vacía.
+ *
+ * `filtros` —con su `limit` y su `offset`— forma parte de la clave, así que dos
+ * páginas del mismo repositorio no comparten entrada de caché. El resultado trae
+ * la página en `data.snapshots`, el total en `data.total` y el aviso de recorte
+ * en `data.truncated`.
  */
-export function useSnapshots(repositoryId: string | null | undefined) {
+export function useSnapshots(
+  repositoryId: string | null | undefined,
+  filtros: FiltrosDeSnapshots = {},
+) {
   return useQuery({
-    queryKey: claves.snapshots(repositoryId ?? ''),
+    queryKey: claves.snapshots(repositoryId ?? '', filtros),
     queryFn: ({ signal }) => {
       // `enabled` garantiza que la consulta no se lanza sin repositorio; el
       // guardia deja el estrechamiento de tipo en manos del compilador en vez
@@ -36,7 +46,7 @@ export function useSnapshots(repositoryId: string | null | undefined) {
       if (repositoryId === null || repositoryId === undefined || repositoryId === '') {
         return Promise.reject(new Error('no hay repositorio seleccionado'))
       }
-      return listarSnapshots(repositoryId, signal)
+      return listarSnapshots(repositoryId, filtros, signal)
     },
     enabled: repositoryId !== null && repositoryId !== undefined && repositoryId !== '',
     retry: REINTENTOS_DE_S3,
