@@ -181,6 +181,16 @@ const SQL_LISTAR_FILTRADO: &str = "SELECT r.id, r.snapshot_id, r.target_id, r.st
 const SQL_CONTAR_FILTRADO: &str = "SELECT COUNT(*) FROM restore_executions \
      WHERE (?1 IS NULL OR target_id = ?1) AND (?2 IS NULL OR status = ?2)";
 
+/// El texto con el que viaja un fallo al **abrir** la transacción del listado: ver
+/// [`SQL_LISTAR_FILTRADO`], que es lo que va dentro.
+const CONSULTA_ABRIR_TRANSACCION: &str =
+    "BEGIN de la transacción del listado de restore_executions";
+
+/// El texto con el que viaja un fallo al **cerrar** la transacción del listado: ver
+/// [`CONSULTA_ABRIR_TRANSACCION`].
+const CONSULTA_CERRAR_TRANSACCION: &str =
+    "COMMIT de la transacción del listado de restore_executions";
+
 /// Actualización del desenlace: estado, motivo y final.
 ///
 /// `snapshot_id`, `target_id` y `started_at` **no** entran: son la identidad de la fila —qué se
@@ -266,9 +276,10 @@ impl Restauraciones {
     /// pool mientras el motor quiere escribir.
     ///
     /// Son **dos** lecturas y no una: la página la resuelve [`SQL_LISTAR_FILTRADO`] y el total
-    /// [`SQL_CONTAR_FILTRADO`], que es la única forma de saber cuántas hay sin traerlas. Las dos
-    /// van con los mismos filtros, así que el total no puede contar otra cosa que lo que la
-    /// página acota.
+    /// [`SQL_CONTAR_FILTRADO`], que es la única forma de saber cuántas hay sin traerlas. Las dos van
+    /// con los mismos filtros y en la **misma transacción**: sin ella el motor podría escribir entre
+    /// la página y la cuenta y el total diría un número que la página no sostiene. Las dos son
+    /// lecturas, así que la transacción no bloquea a nadie mientras dura.
     ///
     /// El total lo cuenta [`SQL_CONTAR_FILTRADO`] sobre la tabla **sola** y no sobre el `JOIN`:
     /// contar las filas de un `LEFT JOIN` que no multiplica —el `ON` casa con una clave primaria—
@@ -277,26 +288,37 @@ impl Restauraciones {
         &self,
         filtro: &FiltroDeRestauraciones,
     ) -> Result<PaginaDeRestauraciones, DbError> {
+        let mut transaccion = self
+            .pool
+            .begin()
+            .await
+            .map_err(error_de_consulta(CONSULTA_ABRIR_TRANSACCION))?;
+
         let filas = sqlx::query(SQL_LISTAR_FILTRADO)
             .bind(filtro.target_id.map(|id| id.hyphenated().to_string()))
             .bind(filtro.status.map(Estado::texto))
             .bind(filtro.limite)
             .bind(filtro.desplazamiento)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *transaccion)
             .await
             .map_err(error_de_consulta(SQL_LISTAR_FILTRADO))?;
+
+        let total = sqlx::query_scalar(SQL_CONTAR_FILTRADO)
+            .bind(filtro.target_id.map(|id| id.hyphenated().to_string()))
+            .bind(filtro.status.map(Estado::texto))
+            .fetch_one(&mut *transaccion)
+            .await
+            .map_err(error_de_consulta(SQL_CONTAR_FILTRADO))?;
+
+        transaccion
+            .commit()
+            .await
+            .map_err(error_de_consulta(CONSULTA_CERRAR_TRANSACCION))?;
 
         let filas = filas
             .iter()
             .map(desde_fila_listada)
             .collect::<Result<_, _>>()?;
-
-        let total = sqlx::query_scalar(SQL_CONTAR_FILTRADO)
-            .bind(filtro.target_id.map(|id| id.hyphenated().to_string()))
-            .bind(filtro.status.map(Estado::texto))
-            .fetch_one(&self.pool)
-            .await
-            .map_err(error_de_consulta(SQL_CONTAR_FILTRADO))?;
 
         Ok(PaginaDeRestauraciones { filas, total })
     }
@@ -1319,5 +1341,83 @@ mod tests {
             sin_target.target_type, None,
             "ni un tipo: los dos son huecos y viajan como `null`"
         );
+    }
+
+    /// 0.3c — La página y el conteo se resuelven en **una sola** transacción.
+    ///
+    /// El contrato de «el total no cuenta otra cosa que lo que la página acota» solo se sostiene si
+    /// las dos consultas van dentro del mismo `begin()`/`commit()`: sueltas, entre una y otra puede
+    /// entrar una escritura del motor. No se puede forzar esa carrera de forma determinista desde
+    /// fuera, así que se mide su **causa**: cuántas veces el listado pide una conexión al pool. Con
+    /// la transacción es **una** (la conexión se retiene hasta el `commit`); sin ella serían **dos**
+    /// —una por consulta— y ahí es donde cabría la escritura intermedia.
+    #[tokio::test]
+    async fn el_listado_resuelve_la_pagina_y_el_conteo_en_una_sola_transaccion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        use crate::db::{migrate, opciones_del_dsn};
+        use crate::test_support::directorio_de_prueba;
+
+        let directorio = directorio_de_prueba();
+
+        let adquisiciones = Arc::new(AtomicUsize::new(0));
+        let cuenta = adquisiciones.clone();
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .before_acquire(move |_conexion, _meta| {
+                let cuenta = cuenta.clone();
+                Box::pin(async move {
+                    cuenta.fetch_add(1, Ordering::SeqCst);
+                    Ok::<bool, sqlx::Error>(true)
+                })
+            })
+            .connect_with(
+                opciones_del_dsn(&directorio.dsn()).expect("el DSN de prueba tiene que ser válido"),
+            )
+            .await
+            .expect("el pool de prueba tiene que abrirse");
+
+        migrate::aplicar(&pool, &migrate::migrador())
+            .await
+            .expect("el esquema del §3 tiene que aplicarse");
+
+        let restauraciones = Restauraciones::nuevo(pool.clone());
+
+        restauraciones
+            .alta(alta_restauracion(None))
+            .await
+            .expect("el alta no puede fallar");
+        restauraciones
+            .alta(alta_restauracion(None))
+            .await
+            .expect("el alta no puede fallar");
+
+        // A partir de aquí solo cuenta lo que el **listado** adquiere.
+        adquisiciones.store(0, Ordering::SeqCst);
+
+        let pagina = restauraciones
+            .listar_filtrado(&FiltroDeRestauraciones {
+                target_id: None,
+                status: None,
+                limite: 50,
+                desplazamiento: 0,
+            })
+            .await
+            .expect("el listado filtrado no puede fallar");
+
+        assert_eq!(pagina.total, 2, "el total tiene que contar las dos filas");
+
+        assert_eq!(
+            adquisiciones.load(Ordering::SeqCst),
+            1,
+            "el listado tiene que resolver la página y el conteo en una sola transacción: dos \
+             adquisiciones de conexión son dos consultas sueltas, y entre ellas cabría una \
+             escritura que dejaría el total contando lo que la página no acota"
+        );
+
+        pool.close().await;
     }
 }
