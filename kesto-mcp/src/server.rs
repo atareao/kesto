@@ -29,21 +29,6 @@ estado de los repositorios, los targets, las tareas y el histórico de ejecucion
 copia cuando toca y comprueba la salud de un repositorio. No restaura instantáneas, no borra \
 recursos y no edita nada: este servidor no expone esas operaciones.";
 
-/// El tope de página que `GET /api/v1/snapshots` acepta: `1..=200`.
-///
-/// `list_snapshots` **no** expone `limit` en su entrada —el consumidor de esta herramienta no
-/// pide páginas, ve la ventana entera—, así que sin este valor fijo la API aplicaría su
-/// defecto (`LIMITE_POR_DEFECTO`, 50) y el MCP dejaría de ver las instantáneas que sí veía
-/// antes de que el listado pasara a paginar. Se pide el máximo válido a propósito: restaurar
-/// el comportamiento previo es el objetivo, y la paginación del lado del agente —que el
-/// agente pueda pedir offset— es un cambio aparte y fuera de alcance.
-///
-/// Es una copia deliberada de `LIMITE_MAXIMO` de `src/api/snapshots.rs`: ese valor vive en el
-/// paquete raíz `kesto`, que es un **binario sin `lib.rs`**, y un binario no es enlazable como
-/// dependencia, así que este crate no puede importarlo. Si el tope del backend cambia, esta
-/// constante hay que acompañarlo a mano.
-const LIMITE_DE_SNAPSHOTS: i64 = 200;
-
 /// El servidor MCP de Kesto.
 #[derive(Debug, Clone)]
 pub struct KestoMcp {
@@ -188,19 +173,26 @@ impl KestoMcp {
     #[tool(
         name = "list_snapshots",
         description = "Lista las instantáneas de un repositorio, con su identificador y su \
-                       fecha. No restaura ninguna."
+                       fecha, y admite `limit` y `offset`. No restaura ninguna. La respuesta \
+                       trae `total` y `truncated`: si viene truncada, pide el resto con \
+                       `offset`."
     )]
     async fn list_snapshots(
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(peticion): Parameters<PorRepositorio>,
     ) -> CallToolResult {
-        // `limit` viaja fijo al tope válido porque la entrada de la herramienta no lo expone
-        // y su defecto dejaría fuera instantáneas que antes llegaban. Ver `LIMITE_DE_SNAPSHOTS`.
-        let consulta = [
-            ("repository_id", peticion.repository_id),
-            ("limit", LIMITE_DE_SNAPSHOTS.to_string()),
-        ];
+        // La herramienta no fija un `limit` propio: lo que el agente no informe lo completa
+        // la API con sus defectos, y así el MCP coincide con ella en defecto y tope —la API es
+        // quien valida el rango y contesta `400` fuera de él— y no hay un valor duplicado.
+        let mut consulta: Vec<(&str, String)> = vec![("repository_id", peticion.repository_id)];
+
+        if let Some(limit) = peticion.limit {
+            consulta.push(("limit", limit.to_string()));
+        }
+        if let Some(offset) = peticion.offset {
+            consulta.push(("offset", offset.to_string()));
+        }
 
         self.leer(&ctx, "/api/v1/snapshots", &consulta).await
     }
@@ -340,6 +332,16 @@ pub struct PorIdentificador {
 pub struct PorRepositorio {
     /// El identificador del repositorio, en su forma canónica con guiones.
     pub repository_id: String,
+    /// Cuántas instantáneas devolver como mucho.
+    ///
+    /// Es **opcional** y la herramienta **no** fija un defecto propio: si no viene, no se manda
+    /// y la API aplica el suyo. Así el defecto y el tope del MCP son los de la API y no hay una
+    /// copia del `LIMITE_MAXIMO` que mantener a mano.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Cuántas instantáneas saltar antes de la primera de la página.
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 /// Los filtros del histórico de ejecuciones, todos opcionales.
