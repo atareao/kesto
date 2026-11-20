@@ -244,7 +244,7 @@ pub fn ruta_del_dsn(dsn: &str) -> Result<PathBuf, DbError> {
 /// `sqlx`, pero se declara igualmente: es la diferencia entre una regla y una
 /// casualidad, y el día que ese defecto cambie, el `ON DELETE CASCADE` del §3
 /// dejaría de ocurrir sin que nada lo delatara.
-fn opciones_del_dsn(dsn: &str) -> Result<SqliteConnectOptions, DbError> {
+pub(crate) fn opciones_del_dsn(dsn: &str) -> Result<SqliteConnectOptions, DbError> {
     let opciones = SqliteConnectOptions::from_str(dsn).map_err(|causa| DbError::DsnIlegible {
         dsn: dsn.to_owned(),
         causa,

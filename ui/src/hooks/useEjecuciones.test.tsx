@@ -70,4 +70,31 @@ describe('useEjecuciones', () => {
 
     expect(fetch.a('/api/v1/executions')).toHaveLength(2)
   })
+
+  it('conserva la página anterior mientras llega la siguiente, sin volver a «cargando»', async () => {
+    const fetch = instalarFetchFalso((llamada) =>
+      llamada.url.includes('offset=10')
+        ? new Promise<never>(() => {}) // la segunda página no llega todavía
+        : {
+            status: 200,
+            data: { executions: [ejecucion({ id: 'e1', job_id: 'j1' })], total: 120 },
+          },
+    )
+
+    const { result, rerender } = renderHook(
+      ({ offset }: { offset: number }) => useEjecuciones({ limit: 10, offset }),
+      { wrapper: envolver(cliente()), initialProps: { offset: 0 } },
+    )
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(result.current.data?.executions[0]?.id).toBe('e1')
+
+    rerender({ offset: 10 })
+    await waitFor(() => expect(fetch.a('/api/v1/executions')).toHaveLength(2))
+
+    expect(result.current.isPlaceholderData).toBe(true)
+    expect(result.current.isPending).toBe(false)
+    expect(result.current.data?.executions[0]?.id).toBe('e1')
+    expect(result.current.data?.total).toBe(120)
+  })
 })
