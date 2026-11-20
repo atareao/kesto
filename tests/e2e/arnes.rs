@@ -1066,22 +1066,34 @@ impl Kesto {
     }
 
     /// Da de alta un repositorio contra el servidor S3 de la batería.
+    ///
+    /// Reintenta de forma acotada ante un `502` —el `init` de rustic contra un SeaweedFS recién
+    /// arrancado se pasa del plazo bajo carga, y un `502` deja cero filas escritas (ver
+    /// [`reintentar`])— y, agotados los intentos, falla en voz alta con el último código y su
+    /// cuerpo.
     pub async fn crear_repositorio(&self, endpoint: &str, cubo: &str) -> Value {
-        self.datos(
-            "el alta del repositorio",
-            Method::POST,
-            "/api/v1/repositories",
-            Some(&json!({
-                "name": format!("e2e-{cubo}"),
-                "endpoint": endpoint,
-                "bucket": cubo,
-                "region": REGION,
-                "access_key_id": ACCESO_S3,
-                "secret_access_key": SECRETO_S3,
-                "passphrase": FRASE_DE_PASO,
-            })),
-        )
-        .await
+        let cuerpo = json!({
+            "name": format!("e2e-{cubo}"),
+            "endpoint": endpoint,
+            "bucket": cubo,
+            "region": REGION,
+            "access_key_id": ACCESO_S3,
+            "secret_access_key": SECRETO_S3,
+            "passphrase": FRASE_DE_PASO,
+        });
+
+        let (estado, valor) = reintentar(INTENTOS_DEL_ALTA, ESPERA_ENTRE_ALTA, || {
+            self.pedir(Method::POST, "/api/v1/repositories", Some(&cuerpo))
+        })
+        .await;
+
+        assert!(
+            estado.is_success(),
+            "el alta del repositorio: `POST /api/v1/repositories` con {INTENTOS_DEL_ALTA} \
+             intentos se quedó en {estado} con {valor}"
+        );
+
+        valor.get("data").cloned().unwrap_or(Value::Null)
     }
 
     /// Cambia la credencial de un repositorio, dejando los dos secretos guardados.
@@ -1352,6 +1364,64 @@ fn identificador_de(data: &Value, que: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("el alta de {que} no trajo `id`: {data}"))
         .to_owned()
+}
+
+// ── El reintento del alta ──────────────────────────────────────────────────
+
+/// Cuántas veces se reenvía el alta de un repositorio antes de darla por perdida.
+///
+/// Un número **pequeño** a propósito: lo que se tolera es un destino recién arrancado que aún no
+/// contesta, no un destino caído. Tres intentos cubren el arranque en frío bajo carga (el `init`
+/// de rustic puede pasarse de `TOPE_DEL_DESTINO` la primera vez) sin convertir un fallo real en
+/// una espera larga.
+pub const INTENTOS_DEL_ALTA: u32 = 3;
+
+/// La espera del primer reintento del alta; la de después dobla a la anterior (backoff).
+///
+/// Con [`INTENTOS_DEL_ALTA`] = 3 las esperas son 2 s y 4 s. Se doblan en vez de repetirse porque
+/// el motivo que se tolera —un destino que se está poniendo en pie— se resuelve con el tiempo, y
+/// una espera que crece acorta el caso bueno sin alargar de más el malo.
+pub const ESPERA_ENTRE_ALTA: Duration = Duration::from_secs(2);
+
+/// Reintenta un «intento» **solo** mientras conteste `502`, con backoff entre intentos.
+///
+/// El bucle no sabe nada de HTTP más allá del código: recibe el intento como clausura y devuelve
+/// la **última** respuesta tal cual. Eso lo hace puro y comprobable sin levantar un servidor —los
+/// tests de este módulo simulan un `502` seguido de un `200` con un contador— y deja que el
+/// llamador decida qué hacer con el resultado final.
+///
+/// - Devuelve en cuanto el código **no** es `502` (incluido un `2xx`).
+/// - Ante `502`, espera `espera` —2 s la primera vez, el doble cada vez— y reintenta.
+/// - Agotados los `intentos`, devuelve el **último `502` con su cuerpo**, sin entrar en pánico:
+///   el llamador falla en voz alta con ese código y ese cuerpo.
+///
+/// # Por qué reintentar el alta es seguro
+///
+/// Un `502` equivale a **cero filas escritas**: en el alta la fila de base de datos se escribe
+/// *después* de abrir el destino, así que si la apertura agota su plazo no queda estado parcial
+/// que un segundo intento pudiera duplicar. Se reenvía la misma petición y nada más.
+///
+/// `intentos` es el número total de llamadas; un valor de `0` se trata como `1`.
+async fn reintentar<F, Fut>(intentos: u32, espera: Duration, intento: F) -> (StatusCode, Value)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = (StatusCode, Value)>,
+{
+    let intentos = intentos.max(1);
+    let mut respuesta = intento().await;
+    let mut numero = 1;
+
+    while respuesta.0 == StatusCode::BAD_GATEWAY && numero < intentos {
+        // Backoff exponencial: 2 s, 4 s, 8 s… El factor se satura para que un número de intentos
+        // grande no desborde el desplazamiento.
+        let factor = 1u32.checked_shl(numero - 1).unwrap_or(u32::MAX);
+        tokio::time::sleep(espera.saturating_mul(factor)).await;
+
+        numero += 1;
+        respuesta = intento().await;
+    }
+
+    respuesta
 }
 
 // ── El mundo de una prueba ─────────────────────────────────────────────────
@@ -1657,4 +1727,153 @@ pub fn copiar_arbol(origen: &Path, destino: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    /// La espera inyectada en las pruebas: diminuta, para que el backoff se pueda medir sin
+    /// que la batería pierda segundos esperándolo.
+    const ESPERA_DE_PRUEBA: Duration = Duration::from_millis(20);
+
+    /// Un contador de llamadas compartido con la clausura del intento.
+    fn contador_de_llamadas() -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let llamadas = Rc::new(Cell::new(0));
+
+        (Rc::clone(&llamadas), llamadas)
+    }
+
+    #[tokio::test]
+    async fn un_502_seguido_de_un_2xx_reintenta_y_devuelve_los_datos() {
+        let (para_la_clausura, llamadas) = contador_de_llamadas();
+
+        let (estado, valor) = reintentar(INTENTOS_DEL_ALTA, ESPERA_DE_PRUEBA, move || {
+            let intento = para_la_clausura.get();
+            para_la_clausura.set(intento + 1);
+
+            async move {
+                if intento == 0 {
+                    (StatusCode::BAD_GATEWAY, json!({ "ok": false }))
+                } else {
+                    (
+                        StatusCode::OK,
+                        json!({ "ok": true, "data": { "id": "uno" } }),
+                    )
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(estado, StatusCode::OK);
+        assert_eq!(valor["data"]["id"], "uno");
+        assert_eq!(llamadas.get(), 2, "un `502` y un `2xx` son dos llamadas");
+    }
+
+    #[tokio::test]
+    async fn un_2xx_no_se_reintenta() {
+        let (para_la_clausura, llamadas) = contador_de_llamadas();
+
+        let (estado, valor) = reintentar(INTENTOS_DEL_ALTA, ESPERA_DE_PRUEBA, move || {
+            para_la_clausura.set(para_la_clausura.get() + 1);
+
+            async move {
+                (
+                    StatusCode::OK,
+                    json!({ "ok": true, "data": { "id": "uno" } }),
+                )
+            }
+        })
+        .await;
+
+        assert_eq!(estado, StatusCode::OK);
+        assert_eq!(valor["data"]["id"], "uno");
+        assert_eq!(llamadas.get(), 1, "un `2xx` no se reintenta");
+    }
+
+    #[tokio::test]
+    async fn un_codigo_que_no_es_502_no_se_reintenta() {
+        let (para_la_clausura, llamadas) = contador_de_llamadas();
+
+        let (estado, valor) = reintentar(INTENTOS_DEL_ALTA, ESPERA_DE_PRUEBA, move || {
+            para_la_clausura.set(para_la_clausura.get() + 1);
+
+            async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "ok": false, "error": "otra cosa" }),
+                )
+            }
+        })
+        .await;
+
+        assert_eq!(estado, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(valor["error"], "otra cosa");
+        assert_eq!(llamadas.get(), 1, "solo el `502` se reintenta");
+    }
+
+    #[tokio::test]
+    async fn un_502_persistente_agota_los_intentos_y_devuelve_el_ultimo() {
+        let (para_la_clausura, llamadas) = contador_de_llamadas();
+
+        let (estado, valor) = reintentar(INTENTOS_DEL_ALTA, ESPERA_DE_PRUEBA, move || {
+            let intento = para_la_clausura.get();
+            para_la_clausura.set(intento + 1);
+
+            async move {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    json!({ "ok": false, "error": format!("el intento {intento}") }),
+                )
+            }
+        })
+        .await;
+
+        assert_eq!(estado, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            valor["error"],
+            format!("el intento {}", INTENTOS_DEL_ALTA - 1),
+            "agotados los intentos devuelve el último, no uno vacío"
+        );
+        assert_eq!(
+            llamadas.get(),
+            INTENTOS_DEL_ALTA as usize,
+            "un `502` persistente gasta los {INTENTOS_DEL_ALTA} intentos"
+        );
+    }
+
+    /// Mide que la espera entre reintentos **crece** (backoff exponencial) y no es constante.
+    ///
+    /// Con 3 intentos el helper duerme `ESPERA_DE_PRUEBA` antes del segundo intento y
+    /// `ESPERA_DE_PRUEBA * 2` antes del tercero, es decir `20 + 2×20 = 60 ms` en total. El umbral
+    /// es `ESPERA_DE_PRUEBA * 3` (60 ms): una espera **constante** solo acumularía `2 × 20 = 40 ms`
+    /// y quedaría por debajo, así que el umbral discrimina de verdad backoff de espera fija.
+    ///
+    /// La aserción es una **cota inferior** (`>=`): la carga de la máquina solo puede aumentar el
+    /// tiempo transcurrido, nunca reducirlo, así que no introduce flakiness.
+    #[tokio::test]
+    async fn el_backoff_espera_entre_intentos() {
+        let inicio = Instant::now();
+
+        let (estado, _) = reintentar(3, ESPERA_DE_PRUEBA, || async {
+            (StatusCode::BAD_GATEWAY, Value::Null)
+        })
+        .await;
+
+        assert_eq!(estado, StatusCode::BAD_GATEWAY);
+
+        let transcurrido = inicio.elapsed();
+        // Backoff real: 20 ms (2.º intento) + 40 ms (3.er intento) = 60 ms; una espera constante
+        // daría 40 ms.
+        let minimo = ESPERA_DE_PRUEBA * 3;
+
+        assert!(
+            transcurrido >= minimo,
+            "con 3 intentos y una espera de {ESPERA_DE_PRUEBA:?} el backoff acumula al menos \
+             {minimo:?} entre reintentos y pasaron {transcurrido:?}"
+        );
+    }
 }
