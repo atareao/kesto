@@ -1,6 +1,7 @@
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
 import { listarSnapshots, restaurarSnapshot } from '../api/snapshots'
 import type { FiltrosDeSnapshots } from '../api/snapshots'
+import type { ListadoDeSnapshots } from '../services/api/types'
 import { claves } from './claves'
 
 /**
@@ -37,7 +38,11 @@ export function useSnapshots(
   repositoryId: string | null | undefined,
   filtros: FiltrosDeSnapshots = {},
 ) {
-  return useQuery({
+  // El tipo del dato va explícito: el `queryFn` tiene una rama que rechaza
+  // (`Promise<never>`) y, con `placeholderData: keepPreviousData` en juego, la
+  // inferencia del genérico de datos se pierde y `data` acabaría tipado como la
+  // propia función del placeholder.
+  return useQuery<ListadoDeSnapshots>({
     queryKey: claves.snapshots(repositoryId ?? '', filtros),
     queryFn: ({ signal }) => {
       // `enabled` garantiza que la consulta no se lanza sin repositorio; el
@@ -50,6 +55,7 @@ export function useSnapshots(
     },
     enabled: repositoryId !== null && repositoryId !== undefined && repositoryId !== '',
     retry: REINTENTOS_DE_S3,
+    placeholderData: keepPreviousData,
   })
 }
 

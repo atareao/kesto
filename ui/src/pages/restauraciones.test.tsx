@@ -510,8 +510,10 @@ describe('filtro por target en Restauraciones', () => {
     await cliente.refetchQueries()
 
     // Al refrescar sigue pidiendo su `target_id` y pinta el vacío: ni error ni
-    // carga infinita.
-    await usuario.click(screen.getByRole('button', { name: 'Actualizar' }))
+    // carga infinita. La consulta por nombre tolera el prefijo «loading» del
+    // botón: al conservar la página anterior el refresco deja `isRefetching` en
+    // `true`, y el icono del botón sobrevive un momento en el DOM.
+    await usuario.click(screen.getByRole('button', { name: /Actualizar/ }))
     await waitFor(() => {
       expect(fetch.a('/api/v1/restorations').at(-1)?.url).toContain(
         `target_id=${TARGET_FACTURACION.id}`,

@@ -86,4 +86,33 @@ describe('useSnapshots', () => {
     expect(result.current.data?.total).toBe(45)
     expect(result.current.data?.truncated).toBe(true)
   })
+
+  it('conserva la página anterior mientras llega la siguiente, sin volver a «cargando»', async () => {
+    const fetch = instalarFetchFalso((llamada) =>
+      llamada.url.includes('offset=10')
+        ? new Promise<never>(() => {}) // la segunda página no llega todavía
+        : {
+            status: 200,
+            data: { snapshots: [{ id: 'a'.repeat(64) }], total: 45, truncated: false },
+          },
+    )
+
+    const cliente = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0, staleTime: 0 } },
+    })
+    const { result, rerender } = renderHook(
+      ({ offset }: { offset: number }) => useSnapshots('r1', { limit: 10, offset }),
+      { wrapper: envolver(cliente), initialProps: { offset: 0 } },
+    )
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(result.current.data?.snapshots[0]?.id).toBe('a'.repeat(64))
+
+    rerender({ offset: 10 })
+    await waitFor(() => expect(fetch.a('/api/v1/snapshots')).toHaveLength(2))
+
+    expect(result.current.isPlaceholderData).toBe(true)
+    expect(result.current.isPending).toBe(false)
+    expect(result.current.data?.snapshots[0]?.id).toBe('a'.repeat(64))
+  })
 })

@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { listarEjecuciones } from '../api/ejecuciones'
 import type { FiltrosDeEjecuciones } from '../api/ejecuciones'
 import { claves } from './claves'
@@ -13,5 +13,6 @@ export function useEjecuciones(filtros: FiltrosDeEjecuciones = {}) {
   return useQuery({
     queryKey: claves.ejecuciones(filtros),
     queryFn: ({ signal }) => listarEjecuciones(filtros, signal),
+    placeholderData: keepPreviousData,
   })
 }

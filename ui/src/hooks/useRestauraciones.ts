@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { listarRestauraciones } from '../api/restauraciones'
 import type { FiltrosDeRestauraciones } from '../api/restauraciones'
 import type { ListadoDeRestauraciones } from '../services/api/types'
@@ -31,6 +31,7 @@ export function useRestauraciones(filtros: FiltrosDeRestauraciones = {}) {
   return useQuery({
     queryKey: claves.restauraciones(filtros),
     queryFn: ({ signal }) => listarRestauraciones(filtros, signal),
+    placeholderData: keepPreviousData,
     refetchInterval: (query) =>
       hayRestauracionesSinCerrar(query.state.data) ? INTERVALO_DE_REFRESCO_MS : false,
   })
