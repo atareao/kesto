@@ -128,10 +128,12 @@ async fn list_snapshots_devuelve_las_instantaneas_del_repositorio() {
         .find(|consulta| consulta.contains(&format!("repository_id={REPOSITORIO}")))
         .unwrap_or_else(|| panic!("no llegó la consulta del listado: {consultas:?}"));
 
-    // La entrada de `list_snapshots` no expone `limit`, así que la herramienta tiene que
-    // mandar el tope válido por su cuenta: sin él la API aplicaría su defecto (50) y el MCP
-    // dejaría de ver las instantáneas que veía antes de que el listado paginara.
-    assert!(consulta.contains("limit=200"), "{consulta}");
+    // `list_snapshots` no fija un `limit` propio: sin `limit` del agente, la API aplica su
+    // defecto. Un `limit` fijo volvería a truncar en silencio lo que el agente no pidió.
+    assert!(
+        !consulta.contains("limit"),
+        "sin `limit` del agente, la herramienta no puede mandar uno propio: {consulta}"
+    );
 }
 
 #[tokio::test]
@@ -505,5 +507,79 @@ async fn una_herramienta_que_no_existe_es_un_error_del_protocolo_y_no_llega_a_la
         recibidas(&mock).await.is_empty(),
         "no puede llegar ninguna petición de restauración a la API: {:?}",
         recibidas(&mock).await
+    );
+}
+
+#[tokio::test]
+async fn list_snapshots_reenvia_limit_y_offset() {
+    let mock = MockServer::start().await;
+    montar_lectura_con_parametro(
+        &mock,
+        "/api/v1/snapshots",
+        "repository_id",
+        REPOSITORIO,
+        json!({
+            "snapshots": [],
+            "total": 0,
+            "truncated": false,
+        }),
+    )
+    .await;
+
+    let sesion = Sesion::abrir(&mock.uri(), Some(TOKEN)).await;
+    let _ = sesion
+        .llamar(
+            "list_snapshots",
+            json!({"repository_id": REPOSITORIO, "limit": 5, "offset": 10}),
+            None,
+        )
+        .await;
+
+    let consultas = consultas(&mock).await;
+    let consulta = consultas
+        .iter()
+        .find(|consulta| consulta.contains(&format!("repository_id={REPOSITORIO}")))
+        .unwrap_or_else(|| panic!("no llegó la consulta del listado: {consultas:?}"));
+
+    // El `limit` y el `offset` del agente se reenvían tal cual: es la API quien valida el
+    // tope y contesta `400` fuera de rango, la herramienta no recorta nada.
+    assert!(consulta.contains("limit=5"), "{consulta}");
+    assert!(consulta.contains("offset=10"), "{consulta}");
+}
+
+#[tokio::test]
+async fn list_snapshots_documenta_la_paginacion() {
+    let mock = MockServer::start().await;
+    api_con_todo(&mock).await;
+    let sesion = Sesion::abrir(&mock.uri(), Some(TOKEN)).await;
+
+    let herramientas = sesion.herramientas().await;
+    let herramienta = herramientas
+        .iter()
+        .find(|herramienta| herramienta["name"] == "list_snapshots")
+        .expect("`list_snapshots` tiene que estar en el catálogo");
+
+    let descripcion = herramienta["description"]
+        .as_str()
+        .expect("la herramienta tiene descripción");
+
+    // La descripción tiene que enseñar al agente a paginar: sin esto no sabe que la respuesta
+    // puede venir truncada ni cómo pedir el resto.
+    for palabra in ["total", "truncated", "offset"] {
+        assert!(
+            descripcion.contains(palabra),
+            "la descripción tiene que citar `{palabra}`: {descripcion}"
+        );
+    }
+
+    let propiedades = &herramienta["inputSchema"]["properties"];
+
+    assert!(
+        propiedades.get("limit").is_some(),
+        "el esquema tiene que exponer `limit`: {propiedades}"
+    );
+    assert!(
+        propiedades.get("offset").is_some(),
+        "el esquema tiene que exponer `offset`: {propiedades}"
     );
 }
