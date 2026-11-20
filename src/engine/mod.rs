@@ -3132,6 +3132,115 @@ mod tests {
         eventos
     }
 
+    /// Espera en el **stream** hasta el evento final y devuelve los eventos recogidos.
+    ///
+    /// Es la mitad que le faltaba a [`recoger`]: la fila y el stream son **dos caminos con orden
+    /// no garantizado entre sí** —el trabajador escribe la fila terminal antes de publicar el
+    /// aviso, pero ver la fila no implica haber recibido el evento—, así que quien mida el evento
+    /// final no puede vaciar el receptor en cuanto la fila sea terminal: tiene que **esperar**
+    /// aquí a un `status` terminal. El plazo no es adorno: convierte un fallo —algo que nunca
+    /// llega— en un mensaje, y no en un cuelgue.
+    async fn recoger_hasta_el_final(
+        receptor: &mut tokio::sync::broadcast::Receiver<EventoDelMotor>,
+        plazo: Duration,
+    ) -> Vec<EventoDeEjecucion> {
+        // Lo que ya esté en el receptor se drena sin esperar: si el terminal ya llegó, no hay
+        // nada que aguardar.
+        let mut eventos = recoger(receptor);
+
+        if matches!(
+            eventos.last().map(|evento| evento.status),
+            Some(Estado::Success | Estado::Failed)
+        ) {
+            return eventos;
+        }
+
+        let limite = Instant::now() + plazo;
+
+        loop {
+            let restante = limite.saturating_duration_since(Instant::now());
+
+            match tokio::time::timeout(restante, receptor.recv()).await {
+                Ok(Ok(EventoDelMotor::Ejecucion(evento))) => {
+                    let terminal = matches!(evento.status, Estado::Success | Estado::Failed);
+                    eventos.push(evento);
+
+                    if terminal {
+                        return eventos;
+                    }
+                }
+                Ok(Ok(EventoDelMotor::Restauracion(_))) => continue,
+                // Un cliente que se pierde eventos no se corta: sigue leyendo.
+                Ok(Err(RecvError::Lagged(_))) => continue,
+                Ok(Err(RecvError::Closed)) => {
+                    panic!("el hub se cerró sin publicar ningún estado terminal")
+                }
+                Err(_) => panic!("no llegó ningún estado terminal en {plazo:?}"),
+            }
+        }
+    }
+
+    /// Construye un evento de ejecución de mentira para estas pruebas.
+    fn evento(
+        execution_id: Uuid,
+        job_id: Uuid,
+        status: Estado,
+        bytes_processed: u64,
+    ) -> EventoDeEjecucion {
+        EventoDeEjecucion {
+            execution_id,
+            job_id,
+            status,
+            bytes_processed,
+            bytes_uploaded: bytes_processed,
+            percentage: None,
+            current_action: "prueba".to_owned(),
+        }
+    }
+
+    /// El ayudante no fabrica el final: lo espera en el stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_ayudante_espera_en_el_stream_hasta_el_evento_terminal() {
+        let hub = super::Hub::nuevo();
+        let mut receptor = hub.suscribir().expect("el hub no está cerrado");
+
+        let ejecucion_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+
+        let emisor = hub.clone();
+        tokio::spawn(async move {
+            emisor.publicar(evento(ejecucion_id, job_id, Estado::Running, 0));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            emisor.publicar(evento(ejecucion_id, job_id, Estado::Failed, 500));
+        });
+
+        let eventos = recoger_hasta_el_final(&mut receptor, PLAZO_DE_ESPERA).await;
+
+        let ultimo = eventos
+            .last()
+            .expect("tiene que haber al menos el terminal");
+        assert_eq!(
+            ultimo.status,
+            Estado::Failed,
+            "el ayudante no esperó al evento terminal: se quedó con un avance"
+        );
+        assert_eq!(ultimo.bytes_processed, 500);
+    }
+
+    /// Sin evento terminal, el ayudante falla en voz alta en vez de devolver lo que había.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "ningún estado terminal")]
+    async fn el_ayudante_falla_en_voz_alta_si_no_llega_el_terminal() {
+        let hub = super::Hub::nuevo();
+        let mut receptor = hub.suscribir().expect("el hub no está cerrado");
+
+        hub.publicar(evento(Uuid::new_v4(), Uuid::new_v4(), Estado::Running, 0));
+
+        // Solo hay avances, nunca el terminal: con un plazo corto, el ayudante tiene que
+        // fallar en voz alta. El `#[should_panic]` exige ese mensaje.
+        let _ = recoger_hasta_el_final(&mut receptor, Duration::from_millis(100)).await;
+    }
+
     /// Vacía el receptor y devuelve los avisos de **restauración** que había.
     ///
     /// Es el hermano de [`recoger`] para la otra mitad del contrato, con las mismas reglas: se lee
@@ -3230,7 +3339,7 @@ mod tests {
 
         let ejecucion = motor.encolar(tarea_con).await.expect("tiene que entrar");
         let fila = aparato.esperar_el_final(&ejecucion.id).await;
-        let eventos = recoger(&mut receptor);
+        let eventos = recoger_hasta_el_final(&mut receptor, PLAZO_DE_ESPERA).await;
 
         assert!(
             eventos.len() >= 2,
@@ -3290,7 +3399,7 @@ mod tests {
 
         let ejecucion = motor.encolar(tarea_sin).await.expect("tiene que entrar");
         let fila = aparato.esperar_el_final(&ejecucion.id).await;
-        let eventos = recoger(&mut receptor);
+        let eventos = recoger_hasta_el_final(&mut receptor, PLAZO_DE_ESPERA).await;
         let final_del_evento = eventos.last().expect("hay eventos");
 
         assert_eq!(
