@@ -1,4 +1,22 @@
 # Changelog
+## [0.17.0] - 2026-11-20
+
+### Bug Fixes
+
+- *(e2e)* Reintento acotado del alta ante 502 bajo carga
+
+### Features
+
+- *(mcp)* Expone `limit` y `offset` en `list_snapshots`
+- *(ui)* Conserva la página anterior al paginar en los tres listados
+
+### Refactor
+
+- *(db)* Envuelve el conteo de restauraciones en la misma transacción
+
+### Testing
+
+- *(engine)* La prueba espera el evento final en el stream, no en la fila
 ## [0.16.0] - 2026-11-19
 
 ### Bug Fixes
@@ -21,6 +39,10 @@
 - *(api)* [**breaking**] Envuelve el listado de ejecuciones en {executions, total}
 - *(ui)* Pagina los tres listados contra el servidor
 - *(api)* [**breaking**] Pagina el listado de instantáneas con total exacto
+
+### Miscellaneous Tasks
+
+- Release v0.16.0
 
 ### Testing
 
