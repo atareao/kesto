@@ -95,7 +95,7 @@ La ventana del servidor temporal se midió con el sondeo dentro del contenedor y
 - [x] 2.4 `cargo fmt --all -- --check` y `cargo clippy --all-targets -- -D warnings` limpios (verificación: 0 warnings).
 - [x] 2.5 `just e2e` una vez con `W` = 2 s (33/33, 1197 s) y repeticiones dirigidas de `mariadb`/`postgres` con `--test-threads=1` (3 + 4 + 5 corridas de PostgreSQL; todas verdes salvo **una** en `copia_y_restauracion_de_postgresql_conserva_las_filas`, no reproducida en 10 repeticiones posteriores) (verificación: la siembra no vuelve a dar `ERROR 2002`).
 - [x] 2.6 `openspec validate arreglo-flake-e2e-171 --strict` → valid (verificación: valid).
-- [ ] 2.7 Cabo abierto: un fallo único y **no reproducido** en `copia_y_restauracion_de_postgresql_conserva_las_filas` (1 de 4 corridas dirigidas; mensaje no conservado). Vigilar en CI (verificación: pendiente).
+- [x] 2.7 Cabo abierto: un fallo único y **no reproducido** en `copia_y_restauracion_de_postgresql_conserva_las_filas`. Se intentó reproducir (12/12 corridas dirigidas verdes con salida completa) sin reaparecer: acumulado **23 corridas, 1 fallo**. Es un escenario de **restauración** cuyo cuerpo **no** toca #171 (en esta rama corre con el código de restauración anterior a #164), así que **no se atribuye** a #171: queda como **residuo documentado y vigilado en el E2E del CI** (si reaparece, capturar el motivo completo) (verificación: hecha).
 
 ### 3. Cierre
 
