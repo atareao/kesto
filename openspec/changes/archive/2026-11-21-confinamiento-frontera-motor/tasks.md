@@ -123,6 +123,6 @@
 - [x] 7.1 `just check-all` (backend y panel) en verde (verificación: termina sin error).
 - [x] 7.2 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas).
 - [x] 7.3 PR a `development` con `Closes #160`, `Closes #161` y `Closes #162` (verificación: el PR abre con los tres cierres y el CI en verde).
-- [ ] 7.4 Fusionado el PR: `just spec-archive confinamiento-frontera-motor` (verificación: el delta entra en `openspec/specs/`).
-- [ ] 7.5 `plans/PLAN-040.md` → `plans/PLAN-040-COMPLETED.md` (verificación: `git mv` hecho).
+- [x] 7.4 Fusionado el PR: `just spec-archive confinamiento-frontera-motor` (verificación: el delta entra en `openspec/specs/`).
+- [x] 7.5 `plans/PLAN-040.md` → `plans/PLAN-040-COMPLETED.md` (verificación: `git mv` hecho).
 - [x] 7.6 Issue de seguimiento para la separación de privilegio del motor (segunda mitad de SEC-06) (verificación: el issue existe y nombra el hallazgo).
