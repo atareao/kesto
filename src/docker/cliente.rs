@@ -4,16 +4,16 @@ use std::future::Future;
 use std::time::Duration;
 
 use bollard::Docker;
-use bollard::container::LogOutput;
+use bollard::container::{InspectContainerOptions, LogOutput};
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 // El modelo de la inspección se importa de `bollard::models` —el reexport de la biblioteca—
 // y no de `bollard::exec`: en `exec` el nombre está **privado**, así que la ruta corta no
 // compila.
-use bollard::models::ExecInspectResponse;
+use bollard::models::{ContainerInspectResponse, ExecInspectResponse};
 use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use super::{Canal, Error, Orden, Trozo};
+use super::{Canal, ETIQUETA_DE_FUENTE_DE_COPIA, Error, Orden, Trozo, VALOR_DE_FUENTE_DE_COPIA};
 
 /// El cliente del motor de contenedores.
 ///
@@ -147,6 +147,10 @@ impl Cliente {
         inactividad_maxima: Duration,
         mut al_llegar: impl FnMut(Trozo),
     ) -> Result<i32, Error> {
+        // La frontera de opt-in, **antes** de crear el `exec`: sin la etiqueta de fuente de copia
+        // no se ejecuta nada. El porqué, entero, en [`Cliente::exigir_fuente_de_copia`].
+        self.exigir_fuente_de_copia(contenedor).await?;
+
         // `env` va **explícito** aunque la orden no traiga variables: es el campo por el que
         // viajan las credenciales de la base, y dejarlo sin poner convertiría un cambio de
         // arriba en credenciales que no llegan sin que nada lo diga.
@@ -337,6 +341,11 @@ impl Cliente {
         lector: impl AsyncRead + Unpin,
         mut al_llegar: impl FnMut(Trozo),
     ) -> Result<i32, Error> {
+        // La frontera de opt-in, **antes** de crear el `exec`, igual que en [`Cliente::ejecutar`]:
+        // la restauración también exige la etiqueta, y la comprobación vive en este único punto
+        // para que ningún camino del motor pueda saltársela.
+        self.exigir_fuente_de_copia(contenedor).await?;
+
         let creado = self
             .docker
             .create_exec(contenedor, opciones_con_entrada(orden))
@@ -461,6 +470,45 @@ impl Cliente {
         codigo_de_salida(&estado).ok_or_else(|| Error::SinCodigoDeSalida {
             contenedor: contenedor.to_owned(),
         })
+    }
+
+    /// Exige que el contenedor se declare **fuente de copia** antes de crear ningún `exec`.
+    ///
+    /// # Por qué la etiqueta y no una lista de configuración
+    ///
+    /// Una lista (`KESTO_ALLOWED_CONTAINERS`) hay que poblarla, y una que no se puebla no
+    /// protege de nada; la etiqueta, en cambio, **viaja con el contenedor**: quien lo crea dice
+    /// si es fuente de copia, así que no hay dos sitios que mantener en sincronía. El propio
+    /// contenedor de Kesto queda denegado por sí solo, porque nadie lo etiqueta, y eso evita
+    /// cablear su nombre —que cambiaría con cualquier renombrado del despliegue—.
+    ///
+    /// # Por qué la comprobación vive aquí
+    ///
+    /// Porque este es el **único punto** por el que pasan todos los `exec` de bollard:
+    /// [`Cliente::ejecutar`] y [`Cliente::ejecutar_con_entrada`]. Ponerla en cada camino del
+    /// motor —hoy extracción y restauración, mañana otro— invitaría a olvidarla en el
+    /// siguiente; aquí no hay forma de saltársela.
+    ///
+    /// # Fail-closed
+    ///
+    /// Sin etiqueta no se ejecuta nada, y no hay un valor por defecto permisivo: la etiqueta
+    /// ausente, un valor distinto de `true` o un contenedor que no se puede inspeccionar acaban
+    /// todos en `failed` y **sin crear el `exec`**.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::ContenedorNoEsFuenteDeCopia`] si el contenedor está y no se declara
+    /// fuente de copia —el motivo lo nombra—, y los errores del transporte
+    /// ([`Error::MotorContesta`], [`Error::MotorNoContesta`]) si la inspección no se pudo
+    /// completar, que es un desenlace **distinto** y no se confunde con el de la etiqueta.
+    async fn exigir_fuente_de_copia(&self, contenedor: &str) -> Result<(), Error> {
+        let inspeccion = self
+            .docker
+            .inspect_container(contenedor, None::<InspectContainerOptions>)
+            .await
+            .map_err(|causa| Error::del_contenedor(contenedor, causa))?;
+
+        exigir_la_etiqueta_de_fuente(contenedor, &inspeccion)
     }
 }
 
@@ -622,6 +670,41 @@ fn codigo_de_salida(estado: &ExecInspectResponse) -> Option<i32> {
         .and_then(|codigo| i32::try_from(codigo).ok())
 }
 
+/// Decide si un contenedor **ya inspeccionado** se declara fuente de copia.
+///
+/// Es la mitad pura de [`Cliente::exigir_fuente_de_copia`]: lee la etiqueta
+/// [`ETIQUETA_DE_FUENTE_DE_COPIA`] de la configuración del contenedor y exige el valor
+/// [`VALOR_DE_FUENTE_DE_COPIA`]. Se separa de la llamada al motor para poder fijar el veredicto
+/// sin un motor de contenedores: la inspección es un valor, y eso se puede construir en una
+/// prueba.
+///
+/// La comparación es **exacta** y **fail-closed**: la etiqueta ausente, un valor distinto de
+/// `true` —`"1"`, `"yes"`, `"false"`— y una inspección sin configuración deniegan todos. No hay
+/// un valor por defecto permisivo que se leería como un sí sin serlo.
+///
+/// # Errors
+///
+/// Devuelve [`Error::ContenedorNoEsFuenteDeCopia`] cuando el contenedor no lleva la etiqueta con
+/// el valor exigido. El motivo lo nombra, que es lo que el operador necesita para recrearlo bien.
+fn exigir_la_etiqueta_de_fuente(
+    contenedor: &str,
+    inspeccion: &ContainerInspectResponse,
+) -> Result<(), Error> {
+    let valor = inspeccion
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|etiquetas| etiquetas.get(ETIQUETA_DE_FUENTE_DE_COPIA));
+
+    if valor.map(String::as_str) == Some(VALOR_DE_FUENTE_DE_COPIA) {
+        return Ok(());
+    }
+
+    Err(Error::ContenedorNoEsFuenteDeCopia {
+        contenedor: contenedor.to_owned(),
+    })
+}
+
 impl std::fmt::Debug for Cliente {
     /// Publica el socket y el tiempo máximo, y **nada del interior de la biblioteca**.
     ///
@@ -639,6 +722,7 @@ impl std::fmt::Debug for Cliente {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -646,10 +730,12 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use bollard::models::ExecInspectResponse;
+    use bollard::models::{ContainerConfig, ContainerInspectResponse, ExecInspectResponse};
 
-    use super::{Cliente, codigo_de_salida};
-    use crate::docker::{Canal, Error, Orden, Trozo};
+    use super::{Cliente, codigo_de_salida, exigir_la_etiqueta_de_fuente};
+    use crate::docker::{
+        Canal, ETIQUETA_DE_FUENTE_DE_COPIA, Error, Orden, Trozo, VALOR_DE_FUENTE_DE_COPIA,
+    };
     use crate::test_support::{
         ContenedorDePrueba, TIMEOUT_DEL_MOTOR, cliente_del_motor, directorio_de_prueba,
         socket_del_motor,
@@ -717,6 +803,93 @@ mod tests {
             format!("{pelada:?}").contains(&ruta),
             "la forma pelada no llegó a la misma ruta: {pelada:?}"
         );
+    }
+
+    /// Una inspección con las etiquetas indicadas, para fijar el veredicto sin motor.
+    fn inspeccion_con_etiquetas(
+        etiquetas: Option<HashMap<String, String>>,
+    ) -> ContainerInspectResponse {
+        ContainerInspectResponse {
+            config: Some(ContainerConfig {
+                labels: etiquetas,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// La etiqueta de fuente de copia con el valor `true` **acepta** el contenedor.
+    ///
+    /// Es el contrapeso: sin este caso, un `exigir_la_etiqueta_de_fuente` que negara siempre
+    /// pasaría las pruebas de denegación y no serviría para nada.
+    #[test]
+    fn la_etiqueta_de_fuente_de_copia_acepta_el_contenedor() {
+        let inspeccion = inspeccion_con_etiquetas(Some(HashMap::from([(
+            ETIQUETA_DE_FUENTE_DE_COPIA.to_owned(),
+            VALOR_DE_FUENTE_DE_COPIA.to_owned(),
+        )])));
+
+        exigir_la_etiqueta_de_fuente("mi-contenedor", &inspeccion)
+            .expect("un contenedor declarado fuente de copia tiene que aceptarse");
+    }
+
+    /// La etiqueta ausente **deniega** y el motivo **nombra el contenedor**.
+    ///
+    /// Es el caso fail-closed: un contenedor que no se declara fuente de copia no puede recibir
+    /// ningún `exec`, y el operador tiene que poder leer de qué contenedor se trata para recrearlo
+    /// con la etiqueta.
+    #[test]
+    fn la_etiqueta_ausente_deniega_y_nombra_el_contenedor() {
+        // Y también cuando la configuración o el mapa de etiquetas no llegan: `None` es ausencia,
+        // no un permiso.
+        for inspeccion in [
+            inspeccion_con_etiquetas(None),
+            inspeccion_con_etiquetas(Some(HashMap::new())),
+            ContainerInspectResponse::default(),
+        ] {
+            let error = exigir_la_etiqueta_de_fuente("mi-contenedor", &inspeccion)
+                .expect_err("un contenedor sin la etiqueta no puede aceptarse");
+
+            assert!(
+                matches!(
+                    &error,
+                    Error::ContenedorNoEsFuenteDeCopia { contenedor }
+                        if contenedor == "mi-contenedor"
+                ),
+                "el error debe ser el de la etiqueta ausente y nombrar el contenedor: {error:?}"
+            );
+
+            let motivo = error.to_string();
+            assert!(
+                motivo.contains("mi-contenedor"),
+                "el motivo no nombra el contenedor: {motivo}"
+            );
+        }
+    }
+
+    /// Cualquier valor distinto de `true` **deniega**: la comparación es exacta.
+    ///
+    /// `"1"`, `"yes"` y `"false"` se leen como un sí en otros sitios, así que aquí se fijan: la
+    /// etiqueta no se interpreta, se compara.
+    #[test]
+    fn un_valor_distinto_de_true_deniega() {
+        for valor in ["1", "yes", "false", "TRUE", " true"] {
+            let inspeccion = inspeccion_con_etiquetas(Some(HashMap::from([(
+                ETIQUETA_DE_FUENTE_DE_COPIA.to_owned(),
+                valor.to_owned(),
+            )])));
+
+            let error = exigir_la_etiqueta_de_fuente("mi-contenedor", &inspeccion)
+                .expect_err("solo el valor `true` exacto puede aceptarse");
+            assert!(
+                matches!(
+                    &error,
+                    Error::ContenedorNoEsFuenteDeCopia { contenedor }
+                        if contenedor == "mi-contenedor"
+                ),
+                "el valor `{valor}` tenía que denegar con el error de la etiqueta: {error:?}"
+            );
+        }
     }
 
     /// El `Debug` del cliente no vuelca el interior de la biblioteca.
@@ -1020,6 +1193,116 @@ mod tests {
             ),
             "el contenedor ausente debe llegar como respuesta del motor: {error:?}"
         );
+    }
+
+    /// Un contenedor **sin** la etiqueta de fuente de copia no recibe ningún `exec`.
+    ///
+    /// Es la frontera del confinamiento medida de punta a punta contra un motor de verdad: el
+    /// motor inspecciona el contenedor, no ve la etiqueta y **no crea el `exec`**. La prueba lo
+    /// mide por su efecto observable —el callback de trozos no recibe nada, así que la orden no
+    /// llegó a correr— y porque el motivo **nombra el contenedor**, que es lo que el operador
+    /// necesita para recrearlo con la etiqueta.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn un_contenedor_sin_la_etiqueta_de_fuente_no_recibe_ningun_exec() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::sin_etiqueta_de_fuente(
+            "un_contenedor_sin_la_etiqueta_de_fuente_no_recibe_ningun_exec",
+        )
+        .await;
+        let nombre = contenedor.nombre().to_owned();
+
+        let orden = orden_de_shell("echo deberia-no-ejecutarse");
+
+        let mut trozos: Vec<Trozo> = Vec::new();
+        let error = cliente
+            .ejecutar(&nombre, &orden, INACTIVIDAD_DE_PRUEBA, |trozo| {
+                trozos.push(trozo);
+            })
+            .await
+            .expect_err("un contenedor sin la etiqueta no puede recibir ningún `exec`");
+        let motivo = error.to_string();
+
+        assert!(
+            matches!(&error, Error::ContenedorNoEsFuenteDeCopia { contenedor } if contenedor == &nombre),
+            "el fallo debe ser el de la etiqueta ausente: {error:?}"
+        );
+        assert!(
+            motivo.contains(&nombre),
+            "el motivo no nombra el contenedor: {motivo}"
+        );
+        assert!(
+            trozos.is_empty(),
+            "la orden llegó a ejecutarse: el contenedor no debía recibir ningún `exec`: {trozos:?}"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// El contrapeso: un contenedor **con** la etiqueta de fuente de copia sí recibe su `exec`.
+    ///
+    /// Sin esta prueba, un `exigir_fuente_de_copia` que negara siempre pasaría la prueba
+    /// negativa y no serviría para nada: el confinamiento no puede cerrar el caso normal.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn un_contenedor_con_la_etiqueta_de_fuente_recibe_su_exec() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor =
+            ContenedorDePrueba::nuevo("un_contenedor_con_la_etiqueta_de_fuente_recibe_su_exec")
+                .await;
+
+        let orden = orden_de_shell("echo si-se-ejecuta");
+
+        let (codigo, trozos) = ejecutar_recogiendo(&cliente, contenedor.nombre(), &orden)
+            .await
+            .expect("un contenedor declarado fuente de copia tiene que ejecutar su orden");
+
+        assert_eq!(codigo, 0, "el `echo` debe salir con cero");
+        assert!(
+            texto_de(&trozos, Canal::Salida).contains("si-se-ejecuta"),
+            "la orden no llegó a ejecutarse: {trozos:?}"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// La restauración a un contenedor **sin** la etiqueta tampoco crea ningún `exec`.
+    ///
+    /// El camino con `stdin` tiene su propia puerta —`ejecutar_con_entrada`— y también pasa por
+    /// la comprobación: un destino que no se declara fuente de copia no recibe la restauración.
+    #[tokio::test]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn la_restauracion_a_un_contenedor_sin_la_etiqueta_no_crea_ningun_exec() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::sin_etiqueta_de_fuente(
+            "la_restauracion_a_un_contenedor_sin_la_etiqueta_no_crea_ningun_exec",
+        )
+        .await;
+        let nombre = contenedor.nombre().to_owned();
+
+        let orden = orden_de_shell("cat > /dev/null");
+
+        let error = cliente
+            .ejecutar_con_entrada(
+                &nombre,
+                &orden,
+                INACTIVIDAD_DE_PRUEBA,
+                &b"volcado-de-prueba"[..],
+                |_| {},
+            )
+            .await
+            .expect_err("un contenedor sin la etiqueta no puede recibir la restauración");
+
+        assert!(
+            matches!(&error, Error::ContenedorNoEsFuenteDeCopia { contenedor } if contenedor == &nombre),
+            "el fallo debe ser el de la etiqueta ausente: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&nombre),
+            "el motivo no nombra el contenedor: {error}"
+        );
+
+        contenedor.retirar().await;
     }
 
     /// Las variables de entorno de la orden **llegan** al proceso del contenedor.

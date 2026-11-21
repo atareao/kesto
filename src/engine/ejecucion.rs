@@ -406,7 +406,7 @@ fn correr(
     // 3. Por dónde sale la copia. Un objetivo incoherente —un directorio sin ruta, una base sin
     //    usuario— se cuenta aquí y no se intenta arreglar.
     let objetivo = Objetivo::from(&target);
-    let por_donde = match ruta(&objetivo) {
+    let por_donde = match ruta(&ajustes.raiz_de_copias, &objetivo) {
         Ok(por_donde) => por_donde,
         Err(causa) => return Cierre::fallida(recortar(&causa.to_string())),
     };
@@ -480,11 +480,16 @@ fn correr(
             &etiqueta,
             en_vivo,
         ),
-        Ruta::PorContenedor { contenedor, orden } => copiar_el_volcado(
+        Ruta::PorContenedor {
+            contenedor,
+            orden,
+            db_path,
+        } => copiar_el_volcado(
             &copia_del_repositorio,
             &acceso,
             &contenedor,
             orden,
+            db_path,
             &nombre,
             &etiqueta,
             en_vivo,
@@ -628,6 +633,7 @@ fn copiar_el_volcado(
     acceso: &Acceso,
     contenedor: &str,
     orden: Orden,
+    db_path: Option<String>,
     nombre: &str,
     etiqueta: &str,
     en_vivo: &Arc<EnVivo>,
@@ -675,6 +681,7 @@ fn copiar_el_volcado(
         ajustes.espera_del_motor,
         contenedor.to_owned(),
         orden,
+        db_path,
         productor,
     )
     .map_err(|motivo| Cierre::fallida(recortar(&motivo)))?;
@@ -811,11 +818,12 @@ fn lanzar_el_productor(
     espera: Duration,
     contenedor: String,
     orden: Orden,
+    db_path: Option<String>,
     productor: ProductorDelVolcado,
 ) -> Result<std::thread::JoinHandle<VueltaDelProductor>, String> {
     std::thread::Builder::new()
         .name(format!("kesto-volcado-{contenedor}"))
-        .spawn(move || producir(socket, espera, contenedor, orden, productor))
+        .spawn(move || producir(socket, espera, contenedor, orden, db_path, productor))
         .map_err(|causa| format!("no se ha podido lanzar el hilo del volcado: {causa}"))
 }
 
@@ -838,6 +846,7 @@ fn producir(
     espera: Duration,
     contenedor: String,
     orden: Orden,
+    db_path: Option<String>,
     productor: ProductorDelVolcado,
 ) -> VueltaDelProductor {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -857,9 +866,16 @@ fn producir(
         let cliente =
             Cliente::conectar(&socket, espera).map_err(|causa| recortar(&causa.to_string()))?;
 
-        volcar(&cliente, &contenedor, &orden, productor, INACTIVIDAD_MAXIMA)
-            .await
-            .map_err(|causa| motivo_del_volcado(&causa, &orden))
+        volcar(
+            &cliente,
+            &contenedor,
+            &orden,
+            db_path.as_deref(),
+            productor,
+            INACTIVIDAD_MAXIMA,
+        )
+        .await
+        .map_err(|causa| motivo_del_volcado(&causa, &orden))
     })
 }
 

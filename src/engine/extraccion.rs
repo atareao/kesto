@@ -53,13 +53,14 @@
 //! de modo que no depende de la receta con la que se arranque—. Ver el `# Seguridad` de
 //! [`Orden`] y el de [`Cliente::ejecutar`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use thiserror::Error;
 
 use crate::db::entities::{Target, TipoDeTarget};
 use crate::docker::{Canal, Cliente, Orden, Trozo};
+use crate::engine::frontera::{self, FronteraError};
 use crate::rustic::ProductorDelVolcado;
 use crate::secret::{REDACTED, SecretString};
 
@@ -200,6 +201,18 @@ pub enum Ruta {
         contenedor: String,
         /// La orden, con la credencial —si la hay— en su entorno.
         orden: Orden,
+        /// El `db_path` declarado cuando el tipo es `sqlite`, para comprobar su forma canónica
+        /// dentro del contenedor **antes** de ejecutar el volcado; `None` en los demás tipos.
+        ///
+        /// No se lleva en la [`Orden`] porque no es parte de lo que se ejecuta: es un dato del
+        /// objetivo que el motor necesita para confinar el campo antes de usarlo. La comprobación
+        /// es un `readlink -f` **dentro del contenedor** —ver
+        /// [`comprobar_la_forma_canonica_del_db_path`]—, así que un target `sqlite` exige que su
+        /// contenedor traiga `readlink` **además** de `sqlite3`: la frontera del campo es el
+        /// contenedor, porque es dentro de él donde el `..` o el enlace cambian a qué fichero
+        /// llega la orden, y es la disposición de **su** sistema de ficheros la que hay que
+        /// resolver, no la de Kesto.
+        db_path: Option<String>,
     },
     /// Un directorio del sistema de ficheros, tal como lo ve este proceso.
     ///
@@ -219,6 +232,12 @@ pub enum Ruta {
 /// No toca el sistema de ficheros ni habla con nadie: decide **por dónde** sale la copia y
 /// con **qué** orden, y nada más. Que el contenedor exista o que la ruta esté ahí se averigua
 /// al usarla —al ejecutar el `exec` o al archivar el directorio—, no aquí.
+///
+/// `raiz_de_copias` es la frontera del `host_path` de un target de directorio: la ruta se
+/// **canonicaliza** —resolviendo los enlaces simbólicos de todos sus componentes, también los de
+/// un directorio padre— y se rechaza si el resultado no queda bajo esa raíz. Se comprueba con la
+/// ruta canónica y se opera con la **declarada**. Ver [`crate::engine::frontera`] para la regla
+/// entera.
 ///
 /// # El comando, y `db_name` decidiendo el alcance
 ///
@@ -246,7 +265,12 @@ pub enum Ruta {
 /// el alcance del volcado cambiaría sin que nada lo note—. Un `db_user` ausente en un target
 /// de base es un objetivo incoherente y **no** un comando a medias: sin usuario, el cliente de
 /// volcado no sabe con quién conectar.
-pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
+///
+/// Y devuelve [`ErrorDeExtraccion::FueraDeLaFrontera`] cuando el `host_path` de un directorio
+/// queda fuera de `raiz_de_copias` —canonicalizado y comparado por componentes—: el alcance de la
+/// ruta es lo que esta función comprueba además de su forma, y se aplica también a las filas
+/// anteriores a la regla.
+pub fn ruta(raiz_de_copias: &Path, objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
     match objetivo.tipo {
         // Un target de directorio **no pasa por Docker**: no hay ningún proceso que ejecutar,
         // así que `PorContenedor` no se construye por este camino ni por ningún otro. La ruta
@@ -254,10 +278,20 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
         // el directorio del host dentro de Kesto—, que es la única lectura que tiene datos
         // detrás: para la otra haría falta un mapeo host→contenedor que nadie ha dado.
         TipoDeTarget::Directory => {
-            let ruta = exigido(objetivo, "host_path", objetivo.host_path.as_deref())?;
+            let declarado = exigido(objetivo, "host_path", objetivo.host_path.as_deref())?;
+
+            // La comprobación es **canónica** —resuelve los enlaces simbólicos de todos los
+            // componentes, también los de un directorio padre— y vive en `frontera`, que es el
+            // único sitio donde se decide qué es una ruta aceptable. Se comprueba con la ruta
+            // canónica y se opera con la **declarada**: lo que se lee es el `host_path` tal cual,
+            // que es el que el `compose` del §8 monta dentro de Kesto. Y va **antes** de construir
+            // nada: un `host_path` fuera de la raíz no llega a abrir el repositorio ni a leer un
+            // byte. Se aplica también a las filas anteriores a la regla, porque la API no es el
+            // único camino al motor.
+            frontera::confinar_host_path(raiz_de_copias, declarado)?;
 
             Ok(Ruta::PorFichero {
-                ruta: PathBuf::from(ruta),
+                ruta: PathBuf::from(declarado),
             })
         }
 
@@ -290,6 +324,7 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
                     cmd,
                     env: entorno_del_exec(TipoDeTarget::Mariadb, objetivo.db_password.as_ref()),
                 },
+                db_path: None,
             })
         }
 
@@ -317,6 +352,7 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
                     cmd,
                     env: entorno_del_exec(TipoDeTarget::Postgresql, objetivo.db_password.as_ref()),
                 },
+                db_path: None,
             })
         }
 
@@ -362,6 +398,10 @@ pub fn ruta(objetivo: &Objetivo) -> Result<Ruta, ErrorDeExtraccion> {
                     ],
                     env: Vec::new(),
                 },
+                // El `db_path` viaja con la ruta para que el motor compruebe su forma canónica
+                // dentro del contenedor antes de volcar: un `..` o un enlace —en el último
+                // componente o en un directorio padre— cambian lo que `sqlite3` leería.
+                db_path: Some(db_path.to_owned()),
             })
         }
     }
@@ -436,6 +476,91 @@ pub struct Resultado {
     pub motivo_del_contenedor: String,
 }
 
+/// Comprueba que el `db_path` declarado es su propia forma canónica **dentro del contenedor**.
+///
+/// Es la comprobación de alcance del campo, y su frontera no es una raíz de Kesto —el `.db` vive
+/// en el sistema de ficheros de otro contenedor, del que Kesto no conoce la disposición—, sino el
+/// contenedor declarado fuente de copia. La comprobación es un `exec` de `readlink -f <db_path>`
+/// **sin `sh -c`**: el `argv` se construye entero, con el binario y sus argumentos, porque este
+/// repositorio no mete una shell en medio de nada. El `stdout` de esa orden es la forma canónica
+/// de la ruta, y la comparación —exacta— la hace [`frontera::coincide_con_su_forma_canonica`], que
+/// es el único sitio donde se decide qué forma canónica vale.
+///
+/// Va **antes** de la orden que usa el `db_path` —el `.dump` de la extracción y la retirada más la
+/// reimportación de la restauración—: un `..` o un enlace —en el último componente o, el
+/// peligroso, en un directorio **padre**— cambian a qué fichero llega la orden, y la retirada de la
+/// restauración **borra**, así que se comprueba antes de borrar nada.
+///
+/// # El `readlink` que falta es un fallo, no un «sigue»
+///
+/// Un contenedor sin `readlink` hace que la orden salga con un código distinto de cero, y eso se
+/// trata como cualquier otro fallo de orden: se lee lo que el contenedor dijo por su canal de
+/// error y se devuelve, sin ejecutar la orden de verdad. Es un requisito del target `sqlite` —el
+/// contenedor tiene que traer `readlink` además de `sqlite3`— y se declara en el rustdoc de
+/// [`Ruta::PorContenedor`] para que el operador sepa de dónde sale.
+///
+/// # Visibilidad
+///
+/// **`pub(crate)`** porque la restauración lo reutiliza tal cual: el reverso de un volcado tiene
+/// delante el mismo `db_path`, el mismo contenedor y el mismo cliente. Una segunda copia sería una
+/// segunda verdad sobre qué es una forma canónica y sobre cómo se lee el canal de error.
+///
+/// # Errors
+///
+/// Devuelve [`ErrorDeExtraccion::FueraDeLaFrontera`] cuando la salida no coincide con el declarado,
+/// [`ErrorDeExtraccion::FormaCanonicaNoSePudoComprobar`] cuando la orden sale con un código
+/// distinto de cero —el `readlink` que falta— y [`ErrorDeExtraccion::Transporte`] cuando falla el
+/// transporte, con lo que el contenedor alcanzó a decir por su canal de error ya depurado.
+pub(crate) async fn comprobar_la_forma_canonica_del_db_path(
+    cliente: &Cliente,
+    contenedor: &str,
+    db_path: &str,
+    inactividad_maxima: Duration,
+) -> Result<(), ErrorDeExtraccion> {
+    let orden = Orden {
+        cmd: vec!["readlink".to_owned(), "-f".to_owned(), db_path.to_owned()],
+        env: Vec::new(),
+    };
+
+    // La forma canónica cabe en el declarado más un salto de línea: en cuanto llegue más que eso
+    // ya no puede coincidir, así que se acota a ese tamaño y un contenedor que escriba sin parar
+    // no infla memoria. El acotado no cambia el veredicto —lo que sobre no haría coincidir nada—,
+    // y el motivo del canal de error se acumula por su cuenta con [`acumular_el_motivo`].
+    let tope = db_path.len() + 2;
+    let mut forma: Vec<u8> = Vec::new();
+    let mut crudo: Vec<u8> = Vec::new();
+
+    let codigo = {
+        let mut al_llegar = |trozo: Trozo| match trozo.canal {
+            Canal::Salida => {
+                if forma.len() < tope {
+                    let libres = tope - forma.len();
+                    forma.extend_from_slice(&trozo.bytes[..libres.min(trozo.bytes.len())]);
+                }
+            }
+            Canal::Error => acumular_el_motivo(&mut crudo, &trozo.bytes),
+        };
+
+        cliente
+            .ejecutar(contenedor, &orden, inactividad_maxima, &mut al_llegar)
+            .await
+    };
+
+    let dijo = motivo_para_guardar(crudo, &orden);
+
+    match codigo {
+        Ok(0) => frontera::coincide_con_su_forma_canonica(db_path, &forma).map_err(Into::into),
+        // El `readlink` que falta, o un `readlink` que no pudo resolver la ruta: el código no es
+        // cero y lo que el contenedor dijo es la pista. La orden de verdad no se ejecuta.
+        Ok(codigo) => Err(ErrorDeExtraccion::FormaCanonicaNoSePudoComprobar {
+            contenedor: contenedor.to_owned(),
+            codigo,
+            motivo: dijo,
+        }),
+        Err(causa) => Err(ErrorDeExtraccion::del_transporte(contenedor, causa, dijo)),
+    }
+}
+
 /// Conduce el `exec`, alimenta el productor con su salida y devuelve lo que dejó.
 ///
 /// El productor se **consume**: solo declara el final si el volcado salió bien. Ver el
@@ -443,7 +568,7 @@ pub struct Resultado {
 /// solo la forma:
 ///
 /// ```text
-/// let resultado = volcar(&cliente, &contenedor, &orden, productor, INACTIVIDAD_MAXIMA).await?;
+/// let resultado = volcar(&cliente, &contenedor, &orden, None, productor, INACTIVIDAD_MAXIMA).await?;
 /// // …
 /// if entrega.completa() { /* el volcado se entregó entero Y el proceso terminó bien */ }
 /// ```
@@ -494,9 +619,20 @@ pub async fn volcar(
     cliente: &Cliente,
     contenedor: &str,
     orden: &Orden,
+    db_path: Option<&str>,
     productor: ProductorDelVolcado,
     inactividad_maxima: Duration,
 ) -> Result<Resultado, ErrorDeExtraccion> {
+    // La comprobación de alcance del `db_path`, **antes** de la orden que lo usa: un `sqlite`
+    // cuyo `db_path` no sea su propia forma canónica dentro del contenedor no se vuelca. Va aquí
+    // y no en [`ruta`] porque necesita el contenedor —el `readlink` se ejecuta dentro de él— y
+    // [`ruta`] compone la orden sin hablar con nadie. El `None` es el de los tipos que no tienen
+    // `db_path`: una base de servidor no lleva ninguna ruta de fichero en su comando.
+    if let Some(db_path) = db_path {
+        comprobar_la_forma_canonica_del_db_path(cliente, contenedor, db_path, inactividad_maxima)
+            .await?;
+    }
+
     let mut bytes_leidos: u64 = 0;
     let mut crudo: Vec<u8> = Vec::new();
     let mut sin_destino: Option<crate::rustic::Error> = None;
@@ -721,6 +857,50 @@ pub enum ErrorDeExtraccion {
         causa: crate::rustic::Error,
         /// Lo que el contenedor dijo por su canal de error, sin la credencial; vacío si no
         /// llegó a decir nada.
+        motivo: String,
+    },
+
+    /// La ruta de un campo no se puede usar: queda fuera de su frontera.
+    ///
+    /// Es el desenlace de [`frontera::confinar_host_path`] cuando el `host_path` de un directorio
+    /// no queda bajo la raíz de copias —resueltos sus enlaces simbólicos— y el de
+    /// [`frontera::coincide_con_su_forma_canonica`] cuando el `db_path` de un `sqlite` no es,
+    /// dentro del contenedor, su propia forma canónica.
+    ///
+    /// El motivo de [`FronteraError`] **nombra el campo** —`host_path` o `db_path`— y **no**
+    /// publica ninguna ruta: es la parte que el operador necesita para encontrar la fila que se
+    /// editó mal, y lo que no escribió no sale de aquí. Se construye con el `?` desde el error de
+    /// la frontera, que es lo que conserva el campo sin reescribirlo.
+    #[error("{causa}")]
+    FueraDeLaFrontera {
+        /// El motivo de la frontera, con el campo nombrado y sin publicar la ruta.
+        #[from]
+        causa: FronteraError,
+    },
+
+    /// No se pudo comprobar la forma canónica del `db_path` dentro del contenedor.
+    ///
+    /// La comprobación es un `exec` de `readlink -f <db_path>` —sin `sh -c`— y este es el
+    /// desenlace de que ese `exec` **no salga con cero**: lo más probable es que el contenedor no
+    /// traiga `readlink`, que es un requisito del target `sqlite` junto a `sqlite3`. El motivo del
+    /// contenedor viaja dentro, depurado como en cualquier otra orden, para que el operador sepa
+    /// si fue un binario que falta o un contenedor que no está.
+    ///
+    /// Sin esta comprobación no se ejecuta el volcado: una ruta cuya forma canónica no se pudo
+    /// leer no se puede dar por confinada, y suponer que coincide sería confiar en el campo que
+    /// se está intentando acotar.
+    #[error(
+        "no se ha podido comprobar la forma canónica de `db_path` en `{contenedor}`: la orden \
+         salió con el código {codigo}{}",
+        lo_que_dijo_el_contenedor(.motivo)
+    )]
+    FormaCanonicaNoSePudoComprobar {
+        /// Contenedor en el que se intentó la comprobación.
+        contenedor: String,
+        /// Código de salida de la orden de comprobación.
+        codigo: i32,
+        /// Lo que el contenedor dijo por su canal de error, sin la credencial; vacío si no dijo
+        /// nada.
         motivo: String,
     },
 }
@@ -1073,7 +1253,8 @@ pub(crate) fn recortar(motivo: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
-    use std::path::PathBuf;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::{
@@ -1083,11 +1264,12 @@ mod tests {
     };
     use crate::db::entities::{Target, TipoDeTarget};
     use crate::docker::{Cliente, Orden};
+    use crate::engine::frontera::{Campo, FronteraError};
     use crate::rustic::{ProductorDelVolcado, TunelDelVolcado, tunel_del_volcado};
     use crate::secret::{REDACTED, SecretString};
     use crate::test_support::{
-        BufferDeLog, ContenedorDePrueba, TIMEOUT_DEL_MOTOR, capturar_log, lector_del_volcado,
-        socket_del_motor,
+        BufferDeLog, ContenedorDePrueba, TIMEOUT_DEL_MOTOR, capturar_log, cliente_del_motor,
+        directorio_de_prueba, lector_del_volcado, socket_del_motor,
     };
     use tracing_subscriber::EnvFilter;
 
@@ -1106,6 +1288,23 @@ mod tests {
     const PLAZO_ESTANCADO: Duration = Duration::from_secs(2);
 
     // ── Ayudantes ────────────────────────────────────────────────────────────
+
+    /// La raíz de copias de las pruebas que no miden el alcance de una ruta.
+    ///
+    /// No hace falta que exista: la comparación por componentes de [`super::ruta`] es de texto
+    /// para las filas que no traen `host_path`, y los casos de directorio que sí miden el alcance
+    /// declaran su propia raíz.
+    const RAIZ: &str = "/backup_sources";
+
+    /// La raíz de copias de las pruebas de forma, como `&Path`.
+    fn raiz() -> &'static Path {
+        Path::new(RAIZ)
+    }
+
+    /// El texto de una ruta de prueba, que el arnés construye siempre en UTF-8.
+    fn texto(ruta: &Path) -> &str {
+        ruta.to_str().expect("las rutas de prueba son UTF-8")
+    }
 
     /// Un `SecretString` con el valor dado.
     fn secreto(valor: &str) -> SecretString {
@@ -1186,8 +1385,10 @@ mod tests {
     /// objetivo de base que saliera por el sistema de ficheros no tendría comando con el que
     /// medir nada, y el fallo tiene que decir eso y no «no hay comando».
     fn por_contenedor(objetivo: &Objetivo) -> (String, Orden) {
-        match ruta(objetivo).expect("esta ruta tiene que construirse") {
-            Ruta::PorContenedor { contenedor, orden } => (contenedor, orden),
+        match ruta(raiz(), objetivo).expect("esta ruta tiene que construirse") {
+            Ruta::PorContenedor {
+                contenedor, orden, ..
+            } => (contenedor, orden),
             Ruta::PorFichero { ruta } => panic!(
                 "un objetivo de tipo `{:?}` no puede salir por el sistema de ficheros: {ruta:?}",
                 objetivo.tipo
@@ -1356,7 +1557,7 @@ mod tests {
     #[test]
     fn un_sqlite_sin_db_path_utilizable_se_rechaza_nombrando_el_campo() {
         for (db_path, esperado) in [(None, None), (Some("   "), Some("en blanco"))] {
-            let error = ruta(&objetivo_sqlite(db_path))
+            let error = ruta(raiz(), &objetivo_sqlite(db_path))
                 .expect_err("un sqlite sin una ruta utilizable no tiene comando");
 
             match (error, esperado) {
@@ -1389,7 +1590,7 @@ mod tests {
     /// silenciosa convertiría una fila mal escrita en otro comando.
     #[test]
     fn un_db_path_que_parece_bandera_se_rechaza() {
-        let error = ruta(&objetivo_sqlite(Some("--version")))
+        let error = ruta(raiz(), &objetivo_sqlite(Some("--version")))
             .expect_err("un `db_path` que parece bandera no puede llegar al `exec`");
 
         match error {
@@ -1411,7 +1612,8 @@ mod tests {
         let mut objetivo = objetivo_sqlite(Some("/var/lib/kesto/kesto.db"));
         objetivo.container_name = None;
 
-        let error = ruta(&objetivo).expect_err("un sqlite sin contenedor no tiene dónde ejecutar");
+        let error =
+            ruta(raiz(), &objetivo).expect_err("un sqlite sin contenedor no tiene dónde ejecutar");
 
         match error {
             ErrorDeExtraccion::CampoQueFalta { tipo, campo } => {
@@ -1462,7 +1664,7 @@ mod tests {
 
             // Y el `Debug` de la orden —y el de la ruta que la lleva dentro— tampoco la
             // publica: es lo que hace que un registro de depuración no sea una filtración.
-            let ruta = ruta(&objetivo).expect("la ruta ya se construyó una vez");
+            let ruta = ruta(raiz(), &objetivo).expect("la ruta ya se construyó una vez");
             assert!(
                 !format!("{ruta:?}").contains(CONTRASENA),
                 "el Debug de la ruta publica la contraseña: {ruta:?}"
@@ -1521,7 +1723,8 @@ mod tests {
             };
             let objetivo = Objetivo { tipo, ..objetivo };
 
-            let error = ruta(&objetivo).expect_err("sin usuario no hay comando que construir");
+            let error =
+                ruta(raiz(), &objetivo).expect_err("sin usuario no hay comando que construir");
 
             assert!(
                 matches!(
@@ -1548,7 +1751,8 @@ mod tests {
             ..objetivo_mariadb(None)
         };
 
-        let error = ruta(&objetivo).expect_err("sin contenedor no hay dónde ejecutar la orden");
+        let error =
+            ruta(raiz(), &objetivo).expect_err("sin contenedor no hay dónde ejecutar la orden");
 
         assert!(
             matches!(
@@ -1574,7 +1778,8 @@ mod tests {
     #[test]
     fn un_campo_informado_pero_en_blanco_no_sirve() {
         let caso = |objetivo: Objetivo, campo: &'static str| {
-            let error = ruta(&objetivo).expect_err("un campo en blanco no puede dar una ruta");
+            let error =
+                ruta(raiz(), &objetivo).expect_err("un campo en blanco no puede dar una ruta");
 
             assert!(
                 matches!(
@@ -1629,8 +1834,8 @@ mod tests {
     #[test]
     fn un_valor_que_parece_bandera_se_rechaza() {
         let caso = |objetivo: Objetivo, campo: &'static str, valor: &str| {
-            let error =
-                ruta(&objetivo).expect_err("un valor que parece una bandera no da un comando");
+            let error = ruta(raiz(), &objetivo)
+                .expect_err("un valor que parece una bandera no da un comando");
             let mensaje = error.to_string();
 
             assert!(
@@ -1712,11 +1917,16 @@ mod tests {
     fn un_target_de_directorio_se_lee_del_sistema_de_ficheros() {
         let ruta_esperada = PathBuf::from("/backup_sources/var_www");
 
-        match ruta(&objetivo_directorio(Some("/backup_sources/var_www")))
-            .expect("un directorio con su ruta da una ruta")
+        match ruta(
+            raiz(),
+            &objetivo_directorio(Some("/backup_sources/var_www")),
+        )
+        .expect("un directorio con su ruta da una ruta")
         {
             Ruta::PorFichero { ruta } => assert_eq!(ruta, ruta_esperada),
-            Ruta::PorContenedor { contenedor, orden } => panic!(
+            Ruta::PorContenedor {
+                contenedor, orden, ..
+            } => panic!(
                 "un directorio no pasa por Docker, y salió por el contenedor `{contenedor}` con \
                  la orden {orden:?}"
             ),
@@ -1726,8 +1936,8 @@ mod tests {
     /// Un directorio **sin** ruta no se puede copiar, y el motivo nombra el campo.
     #[test]
     fn un_target_de_directorio_sin_ruta_no_se_puede_copiar() {
-        let error =
-            ruta(&objetivo_directorio(None)).expect_err("sin ruta no hay directorio que copiar");
+        let error = ruta(raiz(), &objetivo_directorio(None))
+            .expect_err("sin ruta no hay directorio que copiar");
 
         assert!(
             matches!(
@@ -1738,6 +1948,138 @@ mod tests {
                 }
             ),
             "el fallo no nombra la ruta que falta: {error:?}"
+        );
+    }
+
+    // ── El confinamiento del `host_path` (SEC-04) ────────────────────────────
+    //
+    // La regla entera vive en [`crate::engine::frontera`] y se prueba allí sin motor; lo que estas
+    // pruebas fijan es que [`ruta`] la **aplica** en la rama de directorio, que es el único punto
+    // del camino de la copia por el que se decide qué directorio se lee. «Sin leer un byte» se
+    // mide aquí como que no se construye la ruta de lectura: `Ruta::PorFichero` es lo único que la
+    // extracción usaría para leer, y un rechazo no lo devuelve.
+
+    /// **Un `host_path` fuera de la raíz no da ruta de lectura**, y el motivo nombra el campo.
+    ///
+    /// Es el escenario «un host_path fuera de la raíz no se lee»: el motor canonicaliza la ruta y
+    /// la compara contra la raíz de copias por componentes, y al no quedar bajo ella no construye
+    /// la ruta por la que leería el directorio.
+    #[test]
+    fn un_host_path_fuera_de_la_raiz_no_da_ruta_de_lectura() {
+        let raiz_de_copias = directorio_de_prueba();
+        let fuera = directorio_de_prueba();
+
+        let error = ruta(
+            raiz_de_copias.ruta(),
+            &objetivo_directorio(Some(texto(fuera.ruta()))),
+        )
+        .expect_err("un `host_path` fuera de la raíz no puede dar una ruta de lectura");
+
+        assert!(
+            matches!(
+                &error,
+                ErrorDeExtraccion::FueraDeLaFrontera {
+                    causa: FronteraError::FueraDeLaRaiz {
+                        campo: Campo::HostPath
+                    }
+                }
+            ),
+            "el fallo no es el de la frontera: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("host_path"),
+            "el motivo no nombra el campo: {error}"
+        );
+    }
+
+    /// **Un enlace intermedio que escapa se rechaza**, aunque el texto empiece por la raíz.
+    ///
+    /// Es el escenario «un enlace que escapa de la raíz se rechaza»: la ruta declarada es
+    /// textualmente correcta —el borde HTTP la deja pasar, porque su comprobación es de forma— y
+    /// el motor la canonicaliza, ve que el enlace la lleva fuera de la raíz y no construye la ruta
+    /// de lectura. Es la mitad que solo el motor puede cerrar.
+    #[test]
+    fn un_enlace_intermedio_que_escapa_de_la_raiz_no_da_ruta_de_lectura() {
+        let raiz_de_copias = directorio_de_prueba();
+        let fuera = directorio_de_prueba();
+        symlink(fuera.ruta(), raiz_de_copias.ruta().join("enlace"))
+            .expect("el enlace de la prueba se crea");
+
+        let declarado = raiz_de_copias.ruta().join("enlace/fichero");
+
+        let error = ruta(
+            raiz_de_copias.ruta(),
+            &objetivo_directorio(Some(texto(&declarado))),
+        )
+        .expect_err("un enlace que escapa de la raíz no puede dar una ruta de lectura");
+
+        assert!(
+            matches!(
+                &error,
+                ErrorDeExtraccion::FueraDeLaFrontera {
+                    causa: FronteraError::FueraDeLaRaiz {
+                        campo: Campo::HostPath
+                    }
+                }
+            ),
+            "el fallo no es el de la frontera: {error:?}"
+        );
+    }
+
+    /// **Un `host_path` bajo la raíz y existente se lee**, y con la ruta **declarada**.
+    ///
+    /// Es el contrapeso del confinamiento, y fija la invariante «comprobar con la canónica, operar
+    /// con la declarada»: la comprobación resuelve los enlaces simbólicos, pero la ruta que sale
+    /// para leer es la que escribió el operador —la que el `compose` del §8 monta—, no la resuelta.
+    #[test]
+    fn un_host_path_bajo_la_raiz_y_existente_se_lee() {
+        let raiz_de_copias = directorio_de_prueba();
+        let dentro = raiz_de_copias.ruta().join("var_www");
+        std::fs::create_dir(&dentro).expect("el directorio de la prueba se crea");
+
+        let leida = match ruta(
+            raiz_de_copias.ruta(),
+            &objetivo_directorio(Some(texto(&dentro))),
+        )
+        .expect("un `host_path` bajo la raíz y existente da una ruta")
+        {
+            Ruta::PorFichero { ruta } => ruta,
+            Ruta::PorContenedor { contenedor, .. } => {
+                panic!("un directorio no pasa por Docker, y salió por el contenedor `{contenedor}`")
+            }
+        };
+
+        assert_eq!(
+            leida, dentro,
+            "el motor comprueba con la forma canónica y opera con la ruta declarada"
+        );
+    }
+
+    /// **Una ruta que no existe bajo la raíz se acepta**: el directorio puede no estar montado aún.
+    ///
+    /// Es el escenario «composición canónica de una ruta que no existe»: la canonicalización
+    /// resuelve el anteproyecto existente más profundo —la raíz— y recompone el resto tal cual, y
+    /// el resultado queda bajo la raíz, así que la ruta se acepta.
+    #[test]
+    fn un_host_path_bajo_la_raiz_que_no_existe_se_acepta() {
+        let raiz_de_copias = directorio_de_prueba();
+        let declarado = raiz_de_copias.ruta().join("todavia/sin/montar");
+
+        let leida = match ruta(
+            raiz_de_copias.ruta(),
+            &objetivo_directorio(Some(texto(&declarado))),
+        )
+        .expect("una ruta bajo la raíz que todavía no existe es admisible")
+        {
+            Ruta::PorFichero { ruta } => ruta,
+            Ruta::PorContenedor { contenedor, .. } => {
+                panic!("un directorio no pasa por Docker, y salió por el contenedor `{contenedor}`")
+            }
+        };
+
+        assert_eq!(
+            leida, declarado,
+            "la ruta que sale para leer es la declarada, no la canónica"
         );
     }
 
@@ -2193,7 +2535,55 @@ mod tests {
                 let cliente =
                     Cliente::conectar(&socket, TIMEOUT_DEL_MOTOR).expect("el socket existe");
 
-                volcar(&cliente, &contenedor, &orden, productor, inactividad_maxima).await
+                volcar(
+                    &cliente,
+                    &contenedor,
+                    &orden,
+                    None,
+                    productor,
+                    inactividad_maxima,
+                )
+                .await
+            })
+        })
+    }
+
+    /// La misma conducción, con un `db_path` declarado para la comprobación de forma canónica.
+    ///
+    /// Existe por las pruebas del `db_path` de un `sqlite`: el resto de extracciones no llevan
+    /// ruta de fichero —una base de servidor no la tiene—, así que el `None` de
+    /// [`volcar_en_su_hilo`] no vale aquí y el camino tiene que ser el mismo con el campo
+    /// informado.
+    fn volcar_en_su_hilo_con_db_path(
+        contenedor: &str,
+        orden: Orden,
+        db_path: &str,
+        productor: ProductorDelVolcado,
+    ) -> std::thread::JoinHandle<Result<Resultado, ErrorDeExtraccion>> {
+        let socket = socket_del_motor().expect("las pruebas del motor necesitan un socket");
+        let contenedor = contenedor.to_owned();
+        let db_path = db_path.to_owned();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("el runtime del hilo debe poder construirse");
+
+            runtime.block_on(async move {
+                let cliente =
+                    Cliente::conectar(&socket, TIMEOUT_DEL_MOTOR).expect("el socket existe");
+
+                volcar(
+                    &cliente,
+                    &contenedor,
+                    &orden,
+                    Some(&db_path),
+                    productor,
+                    INACTIVIDAD_MAXIMA,
+                )
+                .await
             })
         })
     }
@@ -2829,5 +3219,224 @@ mod tests {
              buffer no están midiendo nada y la ausencia de arriba no significa nada: \
              {registro_desnudo}"
         );
+    }
+
+    // ── El `db_path` canónico dentro del contenedor (SEC-05) ─────────────────
+    //
+    // La comprobación es un `readlink -f` dentro del contenedor: lo que estas pruebas fijan es que
+    // se hace **antes** de la orden del volcado y que su desenlace —coincida, difiera o no se pueda
+    // comprobar— se traduce al de la extracción sin silenciarse. El instrumento es el contenedor de
+    // prueba del arnés y un **testigo**: un fichero que el comando habría escrito si hubiera
+    // corrido, y cuya ausencia es la prueba de que no corrió.
+
+    /// Un guion que deja un testigo y, si corre, imprime un volcado.
+    ///
+    /// El testigo es lo que mide «el volcado no se ejecutó»: la orden del `sqlite3` de verdad no
+    /// escribe en el sistema de ficheros del contenedor, así que la prueba le da un efecto
+    /// observable que sí lo sea.
+    fn orden_con_testigo(testigo: &str) -> Orden {
+        orden_de_shell(&format!("touch {testigo}; printf volcado"))
+    }
+
+    /// ¿Escribió el comando su testigo? Es la sonda de «el volcado corrió o no».
+    async fn corrio_el_volcado(cliente: &Cliente, contenedor: &str, testigo: &str) -> bool {
+        let codigo = cliente
+            .ejecutar(
+                contenedor,
+                &orden_de_shell(&format!("test -e {testigo}")),
+                INACTIVIDAD_MAXIMA,
+                |_| {},
+            )
+            .await
+            .expect("la sonda del testigo no puede fallar por el transporte");
+
+        codigo == 0
+    }
+
+    /// **Un `db_path` que es un enlace no se vuelca**: su forma canónica difiere de la declarada.
+    ///
+    /// Es el escenario «un db_path que es un enlace simbólico se rechaza»: `readlink -f` resuelve
+    /// el enlace a otro fichero, la forma canónica no coincide con el declarado y el comando del
+    /// volcado **no llega a ejecutarse** —lo delata el testigo, que el comando habría escrito—.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn un_db_path_que_no_es_su_forma_canonica_no_llega_a_volcar() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor =
+            ContenedorDePrueba::nuevo("un_db_path_que_no_es_su_forma_canonica_no_llega_a_volcar")
+                .await;
+
+        // Un `.db` real y un enlace que apunta a él: `readlink -f` del enlace da el real, que no
+        // es el declarado.
+        cliente
+            .ejecutar(
+                contenedor.nombre(),
+                &orden_de_shell(
+                    "mkdir -p /datos && : > /datos/base.db && ln -sf /datos/base.db /datos/enlace.db",
+                ),
+                INACTIVIDAD_MAXIMA,
+                |_| {},
+            )
+            .await
+            .expect("la preparación del contenedor no puede fallar por el transporte");
+
+        /// El testigo que el comando del volcado escribiría si llegara a correr.
+        const TESTIGO: &str = "/tmp/el-volcado-corrio";
+
+        let TunelDelVolcado { productor, .. } = tunel_de_prueba("volcado-enlace.sql");
+
+        let error = volcar_en_su_hilo_con_db_path(
+            contenedor.nombre(),
+            orden_con_testigo(TESTIGO),
+            "/datos/enlace.db",
+            productor,
+        )
+        .join()
+        .expect("el hilo del `exec` no puede entrar en pánico")
+        .expect_err("un `db_path` que no es su forma canónica no puede volcarse");
+
+        assert!(
+            matches!(
+                &error,
+                ErrorDeExtraccion::FueraDeLaFrontera {
+                    causa: FronteraError::NoCoincideConSuFormaCanonica {
+                        campo: Campo::DbPath
+                    }
+                }
+            ),
+            "el fallo no es el de la forma canónica: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("db_path"),
+            "el motivo no nombra el campo: {error}"
+        );
+        assert!(
+            !corrio_el_volcado(&cliente, contenedor.nombre(), TESTIGO).await,
+            "el comando del volcado corrió pese a que el `db_path` no es su forma canónica"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// **Un `db_path` canónico sí se vuelca**: la comprobación no estorba a una copia buena.
+    ///
+    /// Es el contrapeso: `readlink -f` devuelve exactamente el declarado, así que la extracción
+    /// sigue su camino y el volcado llega entero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn un_db_path_canonico_se_vuelca() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::nuevo("un_db_path_canonico_se_vuelca").await;
+
+        cliente
+            .ejecutar(
+                contenedor.nombre(),
+                &orden_de_shell("mkdir -p /datos && : > /datos/base.db"),
+                INACTIVIDAD_MAXIMA,
+                |_| {},
+            )
+            .await
+            .expect("la preparación del contenedor no puede fallar por el transporte");
+
+        let TunelDelVolcado {
+            origen,
+            productor,
+            entrega,
+            avance: _,
+        } = tunel_de_prueba("volcado-canonico.sql");
+
+        let orden = orden_de_shell("printf volcado");
+        let hilo =
+            volcar_en_su_hilo_con_db_path(contenedor.nombre(), orden, "/datos/base.db", productor);
+
+        let mut lector = lector_del_volcado(&origen);
+        let mut leido = Vec::new();
+        lector
+            .read_to_end(&mut leido)
+            .expect("el volcado se declaró terminado, así que la lectura no puede fallar");
+
+        let resultado = hilo
+            .join()
+            .expect("el hilo del `exec` no puede entrar en pánico")
+            .expect("un `db_path` canónico no es un fallo de la extracción");
+
+        assert_eq!(resultado.codigo, 0, "el guion sale con cero");
+        assert_eq!(leido, b"volcado", "el volcado canónico no llegó entero");
+        assert!(
+            entrega.completa(),
+            "el volcado se entregó entero y la señal de la entrega sigue en falso"
+        );
+
+        contenedor.retirar().await;
+    }
+
+    /// **Un contenedor sin `readlink` falla en voz alta**: la comprobación no se silencia.
+    ///
+    /// Es el escenario «falta readlink en el contenedor»: sin el binario no se puede leer la forma
+    /// canónica, y suponer que coincide sería confiar en el campo que se está acotando. La
+    /// ejecución queda fallida —con el error del contenedor dentro, lo entregue el motor como
+    /// código distinto de cero o como fallo del transporte al arrancar el `exec`— y el volcado no
+    /// corre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requiere un motor de contenedores, y el CI no levanta ninguno: se ejecuta con cargo test -- --ignored"]
+    async fn un_contenedor_sin_readlink_falla_la_comprobacion_sin_silenciarse() {
+        let cliente = cliente_del_motor().expect("hace falta un socket de Docker o Podman");
+        let contenedor = ContenedorDePrueba::nuevo(
+            "un_contenedor_sin_readlink_falla_la_comprobacion_sin_silenciarse",
+        )
+        .await;
+
+        // `alpine` trae `readlink` como enlace a busybox en `/usr/bin`; se retira y la comprobación
+        // se queda sin binario.
+        cliente
+            .ejecutar(
+                contenedor.nombre(),
+                &orden_de_shell(
+                    "mkdir -p /datos && : > /datos/base.db && rm -f /usr/bin/readlink /bin/readlink",
+                ),
+                INACTIVIDAD_MAXIMA,
+                |_| {},
+            )
+            .await
+            .expect("la preparación del contenedor no puede fallar por el transporte");
+
+        /// El testigo que el comando del volcado escribiría si llegara a correr.
+        const TESTIGO: &str = "/tmp/el-volcado-corrio-sin-readlink";
+
+        let TunelDelVolcado { productor, .. } = tunel_de_prueba("volcado-sin-readlink.sql");
+
+        let error = volcar_en_su_hilo_con_db_path(
+            contenedor.nombre(),
+            orden_con_testigo(TESTIGO),
+            "/datos/base.db",
+            productor,
+        )
+        .join()
+        .expect("el hilo del `exec` no puede entrar en pánico")
+        .expect_err("sin `readlink` no se puede comprobar la forma canónica");
+
+        match &error {
+            ErrorDeExtraccion::FormaCanonicaNoSePudoComprobar {
+                contenedor: cual, ..
+            } => {
+                assert_eq!(
+                    cual,
+                    contenedor.nombre(),
+                    "el error no nombra el contenedor"
+                );
+            }
+            // Según el motor, el binario ausente llega como código distinto de cero o como fallo
+            // del transporte al arrancar el `exec`: los dos son «el fallo del contenedor» y
+            // ninguno se silencia.
+            ErrorDeExtraccion::Transporte { .. }
+            | ErrorDeExtraccion::ContenedorQueNoEsta { .. } => {}
+            otro => panic!("sin `readlink` la comprobación tiene que fallar en voz alta: {otro:?}"),
+        }
+        assert!(
+            !corrio_el_volcado(&cliente, contenedor.nombre(), TESTIGO).await,
+            "el volcado corrió sin haberse podido comprobar la forma canónica del `db_path`"
+        );
+
+        contenedor.retirar().await;
     }
 }

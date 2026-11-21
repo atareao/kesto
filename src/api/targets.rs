@@ -34,6 +34,7 @@ use crate::api::contenido;
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
 use crate::db::entities::{AltaDeTarget, Target, TipoDeTarget};
+use crate::engine::frontera::{self, FronteraError};
 use crate::error::AppError;
 use crate::secret::SecretString;
 use crate::state::AppState;
@@ -246,6 +247,28 @@ fn prohibir(campo: &str, valor: Option<&str>) -> Result<(), AppError> {
     }
 }
 
+/// El `400` de una ruta que no cabe en su alcance.
+///
+/// El texto lo pone [`frontera`], que es la única pieza que sabe qué alcance tiene cada campo y
+/// **nombra el campo** sin publicar ninguna ruta: lo único que se lee en el mensaje es el nombre
+/// de lo que el operador escribió.
+fn fuera_de_alcance(error: FronteraError) -> AppError {
+    AppError::InvalidInput(error.to_string())
+}
+
+/// Comprueba la **forma** del `host_path` contra la raíz de copias, sin tocar el disco.
+///
+/// Es la comprobación textual —la ruta puede no existir todavía, y al dar de alta un directorio es
+/// legítimo que no esté montado—; la canónica, que resuelve enlaces simbólicos, la hace el motor.
+fn exigir_host_path_bajo_la_raiz(raiz: &std::path::Path, host_path: &str) -> Result<(), AppError> {
+    frontera::forma_de_host_path(raiz, host_path).map_err(fuera_de_alcance)
+}
+
+/// Comprueba la **forma** del `db_path` de un `sqlite`: absoluta, sin `..` y sin segmento vacío.
+fn exigir_db_path_sin_ambiguedad(db_path: &str) -> Result<(), AppError> {
+    frontera::forma_de_db_path(db_path).map_err(fuera_de_alcance)
+}
+
 /// Comprueba la coherencia del cuerpo con su tipo y lo convierte en el alta de la capa de
 /// acceso.
 ///
@@ -262,9 +285,15 @@ fn prohibir(campo: &str, valor: Option<&str>) -> Result<(), AppError> {
 /// secreto es obligatorio. Un `directory` no lo mira nunca, porque no admite credenciales: si
 /// el tipo nuevo es `directory`, el secreto se descarta aunque la fila lo tuviera. Un `sqlite`
 /// tampoco: no tiene credenciales de base que conservar.
+///
+/// `raiz` es la raíz de copias efectiva —`Config::raiz_de_copias`, que llega desde el estado— y
+/// es contra ella contra la que se mide el `host_path`. La comprobación es **textual** y va al
+/// final, después de las de presencia y coherencia: un cuerpo al que le falta un campo tiene que
+/// seguir fallando por el campo que falta, no por el alcance de una ruta que ni siquiera venía.
 fn alta_desde(
     cuerpo: &AltaDeTargetDelCable,
     almacenada: Option<&SecretString>,
+    raiz: &std::path::Path,
 ) -> Result<AltaDeTarget, AppError> {
     let target_type = tipo_del_cable(&cuerpo.target_type)?;
 
@@ -279,6 +308,8 @@ fn alta_desde(
             if cuerpo.db_password.is_some() {
                 return Err(no_admitido("db_password"));
             }
+
+            exigir_host_path_bajo_la_raiz(raiz, &host_path)?;
 
             Ok(AltaDeTarget {
                 name: cuerpo.name.clone(),
@@ -340,6 +371,8 @@ fn alta_desde(
                 return Err(no_admitido("db_password"));
             }
 
+            exigir_db_path_sin_ambiguedad(&db_path)?;
+
             Ok(AltaDeTarget {
                 name: cuerpo.name.clone(),
                 target_type,
@@ -383,7 +416,7 @@ pub async fn alta(
     State(state): State<AppState>,
     Json(cuerpo): Json<AltaDeTargetDelCable>,
 ) -> Result<ApiResponse, AppError> {
-    let alta = alta_desde(&cuerpo, None)?;
+    let alta = alta_desde(&cuerpo, None, &state.config.raiz_de_copias)?;
 
     let fila = state.db.targets.alta(alta).await?;
     let vista = TargetDelCable::desde(&fila)?;
@@ -441,7 +474,11 @@ pub async fn actualizar(
     // El secreto almacenado se le pasa al validador para que un `PUT` que no lo informe lo
     // conserve; y si el tipo nuevo es un `directory`, esa rama no lo mira y la credencial se
     // descarta con el resto de los campos de base de datos.
-    let alta = alta_desde(&cuerpo, actual.db_password.as_ref())?;
+    let alta = alta_desde(
+        &cuerpo,
+        actual.db_password.as_ref(),
+        &state.config.raiz_de_copias,
+    )?;
 
     let fila = Target {
         id: actual.id,
@@ -496,12 +533,14 @@ mod tests {
     use std::sync::Arc;
 
     use axum::http::StatusCode;
+    use sqlx::SqlitePool;
 
     use crate::api::api_router;
-    use crate::state::EstadoDeBase;
+    use crate::db::crypto::Clave;
+    use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
-        base_con_clave, body_json, body_text, config_con_dsn, delete, estado_de_prueba,
-        estado_desarrollo, get, post_json, put_json,
+        base_con_clave, body_json, body_text, config_con_dsn, config_con_dsn_y_raiz_de_copias,
+        delete, estado_de_prueba, estado_desarrollo, get, post_json, put_json,
     };
 
     /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
@@ -1251,8 +1290,20 @@ mod tests {
     async fn un_put_que_cambia_el_tipo_a_directory_descarta_la_credencial() {
         let (directorio, pool, clave) = base_con_clave().await;
 
+        let config = config_con_dsn(&directorio.dsn());
+
+        // El `host_path` se compone sobre la raíz que declara la configuración del arnés: esta
+        // prueba mide el descarte de la credencial al cambiar de tipo, no el alcance de la ruta,
+        // así que la ruta tiene que quedar bajo la raíz para que lo que se mida sea lo que se
+        // quiere medir.
+        let host_path = config
+            .raiz_de_copias
+            .join("datos")
+            .to_string_lossy()
+            .to_string();
+
         let estado = estado_de_prueba(
-            config_con_dsn(&directorio.dsn()),
+            config,
             EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
         );
 
@@ -1291,7 +1342,7 @@ mod tests {
             &serde_json::json!({
                 "name": "target-1-32t-bis",
                 "target_type": "directory",
-                "host_path": "/srv/datos",
+                "host_path": host_path,
             }),
         )
         .await;
@@ -1555,5 +1606,390 @@ mod tests {
                 "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
             );
         }
+    }
+
+    // ── El alcance de las rutas: `confinamiento` en el borde HTTP ──────────────
+
+    /// La raíz de copias del §8, que es la que declaran las pruebas de alcance.
+    ///
+    /// No es la raíz de los temporales del arnés —la que lleva [`config_con_dsn`]—: lo que estas
+    /// pruebas miden es justo el alcance contra una raíz concreta, y la del despliegue de
+    /// referencia es esta.
+    const RAIZ_DEL_S8: &str = "/backup_sources";
+
+    /// El estado de las pruebas de alcance: una base de verdad y la raíz del §8 declarada.
+    fn estado_del_alcance(dsn: &str, pool: &SqlitePool, clave: &Arc<Clave>) -> AppState {
+        estado_de_prueba(
+            config_con_dsn_y_raiz_de_copias(dsn, RAIZ_DEL_S8),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(clave)),
+        )
+    }
+
+    /// El mensaje de un rechazo, con la comprobación de que nombra el campo que lo provoca.
+    fn mensaje_que_nombra(cuerpo: &serde_json::Value, campo: &str) -> String {
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto")
+            .to_owned();
+
+        assert!(
+            mensaje.contains(campo),
+            "el rechazo tiene que nombrar el campo `{campo}`, y el mensaje fue {mensaje:?}"
+        );
+
+        mensaje
+    }
+
+    /// Las filas de `backup_targets` que hay en el fichero con el que se abrió el estado.
+    async fn filas_de_targets(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+            .fetch_one(pool)
+            .await
+            .expect("la tabla tiene que ser contable sobre el fichero del estado")
+    }
+
+    /// 2.1 — Un `host_path` fuera de la raíz se rechaza y no deja fila.
+    ///
+    /// Cubre `confinamiento`, escenario «Un host_path fuera de la raíz se rechaza» en lo que toca
+    /// al borde HTTP. La raíz del sistema de ficheros no es un directorio copiable, y aceptarla
+    /// archivaría a S3 todo lo que Kesto ve —incluida su propia base, con los tokens y los
+    /// secretos—. El rechazo tiene que llegar en el formulario y no en la primera copia.
+    #[tokio::test]
+    async fn un_host_path_fuera_de_la_raiz_se_rechaza_sin_fila() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-1",
+                "target_type": "directory",
+                "host_path": "/",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "la raíz del sistema de ficheros no es un directorio copiable: contestó {status} con \
+             {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "host_path");
+
+        assert_eq!(
+            filas_de_targets(&pool).await,
+            0,
+            "una petición rechazada no puede dejar fila escrita"
+        );
+    }
+
+    /// 2.2 — Una raíz que solo coincide como prefijo de cadena no vale.
+    ///
+    /// Cubre `confinamiento`, escenario «Una raíz parecida no basta». `/backup_sources_x` empieza
+    /// por `/backup_sources` como **texto** y no está dentro de él: un confinamiento por prefijo de
+    /// cadena dejaría pasar justo lo que quiere cerrar.
+    #[tokio::test]
+    async fn una_raiz_que_solo_coincide_como_prefijo_de_cadena_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-2",
+                "target_type": "directory",
+                "host_path": "/backup_sources_x",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un directorio hermano de la raíz no está dentro de ella: contestó {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "host_path");
+
+        assert_eq!(
+            filas_de_targets(&pool).await,
+            0,
+            "una petición rechazada no puede dejar fila escrita"
+        );
+    }
+
+    /// 2.3 — Un `host_path` relativo se rechaza.
+    ///
+    /// Cubre `api-resources`, escenario «Un host_path relativo se rechaza»: una ruta relativa no
+    /// dice de qué directorio del host se habla, así que el motor la resolvería contra su propio
+    /// directorio de trabajo.
+    #[tokio::test]
+    async fn un_host_path_relativo_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-3",
+                "target_type": "directory",
+                "host_path": "backup_sources/var_www",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "una ruta de host relativa es un formulario mal escrito: contestó {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "host_path");
+
+        assert_eq!(
+            filas_de_targets(&pool).await,
+            0,
+            "una petición rechazada no puede dejar fila escrita"
+        );
+    }
+
+    /// 2.3b — Un `host_path` con `..` se rechaza.
+    ///
+    /// Cubre `api-resources`, escenario «Un host_path con `..` se rechaza». `/backup_sources/../etc`
+    /// **empieza por** la raíz como texto y `..` es un componente válido para `Path::starts_with`,
+    /// así que sin este rechazo el alta pasaría y el fallo aparecería en la primera copia.
+    #[tokio::test]
+    async fn un_host_path_con_punto_doble_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-3b",
+                "target_type": "directory",
+                "host_path": "/backup_sources/../etc",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`..` en la cadena alcanza lo que no se declara: contestó {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "host_path");
+
+        assert_eq!(
+            filas_de_targets(&pool).await,
+            0,
+            "una petición rechazada no puede dejar fila escrita"
+        );
+    }
+
+    /// 2.4 — Un `host_path` bajo la raíz se acepta aunque no exista todavía.
+    ///
+    /// Es el **contrapeso** de las tres anteriores: la comprobación del borde es **textual** y no
+    /// exige que la ruta exista. Al dar de alta un directorio puede no estar montado aún, y exigir
+    /// su existencia convertiría el alta en una comprobación del despliegue.
+    #[tokio::test]
+    async fn un_host_path_bajo_la_raiz_que_no_existe_se_acepta() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        // La prueba afirma sobre la forma, no sobre el disco, así que la ruta tiene que faltar de
+        // verdad para que el contrapeso signifique algo.
+        assert!(
+            !std::path::Path::new("/backup_sources/var_www").exists(),
+            "esta prueba necesita que `/backup_sources/var_www` no exista en el sistema"
+        );
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-4",
+                "target_type": "directory",
+                "host_path": "/backup_sources/var_www",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un directorio bajo la raíz es un alta válida aunque todavía no esté montado: contestó \
+             {status} con {cuerpo}"
+        );
+
+        assert_eq!(
+            cuerpo["data"]["host_path"], "/backup_sources/var_www",
+            "la fila tiene que quedarse con la ruta declarada: {cuerpo}"
+        );
+    }
+
+    /// 2.5 — Un `db_path` con `..` se rechaza.
+    ///
+    /// Cubre `api-resources`, escenario «Un db_path con `..` se rechaza». El `.db` se ejecuta
+    /// dentro del contenedor y habitualmente como `root`, así que un `..` en la cadena alcanza
+    /// ficheros que nadie declaró; el fallo tiene que verse en el formulario.
+    #[tokio::test]
+    async fn un_db_path_con_punto_doble_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-5",
+                "target_type": "sqlite",
+                "container_name": "contenedor-sqlite",
+                "db_path": "/datos/../etc/base.db",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `db_path` con `..` no declara el fichero que dice: contestó {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "db_path");
+
+        assert_eq!(
+            filas_de_targets(&pool).await,
+            0,
+            "una petición rechazada no puede dejar fila escrita"
+        );
+    }
+
+    /// 2.6 — Un `db_path` relativo se rechaza.
+    ///
+    /// Cubre `api-resources`, escenario «Un db_path relativo se rechaza»: el `.db` se declara con
+    /// su ruta absoluta dentro del contenedor, y una relativa dependería del directorio de trabajo
+    /// con el que el `exec` arranque.
+    #[tokio::test]
+    async fn un_db_path_relativo_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let respuesta = post_json(
+            api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave)),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-6",
+                "target_type": "sqlite",
+                "container_name": "contenedor-sqlite",
+                "db_path": "datos/base.db",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `db_path` relativo es un formulario mal escrito: contestó {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "db_path");
+
+        assert_eq!(
+            filas_de_targets(&pool).await,
+            0,
+            "una petición rechazada no puede dejar fila escrita"
+        );
+    }
+
+    /// 2.7 — La edición aplica la misma regla y no cambia la fila.
+    ///
+    /// Cubre `api-resources`, escenario «La edición aplica la misma regla». El alta y la edición
+    /// comparten el punto de validación, así que un `PUT` que ponga un `host_path` fuera de la raíz
+    /// tiene que contestar el mismo `400` y **dejar la fila como estaba**: un rechazo que
+    /// actualizara a medias sería peor que no rechazar.
+    #[tokio::test]
+    async fn un_put_con_host_path_fuera_de_la_raiz_no_cambia_la_fila() {
+        let (directorio, pool, clave) = base_con_clave().await;
+        let router = api_router(estado_del_alcance(&directorio.dsn(), &pool, &clave));
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/targets",
+            &serde_json::json!({
+                "name": "target-2-7",
+                "target_type": "directory",
+                "host_path": "/backup_sources/var_www",
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "la prueba necesita un target de directorio válido del que partir"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let respuesta = put_json(
+            router,
+            &format!("/api/v1/targets/{id}"),
+            &serde_json::json!({
+                "name": "target-2-7",
+                "target_type": "directory",
+                "host_path": "/etc",
+            }),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `PUT` con el `host_path` fuera de la raíz tiene que rechazarse: contestó {status} \
+             con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "host_path");
+
+        let guardado: String =
+            sqlx::query_scalar("SELECT host_path FROM backup_targets WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que seguir en el fichero de la base");
+
+        assert_eq!(
+            guardado, "/backup_sources/var_www",
+            "una edición rechazada no puede haber cambiado la fila"
+        );
     }
 }

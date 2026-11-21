@@ -54,6 +54,7 @@
 mod cola;
 mod ejecucion;
 pub mod extraccion;
+pub mod frontera;
 mod hub;
 pub mod restauracion;
 
@@ -164,6 +165,13 @@ pub struct Ajustes {
     pub espera_del_motor: Duration,
     /// Cuánto se espera a los trabajadores al parar el motor.
     pub espera_de_parada: Duration,
+    /// Raíz bajo la que el motor acepta el `host_path` de un target `directory`.
+    ///
+    /// Es la raíz de copias de la configuración —`KESTO_BACKUP_ROOT`, con su defecto del §8— y la
+    /// usa el motor como **frontera** al leer y al escribir un directorio: el borde HTTP comprueba
+    /// la forma de la ruta, y aquí se **canonicaliza** contra esta raíz antes de tocar el sistema
+    /// de ficheros. Ver [`crate::engine::frontera`].
+    pub raiz_de_copias: PathBuf,
     /// Cómo se abre un repositorio: el de S3 en producción, el local en las pruebas.
     pub abridor: AbridorDeRepositorios,
     /// Cómo se comprueba la salud de un repositorio: la primitiva de solo lectura en producción, un
@@ -183,9 +191,19 @@ impl Ajustes {
             socket_del_motor: socket.into(),
             espera_del_motor: ESPERA_DEL_MOTOR,
             espera_de_parada: ESPERA_DE_PARADA,
+            raiz_de_copias: raiz_de_copias_por_defecto(),
             abridor: Repositorio::poner_en_marcha,
             comprobador: salud_del_repositorio,
         }
+    }
+
+    /// Los mismos ajustes con otra raíz de copias.
+    ///
+    /// La usa el arranque para inyectar la raíz de la configuración —`KESTO_BACKUP_ROOT`— y las
+    /// pruebas que necesitan medir el alcance contra una raíz concreta.
+    pub fn con_raiz_de_copias(mut self, raiz: impl Into<PathBuf>) -> Self {
+        self.raiz_de_copias = raiz.into();
+        self
     }
 
     /// Los mismos ajustes con otro abridor de repositorios.
@@ -201,14 +219,40 @@ impl Ajustes {
     }
 }
 
+/// La raíz de copias con la que nacen unos ajustes recién creados.
+///
+/// En **producción** es el defecto de la configuración —[`crate::config::DEFAULT_BACKUP_ROOT`],
+/// `/backup_sources`, que es donde el `compose` del §8 monta los directorios a respaldar—: el
+/// arranque la sustituye por la efectiva con [`Ajustes::con_raiz_de_copias`], y esto es solo el
+/// punto de partida.
+///
+/// En las **pruebas** es la raíz de los temporales del arnés
+/// —[`crate::test_support::raiz_de_copias_del_arnes`]—, que es donde viven los directorios que las
+/// pruebas crean con `directorio_de_prueba`. Sin esto, cada prueba que copiara o restaurara un
+/// directorio tendría que declarar una raíz propia, y la que no se acordara mediría el alcance
+/// contra una raíz que no contiene su temporal.
+fn raiz_de_copias_por_defecto() -> PathBuf {
+    #[cfg(test)]
+    {
+        crate::test_support::raiz_de_copias_del_arnes().to_path_buf()
+    }
+
+    #[cfg(not(test))]
+    {
+        PathBuf::from(crate::config::DEFAULT_BACKUP_ROOT)
+    }
+}
+
 impl std::fmt::Debug for Ajustes {
-    /// Publica lo que se puede publicar de unos ajustes: dónde está el motor de contenedores y
-    /// cuánto se espera. El abridor es un puntero y no dice nada, así que va como `abridor`.
+    /// Publica lo que se puede publicar de unos ajustes: dónde está el motor de contenedores,
+    /// cuánto se espera y bajo qué raíz se copian los directorios. El abridor es un puntero y no
+    /// dice nada, así que va como `abridor`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ajustes")
             .field("socket_del_motor", &self.socket_del_motor)
             .field("espera_del_motor", &self.espera_del_motor)
             .field("espera_de_parada", &self.espera_de_parada)
+            .field("raiz_de_copias", &self.raiz_de_copias)
             .finish_non_exhaustive()
     }
 }
@@ -1080,7 +1124,8 @@ impl Motor {
         // El camino, **antes** de tocar nada: un objetivo incoherente no llega al punto de anunciar
         // un arranque que no va a ocurrir. La fila sí se cierra —a `failed`—, porque el trabajo se
         // tomó y esa es la verdad.
-        let camino = match restauracion::comando(&objetivo) {
+        let camino = match restauracion::comando(&self.0.contexto.ajustes.raiz_de_copias, &objetivo)
+        {
             Ok(camino) => camino,
             Err(causa) => {
                 let motivo = recortar(&causa.to_string());
@@ -1111,8 +1156,9 @@ impl Motor {
             CaminoDeRestauracion::PorContenedor {
                 contenedor,
                 ordenes,
+                db_path,
             } => {
-                self.restaurar_en_el_contenedor(acceso, &instantanea, contenedor, ordenes)
+                self.restaurar_en_el_contenedor(acceso, &instantanea, contenedor, ordenes, db_path)
                     .await
             }
         };
@@ -1206,6 +1252,7 @@ impl Motor {
         instantanea: &str,
         contenedor: String,
         ordenes: Vec<Orden>,
+        db_path: Option<String>,
     ) -> Result<(), ErrorDelMotor> {
         let abridor = self.0.contexto.ajustes.abridor;
         let socket = self.0.contexto.ajustes.socket_del_motor.clone();
@@ -1233,6 +1280,7 @@ impl Motor {
                     &cliente,
                     &contenedor,
                     &ordenes,
+                    db_path.as_deref(),
                     lector,
                     INACTIVIDAD_MAXIMA,
                 )

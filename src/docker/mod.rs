@@ -25,6 +25,24 @@ use thiserror::Error;
 
 pub use cliente::Cliente;
 
+/// La etiqueta con la que un contenedor se declara **fuente de copia**.
+///
+/// El motor inspecciona el contenedor de un target **antes** de crear ningún `exec` y exige
+/// que lleve esta etiqueta con el valor [`VALOR_DE_FUENTE_DE_COPIA`]. Sin ella no se ejecuta
+/// nada —es **fail-closed**—, y la declaración **viaja con el contenedor**: quien lo crea dice
+/// si es fuente de copia, así que no hay una lista de configuración que poblar ni dos sitios
+/// que mantener en sincronía. El propio contenedor de Kesto queda denegado por sí solo, porque
+/// nadie lo etiqueta: no hace falta cablear su nombre, que cambiaría con cualquier renombrado
+/// del despliegue.
+pub const ETIQUETA_DE_FUENTE_DE_COPIA: &str = "io.kesto.backup-source";
+
+/// El valor de la etiqueta que declara un contenedor fuente de copia.
+///
+/// Cualquier otro valor —`"1"`, `"yes"`, `"false"`— deniega, igual que la etiqueta ausente: la
+/// comparación es **exacta** y no se acepta una aproximación que se leería como un sí sin
+/// serlo.
+pub const VALOR_DE_FUENTE_DE_COPIA: &str = "true";
+
 /// Una orden a ejecutar dentro de un contenedor.
 ///
 /// `cmd` es la línea de comandos **como lista de argumentos**, no como cadena: la API de
@@ -270,6 +288,29 @@ pub enum Error {
         /// terminó antes de recibir el volcado entero.
         #[source]
         causa: std::io::Error,
+    },
+
+    /// El contenedor no se declara fuente de copia: no se le crea ningún `exec`.
+    ///
+    /// El motor inspecciona el contenedor antes de crear el `exec` y exige la etiqueta
+    /// [`ETIQUETA_DE_FUENTE_DE_COPIA`] con el valor [`VALOR_DE_FUENTE_DE_COPIA`]. Sin ella la
+    /// orden no se ejecuta —**fail-closed**— y la ejecución acaba en `failed`.
+    ///
+    /// Es un desenlace **distinto** del de «no se pudo inspeccionar» —un contenedor que no
+    /// existe o un motor que no contesta llegan como [`Error::MotorContesta`] o
+    /// [`Error::MotorNoContesta`], con su código y su causa—: aquí el motor sí contestó y el
+    /// contenedor está, pero no se ha declarado fuente de copia. Confundir los dos mandaría a
+    /// mirar el motor cuando lo que falta es la etiqueta del contenedor.
+    ///
+    /// El motivo **nombra el contenedor** y no publica nada más: es lo que el operador
+    /// necesita para saber qué contenedor recrear con la etiqueta.
+    #[error(
+        "el contenedor `{contenedor}` no se declara fuente de copia: no lleva la etiqueta \
+         `io.kesto.backup-source=true`, así que el motor no crea ningún `exec` en él"
+    )]
+    ContenedorNoEsFuenteDeCopia {
+        /// Contenedor que no se declaró fuente de copia.
+        contenedor: String,
     },
 }
 
