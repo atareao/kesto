@@ -51,84 +51,84 @@ Fuera (non-goals):
 
 ### 0. Preparación
 
-- [ ] 0.1 Punto de partida en verde: `just check`.
-- [ ] 0.2 Rama desde `development`: `just gf-feature confinamiento-frontera-motor`.
-- [ ] 0.3 Change aprobado por el usuario (`just check-spec` encuentra el change activo).
+- [x] 0.1 Punto de partida en verde: `just check`.
+- [x] 0.2 Rama desde `development`: `just gf-feature confinamiento-frontera-motor`.
+- [x] 0.3 Change aprobado por el usuario (`just check-spec` encuentra el change activo).
 
 ### 1. La raíz de copias: configuración (SEC-04, #160)
 
-- [ ] 1.1 RED: sin `KESTO_BACKUP_ROOT`, la raíz es `/backup_sources`.
-- [ ] 1.2 RED: raíz relativa → error que nombra la variable.
-- [ ] 1.3 RED: raíz vacía → el mismo error, sin caer al defecto.
-- [ ] 1.4 RED: raíz absoluta explícita → configuración válida con esa raíz.
-- [ ] 1.5 GREEN: `src/engine/frontera.rs` con las funciones puras de alcance.
-- [ ] 1.6 GREEN: `src/config.rs` con la variable, el campo `backup_root` y el defecto.
-- [ ] 1.7 REFACTOR: rustdoc y `cargo fmt --all`; `clippy -D warnings` sin warnings.
+- [x] 1.1 RED: sin `KESTO_BACKUP_ROOT`, la raíz es `/backup_sources`.
+- [x] 1.2 RED: raíz relativa → error que nombra la variable.
+- [x] 1.3 RED: raíz vacía → el mismo error, sin caer al defecto.
+- [x] 1.4 RED: raíz absoluta explícita → configuración válida con esa raíz.
+- [x] 1.5 GREEN: `src/engine/frontera.rs` con las funciones puras de alcance.
+- [x] 1.6 GREEN: `src/config.rs` con la variable, el campo `backup_root` y el defecto.
+- [x] 1.7 REFACTOR: rustdoc y `cargo fmt --all`; `clippy -D warnings` sin warnings.
 
 ### 2. El borde HTTP comprueba el alcance (SEC-04 · SEC-05)
 
-- [ ] 2.1 RED: `host_path = "/"` → `400` nombrando el campo, sin fila.
-- [ ] 2.2 RED: `host_path = "/backup_sources_x"` → `400` (prefijo de cadena que no es prefijo de componentes).
-- [ ] 2.3 RED: `host_path` relativo → `400`.
-- [ ] 2.4 RED: `host_path = "/backup_sources/var_www"` inexistente → `201` (contrapeso).
-- [ ] 2.5 RED: `db_path = "/datos/../etc/base.db"` → `400`.
-- [ ] 2.6 RED: `db_path` relativo → `400`.
-- [ ] 2.7 RED: `PUT` con `host_path` fuera de la raíz → `400` y la fila no cambia.
-- [ ] 2.8 `cargo test --locked --bin kesto 'api::targets::tests::'`.
-- [ ] 2.9 GREEN: `alta_desde` llama a `frontera` con la raíz de `AppState`.
-- [ ] 2.10 REFACTOR: mensajes que nombran el campo y la raíz sin revelar rutas ajenas.
+- [x] 2.1 RED: `host_path = "/"` → `400` nombrando el campo, sin fila.
+- [x] 2.2 RED: `host_path = "/backup_sources_x"` → `400` (prefijo de cadena que no es prefijo de componentes).
+- [x] 2.3 RED: `host_path` relativo → `400`.
+- [x] 2.4 RED: `host_path = "/backup_sources/var_www"` inexistente → `201` (contrapeso).
+- [x] 2.5 RED: `db_path = "/datos/../etc/base.db"` → `400`.
+- [x] 2.6 RED: `db_path` relativo → `400`.
+- [x] 2.7 RED: `PUT` con `host_path` fuera de la raíz → `400` y la fila no cambia.
+- [x] 2.8 `cargo test --locked --bin kesto 'api::targets::tests::'`.
+- [x] 2.9 GREEN: `alta_desde` llama a `frontera` con la raíz de `AppState`.
+- [x] 2.10 REFACTOR: mensajes que nombran el campo y la raíz sin revelar rutas ajenas.
 
 ### 3. El motor confina `host_path` (SEC-04, #160)
 
-- [ ] 3.1 RED: copia con `host_path` fuera de la raíz → `failed` sin leer.
-- [ ] 3.2 RED: enlace intermedio que escapa → `failed`.
-- [ ] 3.3 RED: `host_path` bajo la raíz y existente → copia completada (contrapeso).
-- [ ] 3.4 RED: restauración con `host_path` fuera de la raíz → `failed` sin escribir ni podar.
-- [ ] 3.5 RED: composición canónica de una ruta que no existe (anteproyecto existente más profundo).
-- [ ] 3.6 GREEN: `extraccion.rs`, rama `directory`, canonicaliza y confina antes de construir la ruta.
-- [ ] 3.7 GREEN: `restauracion.rs`, rama `directory`, canonicaliza y confina el destino.
-- [ ] 3.8 REFACTOR: un solo sitio decide qué es una ruta aceptable.
+- [x] 3.1 RED: copia con `host_path` fuera de la raíz → `failed` sin leer.
+- [x] 3.2 RED: enlace intermedio que escapa → `failed`.
+- [x] 3.3 RED: `host_path` bajo la raíz y existente → copia completada (contrapeso).
+- [x] 3.4 RED: restauración con `host_path` fuera de la raíz → `failed` sin escribir ni podar.
+- [x] 3.5 RED: composición canónica de una ruta que no existe (anteproyecto existente más profundo).
+- [x] 3.6 GREEN: `extraccion.rs`, rama `directory`, canonicaliza y confina antes de construir la ruta.
+- [x] 3.7 GREEN: `restauracion.rs`, rama `directory`, canonicaliza y confina el destino.
+- [x] 3.8 REFACTOR: un solo sitio decide qué es una ruta aceptable.
 
 ### 4. `db_path` canónico dentro del contenedor (SEC-05, #161)
 
-- [ ] 4.1 RED: `readlink -f` distinto del declarado → copia `failed` sin volcar.
-- [ ] 4.2 RED: el mismo caso en restauración → `failed` sin `rm -f`.
-- [ ] 4.3 RED: `db_path` canónico → el volcado corre con la orden de siempre (contrapeso).
-- [ ] 4.4 RED: `db_path` canónico con vecinos → el `rm -f` no los toca (contrapeso).
-- [ ] 4.5 RED: contenedor sin `readlink` → `failed` con el error del contenedor.
-- [ ] 4.6 GREEN: `extraccion.rs` comprueba la forma canónica antes de la orden de `sqlite`.
-- [ ] 4.7 GREEN: `restauracion.rs` la comprueba antes de la retirada, y acota el `rm -f`.
-- [ ] 4.8 GREEN: la lectura del `stdout` se apoya en el cliente del daemon, sin `sh -c`.
-- [ ] 4.9 REFACTOR: rustdoc del requisito de `readlink` y del coste de declarar la ruta canónica.
+- [x] 4.1 RED: `readlink -f` distinto del declarado → copia `failed` sin volcar.
+- [x] 4.2 RED: el mismo caso en restauración → `failed` sin `rm -f`.
+- [x] 4.3 RED: `db_path` canónico → el volcado corre con la orden de siempre (contrapeso).
+- [x] 4.4 RED: `db_path` canónico con vecinos → el `rm -f` no los toca (contrapeso).
+- [x] 4.5 RED: contenedor sin `readlink` → `failed` con el error del contenedor.
+- [x] 4.6 GREEN: `extraccion.rs` comprueba la forma canónica antes de la orden de `sqlite`.
+- [x] 4.7 GREEN: `restauracion.rs` la comprueba antes de la retirada, y acota el `rm -f`.
+- [x] 4.8 GREEN: la lectura del `stdout` se apoya en el cliente del daemon, sin `sh -c`.
+- [x] 4.9 REFACTOR: rustdoc del requisito de `readlink` y del coste de declarar la ruta canónica.
 
 ### 5. Solo contenedores declarados fuentes de copia (SEC-06, #162)
 
-- [ ] 5.1 RED: contenedor sin etiqueta → `failed` nombrando el contenedor y sin `exec`.
-- [ ] 5.2 RED: contenedor con etiqueta → el `exec` se crea y la orden corre.
-- [ ] 5.3 RED: contenedor que no existe → el mismo fallo que hoy (contrapeso).
-- [ ] 5.4 RED: restauración hacia contenedor sin etiqueta → `failed` sin `exec`.
-- [ ] 5.5 GREEN: `cliente.rs` inspecciona antes de `create_exec` y exige la etiqueta.
-- [ ] 5.6 GREEN: la lectura de las etiquetas, con su propio tipo de error.
-- [ ] 5.7 REFACTOR: rustdoc del porqué de la etiqueta y del único punto de comprobación.
+- [x] 5.1 RED: contenedor sin etiqueta → `failed` nombrando el contenedor y sin `exec`.
+- [x] 5.2 RED: contenedor con etiqueta → el `exec` se crea y la orden corre.
+- [x] 5.3 RED: contenedor que no existe → el mismo fallo que hoy (contrapeso).
+- [x] 5.4 RED: restauración hacia contenedor sin etiqueta → `failed` sin `exec`.
+- [x] 5.5 GREEN: `cliente.rs` inspecciona antes de `create_exec` y exige la etiqueta.
+- [x] 5.6 GREEN: la lectura de las etiquetas, con su propio tipo de error.
+- [x] 5.7 REFACTOR: rustdoc del porqué de la etiqueta y del único punto de comprobación.
 
 ### 6. Arnés, e2e y documentación
 
-- [ ] 6.1 `Receta` gana etiquetas; el e2e etiqueta sus contenedores de origen y apunta la raíz a su temporal.
-- [ ] 6.2 Escenarios nuevos: contenedor sin etiqueta no se copia; `directory` fuera de la raíz no se copia.
-- [ ] 6.3 `src/test_support.rs` y los tests con contenedores declaran la raíz y la etiqueta.
-- [ ] 6.4 `docs/DEFINITION.md` §8: la variable y la etiqueta.
-- [ ] 6.5 `docs/ENTORNO.md`: la variable en la tabla y la nota de compatibilidad.
-- [ ] 6.6 `docs/FEATURE-005-backup-engine.md`: el confinamiento deja de ser una promesa de los tests.
-- [ ] 6.7 `docs/FEATURE-040-confinamiento-frontera-motor.md`.
+- [x] 6.1 `Receta` gana etiquetas; el e2e etiqueta sus contenedores de origen y apunta la raíz a su temporal.
+- [x] 6.2 Escenarios nuevos: contenedor sin etiqueta no se copia; `directory` fuera de la raíz no se copia.
+- [x] 6.3 `src/test_support.rs` y los tests con contenedores declaran la raíz y la etiqueta.
+- [x] 6.4 `docs/DEFINITION.md` §8: la variable y la etiqueta.
+- [x] 6.5 `docs/ENTORNO.md`: la variable en la tabla y la nota de compatibilidad.
+- [x] 6.6 `docs/FEATURE-005-backup-engine.md`: el confinamiento deja de ser una promesa de los tests.
+- [x] 6.7 `docs/FEATURE-040-confinamiento-frontera-motor.md`.
 
 ### 7. Cierre
 
-- [ ] 7.1 `just check-all` en verde.
-- [ ] 7.2 Revisión de `@rust-reviewer` sin bloqueantes.
-- [ ] 7.3 PR a `development` con `Closes #160`, `Closes #161` y `Closes #162`.
-- [ ] 7.4 Fusionado: `just spec-archive confinamiento-frontera-motor`.
-- [ ] 7.5 `plans/PLAN-040.md` → `plans/PLAN-040-COMPLETED.md`.
-- [ ] 7.6 Issue de seguimiento para la separación de privilegio del motor.
+- [x] 7.1 `just check-all` en verde.
+- [x] 7.2 Revisión de `@rust-reviewer` sin bloqueantes.
+- [x] 7.3 PR a `development` con `Closes #160`, `Closes #161` y `Closes #162`.
+- [x] 7.4 Fusionado: `just spec-archive confinamiento-frontera-motor`.
+- [x] 7.5 `plans/PLAN-040.md` → `plans/PLAN-040-COMPLETED.md`.
+- [x] 7.6 Issue de seguimiento para la separación de privilegio del motor.
 
 ## 5. Verificación
 
