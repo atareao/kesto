@@ -99,8 +99,8 @@ La ventana del servidor temporal se midió con el sondeo dentro del contenedor y
 
 ### 3. Cierre
 
-- [ ] 3.1 Marcar las tareas hechas y abrir el PR a `development` con `Closes #171` (verificación: PR creado).
-- [ ] 3.2 `docs/FEATURE-042-arreglo-flake-e2e-171.md` con qué es, ficheros, decisiones —la opción elegida y las descartadas— y cómo verificar (verificación: el documento existe).
+- [x] 3.1 Marcar las tareas hechas y abrir el PR a `development` con `Closes #171` (verificación: PR creado).
+- [x] 3.2 `docs/FEATURE-042-arreglo-flake-e2e-171.md` con qué es, ficheros, decisiones —la opción elegida y las descartadas— y cómo verificar (verificación: el documento existe).
 - [ ] 3.3 Renombrar este plan a `plans/PLAN-042-COMPLETED.md` con `git mv` (verificación: renombrado).
 - [ ] 3.4 Archivar el change: `openspec archive arreglo-flake-e2e-171` (verificación: el change pasa a `openspec/changes/archive/` y el requisito nuevo entra **al final** de `openspec/specs/arnes-de-pruebas/spec.md`, sin dejar huérfanos los escenarios de los requisitos anteriores).
 
