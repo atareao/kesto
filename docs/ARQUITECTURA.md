@@ -6,11 +6,15 @@
 
 Los tres secretos del §3 —`repositories.secret_access_key`, `repositories.passphrase` y `backup_targets.db_password`— se guardan **cifrados**: el valor almacenado es el sobre `v1:<nonce>:<cifrado>` con AES-256-GCM y **nonce aleatorio por valor**, y la clave se deriva de `KESTO_MASTER_KEY` con HKDF-SHA256 y la etiqueta constante `kesto/secrets/v1` (que **no** es configurable: una etiqueta que se puede tocar por variable de entorno es una forma de perder los secretos sin haber rotado nada). Consecuencia que hay que saber: **rotar `KESTO_MASTER_KEY` deja ilegibles los secretos ya guardados** —no hay clave de datos envuelta por una clave rotable—, así que la rotación es una operación con plan y no un cambio de variable.
 
+La clave maestra mide **32 caracteres como mínimo** y una más corta —o **vacía**— no avisa: **impide el arranque**. No es una formalidad: una clave vacía hace la derivación determinista y pública, así que cualquiera podría descifrar los secretos guardados, y con una corta la clave es forzable.
+
 ### Modo de desarrollo (sin OIDC)
 
-Basta `KESTO_MASTER_KEY` para arrancar sin proveedor de identidad: sin ninguna de las tres `OIDC_*` el modo es `Disabled`. En ese modo `GET /api/v1/health` contesta `auth_mode: "disabled"` —eso es lo que hay que consultar para comprobar qué modo está activo— y el arranque lo anuncia con un `WARN`.
+Sin ninguna de las tres `OIDC_*` el modo es `Disabled`, y **no basta con `KESTO_MASTER_KEY`**: el modo de desarrollo exige el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**, así que no se publica. En ese modo `GET /api/v1/health` contesta `auth_mode: "disabled"` —eso es lo que hay que consultar para comprobar qué modo está activo— y el arranque lo anuncia con un `WARN`.
 
-⚠️ Ese modo **no pone ninguna capa**: la mitad protegida no se monta, todo `/api/v1/*` queda abierto y `/api/v1/auth/*` ni siquiera existe —contesta `404` con la envoltura, **no** `401`—. Es para desarrollo, no para un despliegue expuesto. Con las tres `OIDC_*` configuradas, en cambio, todo `/api/v1/*` exige sesión salvo la salud y las dos rutas públicas del flujo de entrada.
+El modo exige el **permiso explícito** `KESTO_ALLOW_INSECURE=1` **y** una dirección de escucha de **loopback**: sin el permiso el proceso se niega a arrancar, y con él `BIND_ADDRESS=0.0.0.0:8080` sigue siendo error. Es lo que convierte un despliegue que perdió sus `OIDC_*` en un arranque fallido en vez de un panel abierto en el puerto publicado.
+
+⚠️ Ese modo **no pone ninguna capa**: la mitad protegida no se monta, todo `/api/v1/*` queda abierto y `/api/v1/auth/*` ni siquiera existe —contesta `404` con la envoltura, **no** `401`—. La única excepción es la gestión de tokens (`/api/v1/tokens*`), que tampoco se monta: sin credencial que exigir, un token emitido así sobreviviría al cambio de modo —su hash queda en la base y no depende de quién lo pidió—, así que la ruta contesta `404`. Es para desarrollo, no para un despliegue expuesto. Con las tres `OIDC_*` configuradas, en cambio, todo `/api/v1/*` exige sesión salvo la salud y las dos rutas públicas del flujo de entrada.
 
 
 ## Restricciones de diseño que un agente rompería por defecto

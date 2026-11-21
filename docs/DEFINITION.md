@@ -291,6 +291,14 @@ services:
       - RUST_LOG=info,kesto=debug
       - DATABASE_URL=sqlite:///app/data/kesto.db
       - BIND_ADDRESS=0.0.0.0:8080
+      # Obligatorias: la plantilla de producción no arranca sin proveedor de
+      # identidad. Sin las OIDC_* el modo sería el de desarrollo, que exige
+      # KESTO_ALLOW_INSECURE=1 y un bind de loopback, y no puede publicar el puerto.
+      - KESTO_MASTER_KEY=${KESTO_MASTER_KEY:?}
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:?}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:?}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:?}
+      - KESTO_SECRET=${KESTO_SECRET:?}
     volumes:
       # Acceso al socket de Docker del host
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -304,3 +312,5 @@ volumes:
   kesto_data:
 
 ```
+
+`compose.yaml` reproduce este despliegue y **exige proveedor de identidad**: declara `KESTO_MASTER_KEY`, las tres `OIDC_*` y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose config` —y `podman compose up`— se niegan a levantar el servicio, sin crear el contenedor, cuando falte cualquiera de ellas. El motivo es que sin las `OIDC_*` el modo sería el de **desarrollo**, que exige el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**: con el proceso atado a loopback el reenvío del puerto no alcanza al servicio, así que `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor y el modo de desarrollo no se publica. Los secretos entran siempre por el entorno del host (`.env` o gestor de secretos), nunca escritos en este fichero.
