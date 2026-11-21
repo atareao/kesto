@@ -142,10 +142,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Arranca la imagen PUBLICADA (por digest) y espera a que el puerto HTTP
-      # conteste. Solo prueba que el contenedor levanta, que las migraciones
-      # corren y que el servidor se ata al puerto. `KESTO_MASTER_KEY` es
-      # obligatoria siempre (el binario se niega a arrancar sin ella).
+      # Arranca la imagen PUBLICADA (por digest) en la FORMA DE PRODUCCIÓN y
+      # consulta `/api/v1/health` desde el runner: exige `200` y que el cuerpo
+      # declare `auth_mode: "oidc"`. Ya no basta con que el contenedor levante:
+      # el modo de desarrollo NO puede verificarse así —el proceso se ata a
+      # loopback, así que el reenvío del puerto no alcanza al servicio—, de modo
+      # que el smoke test usa proveedor de identidad. El emisor puede ser
+      # inalcanzable: el descubrimiento caído solo avisa, no impide arrancar.
+      # `KESTO_MASTER_KEY` y `KESTO_SECRET` son obligatorias y miden ≥ 32.
       - name: Smoke test the image
         run: |
           set -euo pipefail
@@ -157,15 +161,20 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -e RUST_LOG=info \
             -e KESTO_MASTER_KEY='smoke-test-master-key-con-mas-de-32-caracteres' \
+            -e KESTO_SECRET='smoke-test-session-secret-con-mas-de-32-cars' \
+            -e OIDC_ISSUER_URL='https://issuer.invalido.example' \
+            -e OIDC_CLIENT_ID='smoke-test' \
+            -e OIDC_CLIENT_SECRET='smoke-test-secret' \
             -e DATABASE_URL='sqlite:///app/data/kesto.db' \
             -e BIND_ADDRESS='0.0.0.0:8080' \
             "${image}"
 
           ok=0
+          body=''
           for attempt in $(seq 1 30); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)"
-            if [ "${code}" != "000" ]; then
-              echo "El puerto 8080 contestó ${code} tras ${attempt} intento(s)."
+            body="$(curl -fsS http://127.0.0.1:8080/api/v1/health || true)"
+            if [ -n "${body}" ]; then
+              echo "La salud contestó tras ${attempt} intento(s): ${body}"
               ok=1
               break
             fi
@@ -173,7 +182,7 @@ jobs:
           done
 
           if [ "${ok}" != "1" ]; then
-            echo "::error::el contenedor no contestó en HTTP sobre 8080 en 60s."
+            echo "::error::el contenedor no contestó la salud en /api/v1/health en 60s."
             docker logs kesto-smoke || true
             exit 1
           fi
@@ -184,7 +193,15 @@ jobs:
             exit 1
           fi
 
-          echo "Smoke test superado."
+          # `curl -f` ya falla con un HTTP ≥ 400, así que el cuerpo es de un 200.
+          # Ahora tiene que declarar el modo de producción; si no, el smoke test
+          # habría dado por bueno un despliegue sin proveedor de identidad.
+          if ! printf '%s' "${body}" | jq -e '.data.auth_mode == "oidc"' > /dev/null; then
+            echo "::error::la salud no declara auth_mode=oidc: ${body}"
+            exit 1
+          fi
+
+          echo "Smoke test superado: la imagen arranca en la forma de producción."
 
       - name: Dump container logs
         if: failure()

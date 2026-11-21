@@ -487,7 +487,9 @@ fn socket_muerto() -> String {
 /// la base, la dirección de escucha y el socket del motor—, así que la salida depende de lo escrito
 /// aquí y no del entorno de quien corre la suite. Las tres `OIDC_*` se dejan **fuera** a propósito:
 /// lo que estas pruebas miden no es la autenticación, y sin ellas el modo es `Disabled` y la salud
-/// —que es pública en los dos modos— contesta sin sesión, que es lo que hace falta.
+/// —que es pública en los dos modos— contesta sin sesión, que es lo que hace falta. Y precisamente
+/// porque el modo es `Disabled`, el permiso explícito —`KESTO_ALLOW_INSECURE=1`— es obligatorio:
+/// sin él el proceso ni siquiera arranca.
 fn lanzar(puerto: u16, socket_del_motor: &str) -> EnMarcha {
     let base = std::env::temp_dir().join(format!("kesto-arranque-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).expect("el directorio temporal de la prueba debe crearse");
@@ -498,6 +500,7 @@ fn lanzar(puerto: u16, socket_del_motor: &str) -> EnMarcha {
     let child = Command::new(env!("CARGO_BIN_EXE_kesto"))
         .env_clear()
         .env("KESTO_MASTER_KEY", MASTER_KEY)
+        .env("KESTO_ALLOW_INSECURE", "1")
         .env("DATABASE_URL", &dsn)
         .env("BIND_ADDRESS", format!("127.0.0.1:{puerto}"))
         .env("DOCKER_HOST", socket_del_motor)

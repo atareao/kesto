@@ -72,8 +72,9 @@ Tabla completa (nombres, defectos, obligatoriedad) en `docs/ENTORNO.md`. Lo que 
 - Las tres variables `OIDC_*` que gobiernan el modo (`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`) son **un todo o nada**: unas sí y otras no es **error de arranque**, no un modo degradado.
 - `KESTO_MASTER_KEY` es obligatoria **siempre**.
 - `KESTO_SECRET` es obligatoria **en modo OIDC** —es la clave con la que se firma la sesión— y no hace falta en modo `Disabled`. **Rotarla invalida todas las sesiones vivas**.
-- Una credencial de menos de 32 caracteres **avisa y arranca igualmente**.
-- `BIND_ADDRESS` sin puerto es error de arranque, y **el valor vacío no cae al defecto**: `BIND_ADDRESS=` mata el arranque. Si usas `compose` con interpolación de una variable que no definiste, acuérdate de esto.
+- Una credencial —`KESTO_MASTER_KEY` siempre, `KESTO_SECRET` en modo OIDC— de menos de **32 caracteres**, **vacía incluida**, **impide el arranque** nombrando la variable y el mínimo. Ya **no** basta con avisar: la clave vacía hace determinista y pública la derivación del cifrado en reposo.
+- El modo sin autenticación **no es lo que pasa por omisión**: sin las tres `OIDC_*` hace falta el permiso explícito `KESTO_ALLOW_INSECURE=1` (`0` o ausente lo niega; cualquier otro valor es error de arranque) **y** una dirección de escucha de loopback, así que ese modo no se puede publicar. En modo OIDC el permiso ni se consulta. La gestión de tokens (`/api/v1/tokens*`) **no se monta** en ese modo.
+- `BIND_ADDRESS` sin puerto es error de arranque, y **el valor vacío no cae al defecto**: `BIND_ADDRESS=` mata el arranque. Su defecto es `127.0.0.1:8080`, **no** el `0.0.0.0:8080` del §8: escuchar en todas las interfaces es una decisión explícita del operador. Si usas `compose` con interpolación de una variable que no definiste, acuérdate de esto.
 - Lo mismo vale para `RUST_LOG`: presente pero vacía es **error de arranque**, no «sin registro».
 - Un `OIDC_REDIRECT_URL` configurado **solo**, sin las otras tres, se ignora en silencio.
 
@@ -83,7 +84,7 @@ Los tres secretos del §3 —`repositories.secret_access_key`, `repositories.pas
 
 ## Modo de desarrollo (sin OIDC)
 
-Basta `KESTO_MASTER_KEY` para arrancar sin proveedor de identidad: sin ninguna de las tres `OIDC_*` el modo es `Disabled`. `GET /api/v1/health` contesta `auth_mode: "disabled"`. Ese modo **no pone ninguna capa**: la mitad protegida no se monta, todo `/api/v1/*` queda abierto y `/api/v1/auth/*` ni siquiera existe —contesta `404` con la envoltura, **no** `401`—. Es para desarrollo, no para un despliegue expuesto.
+Sin ninguna de las tres `OIDC_*` el modo es `Disabled`, y **no basta con `KESTO_MASTER_KEY`**: hace falta el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**, así que ese modo no se publica. `GET /api/v1/health` contesta `auth_mode: "disabled"`. Ese modo **no pone ninguna capa**: la mitad protegida no se monta, todo `/api/v1/*` queda abierto y `/api/v1/auth/*` ni siquiera existe —contesta `404` con la envoltura, **no** `401`—; la única excepción es la gestión de tokens (`/api/v1/tokens*`), que tampoco se monta. Es para desarrollo, no para un despliegue expuesto.
 
 ## Entorno de desarrollo
 
