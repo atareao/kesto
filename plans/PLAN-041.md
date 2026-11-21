@@ -16,7 +16,7 @@ Restauración por base, mitigación por cliente:
 
 - `sqlite3 -safe` (≥ 3.27) en la reimportación.
 - `mariadb --binary-mode` en la reimportación.
-- `psql -X` + troceado del volcado por `\connect` de primer nivel + descarte de todo metacomando de primer nivel + `\restrict <nonce>` como segunda capa, con una orden `psql -d <base>` por sección.
+- `psql -X` + troceado del volcado por `\connect` de primer nivel + descarte de todo metacomando de primer nivel + `\restrict <nonce>` como segunda capa **obligatoria** (la restauración comprueba `psql --version` y falla si el cliente no la honra), con una orden `psql -d <base>` por sección.
 
 ## Fuera de alcance
 
@@ -51,7 +51,7 @@ Las bases no se conocen hasta leer el volcado, así que las órdenes de las secc
 
 ## Tareas
 
-Las tareas TDD completas, en orden rojo/verde/refactor y con su verificación, están en `openspec/changes/endurecimiento-restauracion/tasks.md` (secciones 0 a 6). Resumen:
+Las tareas TDD completas, en orden rojo/verde/refactor y con su verificación, están en `openspec/changes/endurecimiento-restauracion/tasks.md` (secciones 0 a 7). Resumen:
 
 0. **Preparación** — `just check` en verde, rama, change aprobado, y comprobar que B está archivado (0.4).
 1. **El troceador** (`src/engine/troceador.rs`, módulo puro) — reconocer comilla simple, comilla doble, dólar `$tag$`, comentario de línea, comentario de bloque anidable y bloque `COPY`; frontera solo por `\connect` de primer nivel; descartar metacomandos de primer nivel conservando el `\.` del `COPY`; el estado léxico cruza líneas; trocear un `pg_dumpall` real de dos bases sin perder una línea.
@@ -60,6 +60,7 @@ Las tareas TDD completas, en orden rojo/verde/refactor y con su verificación, e
 4. **La batería de punta a punta** — escenario de restauración global por base y escenario de metacomando que no ejecuta en los tres clientes.
 5. **La frontera de confianza, documentada** — `docs/ARQUITECTURA.md`: frontera de confianza, residual `COPY … FROM PROGRAM`, `sqlite3 ≥ 3.27` y `psql ≥ 17.6`.
 6. **Cierre** — `just check`, `cargo test --locked -- --ignored`, `just e2e`, `just check-all`, `openspec validate --strict`, review de `@rust-reviewer`, PR a `development` con `Closes #164`, plan completado, doc de la feature y archivado del change por PR (`chore/archivar-endurecimiento-restauracion`).
+7. **Correcciones tras la revisión** — puerto fiel del troceador (blancos `[ \t\n\r\f\v]`, detección de `COPY` como `psql`, alias `\c`, `\connect` sin nombre, dólar no ASCII) y la capa 2 como precondición obligatoria (`psql --version` antes de restaurar, fallo sin `\restrict`), con escenario e2e negativo y la documentación y la spec actualizadas.
 
 ## Verificación
 
@@ -74,8 +75,14 @@ Las tareas TDD completas, en orden rojo/verde/refactor y con su verificación, e
 | Riesgo | Mitigación |
 |---|---|
 | Un troceador por línea rompe un volcado legítimo (`\connect` dentro de un dólar o comilla). | Máquina de estados léxica, con los casos límite como tests (tarea 1.2, 1.5). |
-| `\restrict` no existe en `psql < 17.6` (fail-open). | La guarda principal es el **descarte** de metacomandos (capa 1), que no depende de la versión; `\restrict` es la capa 2. |
+| `\restrict` no existe en `psql < 17.6`. | **Precondición obligatoria**: la restauración comprueba `psql --version` antes de leer el volcado y **falla** nombrando el mínimo si el cliente no lo honra. El descarte de metacomandos (capa 1) es la guarda principal; `\restrict` es la capa 2 y ya no es opcional. |
+| Un troceador que buscara la subcadena `FROM stdin` daría falsos positivos (`COPY … TO STDOUT; -- FROM stdin`) y falsos negativos (cabecera partida en dos líneas). | Detección **fiel** a `psql`: letra inicial de los identificadores de primer nivel, tope ocho, sin los de paréntesis, y decisión al `;` a profundidad cero (tarea 7.1.2). |
+| El juego de blancos delante de un metacomando no es solo `[ \t]`: `\f`, `\v` y `\r` también lo preceden y el cliente los ejecuta. | El troceador usa el juego completo `[ \t\n\r\f\v]` (tarea 7.1.1). |
 | El `\unrestrict` de un volcado hostil deshace la capa 2. | El descarte de metacomandos se lleva también el `\unrestrict` (escenario «El `\unrestrict` del volcado no deshace la guarda»). |
+| El nombre de base del `\connect` puede tener forma de **cadena de conexión** (`=`, `postgres://`): `psql -d` lo leería como *conninfo* y desviaría la conexión —con `PGPASSWORD` puesto— al servidor del atacante. | **Fail-closed**: `parece_cadena_de_conexion` y rechazo **antes** de componer la orden de la sección; la restauración falla sin ejecutar esa sección ni las siguientes, y el motivo no publica el valor (tarea 7.5.1, D5c). |
+| ¿La comprobación del esquema coincide **exactamente** con lo que libpq expande? | No, y es deliberado: se compara **sin distinguir mayúsculas**, así que es un **superconjunto** de libpq (`POSTGRES://…` se rechaza aunque libpq lo trataría como nombre plano). *Fail-closed*; el límite queda en la doc de `parece_cadena_de_conexion` y en el spec (tareas 7.6.1 y 7.6.5). |
+| ¿Se valida también la `base_inicial`? | No: la elige el operador en la configuración del target, no viene del volcado; un test ancla la asimetría para que nadie la «arregle» (tarea 7.6.3). |
+| Los errores de SQL **dentro** de una sección no se detectan: `psql` sin `ON_ERROR_STOP` sale con `0`. | Aplazado a **#175**; la garantía real —«se falla cuando una orden sale con un código distinto de cero»— queda escrita en la doc de `ejecutar_por_secciones` (tarea 7.5.3). |
 | `COPY … FROM PROGRAM` ejecuta en el servidor. | Residual aceptado y documentado; su sitio es la separación de privilegio del motor (#173). |
 | Un `sqlite3` sin `-safe` falla la opción. | Fail-closed: la orden falla y el error del contenedor se registra, no se silencia. |
 | El cambio de forma de `CaminoDeRestauracion` toca `ejecutar_las_ordenes` y el puente. | El reparto por defecto (`ALaUltimaOrden`) conserva el comportamiento actual; los tests existentes de `mariadb` y `sqlite` son la red. |
@@ -83,5 +90,8 @@ Las tareas TDD completas, en orden rojo/verde/refactor y con su verificación, e
 ## Follow-ups
 
 - #173 — separación de privilegio del motor (cubre `COPY … FROM PROGRAM`).
+- **#175 — `ON_ERROR_STOP`**: `psql` sin `ON_ERROR_STOP` sale con `0` ante un error de SQL, así que los errores **dentro** de una sección **no** se detectan y una sección con sentencias fallidas se da por buena. La garantía actual es «se falla cuando una orden sale con un código distinto de cero»; decidir la política (¿aborta la restauración entera ante el primer error de SQL?) va en #175. Cerrado el vector del nombre de base con forma de conninfo en la tarea 7.5.1 (D5c).
 - #171 y el flake del e2e (`502 Bad Gateway` de S3/SeaweedFS).
 - Mejora posible anotada y descartada: volcado en formato custom (`pg_dump -Fc`) restaurado con `pg_restore`, inmune a metacomandos por construcción; cambiaría el formato almacenado y sale del alcance de la extracción.
+- **Tope por línea del troceador** (tarea 7.1.5): la memoria está acotada a la línea en curso, pero una línea gigante sin `\n` la acumula entera. Residuo aceptado; su sitio es un tope por línea, no el módulo.
+- **Anclar el troceador a `psqlscan.l`**: los bordes de `COPY`, blancos y `\connect` se han fijado contra `psql 18.6`; si PostgreSQL cambia su lexer, el puerto habría que revisarlo. Es la razón de que el troceador sea un puerto y no una heurística.
