@@ -57,6 +57,7 @@ pub mod extraccion;
 pub mod frontera;
 mod hub;
 pub mod restauracion;
+pub mod troceador;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -88,7 +89,7 @@ pub use extraccion::{
     volcar,
 };
 pub use restauracion::{CaminoDeRestauracion, ErrorDeRestauracion, comando};
-use restauracion::{EscritorDelVolcado, TunelDeRestauracion, tunel_de_restauracion};
+use restauracion::{EscritorDelVolcado, Reparto, TunelDeRestauracion, tunel_de_restauracion};
 
 // Las dos constantes del puente, que el motor pasa a las dos esperas del volcado. Son las
 // **mismas** para el transporte y para el lector del canal —es la misma pregunta vista desde dos
@@ -1157,9 +1158,17 @@ impl Motor {
                 contenedor,
                 ordenes,
                 db_path,
+                reparto,
             } => {
-                self.restaurar_en_el_contenedor(acceso, &instantanea, contenedor, ordenes, db_path)
-                    .await
+                self.restaurar_en_el_contenedor(
+                    acceso,
+                    &instantanea,
+                    contenedor,
+                    ordenes,
+                    db_path,
+                    reparto,
+                )
+                .await
             }
         };
 
@@ -1253,6 +1262,7 @@ impl Motor {
         contenedor: String,
         ordenes: Vec<Orden>,
         db_path: Option<String>,
+        reparto: Reparto,
     ) -> Result<(), ErrorDelMotor> {
         let abridor = self.0.contexto.ajustes.abridor;
         let socket = self.0.contexto.ajustes.socket_del_motor.clone();
@@ -1280,6 +1290,7 @@ impl Motor {
                     &cliente,
                     &contenedor,
                     &ordenes,
+                    reparto,
                     db_path.as_deref(),
                     lector,
                     INACTIVIDAD_MAXIMA,
