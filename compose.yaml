@@ -2,7 +2,9 @@
 #
 # La clave maestra y los secretos NO viven aquí: entran por el entorno del
 # host (`.env` del despliegue o gestor de secretos). Copia `.env.example` a
-# `.env` y rellénalo antes de `podman compose up -d`.
+# `.env` y rellénalo antes de `podman compose up -d`. La plantilla exige
+# `KESTO_MASTER_KEY`, las tres `OIDC_*` y `KESTO_SECRET`: sin cualquiera de
+# ellas el servicio no levanta.
 services:
   kesto:
     image: ghcr.io/atareao/kesto:latest
@@ -10,12 +12,11 @@ services:
     restart: always
     ports:
       - "8080:8080"
-    # Secretos OPCIONALES por `.env`: solo entran si el operador los
-    # descomenta ahí. NO se cablean en `environment:` porque una `OIDC_*`
-    # presente pero VACÍA se lee como «presente» (src/config.rs::resolve_auth
-    # deduce el modo de la mera presencia de las tres): declararlas aquí con
-    # valor por defecto vacío forzaría el modo OIDC y rompería el arranque por
-    # defecto, que debe ser `Disabled`.
+    # Canal de las variables OPCIONALES que la plantilla no declara —como
+    # `KESTO_HSTS_MAX_AGE`—: sin `env_file` no llegarían al contenedor. Las
+    # obligatorias NO dependen de este fichero: se declaran en `environment:` y
+    # las exige `compose` con `:?` (los valores de interpolación los lee del
+    # entorno del host o del `.env` del directorio del proyecto).
     env_file:
       - .env
     environment:
@@ -24,6 +25,16 @@ services:
       BIND_ADDRESS: 0.0.0.0:8080
       # Obligatoria siempre. Sin ella el arranque falla (src/config.rs).
       KESTO_MASTER_KEY: ${KESTO_MASTER_KEY:?falta KESTO_MASTER_KEY}
+      # La plantilla de producción EXIGE proveedor de identidad: sin las
+      # `OIDC_*` el modo sería el de desarrollo, que exige `KESTO_ALLOW_INSECURE=1`
+      # y un bind de loopback, así que `BIND_ADDRESS=0.0.0.0:8080` solo es
+      # legítimo con proveedor. Las cuatro van juntas con `:?`: un `.env` al que
+      # le falte cualquiera de ellas no arranca —`compose config` y `compose up`
+      # se niegan sin crear el contenedor— en vez de forzar un modo roto.
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?falta OIDC_ISSUER_URL}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?falta OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?falta OIDC_CLIENT_SECRET}
+      KESTO_SECRET: ${KESTO_SECRET:?falta KESTO_SECRET}
     volumes:
       # Socket del daemon para el `exec` de bollard, en solo lectura.
       - /var/run/docker.sock:/var/run/docker.sock:ro
