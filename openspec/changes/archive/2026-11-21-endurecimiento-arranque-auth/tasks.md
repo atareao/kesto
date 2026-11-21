@@ -92,7 +92,7 @@
 ## 6. Cierre
 
 - [x] 6.1 `docs/FEATURE-039-endurecimiento-arranque-auth.md` con `just feature-new` (verificación: el documento existe).
-- [ ] 6.2 `plans/PLAN-039.md` con las tareas marcadas y renombrado a `plans/PLAN-039-COMPLETED.md` (verificación: `git mv` hecho).
+- [x] 6.2 `plans/PLAN-039.md` con las tareas marcadas y renombrado a `plans/PLAN-039-COMPLETED.md` (verificación: `git mv` hecho).
 - [x] 6.3 PR a `development` con `Closes #157`, `Closes #158` y `Closes #159`, y la nota de incompatibilidad en el cuerpo (verificación: PR abierto). PR #170.
-- [ ] 6.4 `just spec-archive endurecimiento-arranque-auth` una vez fusionado (verificación: el delta entra en `openspec/specs/`).
+- [x] 6.4 `just spec-archive endurecimiento-arranque-auth` una vez fusionado (verificación: el delta entra en `openspec/specs/`; change archivado como `2026-11-21-endurecimiento-arranque-auth`).
 - [x] 6.5 Issue de seguimiento abierto para la KDF con sal persistida (Argon2id/scrypt), fuera de alcance aquí (verificación: el issue existe y referencia #158). Issue #169.
