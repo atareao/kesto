@@ -32,8 +32,7 @@ mod tests {
     // una segunda fuente de verdad del mismo literal, y cambiar una y no la otra
     // dejaría los dos tests mintiendo en silencio.
     use crate::test_support::{
-        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_con_base, estado_de_prueba,
-        get, lookup_from,
+        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_de_prueba, get, lookup_from,
     };
 
     /// Versión que tiene que declarar la salud: la del binario.
@@ -73,8 +72,18 @@ mod tests {
     }
 
     /// Configuración de desarrollo: sin OIDC.
+    ///
+    /// Declara el permiso explícito del modo sin autenticación: sin las `OIDC_*` la
+    /// aplicación solo arranca con `KESTO_ALLOW_INSECURE=1` y un bind de loopback. Va
+    /// en este ayudante —y no en `state()`, que comparten los de OIDC— porque es el
+    /// único que construye una configuración `Disabled`; en modo `Oidc` el permiso ni
+    /// se consulta, así que declararlo allí no describiría nada.
     async fn desarrollo() -> AppState {
-        state(&[("KESTO_MASTER_KEY", MASTER_KEY)]).await
+        state(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ])
+        .await
     }
 
     /// Configuración con la autenticación encendida.
@@ -176,32 +185,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn con_una_clave_debil_la_salud_contesta_igual() {
-        // El escenario del aviso por credencial débil tiene dos mitades: el
-        // aviso y que el servicio arranque y conteste la salud.
+    async fn con_una_clave_debil_no_hay_salud_que_contestar() {
+        // Este test fijaba que una clave débil solo avisaba y el servicio
+        // arrancaba y contestaba la salud. Ahora una clave débil es puerta de
+        // arranque: no hay salud que contestar porque el proceso no llega a
+        // levantarse. La aserción se invierte a conciencia —la clave deja de
+        // asumir que arranca—; no la «restaures» pensando que era intencional.
         let clave_debil = "c".repeat(12);
-        let lookup = lookup_from(&[("KESTO_MASTER_KEY", &clave_debil)]);
-        let config = Config::from_lookup(&lookup).expect("una clave débil no impide arrancar");
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", &clave_debil),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ]);
 
-        let avisos = config.warnings();
+        let error = Config::from_lookup(&lookup)
+            .expect_err("una clave débil no puede arrancar, así que no contesta la salud");
 
         assert!(
-            avisos
-                .iter()
-                .any(|aviso| aviso.contains("KESTO_MASTER_KEY")),
-            "una clave maestra débil debe avisar: {avisos:?}"
+            error.to_string().contains("KESTO_MASTER_KEY"),
+            "el rechazo debe nombrar la variable débil: {error}"
         );
-
-        let estado = estado_con_base(config).await;
-
-        let respuesta = get(api_router(estado), "/api/v1/health").await;
-
-        assert_eq!(respuesta.status(), StatusCode::OK);
-
-        let cuerpo = body_json(respuesta).await;
-
-        assert_eq!(cuerpo["status"], 200);
-        assert_eq!(cuerpo["data"]["version"], VERSION);
-        assert_eq!(cuerpo["data"]["auth_mode"], "disabled");
+        assert!(
+            !error.to_string().contains(clave_debil.as_str()),
+            "el rechazo no puede publicar el valor de la clave: {error}"
+        );
     }
 }

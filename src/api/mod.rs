@@ -133,15 +133,21 @@ pub fn api_router(state: AppState) -> Router {
         // ninguna capa, así que las rutas de negocio quedan públicas, que es lo que el
         // modo de desarrollo significa. Sin esto, `just dev` contestaría `404` en cada
         // recurso y no habría forma de dar de alta nada sin un proveedor de identidad.
+        // La única ruta de negocio que **no** entra es la gestión de tokens, por el
+        // motivo que se explica en su sitio.
         None => public
             .merge(repositories::router())
             .merge(targets::router())
             .merge(jobs::router())
             .merge(executions::router())
-            // La gestión de tokens, como los recursos: sin capa que montar queda abierta, que es
-            // lo que el modo de desarrollo significa —y es útil para emitir un token con el que
-            // probar el camino `Bearer` sin levantar un proveedor de identidad—.
-            .merge(tokens::router())
+            // La gestión de tokens **no** se monta aquí, y es la única excepción a que la
+            // superficie de negocio quede abierta en este modo. Sin proveedor de identidad no
+            // hay sesión que exigir, así que la ruta de gestión solo puede quedarse abierta
+            // —y emitir credenciales sin credencial alguna— o no existir. Y no es un apunte
+            // pasajero: un token emitido así sobrevive al cambio de modo, porque su hash queda
+            // en la base y no depende de quién lo pidió, de modo que seguiría sirviendo cuando
+            // la autenticación se encienda. Se retira, y contesta el `404` de la envoltura
+            // —como `/api/v1/auth/*`— en vez de un `401` sin capa.
             // Y el explorador, igual: en este modo no hay ninguna capa que montar, así que queda
             // abierto como el resto —es lo que el modo de desarrollo significa— y el panel puede
             // explorar un repositorio sin un proveedor de identidad.
@@ -516,6 +522,9 @@ mod tests {
     async fn con_hsts_toda_respuesta_lleva_la_cabecera() {
         let config = Config::from_lookup(&lookup_from(&[
             ("KESTO_MASTER_KEY", MASTER_KEY_HSTS),
+            // El permiso explícito: esta configuración no trae `OIDC_*`, así que el
+            // modo es `Disabled` y sin el permiso no arrancaría.
+            ("KESTO_ALLOW_INSECURE", "1"),
             ("KESTO_HSTS_MAX_AGE", "31536000"),
         ]))
         .expect("la configuración con HSTS es válida");

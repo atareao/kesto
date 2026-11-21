@@ -390,8 +390,13 @@ mod tests {
 
     #[tokio::test]
     async fn en_desarrollo_no_hay_estado_de_autenticacion() {
-        let config = Config::from_lookup(&lookup_from(&[("KESTO_MASTER_KEY", MASTER_KEY)]))
-            .expect("la configuración de desarrollo es válida");
+        // El permiso explícito es lo que deja arrancar sin proveedor: sin él, una
+        // configuración sin `OIDC_*` no es válida desde el endurecimiento del arranque.
+        let config = Config::from_lookup(&lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ]))
+        .expect("la configuración de desarrollo es válida");
 
         // La guarda del directorio se mantiene viva en la prueba: la base que el estado
         // lleva dentro tiene que existir mientras el pool esté abierto.

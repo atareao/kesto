@@ -446,11 +446,13 @@ mod tests {
     #[test]
     fn el_dsn_de_tres_barras_da_la_ruta_absoluta_sin_barra_de_mas() {
         // El DSN por defecto del SRS, tal y como lo resuelve la configuración
-        // cuando `DATABASE_URL` no está en el entorno.
-        let config = crate::config::Config::from_lookup(&crate::test_support::lookup_from(&[(
-            "KESTO_MASTER_KEY",
-            crate::test_support::MASTER_KEY,
-        )]))
+        // cuando `DATABASE_URL` no está en el entorno. El permiso explícito va con
+        // la clave maestra: sin `OIDC_*` el modo es `Disabled`, y ese modo no
+        // arranca sin él.
+        let config = crate::config::Config::from_lookup(&crate::test_support::lookup_from(&[
+            ("KESTO_MASTER_KEY", crate::test_support::MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ]))
         .expect("la configuración por defecto es válida");
 
         assert_eq!(

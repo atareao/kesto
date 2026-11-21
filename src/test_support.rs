@@ -919,9 +919,17 @@ pub(crate) fn sembrar_snapshot_ajeno(ruta: &Path, passphrase: &str) -> (String, 
 }
 
 /// Configuración válida que apunta a una base de datos dada.
+///
+/// Declara el permiso explícito del modo sin autenticación: sin las `OIDC_*` el
+/// modo es `Disabled`, y desde el endurecimiento del arranque ese modo exige
+/// `KESTO_ALLOW_INSECURE=1` **y** un bind de loopback —[`BIND_ADDRESS`] lo es—.
+/// El permiso va aquí, y no en cada prueba, porque este ayudante es el punto por
+/// el que pasan todas las que abren una base: declararlo una vez evita que
+/// cualquiera tenga que acordarse, y una prueba nueva arranca sin sorpresas.
 pub(crate) fn config_con_dsn(dsn: &str) -> Config {
     Config::from_lookup(&lookup_from(&[
         ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_ALLOW_INSECURE", "1"),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn),
     ]))
@@ -1124,11 +1132,16 @@ pub(crate) fn migrador_roto() -> Migrator {
 /// arnés no mienta sobre dónde está la base. Las bases de los ayudantes se abren en un
 /// directorio temporal y su guarda se **retiene** (ver [`retener`]): la base sobrevive
 /// al ayudante, así que la guarda también tiene que sobrevivir.
+///
+/// Declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— porque este es el modo sin
+/// proveedor de identidad: sin él la aplicación se niega a arrancar, y el arnés no
+/// tendría estado de desarrollo que entregar.
 pub(crate) async fn estado_desarrollo() -> AppState {
     let (dsn, pool, clave) = base_del_arnes().await;
 
     let config = Config::from_lookup(&lookup_from(&[
         ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_ALLOW_INSECURE", "1"),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn.as_str()),
     ]))

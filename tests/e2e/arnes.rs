@@ -926,7 +926,9 @@ impl Kesto {
     ///
     /// El modo es `Disabled` a propósito —no se declara ninguna `OIDC_*`—: sin proveedor de
     /// identidad la mitad protegida no se monta y todo `/api/v1/*` queda abierto, que es justo
-    /// lo que la batería necesita para hablar con la API sin fabricar sesiones.
+    /// lo que la batería necesita para hablar con la API sin fabricar sesiones. Y como el modo
+    /// es `Disabled`, el proceso declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— con un
+    /// bind de loopback: sin ellos la aplicación se niega a arrancar.
     ///
     /// # Errors
     ///
@@ -944,6 +946,7 @@ impl Kesto {
             // `env_clear` deja la prueba hermética: lo que el binario ve es solo lo de aquí.
             .env_clear()
             .env("KESTO_MASTER_KEY", CLAVE_MAESTRA)
+            .env("KESTO_ALLOW_INSECURE", "1")
             .env("BIND_ADDRESS", format!("127.0.0.1:{puerto}"))
             .env(
                 "DATABASE_URL",

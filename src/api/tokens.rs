@@ -344,10 +344,17 @@ mod tests {
     use crate::api::api_router;
     use crate::db::entities::{Scope, hash_de_token};
     use crate::test_support::{
-        body_json, body_text, cookie_de_sesion, delete_with_bearer, delete_with_cookie,
-        estado_oidc, get, get_with_bearer, get_with_cookie, post_json_with_bearer,
-        post_json_with_cookie, router_desarrollo, router_oidc,
+        body_json, body_text, cookie_de_sesion, delete, delete_with_bearer, delete_with_cookie,
+        estado_desarrollo, estado_oidc, get, get_with_bearer, get_with_cookie, post,
+        post_json_with_bearer, post_json_with_cookie, router_desarrollo, router_oidc,
     };
+
+    /// Un identificador bien formado cualquiera.
+    ///
+    /// No hace falta que exista: en modo `Disabled` la ruta de revocación ni se monta, así que
+    /// lo único que importa es que la forma sea válida —un identificador mal formado lo
+    /// rechazaría el extractor con un `400`, que taparía el `404` que se busca—.
+    const UN_UUID: &str = "00000000-0000-4000-8000-000000000000";
 
     /// Crea un token por la API con la sesión de prueba y devuelve su valor en claro.
     async fn crear_token(router: axum::Router, scopes: &serde_json::Value) -> String {
@@ -655,24 +662,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn en_modo_disabled_la_gestion_queda_abierta() {
-        // api-tokens, escenarios «En modo disabled la gestión queda abierta» y «En modo disabled
-        // un Bearer inválido no bloquea».
+    async fn en_modo_disabled_la_gestion_de_tokens_no_esta_montada() {
+        // api-tokens, escenario «En modo disabled la gestión de tokens no está montada».
+        //
+        // Sin proveedor de identidad no hay sesión que exigir, así que una ruta de gestión
+        // solo puede quedarse abierta —y emitir credenciales sin credencial alguna— o no
+        // existir. Se elige lo segundo: las tres rutas contestan el `404` de la envoltura,
+        // como cualquier ruta desconocida, y el alta no llega a escribir ninguna fila.
+        let estado = estado_desarrollo().await;
+        let router = api_router(estado.clone());
+
+        for (metodo, uri) in [
+            ("GET", "/api/v1/tokens".to_owned()),
+            ("POST", "/api/v1/tokens".to_owned()),
+            ("DELETE", format!("/api/v1/tokens/{UN_UUID}")),
+        ] {
+            let respuesta = match metodo {
+                "GET" => get(router.clone(), &uri).await,
+                "POST" => post(router.clone(), &uri).await,
+                _ => delete(router.clone(), &uri).await,
+            };
+
+            let status = respuesta.status();
+            let texto = body_text(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{metodo} {uri} tiene que contestar 404 en modo disabled y contestó {status} \
+                 con {texto}"
+            );
+
+            let cuerpo: serde_json::Value =
+                serde_json::from_str(&texto).expect("el 404 tiene que traer JSON en el cuerpo");
+
+            assert_eq!(cuerpo["status"], 404, "la envoltura del 404: {texto}");
+            assert!(
+                cuerpo["message"]
+                    .as_str()
+                    .is_some_and(|mensaje| !mensaje.is_empty()),
+                "el 404 tiene que traer un mensaje: {texto}"
+            );
+        }
+
+        // Y el alta rechazada no ha emitido ningún token: no queda ninguna fila.
+        let filas = estado
+            .db
+            .tokens
+            .listar()
+            .await
+            .expect("el listado no falla");
+
+        assert!(
+            filas.is_empty(),
+            "en modo disabled el alta no puede emitir ningún token"
+        );
+    }
+
+    #[tokio::test]
+    async fn en_modo_disabled_un_bearer_invalido_no_bloquea_el_resto() {
+        // api-tokens, escenario «En modo disabled un Bearer inválido no bloquea».
+        //
+        // El endurecimiento retira la **gestión** de tokens de este modo, no la capa de
+        // recursos: en modo disabled no se monta ninguna capa, así que el resto de la
+        // superficie sigue abierta y un Bearer inválido no la bloquea. Es el contrapeso de la
+        // prueba de arriba: si el modo dejara de montar la superficie entera, ésta lo diría.
         let router = router_desarrollo().await;
 
-        let listado = get(router.clone(), "/api/v1/tokens").await;
+        let respuesta = get_with_bearer(router, "/api/v1/repositories", "basura").await;
 
         assert_eq!(
-            listado.status(),
-            StatusCode::OK,
-            "sin proveedor, el listado de tokens queda abierto"
-        );
-
-        // Y con un Bearer inválido tampoco bloquea: en este modo no se pone ninguna capa.
-        let con_basura = get_with_bearer(router, "/api/v1/repositories", "basura").await;
-
-        assert_eq!(
-            con_basura.status(),
+            respuesta.status(),
             StatusCode::OK,
             "en modo disabled un Bearer inválido no puede bloquear"
         );
