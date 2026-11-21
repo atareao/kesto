@@ -1,4 +1,4 @@
-//! Los treinta escenarios de `verificacion-e2e`, uno por prueba.
+//! Los treinta y tres escenarios de `verificacion-e2e`, uno por prueba.
 //!
 //! Cada escenario monta su propio mundo —motor, servidor S3, cubo, binario de Kesto y
 //! repositorio— con [`Mundo::nuevo`] y lo recoge al terminar con [`Mundo::cerrar`]. Nada se
@@ -50,20 +50,24 @@ fn texto_de(id: usize) -> String {
     format!("fila-{id:04}-{}", "kesto".repeat(40))
 }
 
-/// El SQL que crea la tabla y siembra `filas` filas conocidas.
+/// El SQL que crea la tabla y siembra `filas` filas conocidas, con `prefijo` delante del texto.
 ///
 /// Vale para los tres motores: `VARCHAR(240)` y `INT PRIMARY KEY` los aceptan MariaDB,
 /// PostgreSQL y SQLite. Viaja por la **entrada estándar** del `exec` y no por un argumento:
 /// el guion de las dos mil filas del escenario del `stdin` no cabe en un argumento —el límite
 /// del kernel para uno suelto ronda los 128 KiB— y el motor contestaría «Argument list too
 /// long» antes de ejecutar nada.
-fn siembra(filas: usize) -> String {
+///
+/// `prefijo` existe para el escenario del volcado global, que siembra **dos** bases con el mismo
+/// número de filas: con el mismo texto en las dos, un reparto mal hecho —todo en una sola base—
+/// sería indistinguible del bueno.
+fn siembra_con(prefijo: &str, filas: usize) -> String {
     let mut sql =
         String::from("CREATE TABLE filas (id INT PRIMARY KEY, texto VARCHAR(240) NOT NULL);\n");
 
     for id in 1..=filas {
         sql.push_str(&format!(
-            "INSERT INTO filas (id, texto) VALUES ({id}, '{}');\n",
+            "INSERT INTO filas (id, texto) VALUES ({id}, '{prefijo}{}');\n",
             texto_de(id)
         ));
     }
@@ -71,15 +75,25 @@ fn siembra(filas: usize) -> String {
     sql
 }
 
-/// El listado que la siembra tiene que producir: `id|texto`, una fila por línea.
-fn listado_esperado(filas: usize) -> String {
+/// El SQL de la siembra por defecto: sin prefijo, la de los escenarios de un solo origen.
+fn siembra(filas: usize) -> String {
+    siembra_con("", filas)
+}
+
+/// El listado que una siembra con `prefijo` tiene que producir: `id|texto`, una fila por línea.
+fn listado_con(prefijo: &str, filas: usize) -> String {
     let mut salida = String::new();
 
     for id in 1..=filas {
-        salida.push_str(&format!("{id}|{}\n", texto_de(id)));
+        salida.push_str(&format!("{id}|{prefijo}{}\n", texto_de(id)));
     }
 
     salida
+}
+
+/// El listado de la siembra por defecto.
+fn listado_esperado(filas: usize) -> String {
+    listado_con("", filas)
 }
 
 /// Ejecuta un guion dentro de un contenedor y **exige** que terminara bien.
@@ -193,25 +207,30 @@ async fn mariadb_con_etiqueta(mundo: &mut Mundo, sufijo: &str, fuente_de_copia: 
 
 /// Siembra las filas conocidas en un MariaDB.
 async fn sembrar_mariadb(mundo: &Mundo, contenedor: &str, filas: usize) {
+    sql_mariadb(mundo, contenedor, &siembra(filas), "la siembra del MariaDB").await;
+}
+
+/// Ejecuta SQL contra un MariaDB por su entrada estándar.
+///
+/// Es la forma de hablar con su base para lo que no cubren los ayudantes de siembra y lectura:
+/// el escenario de los valores que parecen un metacomando crea y vacía su propia tabla.
+async fn sql_mariadb(mundo: &Mundo, contenedor: &str, sql: &str, que: &str) {
     let clave = format!("-p{CLAVE_DE_LA_BASE}");
     let cmd = ["mariadb", "-uroot", &clave, BASE];
 
-    guion_con_entrada(
-        &mundo.motor,
-        contenedor,
-        &cmd,
-        &[],
-        &siembra(filas),
-        "la siembra del MariaDB",
-    )
-    .await;
+    guion_con_entrada(&mundo.motor, contenedor, &cmd, &[], sql, que).await;
 }
 
 /// Lee las filas de un MariaDB en el formato del listado esperado.
 async fn leer_mariadb(mundo: &Mundo, contenedor: &str) -> String {
+    leer_mariadb_de(mundo, contenedor, "filas").await
+}
+
+/// Lee el listado `id|texto` de la tabla `tabla` de un MariaDB.
+async fn leer_mariadb_de(mundo: &Mundo, contenedor: &str, tabla: &str) -> String {
     let orden = format!(
         "mariadb -uroot -p{CLAVE_DE_LA_BASE} -N -B {BASE} -e \
-         \"SELECT CONCAT(id, '|', texto) FROM filas ORDER BY id\""
+         \"SELECT CONCAT(id, '|', texto) FROM {tabla} ORDER BY id\""
     );
 
     guion(&mundo.motor, contenedor, &orden, "la lectura del MariaDB")
@@ -270,38 +289,98 @@ async fn postgres_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
         .await
         .unwrap_or_else(|motivo| panic!("{motivo}"));
 
+    // Y se pregunta qué `psql` es: `\restrict` —la segunda capa— existe desde 17.6, y la batería
+    // tiene que saber qué cliente está midiendo. Guarda del arranque, no escenario.
+    exigir_psql_con_restrict(mundo, &nombre).await;
+
     nombre
 }
 
 /// Siembra las filas conocidas en un PostgreSQL.
 async fn sembrar_postgres(mundo: &Mundo, contenedor: &str, filas: usize) {
-    let clave = format!("PGPASSWORD={CLAVE_DE_LA_BASE}");
-    let cmd = [
-        "psql",
-        "-U",
-        "postgres",
-        "-d",
-        BASE,
-        "-v",
-        "ON_ERROR_STOP=1",
-    ];
-
-    guion_con_entrada(
-        &mundo.motor,
+    sql_postgres(
+        mundo,
         contenedor,
-        &cmd,
-        &[&clave],
+        BASE,
         &siembra(filas),
         "la siembra del PostgreSQL",
     )
     .await;
 }
 
+/// Ejecuta SQL contra **una base concreta** de un PostgreSQL, por su entrada estándar.
+///
+/// Es la forma de hablar con una base que no es la del arnés: el escenario del volcado global
+/// crea, siembra y borra bases propias, y las tres cosas necesitan su propia conexión. `-X`
+/// ignora el `psqlrc` —que un `\set` ajeno cambiaría el resultado— y `ON_ERROR_STOP` hace que un
+/// error se note en vez de dejar una base a medias.
+async fn sql_postgres(mundo: &Mundo, contenedor: &str, base: &str, sql: &str, que: &str) {
+    let clave = format!("PGPASSWORD={CLAVE_DE_LA_BASE}");
+    let cmd = [
+        "psql",
+        "-X",
+        "-U",
+        "postgres",
+        "-d",
+        base,
+        "-v",
+        "ON_ERROR_STOP=1",
+    ];
+
+    guion_con_entrada(&mundo.motor, contenedor, &cmd, &[&clave], sql, que).await;
+}
+
+/// Crea una base de datos propia en un PostgreSQL, conectando a la de mantenimiento.
+async fn crear_base_postgres(mundo: &Mundo, contenedor: &str, base: &str) {
+    sql_postgres(
+        mundo,
+        contenedor,
+        "postgres",
+        &format!("CREATE DATABASE {base};\n"),
+        "la creación de la base",
+    )
+    .await;
+}
+
+/// Borra una base de datos propia de un PostgreSQL, conectando a la de mantenimiento.
+///
+/// El destino se deja limpio **de verdad**: sin la base, el `CREATE DATABASE` del volcado global
+/// tiene que volver a crearla, que es justo lo que mide el reparto por secciones.
+async fn borrar_base_postgres(mundo: &Mundo, contenedor: &str, base: &str) {
+    sql_postgres(
+        mundo,
+        contenedor,
+        "postgres",
+        &format!("DROP DATABASE IF EXISTS {base};\n"),
+        "el borrado de la base",
+    )
+    .await;
+}
+
+/// Siembra la tabla `filas` de una base propia de un PostgreSQL con los datos de **esa** base.
+async fn sembrar_base_postgres(mundo: &Mundo, contenedor: &str, base: &str, filas: usize) {
+    let prefijo = format!("{base}-");
+
+    sql_postgres(
+        mundo,
+        contenedor,
+        base,
+        &siembra_con(&prefijo, filas),
+        "la siembra de la base",
+    )
+    .await;
+}
+
 /// Lee las filas de un PostgreSQL en el formato del listado esperado.
 async fn leer_postgres(mundo: &Mundo, contenedor: &str) -> String {
+    leer_postgres_de(mundo, contenedor, BASE, "filas").await
+}
+
+/// Lee el listado `id|texto` de la tabla `tabla` de una base concreta de un PostgreSQL.
+async fn leer_postgres_de(mundo: &Mundo, contenedor: &str, base: &str, tabla: &str) -> String {
     let orden = format!(
-        "PGPASSWORD={CLAVE_DE_LA_BASE} psql -A -t -U postgres -d {BASE} -c \
-         \"SELECT id || '|' || texto FROM filas ORDER BY id\""
+        "PGPASSWORD={CLAVE_DE_LA_BASE} psql -X -A -t -U postgres -d {base} -c \
+         \"SELECT id || '|' || texto FROM {tabla} ORDER BY id\""
     );
 
     guion(
@@ -316,14 +395,11 @@ async fn leer_postgres(mundo: &Mundo, contenedor: &str) -> String {
 
 /// Vacía de filas el destino de un PostgreSQL.
 async fn limpiar_postgres(mundo: &Mundo, contenedor: &str) {
-    let orden = format!(
-        "PGPASSWORD={CLAVE_DE_LA_BASE} psql -U postgres -d {BASE} -c 'DROP TABLE IF EXISTS filas'"
-    );
-
-    guion(
-        &mundo.motor,
+    sql_postgres(
+        mundo,
         contenedor,
-        &orden,
+        BASE,
+        "DROP TABLE IF EXISTS filas;\n",
         "la limpieza del PostgreSQL",
     )
     .await;
@@ -365,6 +441,12 @@ async fn alpine_con_sqlite(mundo: &mut Mundo, sufijo: &str) -> String {
         .await
         .unwrap_or_else(|motivo| panic!("{motivo}"));
 
+    // Que el binario esté no basta: se pregunta por su versión —`-safe` existe desde 3.27— y por
+    // `readlink`, que es lo que la restauración necesita para resolver la forma canónica de la
+    // ruta antes de retirar el fichero. Son guardas del arranque, no escenarios.
+    exigir_sqlite_con_safe(mundo, &nombre).await;
+    exigir_readlink(mundo, &nombre).await;
+
     nombre
 }
 
@@ -401,6 +483,188 @@ async fn limpiar_sqlite(mundo: &Mundo, contenedor: &str) {
     let orden = format!("rm -f {BASE_SQLITE} {BASE_SQLITE}-wal {BASE_SQLITE}-shm");
 
     guion(&mundo.motor, contenedor, &orden, "la limpieza del SQLite").await;
+}
+
+// ── Las guardas de arranque de los contenedores ────────────────────────────
+
+/// La versión mínima de `sqlite3` que la restauración necesita: `-safe` existe desde 3.27.
+const SQLITE_MINIMO: (u32, u32) = (3, 27);
+
+/// La versión mínima de `psql` que trae `\restrict`: 17.6.
+const PSQL_MINIMO: (u32, u32) = (17, 6);
+
+/// La versión mayor y menor del primer número con forma `X.Y` de una salida de `--version`.
+///
+/// No vale con tomar el primer token: `sqlite3 --version` la abre (`3.45.1 …`) pero
+/// `psql --version` la lleva dentro (`psql (PostgreSQL) 18.6`). Se busca el primer token que
+/// empiece por dígito y tenga un punto, que es la versión en las dos formas.
+fn version_de(salida: &str) -> Option<(u32, u32)> {
+    salida.split_whitespace().find_map(|token| {
+        let (mayor, resto) = token.trim_start_matches('(').split_once('.')?;
+
+        Some((mayor.parse().ok()?, resto.split('.').next()?.parse().ok()?))
+    })
+}
+
+/// Exige que el `sqlite3` del contenedor sea lo bastante nuevo para `-safe`.
+///
+/// El arnés no lo supone: lo **pregunta**. `-safe` es la opción con la que la restauración ignora
+/// los metacomandos del `.dump` (`.shell`, `.system`…), y existe desde SQLite 3.27; un `sqlite3`
+/// más viejo aceptaría el `exec` y aplicaría el volcado **sin** la guarda, así que la falta de
+/// herramienta tiene que hacer fallar el escenario, no colarse por buena.
+async fn exigir_sqlite_con_safe(mundo: &Mundo, contenedor: &str) {
+    let salida = guion(
+        &mundo.motor,
+        contenedor,
+        "sqlite3 --version",
+        "la versión del sqlite3",
+    )
+    .await;
+    let version = salida.salida.trim();
+
+    let Some((mayor, menor)) = version_de(version) else {
+        panic!("no se pudo leer la versión de `sqlite3 --version`: {version:?}");
+    };
+
+    assert!(
+        (mayor, menor) >= SQLITE_MINIMO,
+        "el `sqlite3` del contenedor es `{version}` y la restauración necesita \
+         {SQLITE_MINIMO:?} o más para `-safe`: sin esa opción el volcado se aplicaría sin la \
+         guarda que ignora sus metacomandos"
+    );
+}
+
+/// Exige que el contenedor traiga `readlink`.
+///
+/// Lo usa la comprobación de forma canónica de la ruta del SQLite antes de retirar el fichero:
+/// sin él, la restauración no podría resolver un enlace en un directorio padre y el borrado
+/// previo a la reimportación apuntaría a un fichero que no es el declarado.
+async fn exigir_readlink(mundo: &Mundo, contenedor: &str) {
+    guion(
+        &mundo.motor,
+        contenedor,
+        "command -v readlink",
+        "la comprobación de que existe readlink",
+    )
+    .await;
+}
+
+/// Exige que el `psql` del contenedor soporte `\restrict`.
+///
+/// `\restrict` es la **segunda** capa del endurecimiento —la que rechaza cualquier metacomando
+/// que el troceador dejara escapar— y existe desde `psql` 17.6. Es una **precondición
+/// obligatoria**: la restauración **falla** con un `psql` que no lo honre (ver el escenario
+/// [`un_psql_sin_restrict_falla_la_restauracion_sin_restaurar_nada`]), así que un contenedor que
+/// no lo traiga mediría otra cosa —una restauración que ni siquiera se ejecuta—. La guarda se
+/// conserva en el arranque de la batería para que eso se note **aquí**, al preparar el mundo, y
+/// no como un fallo confuso más adelante.
+async fn exigir_psql_con_restrict(mundo: &Mundo, contenedor: &str) {
+    let salida = guion(
+        &mundo.motor,
+        contenedor,
+        "psql --version",
+        "la versión del psql",
+    )
+    .await;
+    let version = salida.salida.trim();
+
+    let Some((mayor, menor)) = version_de(version) else {
+        panic!("no se pudo leer la versión de `psql --version`: {version:?}");
+    };
+
+    assert!(
+        (mayor, menor) >= PSQL_MINIMO,
+        "el `psql` del contenedor es `{version}` y la segunda capa del endurecimiento \
+         (`\\restrict`) necesita {PSQL_MINIMO:?} o más: con un `psql` viejo la batería estaría \
+         midiendo otra cosa"
+    );
+}
+
+/// La imagen de PostgreSQL cuyo `psql` es **17.5**: justo por debajo del mínimo de `\restrict`.
+///
+/// Es la opción preferida del escenario negativo: mide el borde —una rama 17 anterior al parche de
+/// 2025-08-14— sin alejarse de la rama que la batería usa en el resto de escenarios.
+const IMAGEN_POSTGRES_SIN_RESTRICT: &str = "docker.io/library/postgres:17.5-alpine";
+
+/// La imagen de respaldo: su `psql` es **16.9**, por debajo del mínimo 16.10 de su rama.
+///
+/// Se usa cuando la de 17.5 no se puede traer —una etiqueta antigua que un espejo puede no
+/// conservar—: sigue midiendo lo mismo, un cliente sin `\restrict`.
+const IMAGEN_POSTGRES_SIN_RESTRICT_DE_RESPALDO: &str = "docker.io/library/postgres:16.9-alpine";
+
+/// La imagen de PostgreSQL sin `\restrict` que la batería consigue traer.
+///
+/// Es la **guarda de disponibilidad** del escenario negativo: primero la de 17.5, después la de
+/// respaldo, y si ninguna se puede traer el escenario **falla nombrando las dos** —no puede medir
+/// sin un cliente que no honre `\restrict`, y darlo por bueno sería fingir el escenario—.
+async fn imagen_de_postgres_sin_restrict(mundo: &Mundo) -> String {
+    for candidata in [
+        IMAGEN_POSTGRES_SIN_RESTRICT,
+        IMAGEN_POSTGRES_SIN_RESTRICT_DE_RESPALDO,
+    ] {
+        if mundo.motor.asegurar_imagen(candidata).await.is_ok() {
+            return candidata.to_owned();
+        }
+    }
+
+    panic!(
+        "el escenario del `psql` sin `\\restrict` necesita una imagen de PostgreSQL anterior al \
+         ciclo de parches de 2025-08-14 (`{IMAGEN_POSTGRES_SIN_RESTRICT}` o, en su defecto, \
+         `{IMAGEN_POSTGRES_SIN_RESTRICT_DE_RESPALDO}`) y ninguna se pudo traer"
+    );
+}
+
+/// Levanta un PostgreSQL de una imagen concreta **sin** exigir `\restrict`.
+///
+/// Es el arranque de [`postgres_arrancado`] menos su guarda [`exigir_psql_con_restrict`]: este
+/// escenario mide justo lo contrario —que un `psql` sin `\restrict` **falla** la restauración—,
+/// así que exigir la guarda sería exigir lo que se quiere negar. El resto de escenarios la
+/// conservan.
+async fn postgres_sin_restrict_arrancado(mundo: &mut Mundo, sufijo: &str, imagen: &str) -> String {
+    let nombre = mundo.nombre_de_contenedor(sufijo);
+    let contrasena = format!("POSTGRES_PASSWORD={CLAVE_DE_LA_BASE}");
+    let base = format!("POSTGRES_DB={BASE}");
+
+    mundo
+        .contenedor(Receta {
+            nombre: &nombre,
+            imagen,
+            cmd: &[],
+            env: &[&contrasena, &base],
+            puerto: None,
+            montaje: None,
+            // Se copia de ella y se restaura en ella: se declara fuente de copia.
+            fuente_de_copia: true,
+        })
+        .await;
+
+    let sonda = sonda_de_postgres();
+    mundo
+        .motor
+        .esperar_orden(&nombre, &sonda.argv(), &sonda.env(), PLAZO_DE_ARRANQUE)
+        .await
+        .unwrap_or_else(|motivo| panic!("{motivo}"));
+
+    nombre
+}
+
+/// Si existe una base en un PostgreSQL: es lo que mide «no se restauró nada».
+async fn existe_la_base_postgres(mundo: &Mundo, contenedor: &str, base: &str) -> bool {
+    let orden = format!(
+        "PGPASSWORD={CLAVE_DE_LA_BASE} psql -X -A -t -U postgres -d postgres -c \
+         \"SELECT 1 FROM pg_database WHERE datname = '{base}'\""
+    );
+
+    !guion(
+        &mundo.motor,
+        contenedor,
+        &orden,
+        "la comprobación de que la base existe",
+    )
+    .await
+    .salida
+    .trim()
+    .is_empty()
 }
 
 // ── Directorio ─────────────────────────────────────────────────────────────
@@ -1156,6 +1420,377 @@ async fn el_snapshot_viaja_de_s3_al_stdin_del_contenedor() {
     if let Err(diferencia) = comparar_filas(&listado_esperado(FILAS_DEL_VOLUMEN), &obtenido) {
         panic!("el volcado no llegó entero al destino: {diferencia}");
     }
+
+    mundo.cerrar().await;
+}
+
+// ══ Requisito: el volcado es contenido no confiable ════════════════════════
+
+/// Escenario: la restauración global de PostgreSQL reparte cada base en la suya.
+///
+/// Cubre las tareas 4.1 y 4.2b: un target `postgresql` **sin** `db_name` se extrae con
+/// `pg_dumpall` —un volcado global, con las dos bases dentro— y se restaura. `pg_dumpall` separa
+/// las bases con metacomandos `\connect`, y el único modo de `psql` que rechaza metacomandos
+/// —`\restrict`— **bloquea `\connect`**: anteponerlo a un volcado global **desvía los datos a la
+/// base equivocada** —las filas acaban todas en `postgres`—. Por eso la restauración trocea el
+/// volcado por los `\connect` de primer nivel y restaura **base por base**. Este escenario mide
+/// que cada base acaba con **sus** datos y no con los de otra: es lo que antes fallaba.
+#[tokio::test]
+async fn copia_y_restauracion_global_de_postgresql_reparte_cada_base_en_la_suya() {
+    let mut mundo = Mundo::nuevo().await;
+
+    let contenedor = postgres_arrancado(&mut mundo, "global").await;
+
+    // Dos bases propias, cada una con datos **identificables**: el texto lleva delante el nombre
+    // de la base, así que un dato de una no puede pasar por el de la otra.
+    for base in ["almacen_a", "almacen_b"] {
+        crear_base_postgres(&mundo, &contenedor, base).await;
+        sembrar_base_postgres(&mundo, &contenedor, base, FILAS).await;
+    }
+
+    // El target **sin** `db_name`: es lo que hace que la extracción use `pg_dumpall`.
+    let target = mundo
+        .kesto
+        .crear_target(json!({
+            "name": "e2e-postgres-global",
+            "target_type": "postgresql",
+            "container_name": contenedor,
+            "db_user": "postgres",
+            "db_password": CLAVE_DE_LA_BASE,
+        }))
+        .await;
+    let instantanea = copiar_una_vez(
+        &mundo.kesto,
+        &target,
+        &mundo.repositorio,
+        "e2e-postgres-global",
+    )
+    .await;
+
+    // El destino se deja limpio **de verdad**: sin las bases, el `CREATE DATABASE` del volcado
+    // tiene que volver a crearlas, que es justo lo que prueba que el reparto por secciones
+    // funciona.
+    for base in ["almacen_a", "almacen_b"] {
+        borrar_base_postgres(&mundo, &contenedor, base).await;
+    }
+
+    mundo
+        .kesto
+        .restaurar_exigiendo_exito(
+            &instantanea,
+            &mundo.repositorio,
+            true,
+            PLAZO_DE_LA_RESTAURACION,
+        )
+        .await;
+
+    for base in ["almacen_a", "almacen_b"] {
+        let obtenido = leer_postgres_de(&mundo, &contenedor, base, "filas").await;
+
+        if let Err(diferencia) = comparar_filas(&listado_con(&format!("{base}-"), FILAS), &obtenido)
+        {
+            panic!("la base `{base}` no quedó con sus datos: {diferencia}");
+        }
+
+        // Y, explícitamente, **no** con los de la otra: el fallo que se arregló metía todo en una
+        // sola base, así que la comprobación tiene que ser capaz de ver el dato ajeno.
+        let otra = if base == "almacen_a" {
+            "almacen_b"
+        } else {
+            "almacen_a"
+        };
+        assert!(
+            !obtenido.contains(otra),
+            "la base `{base}` recibió los datos de `{otra}`: {obtenido}"
+        );
+    }
+
+    mundo.cerrar().await;
+}
+
+/// Escenario: un `psql` que no honra `\restrict` falla la restauración sin restaurar nada.
+///
+/// Es la **precondición obligatoria** del reparto por secciones: con un `psql` anterior al ciclo de
+/// parches que trajo `\restrict` —17.6, o el mínimo de su rama— la segunda capa no existe, y un
+/// volcado hostil conseguiría ejecutar metacomandos como `root` en el contenedor destino. Por eso
+/// la restauración **falla en voz alta** —nombrando el contenedor, la versión leída y el mínimo—
+/// en vez de degradarse, y **no** restaura nada: la base que se vació antes sigue sin existir.
+///
+/// La imagen es una por debajo del umbral (ver [`imagen_de_postgres_sin_restrict`]); traerla es la
+/// guarda previa del escenario. Y no se usa [`postgres_arrancado`] porque éste exige justo lo que
+/// aquí se quiere negar.
+#[tokio::test]
+#[ignore = "requiere un motor de contenedores y descargar una imagen antigua de PostgreSQL"]
+async fn un_psql_sin_restrict_falla_la_restauracion_sin_restaurar_nada() {
+    let mut mundo = Mundo::nuevo().await;
+
+    let imagen = imagen_de_postgres_sin_restrict(&mundo).await;
+    let contenedor = postgres_sin_restrict_arrancado(&mut mundo, "sin-restrict", &imagen).await;
+
+    // Una base propia sembrada y un target **sin** `db_name`: la extracción es el volcado global.
+    crear_base_postgres(&mundo, &contenedor, "almacen").await;
+    sembrar_base_postgres(&mundo, &contenedor, "almacen", FILAS).await;
+
+    let target = mundo
+        .kesto
+        .crear_target(json!({
+            "name": "e2e-postgres-sin-restrict",
+            "target_type": "postgresql",
+            "container_name": contenedor,
+            "db_user": "postgres",
+            "db_password": CLAVE_DE_LA_BASE,
+        }))
+        .await;
+    let instantanea = copiar_una_vez(
+        &mundo.kesto,
+        &target,
+        &mundo.repositorio,
+        "e2e-postgres-sin-restrict",
+    )
+    .await;
+
+    // El destino se vacía: la restauración tiene que **no** reponerlo.
+    borrar_base_postgres(&mundo, &contenedor, "almacen").await;
+
+    let (estado, valor) = mundo
+        .kesto
+        .restaurar(&instantanea, &mundo.repositorio, true)
+        .await;
+    assert!(
+        estado.is_success(),
+        "la restauración tenía que lanzarse y contestó {estado} con {valor}"
+    );
+
+    let ejecucion = valor["data"]["execution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("la restauración no trajo `execution_id`: {valor}"));
+    let fila = mundo
+        .kesto
+        .esperar_la_restauracion(ejecucion, PLAZO_DE_LA_RESTAURACION)
+        .await;
+
+    assert_eq!(
+        fila["status"], "failed",
+        "un `psql` sin `\\restrict` tenía que fallar la restauración: {fila}"
+    );
+
+    let motivo = fila["error_message"].as_str().unwrap_or_default();
+    assert!(
+        motivo.contains("17.6") && motivo.contains("restrict"),
+        "el motivo no nombra el mínimo de `\\restrict`: {motivo}"
+    );
+
+    // Y **no** se restauró nada: la base que se vació sigue sin existir.
+    assert!(
+        !existe_la_base_postgres(&mundo, &contenedor, "almacen").await,
+        "la restauración falló pero repuso la base `almacen`: la precondición no cortó antes de \
+         ejecutar nada"
+    );
+
+    mundo.cerrar().await;
+}
+
+/// Los valores que **parecen** un metacomando de cliente y que el ciclo tiene que conservar.
+///
+/// Son datos, no órdenes: viven en una tabla y tienen que volver a ella byte a byte. Cubren los
+/// tres metacomandos que el descarte tiene que reconocer —`\!`, `\.shell` y `\connect`— y uno con
+/// comilla y barras invertidas, que es donde un escapado descuidado perdería la fila.
+const METACOMANDOS: &[&str] = &[
+    r"\! touch /tmp/kesto-pwned",
+    r".shell touch /tmp/kesto-pwned",
+    r"\connect otra_base",
+    r"comillas ' y \\",
+];
+
+/// Escapa un valor para un literal SQL de comillas simples.
+///
+/// Escapa la barra invertida **y** la comilla; en PostgreSQL el literal se abre además con el
+/// prefijo `E`, de modo que el valor se lee igual con `standard_conforming_strings` en cualquier
+/// estado y no depende del modo del servidor.
+fn escapar_sql(valor: &str) -> String {
+    valor.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// El SQL que siembra los valores de [`METACOMANDOS`] en la tabla `frases`.
+///
+/// `prefijo_e` decide cómo se abre el literal: `E'…'` en PostgreSQL —donde el prefijo `E` fija que
+/// la barra invertida escape— y `'…'` en MariaDB, cuyo modo por defecto ya la trata como escape.
+fn siembra_de_metacomandos(prefijo_e: bool) -> String {
+    let mut sql = String::from("CREATE TABLE frases (id INT PRIMARY KEY, texto TEXT NOT NULL);\n");
+
+    for (indice, valor) in METACOMANDOS.iter().enumerate() {
+        let escapado = escapar_sql(valor);
+        let literal = if prefijo_e {
+            format!("E'{escapado}'")
+        } else {
+            format!("'{escapado}'")
+        };
+
+        sql.push_str(&format!(
+            "INSERT INTO frases (id, texto) VALUES ({}, {literal});\n",
+            indice + 1
+        ));
+    }
+
+    sql
+}
+
+/// Comprueba que la orden de shell señuelo **no** se ejecutó en el contenedor.
+///
+/// Los valores de [`METACOMANDOS`] incluyen `touch /tmp/kesto-pwned`: si el descarte de
+/// metacomandos hubiera tratado el **dato** como orden, el fichero estaría ahí. No existe ni antes
+/// ni después; lo que fija el test es que el valor que *parecía* una orden viaja como dato.
+async fn comprobar_que_no_se_ejecuto_la_orden(mundo: &Mundo, contenedor: &str) {
+    guion(
+        &mundo.motor,
+        contenedor,
+        "test ! -e /tmp/kesto-pwned",
+        "la comprobación de que la orden señuelo no se ejecutó",
+    )
+    .await;
+}
+
+/// Escenario: los valores que parecen un metacomando sobreviven al ciclo (PostgreSQL).
+///
+/// Fija que el descarte de metacomandos **no se come contenido**: los valores viajan dentro de un
+/// `COPY` del volcado y tienen que volver íntegros. Si el troceador descartara por subcadena en
+/// vez de por estado léxico, este test perdería filas —o el `\connect` de un dato abriría una
+/// sección falsa—.
+#[tokio::test]
+async fn los_valores_que_parecen_un_metacomando_sobreviven_al_ciclo_en_postgresql() {
+    let mut mundo = Mundo::nuevo().await;
+
+    let contenedor = postgres_arrancado(&mut mundo, "postgres").await;
+    sql_postgres(
+        &mundo,
+        &contenedor,
+        BASE,
+        &siembra_de_metacomandos(true),
+        "la siembra de las frases",
+    )
+    .await;
+
+    let esperado = leer_postgres_de(&mundo, &contenedor, BASE, "frases").await;
+
+    // La siembra dejó de verdad los valores que se querían: si el escapado fallara, el ciclo
+    // conservaría un valor equivocado y el escenario pasaría por bueno.
+    for valor in METACOMANDOS {
+        assert!(
+            esperado.contains(valor),
+            "la siembra no dejó el valor `{valor}`: {esperado}"
+        );
+    }
+
+    let target = mundo
+        .kesto
+        .crear_target(json!({
+            "name": "e2e-metacomandos-postgres",
+            "target_type": "postgresql",
+            "container_name": contenedor,
+            "db_user": "postgres",
+            "db_password": CLAVE_DE_LA_BASE,
+            "db_name": BASE,
+        }))
+        .await;
+    let instantanea = copiar_una_vez(
+        &mundo.kesto,
+        &target,
+        &mundo.repositorio,
+        "e2e-metacomandos-postgres",
+    )
+    .await;
+
+    sql_postgres(
+        &mundo,
+        &contenedor,
+        BASE,
+        "DROP TABLE IF EXISTS frases;\n",
+        "la limpieza del destino",
+    )
+    .await;
+
+    mundo
+        .kesto
+        .restaurar_exigiendo_exito(
+            &instantanea,
+            &mundo.repositorio,
+            true,
+            PLAZO_DE_LA_RESTAURACION,
+        )
+        .await;
+
+    let obtenido = leer_postgres_de(&mundo, &contenedor, BASE, "frases").await;
+
+    if let Err(diferencia) = comparar_filas(&esperado, &obtenido) {
+        panic!("los valores que parecen un metacomando no sobrevivieron: {diferencia}");
+    }
+
+    comprobar_que_no_se_ejecuto_la_orden(&mundo, &contenedor).await;
+
+    mundo.cerrar().await;
+}
+
+/// Escenario: los valores que parecen un metacomando sobreviven al ciclo (MariaDB).
+///
+/// La misma garantía que en PostgreSQL —el descarte de metacomandos no se come datos— para el
+/// cliente de MariaDB, que ignora sus metacomandos con `--binary-mode`: los valores viajan dentro
+/// de los `INSERT` del volcado y tienen que volver íntegros.
+#[tokio::test]
+async fn los_valores_que_parecen_un_metacomando_sobreviven_al_ciclo_en_mariadb() {
+    let mut mundo = Mundo::nuevo().await;
+
+    let contenedor = mariadb_arrancado(&mut mundo, "maria").await;
+    sql_mariadb(
+        &mundo,
+        &contenedor,
+        &siembra_de_metacomandos(false),
+        "la siembra de las frases",
+    )
+    .await;
+
+    let esperado = leer_mariadb_de(&mundo, &contenedor, "frases").await;
+
+    for valor in METACOMANDOS {
+        assert!(
+            esperado.contains(valor),
+            "la siembra no dejó el valor `{valor}`: {esperado}"
+        );
+    }
+
+    let target = target_mariadb(&mundo.kesto, "e2e-metacomandos-maria", &contenedor).await;
+    let instantanea = copiar_una_vez(
+        &mundo.kesto,
+        &target,
+        &mundo.repositorio,
+        "e2e-metacomandos-maria",
+    )
+    .await;
+
+    sql_mariadb(
+        &mundo,
+        &contenedor,
+        "DROP TABLE IF EXISTS frases;\n",
+        "la limpieza del destino",
+    )
+    .await;
+
+    mundo
+        .kesto
+        .restaurar_exigiendo_exito(
+            &instantanea,
+            &mundo.repositorio,
+            true,
+            PLAZO_DE_LA_RESTAURACION,
+        )
+        .await;
+
+    let obtenido = leer_mariadb_de(&mundo, &contenedor, "frases").await;
+
+    if let Err(diferencia) = comparar_filas(&esperado, &obtenido) {
+        panic!("los valores que parecen un metacomando no sobrevivieron: {diferencia}");
+    }
+
+    comprobar_que_no_se_ejecuto_la_orden(&mundo, &contenedor).await;
 
     mundo.cerrar().await;
 }
