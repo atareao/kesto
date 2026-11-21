@@ -1,4 +1,4 @@
-//! Los veintiún escenarios de `verificacion-e2e`, uno por prueba.
+//! Los treinta escenarios de `verificacion-e2e`, uno por prueba.
 //!
 //! Cada escenario monta su propio mundo —motor, servidor S3, cubo, binario de Kesto y
 //! repositorio— con [`Mundo::nuevo`] y lo recoge al terminar con [`Mundo::cerrar`]. Nada se
@@ -148,6 +148,19 @@ async fn copiar_una_vez(kesto: &Kesto, target: &str, repositorio: &str, nombre: 
 
 /// Levanta un MariaDB con su base sembrable y espera a que conteste.
 async fn mariadb_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
+    mariadb_con_etiqueta(mundo, sufijo, true).await
+}
+
+/// Arranca un MariaDB **sin** la etiqueta de fuente de copia.
+///
+/// Es el contenedor de la prueba negativa del confinamiento: el motor no le crea ningún `exec`,
+/// así que una copia de él no puede salir adelante.
+async fn mariadb_arrancado_sin_etiqueta(mundo: &mut Mundo, sufijo: &str) -> String {
+    mariadb_con_etiqueta(mundo, sufijo, false).await
+}
+
+/// Arranca un MariaDB, con o sin la etiqueta que lo declara fuente de copia.
+async fn mariadb_con_etiqueta(mundo: &mut Mundo, sufijo: &str, fuente_de_copia: bool) -> String {
     let nombre = mundo.nombre_de_contenedor(sufijo);
     let imagen = imagen_de_mariadb();
     let contrasena = format!("MARIADB_ROOT_PASSWORD={CLAVE_DE_LA_BASE}");
@@ -161,6 +174,10 @@ async fn mariadb_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
             env: &[&contrasena, &base],
             puerto: None,
             montaje: None,
+            // Se copia de ella y se restaura en ella, así que el motor tiene que poder crear
+            // `exec` en su interior: se declara fuente de copia. La prueba negativa la deja sin
+            // etiqueta a propósito.
+            fuente_de_copia,
         })
         .await;
 
@@ -241,6 +258,8 @@ async fn postgres_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
             env: &[&contrasena, &base],
             puerto: None,
             montaje: None,
+            // Se copia de ella y se restaura en ella: se declara fuente de copia.
+            fuente_de_copia: true,
         })
         .await;
 
@@ -335,6 +354,8 @@ async fn alpine_con_sqlite(mundo: &mut Mundo, sufijo: &str) -> String {
             env: &[],
             puerto: None,
             montaje: None,
+            // Se copia de ella y se restaura en ella: se declara fuente de copia.
+            fuente_de_copia: true,
         })
         .await;
 
@@ -1172,6 +1193,9 @@ async fn un_contenedor_que_no_drena_su_stdin_no_cuelga_la_restauracion() {
             env: &[],
             puerto: None,
             montaje: None,
+            // Es el destino de la restauración, así que el motor tiene que poder crear un
+            // `exec` en él: se declara fuente de copia.
+            fuente_de_copia: true,
         })
         .await;
     mundo
@@ -1461,6 +1485,109 @@ async fn una_purga_fallida_no_deja_el_repositorio_a_medias() {
     assert!(
         estado.is_success(),
         "el repositorio tenía que seguir siendo legible y contestó {estado} con {valor}"
+    );
+
+    mundo.cerrar().await;
+}
+
+// ══ Requisito: la frontera del operador al motor se verifica ═══════════════
+
+/// Escenario: un directorio fuera de la raíz de copias no se copia.
+///
+/// El alta solo comprueba la **forma** del `host_path` —textual y sin tocar el disco—, así que
+/// una ruta que empieza por la raíz y la abandona por un enlace intermedio pasa el borde HTTP.
+/// El motor canonicaliza antes de leer y ve que el enlace la lleva fuera: la copia acaba en
+/// `failed`, el motivo nombra el campo y no llega a escribirse ninguna instantánea. Es la mitad
+/// que solo el motor puede cerrar, y la que el escenario mide de punta a punta.
+#[tokio::test]
+async fn un_directorio_fuera_de_la_raiz_de_copias_no_se_copia() {
+    let mundo = Mundo::nuevo().await;
+
+    // El directorio que se copiaría está **fuera** de la raíz de copias de la batería: cuelga del
+    // temporal del sistema, no de `mundo.raiz`, que es la raíz que el binario declara como
+    // `KESTO_BACKUP_ROOT`. Tiene que existir: la canonicalización resuelve el enlace hasta él.
+    let fuera = std::env::temp_dir().join(mundo.nombre_de_contenedor("fuera-de-la-raiz"));
+    sembrar_directorio(&fuera);
+
+    // El `host_path` declarado es, textualmente, una ruta **bajo** la raíz —el alta la acepta—,
+    // y un enlace la lleva fuera de ella. Se sustituye el directorio que crea `trabajo` por el
+    // enlace: lo que se declara es la ruta, no su destino.
+    let enlace = mundo.trabajo("directorio", "enlace-fuera");
+    std::fs::remove_dir(&enlace)
+        .unwrap_or_else(|causa| panic!("no se pudo preparar `{}`: {causa}", enlace.display()));
+    std::os::unix::fs::symlink(&fuera, &enlace).unwrap_or_else(|causa| {
+        panic!("no se pudo crear el enlace `{}`: {causa}", enlace.display())
+    });
+
+    let target = target_directorio(&mundo.kesto, "e2e-fuera-de-la-raiz", &enlace).await;
+    let tarea = mundo
+        .kesto
+        .crear_tarea(&target, &mundo.repositorio, "e2e-fuera-de-la-raiz", 7)
+        .await;
+
+    let fila = mundo.kesto.copiar(&tarea, PLAZO_DE_LA_COPIA).await;
+
+    assert_eq!(
+        fila["status"], "failed",
+        "una copia cuyo `host_path` escapa de la raíz tenía que fallar: {fila}"
+    );
+
+    let motivo = fila["error_message"].as_str().unwrap_or_default();
+    assert!(
+        motivo.contains("host_path"),
+        "el motivo tenía que nombrar el campo que quedó fuera de la raíz: {motivo}"
+    );
+
+    let instantaneas = mundo.kesto.instantaneas(&mundo.repositorio).await;
+    assert!(
+        instantaneas.is_empty(),
+        "un `host_path` fuera de la raíz no puede dejar instantánea y dejó {instantaneas:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&fuera);
+    mundo.cerrar().await;
+}
+
+/// Escenario: un contenedor que no se declara fuente de copia no se copia.
+///
+/// El motor inspecciona el contenedor antes de crear ningún `exec` y exige la etiqueta
+/// `io.kesto.backup-source=true`. Sin ella la copia acaba en `failed`, el motivo nombra el
+/// contenedor y no llega a escribirse ninguna instantánea: la frontera es **fail-closed** y la
+/// declaración **viaja con el contenedor** —no es una lista de configuración que alguien pudiera
+/// dejar vacía—. Es la mitad que solo el motor puede cerrar: el borde HTTP no sabe si un
+/// contenedor se declaró fuente de copia.
+#[tokio::test]
+async fn un_contenedor_sin_la_etiqueta_de_fuente_no_se_copia() {
+    let mut mundo = Mundo::nuevo().await;
+
+    // El contenedor existe y tiene datos, pero **no** lleva la etiqueta: el motor no le crearía
+    // ningún `exec`. La siembra va por el arnés, que habla con el motor directamente.
+    let contenedor = mariadb_arrancado_sin_etiqueta(&mut mundo, "sin-etiqueta").await;
+    sembrar_mariadb(&mundo, &contenedor, FILAS).await;
+
+    let target = target_mariadb(&mundo.kesto, "e2e-sin-etiqueta", &contenedor).await;
+    let tarea = mundo
+        .kesto
+        .crear_tarea(&target, &mundo.repositorio, "e2e-sin-etiqueta", 7)
+        .await;
+
+    let fila = mundo.kesto.copiar(&tarea, PLAZO_DE_LA_COPIA).await;
+
+    assert_eq!(
+        fila["status"], "failed",
+        "una copia de un contenedor sin la etiqueta de fuente tenía que fallar: {fila}"
+    );
+
+    let motivo = fila["error_message"].as_str().unwrap_or_default();
+    assert!(
+        motivo.contains(&contenedor),
+        "el motivo tenía que nombrar el contenedor que no se declaró fuente de copia: {motivo}"
+    );
+
+    let instantaneas = mundo.kesto.instantaneas(&mundo.repositorio).await;
+    assert!(
+        instantaneas.is_empty(),
+        "un contenedor sin la etiqueta no puede dejar instantánea y dejó {instantaneas:?}"
     );
 
     mundo.cerrar().await;

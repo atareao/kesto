@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
-use crate::docker::Cliente;
+use crate::docker::{Cliente, ETIQUETA_DE_FUENTE_DE_COPIA, VALOR_DE_FUENTE_DE_COPIA};
 use crate::engine::{Ajustes, ComprobadorDeSalud, Dependencias, Motor};
 use crate::rustic::BarrasDelMotor;
 use crate::secret::SecretString;
@@ -926,12 +926,42 @@ pub(crate) fn sembrar_snapshot_ajeno(ruta: &Path, passphrase: &str) -> (String, 
 /// El permiso va aquí, y no en cada prueba, porque este ayudante es el punto por
 /// el que pasan todas las que abren una base: declararlo una vez evita que
 /// cualquiera tenga que acordarse, y una prueba nueva arranca sin sorpresas.
+///
+/// Declara además la raíz de copias de [`raiz_de_copias_del_arnes`], por el mismo motivo: es el
+/// camino por el que pasan las pruebas que siembran un target de directorio sobre un temporal, y
+/// sin ella el borde HTTP rechazaría el alta por alcance. Una prueba que necesite medir el alcance
+/// contra otra raíz usa [`config_con_dsn_y_raiz_de_copias`].
 pub(crate) fn config_con_dsn(dsn: &str) -> Config {
+    config_con_dsn_y_raiz_de_copias(dsn, texto_de_raiz(raiz_de_copias_del_arnes()))
+}
+
+/// La raíz de copias que declaran los estados de prueba que copian temporales del arnés.
+///
+/// Es la raíz de los temporales de esta ejecución —[`raiz_de_la_ejecucion`]—, la que contiene todo
+/// lo que crea [`directorio_de_prueba`]: así un target de directorio sembrado sobre un temporal de
+/// la prueba pasa la comprobación de alcance sin que cada prueba tenga que declarar una raíz
+/// propia. Es la contrapartida de prueba del defecto de producción: el defecto es
+/// `/backup_sources`, que es donde monta el `compose` del §8, y el arnés declara la suya.
+pub(crate) fn raiz_de_copias_del_arnes() -> &'static Path {
+    raiz_de_la_ejecucion()
+}
+
+/// El texto de una ruta del arnés, que siempre se construye en UTF-8.
+fn texto_de_raiz(ruta: &Path) -> &str {
+    ruta.to_str().expect("las rutas del arnés son UTF-8")
+}
+
+/// Configuración de prueba que apunta a una base y declara una raíz de copias **dada**.
+///
+/// Existe para las pruebas del borde HTTP que necesitan medir el alcance contra una raíz concreta
+/// —las que fijan `/backup_sources`, la del §8— en vez de contra la de los temporales del arnés.
+pub(crate) fn config_con_dsn_y_raiz_de_copias(dsn: &str, raiz: &str) -> Config {
     Config::from_lookup(&lookup_from(&[
         ("KESTO_MASTER_KEY", MASTER_KEY),
         ("KESTO_ALLOW_INSECURE", "1"),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn),
+        ("KESTO_BACKUP_ROOT", raiz),
     ]))
     .expect("la configuración de prueba con base de datos es válida")
 }
@@ -1136,6 +1166,10 @@ pub(crate) fn migrador_roto() -> Migrator {
 /// Declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— porque este es el modo sin
 /// proveedor de identidad: sin él la aplicación se niega a arrancar, y el arnés no
 /// tendría estado de desarrollo que entregar.
+///
+/// Declara también la raíz de copias de [`raiz_de_copias_del_arnes`]: este estado es el que usan
+/// las pruebas que siembran un target de directorio sobre un temporal, y sin esa raíz el borde
+/// HTTP rechazaría el alta por alcance.
 pub(crate) async fn estado_desarrollo() -> AppState {
     let (dsn, pool, clave) = base_del_arnes().await;
 
@@ -1144,6 +1178,10 @@ pub(crate) async fn estado_desarrollo() -> AppState {
         ("KESTO_ALLOW_INSECURE", "1"),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn.as_str()),
+        (
+            "KESTO_BACKUP_ROOT",
+            texto_de_raiz(raiz_de_copias_del_arnes()),
+        ),
     ]))
     .expect("la configuración de desarrollo es válida");
 
@@ -1909,8 +1947,8 @@ pub(crate) fn lector_del_volcado(
 // ── Motor de contenedores ────────────────────────────────────────────────────
 //
 // Las pruebas que necesitan un motor de contenedores van marcadas `#[ignore]`, y hoy son
-// **veintisiete**: trece en `src/docker` (todas en `cliente.rs`) y catorce en `src/engine`
-// (siete en `extraccion.rs`, cuatro en `mod.rs` y tres en `restauracion.rs`). El motivo de
+// **treinta y seis**: dieciséis en `src/docker` (todas en `cliente.rs`) y veinte en `src/engine`
+// (diez en `extraccion.rs`, cuatro en `mod.rs` y seis en `restauracion.rs`). El motivo de
 // que estén marcadas es el job `backend` de `.github/workflows/ci.yml`: no declara
 // servicios, así que `cargo test` tiene que quedar verde sin motor. Quien las lance con
 // `cargo test -- --ignored` necesita un motor de verdad en la máquina —y el runner del job
@@ -2004,13 +2042,36 @@ pub(crate) struct ContenedorDePrueba {
 }
 
 impl ContenedorDePrueba {
-    /// Crea y arranca un contenedor de la imagen de prueba, con `sleep 600`.
+    /// Crea y arranca un contenedor de prueba **declarado fuente de copia**.
+    ///
+    /// Lleva la etiqueta [`ETIQUETA_DE_FUENTE_DE_COPIA`] con el valor
+    /// [`VALOR_DE_FUENTE_DE_COPIA`] porque el motor solo crea `exec` en contenedores que la
+    /// declaran: es el caso normal, el de una prueba que quiere que sus órdenes se ejecuten.
+    /// Para el caso contrario —la prueba negativa del confinamiento— está
+    /// [`ContenedorDePrueba::sin_etiqueta_de_fuente`].
     ///
     /// El guardián (`Self`) se construye **entre** el alta y el arranque: en cuanto el
     /// contenedor existe en el motor hay algo que borrar, y construirlo al final dejaba el
     /// arranque —y cualquier pánico intermedio— sin nadie que lo limpiara. Ver el comentario
     /// de dentro.
     pub(crate) async fn nuevo(prueba: &str) -> Self {
+        Self::con_etiquetas(prueba, true).await
+    }
+
+    /// Crea y arranca un contenedor de prueba **sin** la etiqueta de fuente de copia.
+    ///
+    /// Es lo que hace falta para medir el confinamiento de punta a punta: el motor inspecciona
+    /// el contenedor, no ve la etiqueta y **no le crea ningún `exec`**.
+    pub(crate) async fn sin_etiqueta_de_fuente(prueba: &str) -> Self {
+        Self::con_etiquetas(prueba, false).await
+    }
+
+    /// Crea y arranca un contenedor de la imagen de prueba, con `sleep 600`.
+    ///
+    /// `fuente_de_copia` decide si el contenedor nace con la etiqueta que el motor exige para
+    /// crear un `exec` en él: ver [`ContenedorDePrueba::nuevo`] y
+    /// [`ContenedorDePrueba::sin_etiqueta_de_fuente`].
+    async fn con_etiquetas(prueba: &str, fuente_de_copia: bool) -> Self {
         let socket = socket_del_motor()
             .expect("las pruebas del motor necesitan un socket de Docker o Podman");
         let motor = bollard::Docker::connect_with_socket(
@@ -2021,6 +2082,15 @@ impl ContenedorDePrueba {
         .expect("el socket existe, así que el cliente del arnés se construye");
 
         let nombre = format!("kesto-prueba-{prueba}");
+
+        // La etiqueta de fuente de copia **viaja con el contenedor**: quien lo crea dice si lo
+        // es, y el motor solo crea `exec` en los que la llevan. El caso negativo no la pone.
+        let etiquetas = fuente_de_copia.then(|| {
+            HashMap::from([(
+                ETIQUETA_DE_FUENTE_DE_COPIA.to_owned(),
+                VALOR_DE_FUENTE_DE_COPIA.to_owned(),
+            )])
+        });
 
         // Una corrida anterior que muriera sin limpiar deja el nombre ocupado, y el alta
         // fallaría con un `409` que no hablaría de nada de esto. Se retira lo que hubiera con
@@ -2044,6 +2114,7 @@ impl ContenedorDePrueba {
                             .map(|arg| (*arg).to_owned())
                             .collect(),
                     ),
+                    labels: etiquetas,
                     ..Default::default()
                 },
             )

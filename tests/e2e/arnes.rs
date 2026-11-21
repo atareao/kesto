@@ -89,6 +89,20 @@ pub const REGION: &str = "us-east-1";
 /// mundo, así que el nombre no dice nada de la ejecución. Ver [`Motor::recoger_los_restos`].
 pub const ETIQUETA_DEL_CREADOR: &str = "kesto-e2e-pid";
 
+/// Etiqueta con la que un contenedor de la batería se declara **fuente de copia**.
+///
+/// Es el **mismo** valor que `crate::docker::ETIQUETA_DE_FUENTE_DE_COPIA`: el motor solo crea
+/// `exec` en contenedores que la llevan con el valor [`VALOR_DE_FUENTE_DE_COPIA`], así que los
+/// contenedores de los que Kesto copia o en los que restaura tienen que declararla. Se repite
+/// aquí porque la batería es un crate aparte y no puede importar el binario; al cambiar el valor
+/// en producción hay que cambiarlo también aquí.
+pub const ETIQUETA_DE_FUENTE_DE_COPIA: &str = "io.kesto.backup-source";
+
+/// Valor de la etiqueta que declara un contenedor fuente de copia.
+///
+/// El **mismo** que `crate::docker::VALOR_DE_FUENTE_DE_COPIA`: la comparación del motor es exacta.
+pub const VALOR_DE_FUENTE_DE_COPIA: &str = "true";
+
 /// Imagen por defecto del servidor S3 de la batería.
 ///
 /// Fijada por **versión** —nunca `latest`—, como el resto de las piezas, para que la batería no
@@ -289,6 +303,13 @@ pub struct Receta<'a> {
     pub puerto: Option<(u16, u16)>,
     /// Fichero del host montado dentro: `(ruta del host, ruta del contenedor)`.
     pub montaje: Option<(&'a str, &'a str)>,
+    /// Si el contenedor se declara **fuente de copia** para el motor.
+    ///
+    /// El motor solo crea `exec` en contenedores que llevan la etiqueta
+    /// `io.kesto.backup-source=true`, así que los contenedores de los que Kesto copia o en los
+    /// que restaura tienen que declararlo. Los que solo existen para la prueba —el servidor S3,
+    /// por ejemplo— no: nacen sin la etiqueta y el motor no les crearía ningún `exec`.
+    pub fuente_de_copia: bool,
 }
 
 /// Lo que un proceso dejó al terminar dentro de un contenedor.
@@ -497,6 +518,25 @@ impl Motor {
             .montaje
             .map(|(del_host, del_contenedor)| vec![format!("{del_host}:{del_contenedor}:ro,z")]);
 
+        // La etiqueta que deja dicho **qué proceso** creó el contenedor, que es lo único que
+        // permite después distinguir los restos de una ejecución muerta de los contenedores de
+        // otra que esté viva: ver [`Motor::recoger_los_restos`].
+        let mut etiquetas = HashMap::from([(
+            ETIQUETA_DEL_CREADOR.to_owned(),
+            std::process::id().to_string(),
+        )]);
+
+        // Y, si la receta lo pide, la etiqueta que declara el contenedor **fuente de copia**: es
+        // la que el motor exige para crear un `exec` en él, así que sin ella Kesto no podría
+        // copiar ni restaurar. Se añade **sin pisar** la del creador: son dos etiquetas distintas
+        // y las dos hacen falta.
+        if receta.fuente_de_copia {
+            etiquetas.insert(
+                ETIQUETA_DE_FUENTE_DE_COPIA.to_owned(),
+                VALOR_DE_FUENTE_DE_COPIA.to_owned(),
+            );
+        }
+
         let configuracion = Config {
             image: Some(receta.imagen.to_owned()),
             // Un `cmd` vacío se deja **sin declarar**, y no como lista vacía: declararlo vacío
@@ -505,13 +545,7 @@ impl Motor {
             cmd: (!receta.cmd.is_empty())
                 .then(|| receta.cmd.iter().map(|parte| (*parte).to_owned()).collect()),
             env: Some(receta.env.iter().map(|par| (*par).to_owned()).collect()),
-            // La etiqueta que deja dicho **qué proceso** creó el contenedor, que es lo único que
-            // permite después distinguir los restos de una ejecución muerta de los contenedores de
-            // otra que esté viva: ver [`Motor::recoger_los_restos`].
-            labels: Some(HashMap::from([(
-                ETIQUETA_DEL_CREADOR.to_owned(),
-                std::process::id().to_string(),
-            )])),
+            labels: Some(etiquetas),
             host_config: Some(HostConfig {
                 port_bindings: puertos,
                 binds: montajes,
@@ -930,10 +964,14 @@ impl Kesto {
     /// es `Disabled`, el proceso declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— con un
     /// bind de loopback: sin ellos la aplicación se niega a arrancar.
     ///
+    /// `raiz_de_copias` es la raíz bajo la que el motor acepta el `host_path` de un target
+    /// `directory` —se declara como `KESTO_BACKUP_ROOT`—: es la raíz temporal de la batería, y
+    /// los directorios que los escenarios copian cuelgan de ella.
+    ///
     /// # Errors
     ///
     /// Si el proceso no arranca o no llega a contestar la salud.
-    pub async fn arrancar(socket: &str) -> Result<Self, String> {
+    pub async fn arrancar(socket: &str, raiz_de_copias: &Path) -> Result<Self, String> {
         let puerto = puerto_libre();
         let raiz = std::env::temp_dir().join(format!("kesto-e2e-binario-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&raiz)
@@ -941,6 +979,16 @@ impl Kesto {
 
         let registro = File::create(raiz.join("kesto.log"))
             .map_err(|causa| format!("no se pudo abrir el registro de la prueba: {causa}"))?;
+
+        let raiz_de_copias = raiz_de_copias
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "la raíz de copias `{}` no es UTF-8",
+                    raiz_de_copias.display()
+                )
+            })?
+            .to_owned();
 
         let hijo = Command::new(env!("CARGO_BIN_EXE_kesto"))
             // `env_clear` deja la prueba hermética: lo que el binario ve es solo lo de aquí.
@@ -952,6 +1000,7 @@ impl Kesto {
                 "DATABASE_URL",
                 format!("sqlite://{}/kesto.db", raiz.display()),
             )
+            .env("KESTO_BACKUP_ROOT", raiz_de_copias)
             .env("RUST_LOG", "info")
             .env(ENV_DOCKER_HOST, socket)
             .stdin(Stdio::null())
@@ -1493,6 +1542,9 @@ impl Mundo {
                         .expect("la ruta de la configuración del S3 es UTF-8"),
                     "/etc/seaweedfs/s3.json",
                 )),
+                // El servidor S3 **no** es fuente de copia: no se copia ni se restaura en él, así
+                // que no lleva la etiqueta y el motor no le crearía ningún `exec`.
+                fuente_de_copia: false,
             })
             .await
             .unwrap_or_else(|motivo| panic!("{motivo}"));
@@ -1526,7 +1578,7 @@ impl Mundo {
         // El binario, contra el mismo socket del motor. Y sin proveedor de identidad: modo de
         // desarrollo, donde toda la API está abierta.
         let socket = motor.socket().to_owned();
-        let kesto = Kesto::arrancar(&socket)
+        let kesto = Kesto::arrancar(&socket, &raiz)
             .await
             .unwrap_or_else(|motivo| panic!("{motivo}"));
 

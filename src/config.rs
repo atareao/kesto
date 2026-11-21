@@ -1,6 +1,7 @@
 //! Configuración efectiva del proceso, leída del entorno una sola vez al arrancar.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -12,6 +13,8 @@ const ENV_RUST_LOG: &str = "RUST_LOG";
 const ENV_BIND_ADDRESS: &str = "BIND_ADDRESS";
 /// Nombre de la variable que fija la cadena de base de datos (§8 del SRS).
 const ENV_DATABASE_URL: &str = "DATABASE_URL";
+/// Raíz bajo la que viven los directorios que un target `directory` puede copiar.
+const ENV_KESTO_BACKUP_ROOT: &str = "KESTO_BACKUP_ROOT";
 /// Clave maestra del cifrado en reposo: obligatoria siempre.
 const ENV_KESTO_MASTER_KEY: &str = "KESTO_MASTER_KEY";
 /// Clave de firma de la sesión: obligatoria solo con la autenticación encendida.
@@ -73,6 +76,15 @@ pub const DEFAULT_LOG_FILTER: &str = "info";
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8080";
 /// Cadena de base de datos por defecto: la del §8 del SRS.
 const DEFAULT_DATABASE_URL: &str = "sqlite:///app/data/kesto.db";
+/// Raíz de las copias de directorio por defecto.
+///
+/// Es exactamente donde el `compose` del §8 monta los directorios a respaldar
+/// (`/var/www:/backup_sources/var_www:ro`), así que el despliegue de referencia funciona sin
+/// declarar nada. **No** se cablea en código —y de ahí que sea una variable— porque el e2e y el
+/// modo local copian directorios temporales que no viven ahí, y porque el operador tiene que poder
+/// moverla sin tocar el binario; y **no** se deriva de los montajes del propio contenedor porque en
+/// el modo local no hay contenedor de Kesto que inspeccionar.
+pub(crate) const DEFAULT_BACKUP_ROOT: &str = "/backup_sources";
 /// URL de retorno por defecto: el callback local, para el desarrollo con proveedor.
 const DEFAULT_OIDC_REDIRECT_URL: &str = "http://localhost:8080/api/v1/auth/callback";
 /// Longitud mínima, medida en caracteres, que se le exige a una credencial para
@@ -124,6 +136,15 @@ pub struct Config {
     pub bind_address: SocketAddr,
     /// Cadena de conexión de la base de datos (hoy, una ruta SQLite).
     pub database_url: String,
+    /// Raíz bajo la que el motor acepta el `host_path` de un target `directory`.
+    ///
+    /// Se guarda **tal como se declaró**, sin canonicalizar. La comparación del borde HTTP es
+    /// **textual** por diseño —compara el `host_path` declarado contra esta raíz declarada, por
+    /// componentes y sin tocar el disco—, y la canonicalización —que resuelve los enlaces
+    /// simbólicos de los dos lados— es cosa del motor, que la hace por su cuenta cuando la
+    /// necesita. Guardarla resuelta desajustaría el borde: una raíz declarada que es un enlace
+    /// rechazaría con un `400` una ruta textual que el motor sí aceptaría.
+    pub raiz_de_copias: PathBuf,
     /// Modo de autenticación efectivo.
     pub auth: AuthMode,
     /// Clave de firma de la sesión: obligatoria solo con la autenticación encendida.
@@ -202,6 +223,16 @@ pub enum ConfigError {
         name: &'static str,
         /// Longitud mínima exigida.
         min: usize,
+    },
+
+    /// La raíz de las copias de directorio está presente pero no sirve.
+    ///
+    /// Nombra la variable y nunca su valor: el valor es una ruta del despliegue, y este es un
+    /// error de arranque que un operador va a leer en un registro.
+    #[error("la variable de entorno {name} debe ser una ruta absoluta")]
+    InvalidBackupRoot {
+        /// Nombre de la variable mal formada.
+        name: &'static str,
     },
 }
 
@@ -284,6 +315,37 @@ impl Config {
         let database_url = lookup
             .get(ENV_DATABASE_URL)
             .unwrap_or_else(|| DEFAULT_DATABASE_URL.to_owned());
+
+        // La raíz de las copias de directorio. Se lee **aquí**, entre dos variables que ya se
+        // leían, sin mover ninguna: el orden de la lectura es lo que fija qué error se ve primero
+        // cuando hay varios problemas, y reordenarlo cambiaría mensajes ya probados. La variable
+        // es opcional y su ausencia cae al defecto; una raíz presente que no sea absoluta —vacía
+        // incluida— es un error de arranque, como `RUST_LOG=""` y `BIND_ADDRESS=""`: un valor
+        // presente pero inutilizable no se degrada en silencio.
+        //
+        // El valor no se recorta: una raíz que empiece por un espacio no es absoluta y falla, que
+        // es justo lo que hay que hacer con una variable pegada con un espacio de más.
+        //
+        // La raíz se guarda **tal como se declaró**, sin canonicalizar. El borde HTTP compara el
+        // `host_path` declarado contra esta raíz declarada, y la comparación es textual a
+        // propósito; el motor canonicaliza **los dos lados** por su cuenta cuando la necesita. Si
+        // aquí se guardara resuelta, una raíz declarada que es un enlace dejaría de casar con las
+        // rutas textuales que el borde acepta, y el alta rechazaría con un `400` desconcertante una
+        // ruta que el motor sí admitiría.
+        let raiz_de_copias = match lookup.get(ENV_KESTO_BACKUP_ROOT) {
+            None => PathBuf::from(DEFAULT_BACKUP_ROOT),
+            Some(raw) => {
+                let declarada = Path::new(&raw);
+
+                if !declarada.is_absolute() {
+                    return Err(ConfigError::InvalidBackupRoot {
+                        name: ENV_KESTO_BACKUP_ROOT,
+                    });
+                }
+
+                declarada.to_path_buf()
+            }
+        };
 
         // Una `RUST_LOG` presente pero en blanco es un valor presente e
         // inutilizable: `EnvFilter` interpreta la cadena vacía como «todo
@@ -428,6 +490,7 @@ impl Config {
         Ok(Self {
             bind_address,
             database_url,
+            raiz_de_copias,
             auth,
             secret,
             master_key: SecretString::new(master_key),
@@ -530,7 +593,9 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthMode, Config, ConfigError, DEFAULT_BIND_ADDRESS};
+    use std::path::PathBuf;
+
+    use super::{AuthMode, Config, ConfigError, DEFAULT_BACKUP_ROOT, DEFAULT_BIND_ADDRESS};
     use crate::test_support::lookup_from;
 
     /// Clave maestra distinguible, con la longitud de sobra.
@@ -1493,5 +1558,131 @@ mod tests {
             .expect("sin KESTO_SECRET el modo de desarrollo arranca igual");
 
         assert!(matches!(&config.auth, AuthMode::Disabled));
+    }
+
+    /// 1.1 — Sin `KESTO_BACKUP_ROOT`, la raíz de copias es la del `compose` del §8.
+    #[test]
+    fn sin_la_raiz_de_copias_gana_el_defecto() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ]);
+
+        let config =
+            Config::from_lookup(&lookup).expect("sin la raíz de copias la configuración es válida");
+
+        assert_eq!(
+            config.raiz_de_copias,
+            PathBuf::from("/backup_sources"),
+            "sin la variable, la raíz tiene que ser la que monta el §8"
+        );
+    }
+
+    /// 1.2 — Una raíz de copias relativa no se acepta.
+    #[test]
+    fn una_raiz_de_copias_relativa_es_error_de_arranque() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("KESTO_BACKUP_ROOT", "backup_sources"),
+        ]);
+
+        let error =
+            Config::from_lookup(&lookup).expect_err("una raíz de copias relativa no arranca");
+        let mensaje = error.to_string();
+
+        assert!(
+            matches!(&error, ConfigError::InvalidBackupRoot { name } if *name == "KESTO_BACKUP_ROOT"),
+            "el error no señala KESTO_BACKUP_ROOT: {mensaje}"
+        );
+        assert!(
+            mensaje.contains("KESTO_BACKUP_ROOT"),
+            "el mensaje no nombra KESTO_BACKUP_ROOT: {mensaje}"
+        );
+        // El mensaje nombra la variable, nunca el valor de ninguna otra.
+        assert!(
+            !mensaje.contains(MASTER_KEY),
+            "el mensaje publica el valor de KESTO_MASTER_KEY: {mensaje}"
+        );
+    }
+
+    /// 1.3 — Una raíz de copias vacía no cae al defecto.
+    #[test]
+    fn una_raiz_de_copias_vacia_no_cae_al_defecto() {
+        // El artefacto de un `compose` que interpola una variable que no definiste es la cadena
+        // vacía, y una raíz vacía es relativa: el proceso no puede arrancar con una raíz que
+        // nadie pidió, ni puede caer en silencio a `/backup_sources`.
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("KESTO_BACKUP_ROOT", ""),
+        ]);
+
+        let error = Config::from_lookup(&lookup).expect_err("una raíz de copias vacía no arranca");
+        let mensaje = error.to_string();
+
+        assert!(
+            matches!(&error, ConfigError::InvalidBackupRoot { name } if *name == "KESTO_BACKUP_ROOT"),
+            "el error no señala KESTO_BACKUP_ROOT: {mensaje}"
+        );
+        assert!(
+            !mensaje.contains(DEFAULT_BACKUP_ROOT),
+            "el mensaje deja entrever el defecto: {mensaje}"
+        );
+    }
+
+    /// 1.4 — Una raíz de copias absoluta se lee.
+    #[test]
+    fn una_raiz_de_copias_absoluta_se_lee() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("KESTO_BACKUP_ROOT", "/tmp/kesto-copias-de-prueba"),
+        ]);
+
+        let config = Config::from_lookup(&lookup)
+            .expect("una raíz de copias absoluta es una configuración válida");
+
+        assert_eq!(
+            config.raiz_de_copias,
+            PathBuf::from("/tmp/kesto-copias-de-prueba"),
+            "una raíz que no existe se guarda tal cual: el motor la canonicaliza cuando la use"
+        );
+    }
+
+    /// 1.4b — Una raíz de copias que existe se guarda **tal cual**, sin canonicalizar.
+    ///
+    /// La raíz se declara a través de un enlace para que la afirmación signifique algo: si se
+    /// guardara resuelta, el valor diferiría del declarado y el borde HTTP —que compara por texto—
+    /// rechazaría rutas que el motor aceptaría. La canonicalización es cosa del motor.
+    #[test]
+    fn una_raiz_de_copias_existente_se_guarda_tal_cual() {
+        let directorio = crate::test_support::directorio_de_prueba();
+        let real = directorio.ruta().join("real");
+        std::fs::create_dir(&real).expect("el directorio real de la prueba se crea");
+        let enlace = directorio.ruta().join("enlace");
+        std::os::unix::fs::symlink(&real, &enlace).expect("el enlace de la prueba se crea");
+
+        let declarada = enlace.to_str().expect("las rutas del arnés son UTF-8");
+
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("KESTO_BACKUP_ROOT", declarada),
+        ]);
+
+        let config = Config::from_lookup(&lookup).expect("una raíz existente es válida");
+
+        assert_eq!(
+            config.raiz_de_copias,
+            PathBuf::from(declarada),
+            "la raíz se guarda tal como se declaró: la comparación del borde es textual y la \
+             canonicalización es cosa del motor"
+        );
+        assert_ne!(
+            config.raiz_de_copias,
+            std::fs::canonicalize(&enlace).expect("el enlace de la prueba existe"),
+            "guardarla resuelta desajustaría la comparación textual del borde"
+        );
     }
 }

@@ -158,6 +158,8 @@ sqlite3 -readonly <db_path> .dump
 
 El volcado de SQLite es un **volcado SQL** —las sentencias que reconstruyen el esquema y los datos—, no una copia del fichero. `sqlite3 -readonly <db_path> .dump` se ejecuta **dentro del contenedor del target** y lee la base de forma **consistente en caliente**, de modo que la copia es válida con el **modo WAL** activo y con la base **en uso**, sin detener el servicio. El `-readonly` es obligatorio: sin él `sqlite3` **crea** el fichero si la ruta no existe y `.dump` sobre una base vacía no emite nada y sale con código 0, así que una ruta mal escrita daría una ejecución en `success` con un volcado vacío. No se copia el `.db` con un `cp` —ni su `-wal`—: con WAL activo el `.db` puede ir por detrás de su `.wal` y la copia resultante puede restaurarse con corrupción o con datos perdidos sin que nada lo delate. El contenedor del target debe disponer del binario `sqlite3`.
 
+> **Nota (confinamiento del `db_path`).** El `db_path` queda **confinado al contenedor del target** y ha de ser su **forma canónica** dentro de él: antes de ejecutar ninguna orden el motor resuelve `readlink -f <db_path>` y exige coincidencia **exacta** con la ruta declarada; si difiere —hay un `..` o un enlace simbólico, también en un directorio padre— la ejecución acaba en `failed` sin volcar y sin retirar nada. El contenedor ha de traer **`readlink`** además de `sqlite3`. El `host_path` de un target `directory` queda, a su vez, bajo `KESTO_BACKUP_ROOT` (ver §8).
+
 
 ```
 [Target DB Container] 
@@ -299,6 +301,10 @@ services:
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:?}
       - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:?}
       - KESTO_SECRET=${KESTO_SECRET:?}
+      # Raíz bajo la que ha de quedar el `host_path` de un target `directory`.
+      # Ruta absoluta; por defecto /backup_sources, que es donde se montan abajo
+      # los directorios a respaldar. Presente pero relativa o vacía = error de arranque.
+      - KESTO_BACKUP_ROOT=/backup_sources
     volumes:
       # Acceso al socket de Docker del host
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -314,3 +320,16 @@ volumes:
 ```
 
 `compose.yaml` reproduce este despliegue y **exige proveedor de identidad**: declara `KESTO_MASTER_KEY`, las tres `OIDC_*` y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose config` —y `podman compose up`— se niegan a levantar el servicio, sin crear el contenedor, cuando falte cualquiera de ellas. El motivo es que sin las `OIDC_*` el modo sería el de **desarrollo**, que exige el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**: con el proceso atado a loopback el reenvío del puerto no alcanza al servicio, así que `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor y el modo de desarrollo no se publica. Los secretos entran siempre por el entorno del host (`.env` o gestor de secretos), nunca escritos en este fichero.
+
+**`KESTO_BACKUP_ROOT`** es la raíz bajo la que ha de quedar el `host_path` de un target `directory`. Su valor por defecto es `/backup_sources` —exactamente donde este `compose` monta los directorios a respaldar—, así que la plantilla de referencia no necesita declararla. Es una ruta **absoluta**: presente pero relativa o vacía es **error de arranque** que nombra la variable, en la línea de `RUST_LOG=""` y `BIND_ADDRESS=""`; ausente toma el defecto.
+
+Los **contenedores de los que se copia** (los targets de base de datos) han de declararse **fuentes de copia** con la etiqueta `io.kesto.backup-source=true` al crearlos: el motor inspecciona el contenedor **antes** de crear ningún `exec` y lo exige, de modo que sin la etiqueta la ejecución acaba en `failed` sin ejecutar nada. La etiqueta viaja con el contenedor y no hay lista de configuración que poblar; el propio `kesto-app` queda denegado por sí solo, porque nadie lo etiqueta. Un origen de ejemplo:
+
+```yaml
+  mariadb:
+    image: mariadb:11
+    labels:
+      # Se declara fuente de copia: sin esta etiqueta el motor no le crea `exec`.
+      - io.kesto.backup-source=true
+```
+

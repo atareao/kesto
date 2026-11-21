@@ -352,7 +352,8 @@ async fn main() -> std::process::ExitCode {
     //    El socket sale de la configuración —`DOCKER_HOST`, con la ruta del §8 de defecto—,
     //    y no del entorno del proceso: es la misma lectura inyectada que el resto, y es lo
     //    que deja que una prueba quiera otro socket sin tocar el entorno.
-    let ajustes = Ajustes::nuevos(config.docker_host.clone());
+    let ajustes = Ajustes::nuevos(config.docker_host.clone())
+        .con_raiz_de_copias(config.raiz_de_copias.clone());
     // La espera de la parada se lee **antes** de mover los ajustes al motor, porque es el
     // número con el que el apagado de más abajo acota su espera, y de ahí no se puede leer.
     let espera_de_parada = ajustes.espera_de_parada;

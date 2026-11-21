@@ -25,7 +25,7 @@
 //! # Dónde está cada cosa
 //!
 //! - [`arnes`]: el motor de contenedores, el servidor S3, el binario y las comparaciones.
-//! - [`escenarios`]: los veintiún escenarios de `verificacion-e2e`, uno por prueba.
+//! - [`escenarios`]: los treinta escenarios de `verificacion-e2e`, uno por prueba.
 
 mod arnes;
 mod escenarios;
