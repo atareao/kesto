@@ -425,6 +425,21 @@ pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppEr
     ))
 }
 
+/// Juzga el `endpoint` de un cuerpo contra la regla del módulo puro.
+///
+/// Es la **única** puerta del borde para esta regla: el alta y la edición la llaman aquí y nadie
+/// más decide qué `endpoint` vale, así que las dos rutas no pueden discrepar. El motivo se
+/// devuelve tal cual —ya nombra el campo `endpoint` y **no** repite la URL recibida, que es la
+/// regla de los `400` de esta casa—.
+///
+/// El permiso entra por parámetro y sale de la configuración, no de la petición: es una decisión
+/// del operador sobre el despliegue, no un campo del cuerpo, y por eso un cliente no puede
+/// concedérselo a sí mismo.
+fn endpoint_admisible(endpoint: &str, permitir_inseguro: bool) -> Result<(), AppError> {
+    crate::rustic::endpoint::validar(endpoint, permitir_inseguro)
+        .map_err(|error| AppError::InvalidInput(error.to_string()))
+}
+
 /// `POST /api/v1/repositories` — el alta, que habla con el destino y contesta `201`.
 ///
 /// Los dos secretos del cuerpo son `Option`, y aquí se exigen: las columnas del §3 son
@@ -472,6 +487,13 @@ pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppEr
 /// dato del formulario —la passphrase que no abre el repositorio que ya está, o un campo que no
 /// puede funcionar—, y `502` si el que no contesta es el destino. La frontera es de quién es la
 /// culpa, y el porqué está escrito allí, con el de la tabla que **no** elige.
+///
+/// El oráculo que este change **no** cierra: la validación del `endpoint` es una puerta **previa**
+/// —se decide sobre el cuerpo y llega antes de hablar con el destino—, no un sustituto de la
+/// comprobación de conectividad. Por eso el alta sigue distinguiendo los dos desenlaces y **no** los
+/// uniforma: «la petición no vale» sigue siendo `400` —y desde este change ese `400` ya no depende
+/// del destino, porque un `endpoint` inadmisible se rechaza sin llegar a tocarlo—, y «el destino no
+/// responde» sigue siendo `502`. La respuesta del alta sigue diciendo cuál de las dos cosas pasó.
 ///
 /// # Lo que cuesta, y por qué **sí** está acotado
 ///
@@ -526,6 +548,12 @@ pub async fn alta(
             "el campo `passphrase` es obligatorio en un alta".to_owned(),
         ));
     };
+
+    // El `endpoint` se juzga antes de montar la fila y antes de hablar con el destino: es el único
+    // campo que decide a dónde conecta el proceso, y un valor inadmisible no puede llegar ni a la
+    // base ni al motor. Los dos campos obligatorios se comprueban antes porque ése es el orden que
+    // el alta ya tenía y el que sus mensajes tienen probado.
+    endpoint_admisible(&cuerpo.endpoint, state.config.allow_insecure_endpoint)?;
 
     // La fila, montada y **sin escribir**: es el valor con el que se arma el acceso y el que se
     // guardará si el destino contesta bien. Montarla aquí no adelanta nada de lo que el orden evita,
@@ -614,6 +642,10 @@ pub async fn leer(
 /// Lo que se paga, y se dice: si el `PUT` cambia el endpoint o la credencial a algo que no funciona,
 /// la fila queda guardada y el fallo aparecerá en la primera copia. Es el mismo trato que tenía el
 /// alta antes de este change, y se acepta porque la alternativa —no poder editar— es peor.
+///
+/// Lo que **sí** comparte con el alta desde ahora es la regla del `endpoint`: se juzga en el borde
+/// de las dos rutas y en un solo sitio —[`endpoint_admisible`]—, así que un valor inadmisible se
+/// rechaza aquí igual que allí y el `PUT` no puede ser la puerta de atrás del `POST`.
 pub async fn actualizar(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -624,6 +656,12 @@ pub async fn actualizar(
     let Some(actual) = state.db.repositorios.leer(&uuid).await? else {
         return Err(repositorio_ausente());
     };
+
+    // La edición aplica **la misma** regla que el alta: sin esto, el `PUT` sería la puerta de atrás
+    // del `POST` —bastaría dar de alta un `endpoint` admisible y editarlo después por el que no lo
+    // es—. El `404` de la fila ausente se decide antes, igual que antes de este change: la
+    // validación no cambia qué desenlace tiene una fila que no está.
+    endpoint_admisible(&cuerpo.endpoint, state.config.allow_insecure_endpoint)?;
 
     let fila = Repositorio {
         id: actual.id,
@@ -839,9 +877,10 @@ mod tests {
     use crate::state::EstadoDeBase;
     use crate::test_support::{
         OTRA_PASSPHRASE_DE_PRUEBA, PASSPHRASE_DE_PRUEBA, abrir_local, base_con_clave, body_json,
-        body_text, capturar_log, config_con_dsn, delete, destino_local_de_prueba,
-        directorio_de_prueba, estado_de_prueba, estado_de_prueba_con_comprobador,
-        estado_desarrollo, get, post, post_crudo, post_json, put_json, sembrar_snapshots,
+        body_text, capturar_log, config_con_dsn, config_con_dsn_y_endpoint_inseguro, delete,
+        destino_local_de_prueba, directorio_de_prueba, endpoint_de_prueba, estado_de_prueba,
+        estado_de_prueba_con_comprobador, estado_desarrollo, get, post, post_crudo, post_json,
+        put_json, ruta_del_endpoint, sembrar_snapshots,
     };
 
     /// Credencial distinguible que las pruebas de rechazo de cuerpo no pueden ver salir.
@@ -1370,6 +1409,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn un_put_con_el_endpoint_inadmisible_sobre_una_fila_inexistente_contesta_404() {
+        // El orden importa y es lo que mide esta prueba: en `actualizar` la fila se busca **antes**
+        // de juzgar el `endpoint`, así que un `PUT` a una fila que no está es un `404` aunque su
+        // `endpoint` tampoco valga. Si el `400` de la validación se adelantara, el panel dejaría de
+        // poder distinguir «no existe» de «no vale».
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let id = Uuid::new_v4().to_string();
+
+        let respuesta = put_json(
+            api_router(estado),
+            &format!("/api/v1/repositories/{id}"),
+            &cuerpo_contra(
+                "repo-cruce-404",
+                "http://s3.example.test/cruce",
+                PASSPHRASE_DE_PRUEBA,
+            ),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "la fila ausente se decide antes que el `endpoint`: {status} con {cuerpo}"
+        );
+        assert_eq!(
+            cuerpo["status"], 404,
+            "la envoltura repite el código: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_alta_sin_secreto_con_el_endpoint_inadmisible_contesta_400_por_el_secreto() {
+        // El otro cruce: en `alta` los dos secretos obligatorios se comprueban **antes** que el
+        // `endpoint`, así que a un cuerpo al que le falta `secret_access_key` y además trae un
+        // `endpoint` por `http` se le contesta por el secreto. El mensaje tiene que nombrar el
+        // campo del secreto, no el `endpoint`.
+        let router = api_router(estado_desarrollo().await);
+
+        let mut cuerpo = cuerpo_contra(
+            "repo-cruce-400",
+            "http://s3.example.test/cruce",
+            PASSPHRASE_DE_PRUEBA,
+        );
+        cuerpo
+            .as_object_mut()
+            .expect("el cuerpo es un objeto")
+            .remove("secret_access_key");
+
+        let respuesta = post_json(router, "/api/v1/repositories", &cuerpo).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un alta sin secreto es un 400, y se decide antes que el `endpoint`: {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"].as_str().unwrap_or_default();
+        assert!(
+            mensaje.contains("secret_access_key"),
+            "el 400 tiene que nombrar el campo que falta: {cuerpo}"
+        );
+    }
+
     /// 1.32 — Un `PUT` sin el secreto conserva el almacenado.
     ///
     /// Cubre `api-resources`, requisito 3 (escenario «Un PUT sin el secreto conserva el
@@ -1599,12 +1714,13 @@ mod tests {
 
     /// El cuerpo de un alta válida, con valores distinguibles por su nombre.
     ///
-    /// El `endpoint` es la ruta de un directorio temporal y no una URL de mentira, y eso no es un
-    /// detalle del arnés: desde el change `backup-engine` el alta **habla con el destino** —lo
-    /// inicializa si está vacío—, así que una URL que no existe convierte un alta válida en un
-    /// fallo por destino inalcanzable. [`destino_local_de_prueba`] deja además la ruta viva mientras
-    /// el proceso de pruebas corra, que es lo que hace falta porque el alta ocurre después de
-    /// construir el cuerpo.
+    /// El `endpoint` es una URL `https` de anfitrión fingido cuyo **camino** es la ruta de un
+    /// directorio temporal —lo que deja [`destino_local_de_prueba`]—, y eso no es un detalle del
+    /// arnés: desde el change `backup-engine` el alta **habla con el destino** —lo inicializa si
+    /// está vacío—, así que un `endpoint` cuyo camino no exista convierte un alta válida en un fallo
+    /// por destino inalcanzable. El abridor local del arnés traduce ese camino a la ruta y abre ahí
+    /// el repositorio, y [`destino_local_de_prueba`] deja además la ruta viva mientras el proceso de
+    /// pruebas corra, que es lo que hace falta porque el alta ocurre después de construir el cuerpo.
     fn cuerpo_de_alta(nombre: &str) -> serde_json::Value {
         serde_json::json!({
             "name": nombre,
@@ -1936,9 +2052,10 @@ mod tests {
     //
     // Cubre `api-resources`, requisito «El alta de un repositorio conecta con él, y lo inicializa
     // si todavía no existe», con sus cuatro escenarios. El instrumento es el abridor **local** del
-    // arnés: el `endpoint` de la fila es la ruta de un directorio temporal y el motor abre ahí un
-    // repositorio del sistema de ficheros, así que los cuatro desenlaces se recorren sin red, sin
-    // S3 y sin credenciales —que es lo que permite que esto corra en el CI—.
+    // arnés: el `endpoint` de la fila es una URL `https` de anfitrión fingido cuyo camino es la ruta
+    // de un directorio temporal —el abridor local traduce ese camino y abre ahí—, así que los cuatro
+    // desenlaces se recorren sin red, sin S3 y sin credenciales —que es lo que permite que esto
+    // corra en el CI—.
 
     /// El secreto de estas pruebas, distinguible para que un `contains` no dé un falso positivo.
     const SECRETO_DEL_ALTA_1_31: &str = "AKIAIOSFODNN7EXAMPLE-secreto-del-alta-1-31";
@@ -2015,12 +2132,15 @@ mod tests {
         let router = api_router(estado_desarrollo().await);
 
         let destino = directorio_de_prueba();
-        let ruta = destino.ruta().to_string_lossy().into_owned();
 
         let respuesta = post_json(
             router,
             "/api/v1/repositories",
-            &cuerpo_contra("repo-1-31a", &ruta, PASSPHRASE_DE_PRUEBA),
+            &cuerpo_contra(
+                "repo-1-31a",
+                &endpoint_de_prueba(destino.ruta()),
+                PASSPHRASE_DE_PRUEBA,
+            ),
         )
         .await;
 
@@ -2055,7 +2175,6 @@ mod tests {
         let router = api_router(estado_desarrollo().await);
 
         let destino = directorio_de_prueba();
-        let ruta = destino.ruta().to_string_lossy().into_owned();
         let antes = inventario(destino.ruta());
 
         sembrar_snapshots(
@@ -2067,7 +2186,11 @@ mod tests {
         let respuesta = post_json(
             router,
             "/api/v1/repositories",
-            &cuerpo_contra("repo-1-31b", &ruta, PASSPHRASE_DE_PRUEBA),
+            &cuerpo_contra(
+                "repo-1-31b",
+                &endpoint_de_prueba(destino.ruta()),
+                PASSPHRASE_DE_PRUEBA,
+            ),
         )
         .await;
 
@@ -2117,13 +2240,14 @@ mod tests {
         );
 
         // El destino es un fichero de verdad en la ruta donde el motor espera un directorio.
-        let ruta = destino_local_de_prueba("repo-1-31c");
+        let endpoint = destino_local_de_prueba("repo-1-31c");
+        let ruta = ruta_del_endpoint(&endpoint);
         std::fs::write(&ruta, b"esto no es un repositorio").expect("el fichero del destino");
 
         let respuesta = post_json(
             api_router(estado),
             "/api/v1/repositories",
-            &cuerpo_contra("repo-1-31c", &ruta, PASSPHRASE_DE_PRUEBA),
+            &cuerpo_contra("repo-1-31c", &endpoint, PASSPHRASE_DE_PRUEBA),
         )
         .await;
 
@@ -2181,7 +2305,6 @@ mod tests {
         );
 
         let destino = directorio_de_prueba();
-        let ruta = destino.ruta().to_string_lossy().into_owned();
 
         sembrar_snapshots(
             destino.ruta(),
@@ -2194,7 +2317,11 @@ mod tests {
         let respuesta = post_json(
             api_router(estado),
             "/api/v1/repositories",
-            &cuerpo_contra("repo-1-31d", &ruta, OTRA_PASSPHRASE_DE_PRUEBA),
+            &cuerpo_contra(
+                "repo-1-31d",
+                &endpoint_de_prueba(destino.ruta()),
+                OTRA_PASSPHRASE_DE_PRUEBA,
+            ),
         )
         .await;
 
@@ -2235,6 +2362,272 @@ mod tests {
         assert!(
             !texto.contains(SECRETO_DEL_ALTA_1_31),
             "el error publicó la clave secreta que iba en la petición: {texto}"
+        );
+    }
+
+    // ── El borde valida el `endpoint` ────────────────────────────────────────
+    //
+    // Cubre `api-resources`, requisito «El `endpoint` de una fila de repositorio tiene que ser
+    // admisible». El `endpoint` es el único campo de la fila que decide **a dónde** conecta el
+    // proceso, y su comprobación es pura: no sale a la red ni toca el destino, así que un valor
+    // inadmisible se corta en el borde con un `400` y sin escribir nada. Los cinco desenlaces
+    // —los dos rechazos, los dos contrapesos y el del permiso declarado— se recorren aquí.
+
+    /// El `endpoint` de prueba con el esquema rebajado a `http`.
+    ///
+    /// El valor de [`destino_local_de_prueba`] es una URL `https://destino.local/<ruta>`; lo único
+    /// que se cambia es el esquema, así que el resto de la URL —anfitrión y camino— queda igual y
+    /// el único motivo de rechazo posible es el esquema.
+    fn con_esquema_http(endpoint: &str) -> String {
+        endpoint.replacen("https://", "http://", 1)
+    }
+
+    /// El `endpoint` de prueba con el anfitrión rebajado al loopback.
+    ///
+    /// Se queda el **camino** de la URL de prueba —que es la ruta real donde el abridor local
+    /// abre el repositorio— y se le pone `127.0.0.1` de anfitrión, así que el único motivo de
+    /// rechazo posible es la dirección.
+    fn con_anfitrion_de_loopback(endpoint: &str) -> String {
+        format!("https://127.0.0.1{}", ruta_del_endpoint(endpoint).display())
+    }
+
+    /// 5.1 — Un alta con el `endpoint` por `http` y sin permiso contesta `400` y no deja fila.
+    #[tokio::test]
+    async fn un_alta_con_el_endpoint_por_http_sin_permiso_contesta_400_y_no_deja_fila() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        let endpoint = con_esquema_http(&destino_local_de_prueba("repo-5-1"));
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-5-1", &endpoint, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `endpoint` por http sin permiso es una petición mal formada: contestó {status} \
+             con {texto}"
+        );
+        assert!(
+            texto.contains("endpoint"),
+            "el 400 tiene que nombrar el campo: {texto}"
+        );
+        assert!(
+            !texto.contains("destino.local"),
+            "el 400 no puede repetir el `endpoint` recibido: {texto}"
+        );
+        assert_eq!(
+            filas_de_repositorios(&pool).await,
+            0,
+            "un alta rechazada no puede dejar fila"
+        );
+    }
+
+    /// 5.2 — Un alta con el `endpoint` al loopback y sin permiso contesta `400` y no deja fila.
+    #[tokio::test]
+    async fn un_alta_con_el_endpoint_al_loopback_sin_permiso_contesta_400_y_no_deja_fila() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        let endpoint = con_anfitrion_de_loopback(&destino_local_de_prueba("repo-5-2"));
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-5-2", &endpoint, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `endpoint` contra el loopback sin permiso es una petición mal formada: contestó \
+             {status} con {texto}"
+        );
+        assert!(
+            texto.contains("endpoint"),
+            "el 400 tiene que nombrar el campo: {texto}"
+        );
+        assert_eq!(
+            filas_de_repositorios(&pool).await,
+            0,
+            "un alta rechazada no puede dejar fila"
+        );
+    }
+
+    /// 5.3 — Un `endpoint` admisible contra un destino que no responde sigue siendo `502`.
+    ///
+    /// Es el contrapeso del oráculo que este change **no** cierra: el `endpoint` pasa la
+    /// validación —es una URL `https` con anfitrión público— y el fallo es del destino, así que el
+    /// código tiene que seguir siendo el `502` de siempre y no un `400`. El destino es un fichero
+    /// de verdad en la ruta donde el motor espera un directorio, que es lo que hace que el motor
+    /// falle en el acto y sin salir de la máquina.
+    #[tokio::test]
+    async fn un_endpoint_admisible_contra_un_destino_que_falla_sigue_contestando_502() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        let endpoint = destino_local_de_prueba("repo-5-3");
+        std::fs::write(ruta_del_endpoint(&endpoint), b"esto no es un repositorio")
+            .expect("el fichero del destino");
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-5-3", &endpoint, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "un destino que no responde es un fallo del servicio de fuera, no de la petición: \
+             contestó {status} con {texto}"
+        );
+        assert_eq!(
+            filas_de_repositorios(&pool).await,
+            0,
+            "un alta contra un destino que falla no puede dejar fila"
+        );
+    }
+
+    /// 5.4 — Un `PUT` con el `endpoint` por `http` y sin permiso contesta `400` y no cambia la fila.
+    #[tokio::test]
+    async fn un_put_con_el_endpoint_por_http_sin_permiso_contesta_400_y_no_cambia_la_fila() {
+        let router = api_router(estado_desarrollo().await).clone();
+
+        let respuesta = post_json(
+            router.clone(),
+            "/api/v1/repositories",
+            &cuerpo_de_alta("repo-5-4"),
+        )
+        .await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::CREATED,
+            "el alta de partida tiene que contestar 201"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador")
+            .to_owned();
+        let endpoint = cuerpo["data"]["endpoint"]
+            .as_str()
+            .expect("la vista del alta trae el endpoint")
+            .to_owned();
+
+        let respuesta = put_json(
+            router.clone(),
+            &format!("/api/v1/repositories/{id}"),
+            &cuerpo_contra(
+                "repo-5-4-modificado",
+                &con_esquema_http(&endpoint),
+                PASSPHRASE_DE_PRUEBA,
+            ),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `endpoint` por http sin permiso es una petición mal formada: contestó {status} \
+             con {texto}"
+        );
+        assert!(
+            texto.contains("endpoint"),
+            "el 400 tiene que nombrar el campo: {texto}"
+        );
+
+        let respuesta = get(router, &format!("/api/v1/repositories/{id}")).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "la fila tiene que seguir estando"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            cuerpo["data"]["name"], "repo-5-4",
+            "un PUT rechazado no puede haber cambiado el nombre"
+        );
+        assert_eq!(
+            cuerpo["data"]["endpoint"], endpoint,
+            "un PUT rechazado no puede haber cambiado el endpoint"
+        );
+    }
+
+    /// 5.5 — Con el permiso declarado, el alta por `http` contra el loopback sigue adelante.
+    ///
+    /// Es el contrapeso que justifica que el permiso exista: es el caso del laboratorio local y el
+    /// de la batería e2e —un almacén en la propia máquina y en claro—, y sin este desenlace la
+    /// validación sería una prohibición sin salida.
+    #[tokio::test]
+    async fn con_el_permiso_declarado_el_alta_por_http_al_loopback_sigue_adelante() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn_y_endpoint_inseguro(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        let endpoint = format!(
+            "http://127.0.0.1{}",
+            ruta_del_endpoint(&destino_local_de_prueba("repo-5-5")).display()
+        );
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_contra("repo-5-5", &endpoint, PASSPHRASE_DE_PRUEBA),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let texto = body_text(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "con el permiso declarado el alta tiene que seguir adelante: contestó {status} con \
+             {texto}"
+        );
+        assert_eq!(
+            filas_de_repositorios(&pool).await,
+            1,
+            "el alta admitida tiene que dejar su fila"
         );
     }
 

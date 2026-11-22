@@ -58,6 +58,11 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 axum-extra = { version = "0.10.3", features = ["cookie"] }
 rand = "0.8.8"
 urlencoding = "2.1.3"
+# URL parsing for the repository `endpoint`: the scheme, the host and the literal address.
+# Hand-rolling it is where the mistakes go (`https://evil@127.0.0.1`, schemes with spaces,
+# IPv6 in brackets). `reqwest` already pulls `url` into the tree, so declaring it directly
+# adds no new crate to `Cargo.lock` -- only the edge.
+url = "2.5.8"
 
 # Persistence (db-schema): SQLite through sqlx, plus the RustCrypto stack that
 # seals the three secret columns at rest. Same rule as above -- every version is

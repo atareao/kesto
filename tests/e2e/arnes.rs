@@ -1084,6 +1084,12 @@ impl Kesto {
     /// es `Disabled`, el proceso declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— con un
     /// bind de loopback: sin ellos la aplicación se niega a arrancar.
     ///
+    /// El almacén de la batería es un servidor S3 en `http://127.0.0.1:<puerto>` —esquema en claro
+    /// y anfitrión de loopback—, así que el borde rechazaría su `endpoint` con un `400` sin el
+    /// permiso del `endpoint`. Se declara con la misma forma que `KESTO_ALLOW_INSECURE` y por el
+    /// mismo motivo —`KESTO_ALLOW_INSECURE_ENDPOINT=1`—, porque la batería es un laboratorio local
+    /// y no un despliegue.
+    ///
     /// `raiz_de_copias` es la raíz bajo la que el motor acepta el `host_path` de un target
     /// `directory` —se declara como `KESTO_BACKUP_ROOT`—: es la raíz temporal de la batería, y
     /// los directorios que los escenarios copian cuelgan de ella.
@@ -1115,6 +1121,7 @@ impl Kesto {
             .env_clear()
             .env("KESTO_MASTER_KEY", CLAVE_MAESTRA)
             .env("KESTO_ALLOW_INSECURE", "1")
+            .env("KESTO_ALLOW_INSECURE_ENDPOINT", "1")
             .env("BIND_ADDRESS", format!("127.0.0.1:{puerto}"))
             .env(
                 "DATABASE_URL",

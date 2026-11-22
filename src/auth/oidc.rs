@@ -525,7 +525,7 @@ mod tests {
         );
         assert!(
             location.contains(
-                "redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fapi%2Fv1%2Fauth%2Fcallback"
+                "redirect_uri=https%3A%2F%2Fpanel.example.test%2Fapi%2Fv1%2Fauth%2Fcallback"
             ),
             "el redirect_uri debe ir codificado en la Location: {location}"
         );

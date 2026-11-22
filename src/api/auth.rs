@@ -183,7 +183,7 @@ pub async fn callback(
         Err(error) => return error.into_response(),
     };
 
-    let cookie = match session::session_cookie(token, &auth.settings.redirect_url) {
+    let cookie = match session::session_cookie(token) {
         Ok(cookie) => cookie,
         Err(error) => return error.into_response(),
     };
@@ -275,20 +275,23 @@ fn cookie_de_borrado() -> Cookie<'static> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::time::Instant;
 
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
     use crate::api::api_router;
+    use crate::auth::limite::MAX_PETICIONES_DE_LOGIN;
     use crate::auth::session::SESSION_COOKIE_NAME;
     use crate::error::AppError;
     use crate::test_support::{
         EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SUB, body_json, body_text, callback_url,
-        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc_con_emisor, get, get_with_cookie,
-        header_text, login_state_y_nonce, parametros_de_consulta, post, post_with_cookie,
-        proveedor_falso::ACCESS_TOKEN, proveedor_falso::IdToken, proveedor_falso::ProveedorFalso,
-        router_oidc, router_oidc_con_emisor, session_cookie_header, token_de_set_cookie,
+        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc_con_emisor, get,
+        get_con_cabecera, get_con_conexion, get_with_cookie, header_text, login_state_y_nonce,
+        parametros_de_consulta, post, post_with_cookie, proveedor_falso::ACCESS_TOKEN,
+        proveedor_falso::IdToken, proveedor_falso::ProveedorFalso, router_oidc,
+        router_oidc_con_emisor, session_cookie_header, token_de_set_cookie,
     };
 
     #[tokio::test]
@@ -345,6 +348,155 @@ mod tests {
         assert!(
             !entrada.expirado_en(Instant::now()),
             "un state recién emitido no puede estar caducado: {entrada:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_login_por_encima_del_cupo_contesta_429() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = estado_oidc_con_emisor(&proveedor.issuer).await;
+        // El limitador vive en el estado, que se clona en cada petición: esta copia
+        // comparte el mismo mapa que usa el router.
+        let auth = estado
+            .auth
+            .clone()
+            .expect("en modo Oidc hay estado de autenticación");
+        let router = api_router(estado);
+
+        for intento in 0..MAX_PETICIONES_DE_LOGIN {
+            let respuesta = get(router.clone(), "/api/v1/auth/login").await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::FOUND,
+                "la petición {intento} está dentro del cupo y tiene que redirigir"
+            );
+        }
+
+        let respuesta = get(router.clone(), "/api/v1/auth/login").await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "por encima del cupo el login tiene que contestar 429"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 429, "el 429 lleva la envoltura: {cuerpo}");
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 429 tiene que traer un mensaje: {cuerpo}"
+        );
+
+        let logins = auth.logins.lock().await;
+
+        assert_eq!(
+            logins.len(),
+            MAX_PETICIONES_DE_LOGIN as usize,
+            "una petición rechazada por el límite no puede guardar su state en el mapa"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_login_dentro_del_cupo_sigue_redirigiendo() {
+        // Contrapeso: el límite no puede romper el camino bueno.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        let respuesta = get(router, "/api/v1/auth/login").await;
+
+        assert_eq!(respuesta.status(), StatusCode::FOUND);
+
+        let location = header_text(&respuesta, header::LOCATION).expect("el 302 trae Location");
+
+        assert!(
+            location.contains("state="),
+            "la redirección tiene que traer el state del flujo: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_respuesta_429_no_publica_la_cabecera_de_la_peticion() {
+        // El límite cuenta por la IP del **socket**, no por una cabecera que el
+        // cliente puede falsificar, y el 429 no puede devolver al cuerpo nada de lo
+        // que mandó la petición.
+        const RASTRO: &str = "rastro-de-la-peticion-que-no-puede-salir";
+
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        let mut ultima = None;
+
+        for indice in 0..=MAX_PETICIONES_DE_LOGIN {
+            // Cada petición declara una IP de origen **distinta** en la cabecera: si
+            // el límite se creyera esa cabecera, ninguna agotaría el cupo.
+            let respuesta = get_con_cabecera(
+                router.clone(),
+                "/api/v1/auth/login",
+                header::HeaderName::from_static("x-forwarded-for"),
+                &format!("203.0.113.{indice}, {RASTRO}"),
+            )
+            .await;
+
+            ultima = Some(respuesta);
+        }
+
+        let respuesta = ultima.expect("el bucle lanza peticiones");
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "la cabecera no puede estrenar una IP en cada petición: el cupo se agota igual"
+        );
+
+        let cuerpo = body_text(respuesta).await;
+
+        assert!(
+            !cuerpo.contains(RASTRO),
+            "el 429 no puede publicar nada de lo que mandó la petición: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dos_sockets_distintos_son_dos_ips_aunque_la_cabecera_sea_la_misma() {
+        // Escenario del delta: la IP sale del **socket**, no de `X-Forwarded-For`. Dos conexiones
+        // distintas con la misma cabecera tienen que contar como dos IPs, de modo que el cupo de la
+        // primera no agote el de la segunda. La mitad «la cabecera se ignora» la cubre
+        // `la_respuesta_429_no_publica_la_cabecera_de_la_peticion`, que manda una cabecera distinta
+        // en cada petición y aun así agota el cupo: aquí la cabecera es la misma para las dos y lo
+        // que cambia es el socket.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        let origen_a: SocketAddr = "10.0.0.1:1111".parse().expect("dirección válida");
+        let origen_b: SocketAddr = "10.0.0.2:2222".parse().expect("dirección válida");
+
+        for intento in 0..MAX_PETICIONES_DE_LOGIN {
+            let respuesta = get_con_conexion(router.clone(), "/api/v1/auth/login", origen_a).await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::FOUND,
+                "la petición {intento} del socket A está dentro del cupo"
+            );
+        }
+
+        let agotada = get_con_conexion(router.clone(), "/api/v1/auth/login", origen_a).await;
+        assert_eq!(
+            agotada.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "el socket A tiene que haber agotado su cupo"
+        );
+
+        // La misma cabecera, un socket distinto: tiene su propio cupo.
+        let otra = get_con_conexion(router.clone(), "/api/v1/auth/login", origen_b).await;
+        assert_eq!(
+            otra.status(),
+            StatusCode::FOUND,
+            "un socket distinto es una IP distinta: la cabecera compartida no puede unirlos"
         );
     }
 

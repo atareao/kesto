@@ -20,12 +20,17 @@ mod secretos;
 mod particion;
 
 use axum::Router;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderValue, header};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde::Serialize;
+use std::net::SocketAddr;
+use std::time::Instant;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::api::response::Data;
+use crate::auth::limite::IP_CENTINELA;
 use crate::auth::middleware;
 use crate::engine::ErrorDelMotor;
 use crate::error::AppError;
@@ -69,6 +74,47 @@ async fn trazar(
     respuesta
 }
 
+/// Mensaje con el que se rechaza un login que ha pasado su cupo.
+///
+/// Dice qué hacer —esperar— y **nada** de la petición: ni la IP de origen ni el valor de
+/// ninguna cabecera. El límite es por IP, y publicar la IP en el cuerpo le contaría al que
+/// abusa lo que ya sabe y a quien no abusa lo que no necesita.
+const DEMASIADAS_PETICIONES: &str =
+    "demasiados intentos de entrada seguidos: espera un momento y vuelve a intentarlo";
+
+/// Corta el login de una IP que ya ha pasado su cupo.
+///
+/// La IP sale del **socket** de la conexión (`ConnectInfo<SocketAddr>`) y **nunca** de una
+/// cabecera: `X-Forwarded-For` la falsifica el cliente, así que honrarla sería regalar el
+/// límite —bastaría variar la cabecera para estrenar una IP en cada petición—. Kesto no se
+/// despliega detrás de un proxy de confianza, así que no hay ninguna cabecera que honrar.
+///
+/// Donde no hay información de conexión —las pruebas despachan el router con `oneshot`, sin
+/// socket— se usa la centinela: todas esas peticiones comparten un mismo cubo, y el límite
+/// sigue siendo ejercitable sin abrir un puerto.
+async fn limitar_el_login(
+    State(state): State<AppState>,
+    peticion: axum::extract::Request,
+    siguiente: axum::middleware::Next,
+) -> axum::response::Response {
+    let ip = peticion
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|conexion| conexion.0.ip())
+        .unwrap_or(IP_CENTINELA);
+
+    let permitido = {
+        let mut limitador = state.limite.lock().await;
+        limitador.permitir(ip, Instant::now())
+    };
+
+    if !permitido {
+        return AppError::TooManyRequests(DEMASIADAS_PETICIONES.to_owned()).into_response();
+    }
+
+    siguiente.run(peticion).await
+}
+
 /// Router de `/api/v1`.
 ///
 /// La superficie se parte en dos mitades por **lista blanca**: una pública —la
@@ -88,8 +134,18 @@ pub fn api_router(state: AppState) -> Router {
     let router = match &state.auth {
         // Con proveedor, el flujo de entrada es público y el resto, protegido.
         Some(_) => {
-            public = public
+            // El límite de tasa se cuelga **solo** de la ruta de entrada, y con `route_layer`
+            // sobre su propio sub-router: el callback no es una ruta que estrene nada —su
+            // `state` ya tiene que existir— y no necesita cupo propio.
+            let entrada = Router::new()
                 .route("/api/v1/auth/login", get(auth::login))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    limitar_el_login,
+                ));
+
+            public = public
+                .merge(entrada)
                 .route("/api/v1/auth/callback", get(auth::callback));
 
             // La superficie de negocio: las rutas del flujo de entrada y las de los

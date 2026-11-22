@@ -106,10 +106,11 @@ pub fn verify(secret: &SecretString, token: &str) -> Result<Claims, AppError> {
 
 /// Construye la cookie de sesión con el JWT dado.
 ///
-/// `redirect_url` decide el atributo `Secure`: se añade solo cuando su esquema
-/// es `https`, porque en desarrollo se entra por `http://localhost` y una
-/// cookie `Secure` no viajaría, así que la sesión no se establecería nunca.
-pub fn session_cookie(token: String, redirect_url: &str) -> Result<Cookie<'static>, AppError> {
+/// El atributo `Secure` es **incondicional**: sin él la cookie viajaría en
+/// claro, y una sesión interceptable es peor que una sesión que no se establece.
+/// Quien decide si el despliegue es admisible es el arranque —en modo OIDC
+/// `OIDC_REDIRECT_URL` tiene que ser `https`—, no la forma de la respuesta.
+pub fn session_cookie(token: String) -> Result<Cookie<'static>, AppError> {
     // El crate `cookie` espera una duración del crate `time`, que es una
     // dependencia transitiva y no se puede nombrar desde aquí. La conversión
     // desde `std::time::Duration` deja que el compilador infiera el tipo del
@@ -123,20 +124,9 @@ pub fn session_cookie(token: String, redirect_url: &str) -> Result<Cookie<'stati
         .http_only(true)
         .same_site(SameSite::Strict)
         .path("/")
-        .secure(requires_secure(redirect_url))
+        .secure(true)
         .max_age(max_age)
         .build())
-}
-
-/// ¿El esquema de la URL de retorno obliga a marcar la cookie como `Secure`?
-///
-/// Una URL que no se pueda leer como `esquema://…` no se considera segura: el
-/// defecto útil es el del desarrollo, donde el retorno es `http` sobre
-/// `localhost`.
-fn requires_secure(redirect_url: &str) -> bool {
-    redirect_url
-        .split_once("://")
-        .is_some_and(|(esquema, _)| esquema.eq_ignore_ascii_case("https"))
 }
 
 #[cfg(test)]
@@ -144,27 +134,13 @@ mod tests {
     use axum_extra::extract::cookie::SameSite;
 
     use super::{Claims, SESSION_COOKIE_NAME, SESSION_LIFETIME, issue, session_cookie, verify};
-    use crate::config::{AuthMode, Config};
     use crate::error::AppError;
     use crate::secret::SecretString;
-    use crate::test_support::lookup_from;
 
-    /// Clave maestra larga: que ningún aviso se cuele en la respuesta.
-    const MASTER_KEY: &str = "clave-maestra-distinguible-000000000000000000000000000000000000";
     /// Clave de firma de la sesión, con la longitud de sobra.
     const SECRET: &str = "clave-de-firma-distinguible-000000000000000000000000000000000000";
     /// Otra clave de firma, distinguible de la anterior: es la que no vale.
     const OTHER_SECRET: &str = "otra-clave-de-firma-000000000000000000000000000000000000000000";
-    /// Emisor del proveedor de pruebas.
-    const OIDC_ISSUER: &str = "https://idp.example.test/realms/kesto";
-    /// Identificador del cliente de pruebas.
-    const OIDC_CLIENT_ID: &str = "kesto-panel";
-    /// Secreto de cliente OIDC: solo tiene que estar presente.
-    const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
-    /// URL de retorno con esquema `http`: el caso del desarrollo.
-    const REDIRECT_HTTP: &str = "http://localhost:8080/api/v1/auth/callback";
-    /// URL de retorno con esquema `https`: el caso del despliegue.
-    const REDIRECT_HTTPS: &str = "https://kesto.example.test/api/v1/auth/callback";
     /// Usuario distinguible de la sesión.
     const SUB: &str = "usuario-distinguible-1";
     /// Correo distinguible de la sesión.
@@ -186,28 +162,6 @@ mod tests {
     /// Emite una sesión con los valores distinguibles de estas pruebas.
     fn sesion() -> String {
         issue(&secret(), SUB.to_owned(), EMAIL.to_owned()).expect("la emisión no puede fallar")
-    }
-
-    /// URL de retorno efectiva de una configuración con la autenticación encendida.
-    ///
-    /// La configuración entra por lectura inyectada, como en `bootstrap-core`:
-    /// nunca se muta el entorno del proceso.
-    fn redirect_configurado(redirect_url: &str) -> String {
-        let lookup = lookup_from(&[
-            ("KESTO_MASTER_KEY", MASTER_KEY),
-            ("KESTO_SECRET", SECRET),
-            ("OIDC_ISSUER_URL", OIDC_ISSUER),
-            ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
-            ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
-            ("OIDC_REDIRECT_URL", redirect_url),
-        ]);
-
-        let config = Config::from_lookup(&lookup).expect("la configuración OIDC es válida");
-
-        match &config.auth {
-            AuthMode::Oidc(settings) => settings.redirect_url.clone(),
-            AuthMode::Disabled => panic!("las tres variables OIDC deben encender la autenticación"),
-        }
     }
 
     /// Cancela la firma de un JWT alterando un carácter de su contenido.
@@ -263,7 +217,7 @@ mod tests {
 
     #[test]
     fn los_atributos_de_la_cookie() {
-        let cookie = session_cookie(sesion(), REDIRECT_HTTP).expect("la cookie se construye");
+        let cookie = session_cookie(sesion()).expect("la cookie se construye");
 
         assert_eq!(
             cookie.name(),
@@ -293,7 +247,13 @@ mod tests {
         // Y el renderizado, que es lo que viaja de verdad en la cabecera.
         let cabecera = cookie.to_string();
 
-        for atributo in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age="] {
+        for atributo in [
+            "HttpOnly",
+            "SameSite=Strict",
+            "Path=/",
+            "Max-Age=",
+            "Secure",
+        ] {
             assert!(
                 cabecera.contains(atributo),
                 "la Set-Cookie no trae {atributo}: {cabecera}"
@@ -302,26 +262,20 @@ mod tests {
     }
 
     #[test]
-    fn el_secure_depende_del_esquema_de_retorno() {
-        let con_http = session_cookie(sesion(), &redirect_configurado(REDIRECT_HTTP))
-            .expect("la cookie se construye");
-
-        assert!(
-            !con_http.to_string().contains("Secure"),
-            "con retorno http la cookie no puede ir Secure, o no viajaría: {con_http}"
-        );
-
-        let con_https = session_cookie(sesion(), &redirect_configurado(REDIRECT_HTTPS))
-            .expect("la cookie se construye");
+    fn el_secure_no_depende_del_esquema_de_retorno() {
+        // El atributo es incondicional: quien decide si el despliegue es admisible es el arranque
+        // —con OIDC la URL de retorno tiene que ser `https`—, no la forma de la respuesta, y
+        // `session_cookie` ni siquiera recibe esa URL. La cookie va `Secure` siempre.
+        let cookie = session_cookie(sesion()).expect("la cookie se construye");
 
         assert_eq!(
-            con_https.secure(),
+            cookie.secure(),
             Some(true),
-            "con retorno https la cookie debe ir Secure"
+            "la cookie tiene que ir Secure sin depender de ninguna URL de retorno"
         );
         assert!(
-            con_https.to_string().contains("Secure"),
-            "con retorno https la Set-Cookie debe declarar Secure: {con_https}"
+            cookie.to_string().contains("Secure"),
+            "la Set-Cookie tiene que declarar Secure: {cookie}"
         );
     }
 
@@ -356,7 +310,7 @@ mod tests {
 
         let token = sesion();
         let claims = verify(&secret(), &token).expect("el JWT emitido debe verificarse");
-        let cookie = session_cookie(token, REDIRECT_HTTP).expect("la cookie se construye");
+        let cookie = session_cookie(token).expect("la cookie se construye");
 
         let max_age = cookie
             .max_age()
@@ -443,7 +397,7 @@ mod tests {
         // —credenciales distinguibles buscadas literalmente en el log de un flujo
         // completo— es el escenario 1.38, en `src/api/auth.rs`.
         let token = sesion();
-        let cookie = session_cookie(token.clone(), REDIRECT_HTTP).expect("la cookie se construye");
+        let cookie = session_cookie(token.clone()).expect("la cookie se construye");
 
         assert_eq!(
             cookie.value(),

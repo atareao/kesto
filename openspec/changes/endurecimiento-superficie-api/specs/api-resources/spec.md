@@ -18,6 +18,8 @@ Sobre el host, y siempre que sea una dirección literal:
 - SHALL rechazarse **salvo permiso explícito** el loopback (`127.0.0.0/8`, `::1`) y un nombre `localhost` o terminado en `.localhost`;
 - SHALL aceptarse el rango privado (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`) y las direcciones públicas.
 
+Una dirección IPv6 que lleve **embebida** una IPv4 —la forma IPv4-mapeada `::ffff:a.b.c.d` (RFC 4291) y el prefijo NAT64 bien conocido `64:ff9b::/96` (RFC 6052)— SHALL juzgarse por esa IPv4, porque es la dirección que de verdad se alcanza: `https://[::ffff:127.0.0.1]` es loopback y `https://[::ffff:169.254.169.254]` es la dirección de metadatos.
+
 Un `endpoint` que lleve credenciales embebidas (`https://usuario:clave@host`) SHALL rechazarse siempre: acabarían escritas en la fila y en los registros.
 
 El mensaje del `400` SHALL nombrar el campo y NO SHALL repetir el valor recibido.
@@ -43,6 +45,13 @@ La validación NO SHALL resolver el nombre del host: un `endpoint` con nombre se
 - **GIVEN** un alta cuyo `endpoint` es `https://169.254.169.254` y el permiso declarado
 - **WHEN** se atiende la petición
 - **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+
+#### Scenario: Una IPv4 embebida en una IPv6 se juzga por la IPv4
+- **GIVEN** un alta cuyo `endpoint` es `https://[::ffff:127.0.0.1]:9000` y sin permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+- **AND** lo mismo SHALL cumplirse para la forma NAT64 `https://[64:ff9b::7f00:1]:9000`
+- **AND** con el permiso declarado, `https://[::ffff:127.0.0.1]:9000` SHALL admitirse como se admite `127.0.0.1`
 
 #### Scenario: Con permiso, un endpoint local y en claro se acepta
 - **GIVEN** un alta cuyo `endpoint` es `http://127.0.0.1:9000` y el permiso declarado

@@ -149,7 +149,8 @@ jobs:
       # loopback, así que el reenvío del puerto no alcanza al servicio—, de modo
       # que el smoke test usa proveedor de identidad. El emisor puede ser
       # inalcanzable: el descubrimiento caído solo avisa, no impide arrancar.
-      # `KESTO_MASTER_KEY` y `KESTO_SECRET` son obligatorias y miden ≥ 32.
+      # `KESTO_MASTER_KEY` y `KESTO_SECRET` son obligatorias y miden ≥ 32. Las
+      # cuatro `OIDC_*` van también, y `OIDC_REDIRECT_URL` tiene que ser `https`.
       - name: Smoke test the image
         run: |
           set -euo pipefail
@@ -165,6 +166,7 @@ jobs:
             -e OIDC_ISSUER_URL='https://issuer.invalido.example' \
             -e OIDC_CLIENT_ID='smoke-test' \
             -e OIDC_CLIENT_SECRET='smoke-test-secret' \
+            -e OIDC_REDIRECT_URL='https://kesto.invalido.example/api/v1/auth/callback' \
             -e DATABASE_URL='sqlite:///app/data/kesto.db' \
             -e BIND_ADDRESS='0.0.0.0:8080' \
             "${image}"

@@ -139,6 +139,10 @@ fn el_arranque_avisa_si_el_proveedor_no_contesta_y_arranca_igualmente() {
         .env("OIDC_ISSUER_URL", &emisor)
         .env("OIDC_CLIENT_ID", "kesto-panel")
         .env("OIDC_CLIENT_SECRET", "secreto-de-cliente-distinguible")
+        .env(
+            "OIDC_REDIRECT_URL",
+            "https://panel.example.test/api/v1/auth/callback",
+        )
         .env("DATABASE_URL", &dsn)
         // Un puerto efímero: lo elige el sistema y ningún test choca con el 8080
         // del Kesto en desarrollo.
@@ -1074,4 +1078,76 @@ fn un_sigterm_acaba_con_el_proceso_aunque_haya_un_cliente_en_el_stream() {
     // El cliente se suelta aquí, con el proceso ya muerto y sus aserciones ya hechas: el socket
     // tiene que haber estado abierto todo el tiempo para que la prueba midiera lo que mide.
     drop(cliente);
+}
+
+/// El retorno de OIDC por `http` **no** deja arrancar el binario.
+///
+/// Es el otro extremo del `Secure` incondicional de la cookie: si el atributo ya
+/// no depende del retorno, quien decide si el despliegue es admisible es el
+/// arranque. Se lanza el binario de verdad —con las tres `OIDC_*` y el retorno
+/// por `http`— y se exige que **termine en fallo** nombrando la variable, que es
+/// lo que el operador lee en su registro.
+#[test]
+fn el_arranque_no_sale_adelante_si_el_retorno_de_oidc_no_es_https() {
+    let base = std::env::temp_dir().join(format!("kesto-arranque-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("el directorio temporal de la prueba debe crearse");
+
+    let directorio = DirectorioTemporal(base);
+    let dsn = format!("sqlite://{}/kesto.db", directorio.0.display());
+
+    let mut hijo = Hijo(
+        Command::new(env!("CARGO_BIN_EXE_kesto"))
+            .env_clear()
+            .env("KESTO_MASTER_KEY", MASTER_KEY)
+            .env("KESTO_SECRET", SESSION_SECRET)
+            .env("OIDC_ISSUER_URL", emisor_caido())
+            .env("OIDC_CLIENT_ID", "kesto-panel")
+            .env("OIDC_CLIENT_SECRET", "secreto-de-cliente-distinguible")
+            .env(
+                "OIDC_REDIRECT_URL",
+                "http://localhost:8080/api/v1/auth/callback",
+            )
+            .env("DATABASE_URL", &dsn)
+            .env("BIND_ADDRESS", "127.0.0.1:0")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("el binario de Kesto debe poder lanzarse"),
+    );
+
+    let inicio = Instant::now();
+    let estado = loop {
+        if let Some(estado) = hijo
+            .0
+            .try_wait()
+            .expect("el proceso debe poder consultarse")
+        {
+            break estado;
+        }
+
+        if inicio.elapsed() >= ESPERA {
+            panic!("con el retorno por http el proceso tenía que morir, y sigue vivo");
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(
+        !estado.success(),
+        "el arranque tenía que fallar y salió con {estado}"
+    );
+
+    let mut error = String::new();
+    hijo.0
+        .stderr
+        .take()
+        .expect("stderr capturado")
+        .read_to_string(&mut error)
+        .expect("el stderr del proceso debe poder leerse");
+
+    assert!(
+        error.contains("OIDC_REDIRECT_URL"),
+        "el motivo tiene que nombrar la variable: {error}"
+    );
 }

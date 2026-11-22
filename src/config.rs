@@ -28,6 +28,8 @@ const ENV_KESTO_SECRET: &str = "KESTO_SECRET";
 /// —y el motor, que dirige el socket del daemon— abiertos en todas las
 /// interfaces. El permiso convierte el modo de desarrollo en una decisión.
 const ENV_KESTO_ALLOW_INSECURE: &str = "KESTO_ALLOW_INSECURE";
+/// Permiso explícito para que el borde admita un `endpoint` de repositorio inseguro.
+const ENV_KESTO_ALLOW_INSECURE_ENDPOINT: &str = "KESTO_ALLOW_INSECURE_ENDPOINT";
 /// Emisor del proveedor OIDC.
 const ENV_OIDC_ISSUER_URL: &str = "OIDC_ISSUER_URL";
 /// Identificador público del cliente OIDC.
@@ -85,8 +87,6 @@ const DEFAULT_DATABASE_URL: &str = "sqlite:///app/data/kesto.db";
 /// moverla sin tocar el binario; y **no** se deriva de los montajes del propio contenedor porque en
 /// el modo local no hay contenedor de Kesto que inspeccionar.
 pub(crate) const DEFAULT_BACKUP_ROOT: &str = "/backup_sources";
-/// URL de retorno por defecto: el callback local, para el desarrollo con proveedor.
-const DEFAULT_OIDC_REDIRECT_URL: &str = "http://localhost:8080/api/v1/auth/callback";
 /// Longitud mínima, medida en caracteres, que se le exige a una credencial para
 /// dejar arrancar.
 ///
@@ -170,6 +170,15 @@ pub struct Config {
     /// el TLS lo termina un proxy, y la HSTS es suya. Con un valor presente, toda
     /// respuesta lleva `Strict-Transport-Security: max-age=<n>`.
     pub hsts_max_age: Option<u64>,
+
+    /// Si el borde admite un `endpoint` de repositorio inseguro (`KESTO_ALLOW_INSECURE_ENDPOINT`).
+    ///
+    /// El permiso rebaja **dos** cosas a la vez —el esquema `http` y el loopback, con su nombre
+    /// `localhost`—, porque son el mismo caso: el destino está en la propia máquina y en claro. Lo
+    /// que **no** rebaja nunca es la dirección de enlace local, la de metadatos, la no especificada
+    /// ni las credenciales embebidas. El defecto es el permiso **negado**, que es lo que hace que un
+    /// `compose` que perdió su variable no abra el agujero en silencio.
+    pub allow_insecure_endpoint: bool,
 }
 
 /// Fallo de configuración: la aplicación no puede arrancar.
@@ -195,6 +204,17 @@ pub enum ConfigError {
     #[error("la configuración de OIDC está incompleta: falta {name}")]
     IncompleteOidc {
         /// Nombre de la variable que falta.
+        name: &'static str,
+    },
+
+    /// La URL de retorno de OIDC no va por `https` en un modo que sí lo exige.
+    ///
+    /// La cookie de sesión viaja con `Secure` incondicional, así que un retorno
+    /// por `http` no podría establecer la sesión nunca: es un error de arranque,
+    /// no un modo degradado.
+    #[error("la variable de entorno {name} debe ser una URL `https` en modo OIDC")]
+    InsecureRedirect {
+        /// Nombre de la variable mal formada.
         name: &'static str,
     },
 
@@ -278,6 +298,15 @@ fn exigir_longitud_minima(name: &'static str, valor: &str) -> Result<(), ConfigE
     }
 
     Ok(())
+}
+
+/// ¿El esquema de esta URL es `https`?
+///
+/// La variable es una URL de configuración y lo único que decide aquí es el
+/// esquema, que es lo que precede a `://`; no hace falta un analizador entero.
+fn es_https(url: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(esquema, _)| esquema.eq_ignore_ascii_case("https"))
 }
 
 impl Config {
@@ -487,6 +516,24 @@ impl Config {
             .filter(|valor| !valor.is_empty())
             .unwrap_or_else(|| DEFAULT_DOCKER_HOST.to_owned());
 
+        // El permiso del `endpoint` se lee **siempre**, también con la autenticación encendida: el
+        // `endpoint` de un repositorio se valida en los dos modos, así que una variable que solo se
+        // leyera en el modo de desarrollo dejaría el permiso concedido sin declararlo. Va al final
+        // a propósito: el orden de lectura fija qué error se ve primero cuando hay varios
+        // problemas, y meterlo antes cambiaría mensajes ya probados.
+        let allow_insecure_endpoint = match lookup.get(ENV_KESTO_ALLOW_INSECURE_ENDPOINT) {
+            None => false,
+            Some(raw) => match raw.trim() {
+                "1" => true,
+                "0" => false,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        name: ENV_KESTO_ALLOW_INSECURE_ENDPOINT,
+                    });
+                }
+            },
+        };
+
         Ok(Self {
             bind_address,
             database_url,
@@ -497,6 +544,7 @@ impl Config {
             log_filter,
             docker_host,
             hsts_max_age,
+            allow_insecure_endpoint,
         })
     }
 
@@ -513,12 +561,25 @@ impl Config {
     ) -> Result<AuthMode, ConfigError> {
         match (issuer, client_id, client_secret) {
             (Some(issuer), Some(client_id), Some(client_secret)) => {
+                // El retorno no tiene defecto: la cookie de sesión viaja con
+                // `Secure` incondicional, así que un retorno por `http` no podría
+                // establecer la sesión nunca. Ausente o no `https` es error de
+                // arranque, y el mensaje nombra la variable.
+                let redirect_url = redirect_url.ok_or(ConfigError::MissingVariable {
+                    name: ENV_OIDC_REDIRECT_URL,
+                })?;
+
+                if !es_https(&redirect_url) {
+                    return Err(ConfigError::InsecureRedirect {
+                        name: ENV_OIDC_REDIRECT_URL,
+                    });
+                }
+
                 Ok(AuthMode::Oidc(OidcSettings {
                     issuer,
                     client_id,
                     client_secret: SecretString::new(client_secret),
-                    redirect_url: redirect_url
-                        .unwrap_or_else(|| DEFAULT_OIDC_REDIRECT_URL.to_owned()),
+                    redirect_url,
                 }))
             }
             (None, None, None) => Ok(AuthMode::Disabled),
@@ -609,6 +670,10 @@ mod tests {
     const OIDC_ISSUER: &str = "https://idp.example.test/realms/kesto";
     /// Identificador del cliente de pruebas.
     const OIDC_CLIENT_ID: &str = "kesto-panel";
+    /// URL de retorno por `https`: la única admisible en modo `Oidc`.
+    const OIDC_REDIRECT_HTTPS: &str = "https://panel.example.test/api/v1/auth/callback";
+    /// URL de retorno por `http`: el caso que deja de ser admisible.
+    const OIDC_REDIRECT_HTTP: &str = "http://localhost:8080/api/v1/auth/callback";
     /// Dirección de escucha propia, para detectarla en el volcado.
     const BIND: &str = "127.0.0.1:19090";
     /// Cadena de base de datos propia, para detectarla en el volcado.
@@ -627,6 +692,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let config = Config::from_lookup(&lookup).expect("el compose del SRS es válido");
@@ -875,6 +941,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let config = Config::from_lookup(&lookup).expect("las tres variables OIDC son válidas");
@@ -884,12 +951,72 @@ mod tests {
                 assert_eq!(settings.issuer, OIDC_ISSUER);
                 assert_eq!(settings.client_id, OIDC_CLIENT_ID);
                 assert_eq!(
-                    settings.redirect_url, "http://localhost:8080/api/v1/auth/callback",
-                    "sin OIDC_REDIRECT_URL, el retorno debe ser el callback local"
+                    settings.redirect_url, OIDC_REDIRECT_HTTPS,
+                    "el retorno tiene que ser el declarado, no un valor por defecto"
                 );
             }
             AuthMode::Disabled => panic!("las tres variables OIDC deben encender la autenticación"),
         }
+    }
+
+    #[test]
+    fn con_oidc_la_url_de_retorno_es_obligatoria() {
+        // El retorno no tiene valor por defecto: en modo OIDC un retorno que no
+        // sea `https` no tiene uso legítimo, así que un defecto no podría ser
+        // válido nunca. Se exige declarado y se nombra la variable que falta.
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_SECRET", SESSION_SECRET),
+            ("OIDC_ISSUER_URL", OIDC_ISSUER),
+            ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+            ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+        ]);
+
+        let error = Config::from_lookup(&lookup)
+            .expect_err("sin OIDC_REDIRECT_URL no se puede arrancar en modo Oidc");
+
+        assert!(
+            error.to_string().contains("OIDC_REDIRECT_URL"),
+            "el mensaje tiene que nombrar la variable: {error}"
+        );
+    }
+
+    #[test]
+    fn con_oidc_un_retorno_por_http_no_arranca() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_SECRET", SESSION_SECRET),
+            ("OIDC_ISSUER_URL", OIDC_ISSUER),
+            ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+            ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTP),
+        ]);
+
+        let error = Config::from_lookup(&lookup)
+            .expect_err("un retorno por http no puede arrancar en modo Oidc");
+
+        assert!(
+            error.to_string().contains("OIDC_REDIRECT_URL"),
+            "el mensaje tiene que nombrar la variable: {error}"
+        );
+    }
+
+    #[test]
+    fn sin_oidc_la_url_de_retorno_se_ignora() {
+        // Sin las tres `OIDC_*` no hay modo OIDC al que aplicarle la regla, así
+        // que la variable se ignora en silencio, aunque venga por `http`.
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTP),
+        ]);
+
+        let config = Config::from_lookup(&lookup).expect("sin OIDC la configuración es válida");
+
+        assert!(
+            matches!(config.auth, AuthMode::Disabled),
+            "sin las tres OIDC_* el modo tiene que ser Disabled"
+        );
     }
 
     #[test]
@@ -951,6 +1078,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let error = Config::from_lookup(&con_oidc).expect_err("con OIDC falta KESTO_SECRET");
@@ -1152,6 +1280,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
             ("BIND_ADDRESS", BIND),
             ("DATABASE_URL", DATABASE),
         ]);
@@ -1228,6 +1357,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let error = Config::from_lookup(&lookup)
@@ -1308,6 +1438,85 @@ mod tests {
         );
     }
 
+    /// 5.6 — Un permiso del `endpoint` que no es `1` ni `0` es error de formato.
+    ///
+    /// El permiso del `endpoint` es un booleano de entorno como el permiso del modo sin
+    /// autenticación, y se lee **siempre** —también con la autenticación encendida, porque el
+    /// `endpoint` de un repositorio se valida en los dos modos—: la tabla de sinónimos no existe, y
+    /// un valor que no sea `1` ni `0` tiene que impedir el arranque nombrando la variable y sin
+    /// publicar el valor.
+    #[test]
+    fn un_permiso_del_endpoint_inservible_es_error_de_formato() {
+        for valor in ["", "true", "2", "si"] {
+            let lookup = lookup_from(&[
+                ("KESTO_MASTER_KEY", MASTER_KEY),
+                ("KESTO_ALLOW_INSECURE", "1"),
+                ("BIND_ADDRESS", "127.0.0.1:8080"),
+                ("KESTO_ALLOW_INSECURE_ENDPOINT", valor),
+            ]);
+
+            let error = Config::from_lookup(&lookup)
+                .err()
+                .unwrap_or_else(|| panic!("`{valor}` no es un valor de permiso válido"));
+            let mensaje = error.to_string();
+
+            assert!(
+                mensaje.contains("KESTO_ALLOW_INSECURE_ENDPOINT"),
+                "el mensaje no nombra la variable: {mensaje}"
+            );
+            assert!(
+                !mensaje.contains(valor) || valor.is_empty(),
+                "el mensaje publica el valor del permiso: {mensaje}"
+            );
+        }
+    }
+
+    /// 5.6 (contrapeso) — `1` concede el permiso del `endpoint`.
+    #[test]
+    fn el_permiso_del_endpoint_se_concede_con_uno() {
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("BIND_ADDRESS", "127.0.0.1:8080"),
+            ("KESTO_ALLOW_INSECURE_ENDPOINT", "1"),
+        ]);
+
+        let config = Config::from_lookup(&lookup).expect("`1` concede el permiso");
+
+        assert!(
+            config.allow_insecure_endpoint,
+            "`1` tiene que conceder el permiso del endpoint"
+        );
+    }
+
+    /// 5.6 (contrapeso) — La ausencia de la variable niega el permiso.
+    ///
+    /// Es el defecto, y el que importa: un despliegue que nunca declaró la variable no puede
+    /// encontrarse el agujero abierto. `0` significa lo mismo, y se comprueba aquí para que la
+    /// equivalencia quede escrita.
+    #[test]
+    fn sin_la_variable_el_permiso_del_endpoint_esta_negado() {
+        for valor in [None, Some("0")] {
+            let mut pares = vec![
+                ("KESTO_MASTER_KEY", MASTER_KEY),
+                ("KESTO_ALLOW_INSECURE", "1"),
+                ("BIND_ADDRESS", "127.0.0.1:8080"),
+            ];
+
+            if let Some(valor) = valor {
+                pares.push(("KESTO_ALLOW_INSECURE_ENDPOINT", valor));
+            }
+
+            let config = Config::from_lookup(&lookup_from(&pares))
+                .unwrap_or_else(|_| panic!("`{valor:?}` no impide el arranque"));
+
+            assert!(
+                !config.allow_insecure_endpoint,
+                "`{valor:?}` tiene que negar el permiso del endpoint"
+            );
+        }
+    }
+
     /// 1.4 — `0` y la ausencia significan lo mismo: permiso negado.
     #[test]
     fn el_permiso_negado_no_arranca_como_su_ausencia() {
@@ -1346,6 +1555,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let config =
@@ -1390,6 +1600,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let config = Config::from_lookup(&lookup)
@@ -1462,6 +1673,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let error = Config::from_lookup(&lookup)
@@ -1483,6 +1695,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let error = Config::from_lookup(&lookup)
@@ -1509,6 +1722,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_HTTPS),
         ]);
 
         let config = Config::from_lookup(&lookup).expect("dos credenciales largas son válidas");
