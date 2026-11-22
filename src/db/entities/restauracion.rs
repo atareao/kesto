@@ -542,11 +542,15 @@ mod tests {
     }
 
     /// Las columnas del índice dado, en su orden.
-    async fn columnas_del_indice(pool: &SqlitePool, indice: &str) -> Vec<String> {
-        // `AssertSqlSafe` porque el nombre del índice se interpola y un `PRAGMA` no
-        // admite valor enlazado. Es seguro por construcción: el único llamador de este
-        // módulo de pruebas pasa el literal `"idx_restore_executions_status_started_at"`
-        // y ningún nombre llega de fuera (`saneamiento-de-dependencias`).
+    ///
+    /// El parámetro es `&'static str`, y eso es lo que hace segura la interpolación: el
+    /// nombre del índice solo puede ser una **constante de compilación**, así que el
+    /// compilador **impide** que entre una cadena construida en ejecución. `AssertSqlSafe`
+    /// sigue haciendo falta porque `sqlx 0.9` solo implementa `SqlSafeStr` para `&'static str`
+    /// y aquí el texto se compone con `format!` —un `PRAGMA` no admite valor enlazado—. La
+    /// consulta que llega a SQLite es la misma que antes del salto
+    /// (`saneamiento-de-dependencias`).
+    async fn columnas_del_indice(pool: &SqlitePool, indice: &'static str) -> Vec<String> {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "PRAGMA index_info('{indice}')"
         )))

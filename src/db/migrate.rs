@@ -273,20 +273,24 @@ mod tests {
     }
 
     /// El plan que SQLite usaría para una consulta, como texto.
-    async fn plan_de(pool: &SqlitePool, consulta: &str) -> String {
-        // `AssertSqlSafe` porque la cadena no es estática: `sqlx 0.9` solo implementa
-        // `SqlSafeStr` para `&'static str` y obliga a auditar el resto. Aquí el SQL es
-        // seguro por construcción —sale de las constantes `&str` de este mismo módulo de
-        // pruebas y de `EXPLAIN QUERY PLAN`, que no interpola ningún valor— y la consulta
-        // que se ejecuta es la misma que antes del salto (`saneamiento-de-dependencias`).
-        let filas = sqlx::query(sqlx::AssertSqlSafe(consulta))
+    ///
+    /// El parámetro es `&'static str`, y eso es lo que hace segura la construcción: la
+    /// consulta solo puede ser una **constante de compilación**, así que el compilador
+    /// **impide** que entre una cadena construida en ejecución. `AssertSqlSafe` sigue
+    /// haciendo falta porque `sqlx 0.9` solo implementa `SqlSafeStr` para `&'static str` y
+    /// aquí el texto se compone con `format!`; el prefijo `EXPLAIN QUERY PLAN` se añade
+    /// **aquí dentro**, de modo que lo único que se interpola es esa constante. La consulta
+    /// que llega a SQLite es la misma que antes del salto (`saneamiento-de-dependencias`).
+    async fn plan_de(pool: &SqlitePool, consulta: &'static str) -> String {
+        let sentencia = format!("EXPLAIN QUERY PLAN {consulta}");
+        let filas = sqlx::query(sqlx::AssertSqlSafe(sentencia.as_str()))
             .fetch_all(pool)
             .await
-            .unwrap_or_else(|error| panic!("el plan de `{consulta}` no puede fallar: {error}"));
+            .unwrap_or_else(|error| panic!("el plan de `{sentencia}` no puede fallar: {error}"));
 
         assert!(
             !filas.is_empty(),
-            "`{consulta}` no devolvió ninguna línea de plan"
+            "`{sentencia}` no devolvió ninguna línea de plan"
         );
 
         filas
@@ -1488,11 +1492,7 @@ mod tests {
         // Plan medido:
         //   SEARCH backup_targets USING INDEX sqlite_autoindex_backup_targets_1 (id=?)
         //   SEARCH backup_jobs    USING COVERING INDEX idx_backup_jobs_target_id (target_id=?)
-        let plan_target = plan_de(
-            &pool,
-            "EXPLAIN QUERY PLAN DELETE FROM backup_targets WHERE id = 'x'",
-        )
-        .await;
+        let plan_target = plan_de(&pool, "DELETE FROM backup_targets WHERE id = 'x'").await;
 
         assert!(
             plan_target.contains("idx_backup_jobs_target_id"),
@@ -1507,11 +1507,7 @@ mod tests {
         //   SEARCH repositories USING INDEX sqlite_autoindex_repositories_1 (id=?)
         //   SEARCH backup_jobs  USING COVERING INDEX idx_backup_jobs_repository_id (repository_id=?)
         // El segundo salto (backup_jobs → job_executions) no aparece: ver el doc.
-        let plan_repositorio = plan_de(
-            &pool,
-            "EXPLAIN QUERY PLAN DELETE FROM repositories WHERE id = 'x'",
-        )
-        .await;
+        let plan_repositorio = plan_de(&pool, "DELETE FROM repositories WHERE id = 'x'").await;
 
         assert!(
             plan_repositorio.contains("idx_backup_jobs_repository_id"),
@@ -1526,11 +1522,7 @@ mod tests {
         // Plan medido:
         //   SEARCH backup_jobs    USING INDEX sqlite_autoindex_backup_jobs_1 (id=?)
         //   SEARCH job_executions USING COVERING INDEX idx_job_executions_job_id (job_id=?)
-        let plan_tarea = plan_de(
-            &pool,
-            "EXPLAIN QUERY PLAN DELETE FROM backup_jobs WHERE id = 'x'",
-        )
-        .await;
+        let plan_tarea = plan_de(&pool, "DELETE FROM backup_jobs WHERE id = 'x'").await;
 
         assert!(
             plan_tarea.contains("idx_job_executions_job_id"),
@@ -1551,8 +1543,7 @@ mod tests {
 
         let plan = plan_de(
             &pool,
-            "EXPLAIN QUERY PLAN SELECT id, status FROM job_executions \
-             WHERE status = 'pending' ORDER BY started_at",
+            "SELECT id, status FROM job_executions WHERE status = 'pending' ORDER BY started_at",
         )
         .await;
 
@@ -1575,8 +1566,8 @@ mod tests {
 
         let plan = plan_de(
             &pool,
-            "EXPLAIN QUERY PLAN SELECT e.id FROM job_executions e \
-             JOIN backup_jobs j ON j.id = e.job_id WHERE j.repository_id = 'x'",
+            "SELECT e.id FROM job_executions e JOIN backup_jobs j ON j.id = e.job_id \
+             WHERE j.repository_id = 'x'",
         )
         .await;
 
@@ -2006,7 +1997,7 @@ mod tests {
         //           SEARCH e USING INDEX idx_job_executions_job_id (job_id=?)
         //   Soltó   SCAN e
         for (nombre, consulta) in [("la de una instantánea", DE_UNA), ("la del lote", DE_LOTE)] {
-            let plan = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {consulta}")).await;
+            let plan = plan_de(&pool, consulta).await;
             assert!(
                 !plan.contains("idx_job_executions_snapshot_id"),
                 "el plan de {nombre} usa un índice que la migración no ha creado: {plan}"
@@ -2018,8 +2009,7 @@ mod tests {
             );
         }
 
-        let suelto_sin_indice =
-            plan_de(&pool, &format!("EXPLAIN QUERY PLAN {SOLO_EL_FILTRO}")).await;
+        let suelto_sin_indice = plan_de(&pool, SOLO_EL_FILTRO).await;
         assert!(
             suelto_sin_indice.contains("SCAN e"),
             "sin índice, el filtro por `snapshot_id` debería recorrer la tabla: {suelto_sin_indice}"
@@ -2056,13 +2046,13 @@ mod tests {
         // SEARCH e USING INDEX idx_job_executions_snapshot_id (snapshot_id=?), y después SEARCH j
         // y SEARCH t por sus claves primarias—, y el del lote sigue yendo por las claves
         // foráneas, porque sin `ANALYZE` nadie le ha dicho que la clave sea única.
-        let de_una = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {DE_UNA}")).await;
+        let de_una = plan_de(&pool, DE_UNA).await;
         assert!(
             de_una.contains("idx_job_executions_snapshot_id"),
             "el plan de la consulta de una instantánea no usa el índice de su columna: {de_una}"
         );
 
-        let de_lote = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {DE_LOTE}")).await;
+        let de_lote = plan_de(&pool, DE_LOTE).await;
         assert!(
             !de_lote.contains("idx_job_executions_snapshot_id"),
             "sin estadísticas, la consulta del lote no tiene por qué usar el índice: {de_lote}"
@@ -2070,7 +2060,7 @@ mod tests {
 
         // Y el filtro suelto, que es el que no tenía otra puerta: de `SCAN e` a
         // `SEARCH e USING INDEX idx_job_executions_snapshot_id (snapshot_id=?)`.
-        let suelto = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {SOLO_EL_FILTRO}")).await;
+        let suelto = plan_de(&pool, SOLO_EL_FILTRO).await;
         assert!(
             suelto.contains("idx_job_executions_snapshot_id"),
             "el filtro por `snapshot_id` no usa el índice de su columna: {suelto}"
@@ -2110,14 +2100,17 @@ mod tests {
             .expect("la base con estadísticas debe poder reabrirse");
 
         for (nombre, consulta) in [("la de una instantánea", DE_UNA), ("la del lote", DE_LOTE)] {
-            let plan = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {consulta}")).await;
+            let plan = plan_de(&pool, consulta).await;
             assert!(
                 !plan.contains("SCAN e"),
                 "con estadísticas, el plan de {nombre} recorre `job_executions` entera: {plan}"
             );
             assert!(
                 plan.contains("idx_job_executions_job_id"),
-                "con estadísticas, el plan de {nombre} no entra en `e` por su clave foránea: {plan}"
+                "con estadísticas, el plan de {nombre} no entra en `e` por su clave foránea: {plan} \
+                 — un rojo aquí no es la migración: el planificador de SQLite se ha vuelto a \
+                 mover, y lo que hay que rehacer es esta medición (D10 del change \
+                 `saneamiento-de-dependencias`)"
             );
         }
 
