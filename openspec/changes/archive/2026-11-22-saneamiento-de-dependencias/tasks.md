@@ -4,10 +4,10 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 
 ## 0. Preparación
 
-- [ ] 0.1 Rama `feature/saneamiento-de-dependencias` desde `development`.
-- [ ] 0.2 Change `saneamiento-de-dependencias` en `openspec/changes/` (proposal, design, tasks y los deltas de `cadena-de-suministro` y `db`).
-- [ ] 0.3 `plans/PLAN-044.md` con las tareas de este fichero.
-- [ ] 0.4 `openspec validate --strict saneamiento-de-dependencias` válido (verificación: termina sin error).
+- [x] 0.1 Rama `feature/saneamiento-de-dependencias` desde `development`.
+- [x] 0.2 Change `saneamiento-de-dependencias` en `openspec/changes/` (proposal, design, tasks y los deltas de `cadena-de-suministro` y `db`).
+- [x] 0.3 `plans/PLAN-044.md` con las tareas de este fichero.
+- [x] 0.4 `openspec validate --strict saneamiento-de-dependencias` válido (verificación: termina sin error).
 
 ## 1. RED — la puerta y su cableado, que hoy no existen
 
@@ -49,11 +49,11 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 
 ## 6. Cierre
 
-- [ ] 6.1 `just e2e` en verde.
+- [x] 6.1 `just e2e` en verde.
 - [x] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
 - [x] 6.3 `docs/ENTORNO.md` (versiones y MSRV), `GIT_FLOW.md` (la tabla del CI) y `AGENTS.md` (el gate y la paridad del workspace).
 - [x] 6.4 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas). Las cinco observaciones se aplicaron: (1) los dos ayudantes de pruebas a `&'static str`; (2) el `assert!` de `ANALYZE` invita a re-medir; (3) D9, coherente en pasado; (4) comentario de Dependabot ajustado; (5) toolchain fijada en el job `dependencies`.
-- [ ] 6.5 PR a `development` con `Closes #167`; CI en verde; fusionar y cerrar #167 a mano.
-- [ ] 6.6 `just spec-archive saneamiento-de-dependencias` (verificación: el delta entra en `openspec/specs/`).
-- [ ] 6.7 `plans/PLAN-044.md` → `plans/PLAN-044-COMPLETED.md` (verificación: `git mv` hecho).
-- [ ] 6.8 PR del archivado a `development`.
+- [x] 6.5 PR a `development` con `Closes #167`; CI en verde; fusionar y cerrar #167 a mano.
+- [x] 6.6 `just spec-archive saneamiento-de-dependencias` (verificación: el delta entra en `openspec/specs/`).
+- [x] 6.7 `plans/PLAN-044.md` → `plans/PLAN-044-COMPLETED.md` (verificación: `git mv` hecho).
+- [x] 6.8 PR del archivado a `development`.
