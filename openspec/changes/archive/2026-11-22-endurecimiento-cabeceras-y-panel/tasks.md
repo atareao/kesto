@@ -59,5 +59,5 @@
 
 - [x] 4.1 `docs/FEATURE-045-endurecimiento-cabeceras-y-panel.md` con el porqué y las decisiones.
 - [x] 4.2 Actualizar `docs/ARQUITECTURA.md` (cabeceras y CSP del origen compuesto).
-- [ ] 4.3 `openspec archive endurecimiento-cabeceras-y-panel`.
-- [ ] 4.4 Renombrar `plans/PLAN-045.md` a `plans/PLAN-045-COMPLETED.md`.
+- [x] 4.3 `openspec archive endurecimiento-cabeceras-y-panel`.
+- [x] 4.4 Renombrar `plans/PLAN-045.md` a `plans/PLAN-045-COMPLETED.md`.

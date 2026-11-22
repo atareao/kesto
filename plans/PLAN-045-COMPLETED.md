@@ -66,8 +66,8 @@ Fuera de alcance: autenticación (SEC-16, SEC-17), `container_name` y el resto d
 
 - [x] 4.1 `docs/FEATURE-045-endurecimiento-cabeceras-y-panel.md`.
 - [x] 4.2 `docs/ARQUITECTURA.md` (cabeceras y CSP del origen compuesto).
-- [ ] 4.3 `openspec archive endurecimiento-cabeceras-y-panel`.
-- [ ] 4.4 Renombrar este plan a `plans/PLAN-045-COMPLETED.md`.
+- [x] 4.3 `openspec archive endurecimiento-cabeceras-y-panel`.
+- [x] 4.4 Renombrar este plan a `plans/PLAN-045-COMPLETED.md`.
 
 ## Criterios de aceptación
 
