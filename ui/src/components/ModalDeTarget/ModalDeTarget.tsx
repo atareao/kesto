@@ -83,7 +83,8 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
         name="name"
         rules={[{ required: true, message: 'Escribe un nombre.' }]}
       >
-        <Input placeholder="p. ej. datos-web" />
+        {/* Mismo tope que la API: un `name` de más de 120 caracteres es un `400`. */}
+        <Input placeholder="p. ej. datos-web" maxLength={120} />
       </Form.Item>
 
       <Form.Item label="Tipo" name="target_type" rules={[{ required: true }]}>
@@ -103,7 +104,8 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
           name="host_path"
           rules={[{ required: true, message: 'Escribe la ruta del host.' }]}
         >
-          <Input placeholder="/srv/datos" />
+          {/* Mismo tope que la API: un `host_path` de más de 4096 es un `400`. */}
+          <Input placeholder="/srv/datos" maxLength={4096} />
         </Form.Item>
       )}
 
@@ -114,7 +116,8 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
             name="container_name"
             rules={[{ required: true, message: 'Escribe el contenedor.' }]}
           >
-            <Input placeholder="nombre-del-contenedor" />
+            {/* Mismo tope que la API: un `container_name` de más de 128 es un `400`. */}
+            <Input placeholder="nombre-del-contenedor" maxLength={128} />
           </Form.Item>
           {esSqlite ? (
             <Form.Item
@@ -122,7 +125,8 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
               name="db_path"
               rules={[{ required: true, message: 'Escribe la ruta del fichero .db.' }]}
             >
-              <Input placeholder="/var/lib/kesto/kesto.db" />
+              {/* Mismo tope que la API: un `db_path` de más de 1024 es un `400`. */}
+              <Input placeholder="/var/lib/kesto/kesto.db" maxLength={1024} />
             </Form.Item>
           ) : (
             <>
@@ -131,7 +135,8 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
                 name="db_user"
                 rules={[{ required: true, message: 'Escribe el usuario.' }]}
               >
-                <Input placeholder="kesto" />
+                {/* Mismo tope que la API: un `db_user` de más de 63 es un `400`. */}
+                <Input placeholder="kesto" maxLength={63} />
               </Form.Item>
               <Form.Item
                 label="Contraseña de la base de datos"
@@ -149,7 +154,8 @@ function FormularioDeTarget({ target, formulario }: PropsDelFormularioDeTarget) 
                 name="db_name"
                 rules={[{ required: true, message: 'Escribe el nombre de la base.' }]}
               >
-                <Input placeholder="kesto" />
+                {/* Mismo tope que la API: un `db_name` de más de 63 es un `400`. */}
+                <Input placeholder="kesto" maxLength={63} />
               </Form.Item>
             </>
           )}

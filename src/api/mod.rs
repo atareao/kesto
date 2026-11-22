@@ -11,6 +11,7 @@ pub mod response;
 pub mod restorations;
 pub mod snapshots;
 pub mod targets;
+pub mod texto;
 pub mod tokens;
 
 #[cfg(test)]

@@ -79,7 +79,8 @@ function FormularioDeRepositorio({
         name="name"
         rules={[{ required: true, message: 'Escribe un nombre.' }]}
       >
-        <Input placeholder="p. ej. copias-s3" />
+        {/* Mismo tope que la API: un `name` de más de 120 caracteres es un `400`. */}
+        <Input placeholder="p. ej. copias-s3" maxLength={120} />
       </Form.Item>
 
       <Form.Item
@@ -87,7 +88,8 @@ function FormularioDeRepositorio({
         name="endpoint"
         rules={[{ required: true, message: 'Escribe el endpoint.' }]}
       >
-        <Input placeholder="https://s3.example.com" />
+        {/* Mismo tope que la API: un `endpoint` de más de 2048 es un `400`. */}
+        <Input placeholder="https://s3.example.com" maxLength={2048} />
       </Form.Item>
 
       <Space size="middle" wrap align="start">
@@ -96,14 +98,16 @@ function FormularioDeRepositorio({
           name="bucket"
           rules={[{ required: true, message: 'Escribe el bucket.' }]}
         >
-          <Input placeholder="copias" />
+          {/* Mismo tope que la API: un `bucket` de más de 63 es un `400`. */}
+          <Input placeholder="copias" maxLength={63} />
         </Form.Item>
         <Form.Item
           label="Región"
           name="region"
           rules={[{ required: true, message: 'Escribe la región.' }]}
         >
-          <Input placeholder="eu-west-1" />
+          {/* Mismo tope que la API: una `region` de más de 64 es un `400`. */}
+          <Input placeholder="eu-west-1" maxLength={64} />
         </Form.Item>
       </Space>
 
@@ -112,7 +116,8 @@ function FormularioDeRepositorio({
         name="access_key_id"
         rules={[{ required: true, message: 'Escribe el identificador de la clave.' }]}
       >
-        <Input placeholder="AKIA…" />
+        {/* Mismo tope que la API: un `access_key_id` de más de 128 es un `400`. */}
+        <Input placeholder="AKIA…" maxLength={128} />
       </Form.Item>
 
       <Form.Item

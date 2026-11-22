@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
+use crate::api::texto;
 use crate::api::{contenido, del_motor, del_motor_en_el_alta};
 use crate::db::entities::{AltaDeRepositorio, Repositorio, SaludDeRepositorio};
 use crate::error::AppError;
@@ -83,6 +84,12 @@ pub fn router() -> Router<AppState> {
 #[serde(deny_unknown_fields)]
 pub struct AltaDeRepositorioDelCable {
     /// Nombre del repositorio.
+    ///
+    /// `#[serde(default)]` es lo que hace que un cuerpo **sin** la clave llegue aquí como cadena
+    /// vacía en vez de ser rechazado por el extractor: así el `400` lo contesta
+    /// [`campos_de_texto`] —que nombra `name`— y no la clase genérica de serde, que no nombra el
+    /// campo.
+    #[serde(default)]
     pub name: String,
     /// Endpoint del servicio S3.
     pub endpoint: String,
@@ -440,6 +447,43 @@ fn endpoint_admisible(endpoint: &str, permitir_inseguro: bool) -> Result<(), App
         .map_err(|error| AppError::InvalidInput(error.to_string()))
 }
 
+/// Los cinco campos de texto del cuerpo, ya recortados y medidos contra su cota.
+///
+/// Los dos secretos **no** están: un secreto no se recorta —recortarlo lo cambiaría— ni se acota.
+/// Por eso este tipo no los lleva y quien lo usa los resuelve por su cuenta, que además es distinto
+/// en el alta y en la edición.
+struct CamposDeTexto {
+    name: String,
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key_id: String,
+}
+
+/// Recorta y mide los cinco campos de texto, o contesta el `400` que nombra el que falle.
+///
+/// La comparten el alta y la edición —las dos puertas de escritura del recurso—, así que las dos
+/// aplican la **misma** regla y no hay una tercera que se olvide. El `endpoint` sale ya recortado
+/// para que la validación de admisibilidad de después juzgue el valor que se va a guardar y no lo
+/// que se envió con espacios alrededor.
+fn campos_de_texto(cuerpo: &AltaDeRepositorioDelCable) -> Result<CamposDeTexto, AppError> {
+    Ok(CamposDeTexto {
+        name: texto::obligatorio("name", Some(cuerpo.name.as_str()), texto::COTA_NOMBRE)?,
+        endpoint: texto::obligatorio(
+            "endpoint",
+            Some(cuerpo.endpoint.as_str()),
+            texto::COTA_ENDPOINT,
+        )?,
+        bucket: texto::obligatorio("bucket", Some(cuerpo.bucket.as_str()), texto::COTA_BUCKET)?,
+        region: texto::obligatorio("region", Some(cuerpo.region.as_str()), texto::COTA_REGION)?,
+        access_key_id: texto::obligatorio(
+            "access_key_id",
+            Some(cuerpo.access_key_id.as_str()),
+            texto::COTA_ACCESS_KEY,
+        )?,
+    })
+}
+
 /// `POST /api/v1/repositories` — el alta, que habla con el destino y contesta `201`.
 ///
 /// Los dos secretos del cuerpo son `Option`, y aquí se exigen: las columnas del §3 son
@@ -474,6 +518,13 @@ fn endpoint_admisible(endpoint: &str, permitir_inseguro: bool) -> Result<(), App
 /// El `PUT` de este mismo recurso hace lo contrario, y a propósito: **no** conecta ni inicializa.
 /// Editar una fila no puede depender de que el destino esté en pie, y el motivo entero está en su
 /// manejador.
+///
+/// # El recorte y las cotas
+///
+/// Los cinco campos de texto —`name`, `endpoint`, `bucket`, `region` y `access_key_id`— pasan por
+/// [`campos_de_texto`], que los recorta y los mide contra su cota antes de nada: el tope se cuenta
+/// sobre lo que se va a guardar y un rechazo nombra el campo sin repetir el valor. Los dos secretos
+/// —`secret_access_key` y `passphrase`— **no** pasan por ahí: un secreto no se recorta ni se acota.
 ///
 /// # Los dos desenlaces, y el `400` frente al `502`
 ///
@@ -537,6 +588,10 @@ pub async fn alta(
     State(state): State<AppState>,
     Json(cuerpo): Json<AltaDeRepositorioDelCable>,
 ) -> Result<ApiResponse, AppError> {
+    // El recorte y las cotas de los cinco campos de texto, antes de nada: los campos de **secreto**
+    // no pasan por ahí —un secreto no se recorta ni se acota— y se comprueban aparte.
+    let campos = campos_de_texto(&cuerpo)?;
+
     let Some(secret_access_key) = cuerpo.secret_access_key else {
         return Err(AppError::InvalidInput(
             "el campo `secret_access_key` es obligatorio en un alta".to_owned(),
@@ -551,19 +606,20 @@ pub async fn alta(
 
     // El `endpoint` se juzga antes de montar la fila y antes de hablar con el destino: es el único
     // campo que decide a dónde conecta el proceso, y un valor inadmisible no puede llegar ni a la
-    // base ni al motor. Los dos campos obligatorios se comprueban antes porque ése es el orden que
-    // el alta ya tenía y el que sus mensajes tienen probado.
-    endpoint_admisible(&cuerpo.endpoint, state.config.allow_insecure_endpoint)?;
+    // base ni al motor. Se juzga el valor **recortado**, que es el que se va a guardar. Los dos
+    // secretos se comprueban antes porque ése es el orden que el alta ya tenía y el que sus
+    // mensajes tienen probado.
+    endpoint_admisible(&campos.endpoint, state.config.allow_insecure_endpoint)?;
 
     // La fila, montada y **sin escribir**: es el valor con el que se arma el acceso y el que se
     // guardará si el destino contesta bien. Montarla aquí no adelanta nada de lo que el orden evita,
     // porque no toca la base.
     let alta = AltaDeRepositorio {
-        name: cuerpo.name,
-        endpoint: cuerpo.endpoint,
-        bucket: cuerpo.bucket,
-        region: cuerpo.region,
-        access_key_id: cuerpo.access_key_id,
+        name: campos.name,
+        endpoint: campos.endpoint,
+        bucket: campos.bucket,
+        region: campos.region,
+        access_key_id: campos.access_key_id,
         secret_access_key,
         passphrase,
     };
@@ -657,19 +713,22 @@ pub async fn actualizar(
         return Err(repositorio_ausente());
     };
 
-    // La edición aplica **la misma** regla que el alta: sin esto, el `PUT` sería la puerta de atrás
-    // del `POST` —bastaría dar de alta un `endpoint` admisible y editarlo después por el que no lo
-    // es—. El `404` de la fila ausente se decide antes, igual que antes de este change: la
-    // validación no cambia qué desenlace tiene una fila que no está.
-    endpoint_admisible(&cuerpo.endpoint, state.config.allow_insecure_endpoint)?;
+    // El recorte y las cotas de los cinco campos de texto, con la **misma** regla que el alta.
+    let campos = campos_de_texto(&cuerpo)?;
+
+    // La edición aplica **la misma** regla de `endpoint` que el alta: sin esto, el `PUT` sería la
+    // puerta de atrás del `POST` —bastaría dar de alta un `endpoint` admisible y editarlo después
+    // por el que no lo es—. El `404` de la fila ausente se decide antes, igual que antes de este
+    // change: la validación no cambia qué desenlace tiene una fila que no está.
+    endpoint_admisible(&campos.endpoint, state.config.allow_insecure_endpoint)?;
 
     let fila = Repositorio {
         id: actual.id,
-        name: cuerpo.name,
-        endpoint: cuerpo.endpoint,
-        bucket: cuerpo.bucket,
-        region: cuerpo.region,
-        access_key_id: cuerpo.access_key_id,
+        name: campos.name,
+        endpoint: campos.endpoint,
+        bucket: campos.bucket,
+        region: campos.region,
+        access_key_id: campos.access_key_id,
         secret_access_key: resolver_secreto(
             cuerpo.secret_access_key,
             actual.secret_access_key,
@@ -2631,6 +2690,62 @@ mod tests {
         );
     }
 
+    /// 5.6 — Un `endpoint` con espacios alrededor se guarda **recortado**.
+    ///
+    /// El `endpoint` se juzga por su valor **recortado**, y el valor que se guarda es el recortado:
+    /// el diseño no dice «se acepta con espacios», dice que los espacios de los extremos no forman
+    /// parte del valor. Lo que fija esta prueba es que la fila guarda el valor limpio y que la
+    /// petición sigue adelante: si el recorte se perdiera, la columna llevaría los espacios y la
+    /// conexión posterior saldría contra una URL que no es la que el operador quiso.
+    #[tokio::test]
+    async fn un_endpoint_con_espacios_se_guarda_recortado() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), clave),
+        );
+
+        let endpoint = destino_local_de_prueba("repo-5-6");
+
+        let mut cuerpo_de_la_peticion = cuerpo_contra("repo-5-6", &endpoint, PASSPHRASE_DE_PRUEBA);
+        cuerpo_de_la_peticion["endpoint"] = serde_json::json!(format!("  {endpoint}  "));
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_de_la_peticion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "los espacios de los extremos no impiden dar de alta un `endpoint` válido: contestó \
+             {status} con {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let guardado: String =
+            sqlx::query_scalar("SELECT endpoint FROM repositories WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que estar en el fichero de la base");
+
+        assert_eq!(
+            guardado, endpoint,
+            "el `endpoint` se guarda recortado, sin los espacios de los extremos"
+        );
+    }
+
     // ── La salud por repositorio ─────────────────────────────────────────────────
     //
     // `POST /api/v1/repositories/{id}/health` y `POST /api/v1/repositories/health`, más los
@@ -3149,6 +3264,204 @@ mod tests {
                 .as_str()
                 .is_some_and(|mensaje| !mensaje.is_empty()),
             "el 404 tiene que explicar que no hay fila que comprobar: {cuerpo}"
+        );
+    }
+
+    // ── Cotas y recorte de los campos de texto (SEC-13) ──────────────────────
+    //
+    // Cubre `api-resources`, requisito «Los campos de texto se recortan y tienen una cota por
+    // campo» en la mitad de `/repositories`: el recorte va antes de medir y de guardar, un
+    // obligatorio que queda vacío es un `400` que nombra el campo, y lo que supera su cota es un
+    // `400` que nombra el campo y **no repite el valor**. Los dos secretos —`secret_access_key` y
+    // `passphrase`— **no** se acotan: un secreto no se recorta ni se mide.
+
+    /// 3.1 — Un `name` en blanco o por encima de su cota contesta `400` nombrando `name`.
+    #[tokio::test]
+    async fn un_name_vacio_o_demasiado_largo_contesta_400_nombrando_name() {
+        let router = api_router(estado_desarrollo().await);
+
+        let mut en_blanco = cuerpo_de_alta("repo-3-1");
+        en_blanco["name"] = serde_json::json!("   ");
+
+        let respuesta = post_json(router.clone(), "/api/v1/repositories", &en_blanco).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `name` de solo espacios es un campo vacío: contestó {status} con {cuerpo}"
+        );
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| mensaje.contains("name")),
+            "el motivo tiene que nombrar `name`: {cuerpo}"
+        );
+
+        let largo = "n".repeat(121);
+        let mut por_encima = cuerpo_de_alta("repo-3-1");
+        por_encima["name"] = serde_json::json!(largo);
+
+        let respuesta = post_json(router, "/api/v1/repositories", &por_encima).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `name` de 121 caracteres supera su cota de 120: contestó {status} con {cuerpo}"
+        );
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| mensaje.contains("name")),
+            "el motivo tiene que nombrar `name`: {cuerpo}"
+        );
+        assert!(
+            !cuerpo.to_string().contains(&largo),
+            "el rechazo no puede repetir el valor recibido: {cuerpo}"
+        );
+    }
+
+    /// 3.1b — Un cuerpo **sin** la clave `name` contesta `400` nombrando `name`.
+    ///
+    /// Un `name` ausente no es lo mismo que uno en blanco para el extractor: sin
+    /// `#[serde(default)]` el cuerpo lo rechazaría la clase genérica de serde, que **no** nombra el
+    /// campo. Con el defecto declarado, el cuerpo entra al manejador con el nombre vacío y contesta
+    /// el mismo `400` que el blanco —el de [`texto::obligatorio`]—, que sí nombra `name`.
+    #[tokio::test]
+    async fn un_name_ausente_contesta_400_nombrando_name() {
+        let router = api_router(estado_desarrollo().await);
+
+        let mut cuerpo = cuerpo_de_alta("repo-3-1b");
+        if let Some(mapa) = cuerpo.as_object_mut() {
+            mapa.remove("name");
+        }
+
+        let respuesta = post_json(router, "/api/v1/repositories", &cuerpo).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un cuerpo sin `name` tiene que rechazarse con un 400 que nombre el campo: contestó \
+             {status} con {cuerpo}"
+        );
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| mensaje.contains("name")),
+            "el motivo tiene que nombrar `name`: {cuerpo}"
+        );
+    }
+
+    /// 3.2 — Un `bucket`, `region`, `access_key_id` o `endpoint` por encima de su cota, `400`.
+    #[tokio::test]
+    async fn un_campo_por_encima_de_su_cota_contesta_400_nombrando_el_campo() {
+        let router = api_router(estado_desarrollo().await);
+
+        let casos = [
+            ("bucket", "b".repeat(64)),
+            ("region", "r".repeat(65)),
+            ("access_key_id", "a".repeat(129)),
+        ];
+
+        for (campo, valor) in casos {
+            let mut cuerpo = cuerpo_de_alta("repo-3-2");
+            cuerpo[campo] = serde_json::json!(valor);
+
+            let respuesta = post_json(router.clone(), "/api/v1/repositories", &cuerpo).await;
+
+            let status = respuesta.status();
+            let respuesta = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "el campo `{campo}` por encima de su cota tiene que rechazarse: contestó {status} \
+                 con {respuesta}"
+            );
+            assert!(
+                respuesta["message"]
+                    .as_str()
+                    .is_some_and(|mensaje| mensaje.contains(campo)),
+                "el motivo tiene que nombrar `{campo}`: {respuesta}"
+            );
+        }
+
+        // El `endpoint` va aparte porque su cota es 2048 y el valor tiene que seguir teniendo forma
+        // de URL para que el rechazo sea por la cota y no por el esquema.
+        let mut cuerpo = cuerpo_de_alta("repo-3-2");
+        cuerpo["endpoint"] = serde_json::json!(format!("https://{}", "e".repeat(2048)));
+
+        let respuesta = post_json(router, "/api/v1/repositories", &cuerpo).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `endpoint` por encima de su cota tiene que rechazarse: contestó {status} con \
+             {cuerpo}"
+        );
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| mensaje.contains("endpoint")),
+            "el motivo tiene que nombrar `endpoint`: {cuerpo}"
+        );
+    }
+
+    /// 3.3 — Un `bucket` con espacios a los lados se guarda recortado.
+    #[tokio::test]
+    async fn un_bucket_con_espacios_se_guarda_recortado() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_alta("repo-3-3");
+        cuerpo_de_la_peticion["bucket"] = serde_json::json!("  cubo-3-3  ");
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/repositories",
+            &cuerpo_de_la_peticion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "el recorte deja un bucket válido y el alta tiene que seguir adelante: contestó \
+             {status} con {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let bucket: String = sqlx::query_scalar("SELECT bucket FROM repositories WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .expect("la fila tiene que estar en el fichero de la base");
+
+        assert_eq!(
+            bucket, "cubo-3-3",
+            "el bucket se guarda recortado, sin los espacios de los extremos"
         );
     }
 }
