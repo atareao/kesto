@@ -209,4 +209,52 @@ describe('ModalDeTarget', () => {
     expect(alta?.cuerpo).not.toHaveProperty('db_password')
     expect(alta?.cuerpo).not.toHaveProperty('db_name')
   })
+
+  it('los campos de texto no dejan escribir más de lo que el borde acepta', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
+    })
+
+    montarArnes([])
+
+    await usuario.click(screen.getByRole('button', { name: 'Nuevo target' }))
+    const dialogo = await screen.findByRole('dialog')
+
+    // Un directorio: el nombre y la ruta del host.
+    expect(within(dialogo).getByRole('textbox', { name: 'Nombre' })).toHaveAttribute(
+      'maxlength',
+      '120',
+    )
+    expect(within(dialogo).getByLabelText('Ruta del host')).toHaveAttribute('maxlength', '4096')
+
+    // Un sqlite: el contenedor y la ruta del `.db` dentro del contenedor.
+    await elegirEnSelect(usuario, 'Tipo', 'SQLite', dialogo)
+    expect(within(dialogo).getByLabelText('Contenedor')).toHaveAttribute('maxlength', '128')
+    expect(within(dialogo).getByLabelText(/ruta del \.db/i)).toHaveAttribute('maxlength', '1024')
+  })
+
+  it('los campos de credenciales de la base llevan su tope, y el secreto no', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
+    })
+
+    montarArnes([])
+
+    await usuario.click(screen.getByRole('button', { name: 'Nuevo target' }))
+    const dialogo = await screen.findByRole('dialog')
+    await elegirEnSelect(usuario, 'Tipo', 'MariaDB', dialogo)
+
+    expect(within(dialogo).getByLabelText('Contenedor')).toHaveAttribute('maxlength', '128')
+    expect(within(dialogo).getByLabelText('Usuario de la base de datos')).toHaveAttribute(
+      'maxlength',
+      '63',
+    )
+    expect(within(dialogo).getByLabelText('Base de datos')).toHaveAttribute('maxlength', '63')
+    // El borde no acota el secreto: el campo no lleva tope.
+    expect(within(dialogo).getByLabelText(/contraseña de la base de datos/i)).not.toHaveAttribute(
+      'maxlength',
+    )
+  })
 })

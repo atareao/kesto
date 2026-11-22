@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
+use crate::api::texto;
 use crate::api::{TAREA_QUE_NO_ESTA, contenido, del_motor};
 use crate::db::entities::{AltaDeTarea, Ejecucion, Tarea};
 use crate::error::AppError;
@@ -259,7 +260,12 @@ async fn repositorio_resuelto(estado: &AppState, valor: &str) -> Result<Uuid, Ap
     Ok(uuid)
 }
 
-/// El `400` de una retención que no conservaría nada.
+/// El `400` de una retención que el motor no sabría leer o que no conservaría nada.
+///
+/// Dos reglas, y las dos por el mismo motivo: que el valor que entra por el formulario sea uno que
+/// el motor sepa leer.
+///
+/// # Las tres a cero
 ///
 /// Con las **tres** reglas a cero no hay ninguna que conserve: la retención no conserva de menos,
 /// **borra todo** el historial del repositorio en la copia siguiente, incluida la que se acaba de
@@ -269,16 +275,26 @@ async fn repositorio_resuelto(estado: &AppState, valor: &str) -> Result<Uuid, Ap
 /// del operador —«de esta regla no conserves ninguna»— y lo que no es una decisión es que las tres
 /// sean cero.
 ///
+/// # Un negativo que no sea `-1`, o algo que no cabe en el entero
+///
+/// El motor —`rustic::retencion::reglas`, descrito en su módulo— lee las tres columnas como un
+/// entero de **32 bits** y le da un único significado especial al `-1`: «conservar todo». Cualquier
+/// otro negativo, y cualquier valor que no quepa en `i32`, es un valor que el motor **rechaza** al
+/// ir a copiar. Rechazarlo aquí es lo que lo para en el formulario, donde se puede corregir en la
+/// misma petición, en vez de dejar que aparezca como un fallo de la primera copia; el `-1` se
+/// conserva porque hoy es la forma legítima de pedir «conservar todo» y rechazarlo rompería
+/// configuraciones válidas.
+///
 /// # Por qué esta comprobación no es la del motor
 ///
-/// El motor tiene el suyo —`rustic::retencion::reglas`, que devuelve
-/// `rustic::Error::RetencionQueLoBorraTodo`— y **ninguna de las dos sobra**: protegen de dos caminos
-/// distintos. Ésta protege el formulario, que es por donde entra una fila de verdad y donde el
-/// operador puede corregir en la misma petición; la del motor protege la copia de una fila escrita
-/// **directamente** en la base, que aquí no pasa y que el motor no puede rechazar al leerla sin
-/// dejar la copia sin hacer. La de aquí es la que puede contestar un `400` que nombre las tres
-/// columnas; la de allí es la que impide que la retención de una fila ya escrita borre el
-/// historial.
+/// El motor tiene la suya —`rustic::retencion::reglas`, que devuelve
+/// `rustic::Error::RetencionQueLoBorraTodo` para los tres ceros y `retencion::Error::RetencionFallida`
+/// para el negativo imposible— y **ninguna de las dos sobra**: protegen de dos caminos distintos.
+/// Ésta protege el formulario, que es por donde entra una fila de verdad y donde el operador puede
+/// corregir en la misma petición; la del motor protege la copia de una fila escrita **directamente**
+/// en la base, que aquí no pasa y que el motor no puede rechazar al leerla sin dejar la copia sin
+/// hacer. La de aquí es la que puede contestar un `400` que nombre las columnas; la de allí es la
+/// que impide que la retención de una fila ya escrita borre el historial.
 fn retencion_que_conserva(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppError> {
     if cuerpo.keep_daily == 0 && cuerpo.keep_weekly == 0 && cuerpo.keep_monthly == 0 {
         return Err(AppError::InvalidInput(
@@ -287,6 +303,22 @@ fn retencion_que_conserva(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppError> 
              historial del repositorio"
                 .to_owned(),
         ));
+    }
+
+    // El mismo juego de valores que lee el motor: de cero en adelante, o el `-1` de «conservar
+    // todo». El tope es el del entero de 32 bits que la biblioteca usa.
+    for (columna, valor) in [
+        ("keep_daily", cuerpo.keep_daily),
+        ("keep_weekly", cuerpo.keep_weekly),
+        ("keep_monthly", cuerpo.keep_monthly),
+    ] {
+        if valor < -1 || valor > i64::from(i32::MAX) {
+            return Err(AppError::InvalidInput(format!(
+                "el campo `{columna}` admite un valor de cero en adelante hasta {}, o el `-1`, que \
+                 significa conservar todo",
+                i32::MAX
+            )));
+        }
     }
 
     Ok(())
@@ -312,14 +344,7 @@ fn cron_que_el_reloj_sepa_leer(cuerpo: &AltaDeTareaDelCable) -> Result<(), AppEr
     Ok(())
 }
 
-/// El tope del nombre de una tarea, en caracteres.
-///
-/// Es una constante y no un literal repetido porque la usan el mensaje del `400` y —en el panel— el
-/// `maxLength` del campo: un tope escrito dos veces puede separarse, y entonces el servidor
-/// rechazaría lo que el formulario deja escribir.
-const NOMBRE_MAXIMO: usize = 120;
-
-/// El `400` de un nombre que falta o no cabe, y la normalización del que sí.
+/// El nombre de la tarea, recortado y medido, o el `400` que lo nombra.
 ///
 /// El nombre es **obligatorio**: un cuerpo que no traiga la clave, que la traiga a `null` o que la
 /// traiga en blanco —vacía o de solo espacios— es un `400` que **nombra `name`**, porque lo que hay
@@ -329,40 +354,14 @@ const NOMBRE_MAXIMO: usize = 120;
 /// con el tipo, con un error ajeno a la envoltura del §5 y sin nombrar `name`—, y de aquí sale un
 /// rechazo **distinguible** del `409` del duplicado, que nace al violar la unicidad de la base.
 ///
-/// Cuando llega, se **recorta** primero —los espacios de los extremos no son parte del nombre, y el
-/// tope se mide sobre lo recortado, no sobre lo que alguien pegó— y luego:
-///
-/// * Si tras recortar queda vacío, es un `400`: una tarea sin nombre no es un estado posible desde
-///   la `0007` —la columna es `NOT NULL`—, así que no hay un `None` al que caer.
-/// * Si supera [`NOMBRE_MAXIMO`] caracteres, es un `400` que **nombra `name`** y **no repite el
-///   valor**: la regla de la casa es que un rechazo diga qué campo está mal, nunca lo que traía.
-///
-/// El tope se mide en caracteres y no en bytes: `bytes()` contaría tres por cada acentuada y
-/// rechazaría un nombre que el formulario deja escribir. La comprobación va **antes de escribir** y
-/// la comparten el alta y la edición —las dos pasan por [`alta_desde`]—, así que una petición
-/// rechazada no puede dejar fila y no hay una tercera puerta de escritura que se olvide de ella.
+/// El recorte, la obligatoriedad y la cota de [`texto::COTA_NOMBRE`] caracteres los aplica
+/// [`texto::obligatorio`], que es la **misma** regla que la de los demás campos de texto del borde:
+/// era una copia local y pasó a ser una llamada para que el tope y el recorte no pudieran separarse
+/// de los de `/targets` y `/repositories`. La comprobación va **antes de escribir** y la comparten
+/// el alta y la edición —las dos pasan por [`alta_desde`]—, así que una petición rechazada no puede
+/// dejar fila y no hay una tercera puerta de escritura que se olvide de ella.
 fn nombre_del_cuerpo(cuerpo: &AltaDeTareaDelCable) -> Result<String, AppError> {
-    let Some(nombre) = cuerpo.name.as_deref() else {
-        return Err(AppError::InvalidInput(
-            "el campo `name` es obligatorio: falta el nombre de la tarea".to_owned(),
-        ));
-    };
-
-    let recortado = nombre.trim();
-
-    if recortado.chars().count() > NOMBRE_MAXIMO {
-        return Err(AppError::InvalidInput(format!(
-            "el campo `name` no puede superar los {NOMBRE_MAXIMO} caracteres"
-        )));
-    }
-
-    if recortado.is_empty() {
-        return Err(AppError::InvalidInput(
-            "el campo `name` es obligatorio: falta el nombre de la tarea".to_owned(),
-        ));
-    }
-
-    Ok(recortado.to_owned())
+    texto::obligatorio("name", cuerpo.name.as_deref(), texto::COTA_NOMBRE)
 }
 
 /// Valida el cuerpo y lo convierte en el alta de la capa de acceso.
@@ -3002,6 +3001,168 @@ mod tests {
             lectura["data"]["keep_daily"],
             serde_json::json!(7),
             "ni ninguno de los otros campos que traía el cuerpo: {lectura}"
+        );
+    }
+
+    // ── La retención negativa alineada con el motor (SEC-14) ─────────────────
+    //
+    // Cubre `api-resources`, requisito «El alta y la edición de una tarea rechazan una retención
+    // negativa que no sea -1». El motor (`rustic::retencion`) lee `-1` como «conservar todo» y
+    // rechaza cualquier otro negativo o lo que no quepa en un entero de 32 bits, así que el borde
+    // tiene que rechazar **lo mismo**: un valor que el motor no sabría leer se para en el formulario
+    // en vez de aparecer como un fallo de la primera copia. Las dos capas existen porque protegen de
+    // dos caminos distintos —el formulario y una fila escrita por debajo de la API—.
+
+    /// 5.1 — Una regla negativa distinta de `-1` se rechaza nombrando su columna.
+    #[tokio::test]
+    async fn una_retencion_negativa_distinta_de_menos_uno_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-de-la-retencion-negativa").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-de-la-retencion-negativa").await;
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_tarea(&target, &repositorio);
+        cuerpo_de_la_peticion["keep_daily"] = serde_json::json!(-5);
+
+        let respuesta = post_json(router, "/api/v1/jobs", &cuerpo_de_la_peticion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `-5` no lo lee el motor, así que el borde no lo puede aceptar: contestó {status} \
+             con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto");
+
+        assert!(
+            mensaje.contains("keep_daily"),
+            "el rechazo tiene que nombrar la columna, y el mensaje fue {mensaje:?}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla de tareas tiene que poder contarse");
+
+        assert_eq!(
+            filas, 0,
+            "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
+        );
+    }
+
+    /// 5.2 — El `-1` se acepta como «conservar todo» y la fila lo guarda.
+    #[tokio::test]
+    async fn menos_uno_se_acepta_como_conservar_todo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-del-conservar-todo").await;
+        let repositorio = repositorio_de_prueba(&router, "repositorio-del-conservar-todo").await;
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_tarea(&target, &repositorio);
+        cuerpo_de_la_peticion["keep_daily"] = serde_json::json!(-1);
+
+        let respuesta = post_json(router, "/api/v1/jobs", &cuerpo_de_la_peticion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "el `-1` es la forma legítima de pedir «conservar todo»: contestó {status} con {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let guardado: i64 = sqlx::query_scalar("SELECT keep_daily FROM backup_jobs WHERE id = ?1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .expect("la fila tiene que estar en el fichero de la base");
+
+        assert_eq!(
+            guardado, -1,
+            "la fila tiene que guardar el `-1` tal cual, que es lo que el motor lee"
+        );
+    }
+
+    /// 5.3 — Una regla por encima del entero de la biblioteca se rechaza.
+    #[tokio::test]
+    async fn una_regla_por_encima_del_entero_de_la_biblioteca_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let target = target_de_prueba(&router, "target-de-la-retencion-enorme").await;
+        let repositorio =
+            repositorio_de_prueba(&router, "repositorio-de-la-retencion-enorme").await;
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_tarea(&target, &repositorio);
+        cuerpo_de_la_peticion["keep_weekly"] = serde_json::json!(i64::from(i32::MAX) + 1);
+
+        let respuesta = post_json(router, "/api/v1/jobs", &cuerpo_de_la_peticion).await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un valor que no cabe en el entero de 32 bits que usa el motor tiene que rechazarse: \
+             contestó {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto");
+
+        assert!(
+            mensaje.contains("keep_weekly"),
+            "el rechazo tiene que nombrar la columna, y el mensaje fue {mensaje:?}"
+        );
+        assert!(
+            mensaje.contains(&i32::MAX.to_string()),
+            "el rechazo de un valor por encima del tope tiene que decir cuál es el máximo, y el \
+             mensaje fue {mensaje:?}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_jobs")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla de tareas tiene que poder contarse");
+
+        assert_eq!(
+            filas, 0,
+            "una petición rechazada no puede dejar fila escrita: quedaron {filas}"
         );
     }
 }

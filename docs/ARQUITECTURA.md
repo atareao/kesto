@@ -66,3 +66,12 @@ Un `sqlite3` que no soporte `-safe` **hace fallar la restauración** en vez de d
 - **`foreign_keys` va en las opciones de conexión del pool**, nunca en un `PRAGMA` suelto: es una opción *por conexión* y está apagada por defecto, así que un `PRAGMA` ejecutado una vez solo afecta a una conexión del pool y el `ON DELETE CASCADE` **no ocurre sin que nada lo delate**.
 - **El arnés de captura de registro (`src/test_support.rs`) instala un suscriptor global y elige el buffer por hilo**: nunca `set_default` ni `with_default`. Un despachante de hilo deja un callsite cacheado como `Interest::never` para todo el proceso y su registro desaparece **en silencio** —el síntoma es «el log está vacío», no «el arnés está roto»—, y solo se manifiesta en CI (2 CPUs), no en local.
 
+## Validación de entrada en el borde
+
+La validación de los campos de texto de los recursos (`/repositories`, `/targets`, `/jobs`) vive en el **borde HTTP** y se comparte por un módulo único (`src/api/texto.rs`), no se repite por recurso. Cada campo tiene una cota en **caracteres**; el valor se recorta antes de medirse; y el `400` **nombra el campo** y **nunca repite el valor**.
+
+- Un campo **obligatorio** en blanco o ausente es un `400` con el nombre del campo; un campo **opcional** en blanco se guarda como `NULL` (el esquema no tiene una noción de cadena vacía distinta de «ausente»).
+- `container_name` se valida contra el juego de caracteres de Docker (`[A-Za-z0-9][A-Za-z0-9_.-]*`) porque el cliente de la API de Docker interpola el nombre **sin codificar** en la ruta de la petición: sin esta validación, un nombre con `/`, `..` o `?` desviaría la petición a otro punto de la API.
+- La **cota del `400` y el `maxLength` del panel son el mismo número**: un formulario que deje escribir un valor que el servidor rechaza obliga al operador a un ida y vuelta para descubrir el tope. Los secretos (`secret_access_key`, `passphrase`, `db_password`) no se acotan.
+- La **retención** del borde está alineada con la que lee el motor (`-1` = «conservar todo»; `< -1` o `> i32::MAX` = `400`), sin sustituir el guardarraíl del motor.
+

@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::api::contenido;
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
+use crate::api::texto;
 use crate::db::entities::{AltaDeTarget, Target, TipoDeTarget};
 use crate::engine::frontera::{self, FronteraError};
 use crate::error::AppError;
@@ -61,6 +62,11 @@ pub fn router() -> Router<AppState> {
 #[serde(deny_unknown_fields)]
 pub struct AltaDeTargetDelCable {
     /// Nombre del target.
+    ///
+    /// `#[serde(default)]` es lo que hace que un cuerpo **sin** la clave llegue aquí como cadena
+    /// vacía en vez de ser rechazado por el extractor: así el `400` lo contesta
+    /// [`alta_desde`] —que nombra `name`— y no la clase genérica de serde, que no nombra el campo.
+    #[serde(default)]
     pub name: String,
     /// Tipo de fuente: `directory`, `mariadb`, `postgresql` o `sqlite`.
     pub target_type: String,
@@ -203,10 +209,9 @@ fn falta(campo: &str) -> AppError {
 
 /// El `400` de un campo que viene vacío.
 ///
-/// Un campo informado y vacío **no** es «no lo informes» —para eso está omitirlo—, sino una
-/// cadena vacía, y la columna del §3 guarda nulo para lo ausente: admitirla escribiría una
-/// cadena vacía donde el esquema espera nulo, y el motor ejecutaría un `docker exec` con el
-/// nombre de un contenedor que es la cadena vacía.
+/// Se usa para el **secreto** `db_password`, que no pasa por [`texto`]: un secreto no se recorta
+/// —recortarlo lo cambiaría— ni se acota. El resto de campos de texto resuelven la misma
+/// distinción en [`texto::obligatorio`] y [`texto::opcional`].
 fn vacio(campo: &str) -> AppError {
     AppError::InvalidInput(format!("el campo `{campo}` no puede ir vacío"))
 }
@@ -218,25 +223,13 @@ fn no_admitido(campo: &str) -> AppError {
     ))
 }
 
-/// Devuelve el texto de un campo obligatorio, o el `400` que lo nombra.
-fn exigir_presente(campo: &str, valor: Option<&str>) -> Result<String, AppError> {
-    match valor {
-        Some(texto) if !texto.is_empty() => Ok(texto.to_owned()),
-        Some(_) => Err(vacio(campo)),
-        None => Err(falta(campo)),
-    }
-}
-
-/// Devuelve el texto de un campo opcional, o el `400` si viene vacío.
+/// Devuelve el nombre del contenedor recortado y validado contra el juego de Docker, o el `400`.
 ///
-/// Ausente se queda en `None` —que es lo que la columna guarda como `NULL`— y presente pero
-/// vacío se rechaza: son dos cosas distintas, y la segunda no tiene significado en el §3.
-fn opcional_no_vacio(campo: &str, valor: Option<&str>) -> Result<Option<String>, AppError> {
-    match valor {
-        None => Ok(None),
-        Some("") => Err(vacio(campo)),
-        Some(texto) => Ok(Some(texto.to_owned())),
-    }
+/// Es obligatorio en los tipos que lo admiten, así que un valor ausente o en blanco se traduce al
+/// `400` de [`falta`]: el juego de caracteres se aplica en [`texto::nombre_de_contenedor`] y la
+/// obligatoriedad, aquí, porque el juego es una regla del campo y la obligatoriedad, del tipo.
+fn contenedor_obligatorio(valor: Option<&str>) -> Result<String, AppError> {
+    texto::nombre_de_contenedor(valor)?.ok_or_else(|| falta("container_name"))
 }
 
 /// El `400` si un campo que este tipo no admite viene informado.
@@ -290,6 +283,20 @@ fn exigir_db_path_sin_ambiguedad(db_path: &str) -> Result<(), AppError> {
 /// es contra ella contra la que se mide el `host_path`. La comprobación es **textual** y va al
 /// final, después de las de presencia y coherencia: un cuerpo al que le falta un campo tiene que
 /// seguir fallando por el campo que falta, no por el alcance de una ruta que ni siquiera venía.
+///
+/// # El recorte y las cotas
+///
+/// Cada campo de texto pasa por [`texto`], que lo **recorta** antes de medirlo y guardarlo y le
+/// aplica su cota: el tope se mide sobre lo que de verdad se va a escribir, y los espacios de los
+/// extremos no son parte del valor. Un campo **obligatorio** que tras recortar quede vacío es un
+/// `400` que nombra el campo —la misma regla que la falta—; un campo **opcional** —`db_name`— se
+/// guarda como `NULL`, nunca como la cadena vacía. El `container_name` lleva además el juego de
+/// caracteres de Docker, que cierra la inyección de ruta en la API de Docker.
+///
+/// **Un cambio de comportamiento deliberado**: antes, un opcional informado en blanco se rechazaba
+/// con un `400` y se exigía distinguirlo de su ausencia. Ahora el blanco se normaliza al `NULL` —los
+/// dos significan «no lo he informado»—, que es lo que el §3 guarda para lo ausente y lo que el
+/// motor lee como el volcado global.
 fn alta_desde(
     cuerpo: &AltaDeTargetDelCable,
     almacenada: Option<&SecretString>,
@@ -297,9 +304,19 @@ fn alta_desde(
 ) -> Result<AltaDeTarget, AppError> {
     let target_type = tipo_del_cable(&cuerpo.target_type)?;
 
+    // El nombre es obligatorio en los **cuatro** tipos y se recorta antes de medirlo, así que se
+    // valida una sola vez, antes de la rama: es el mismo campo para todos y no hay motivo para que
+    // tres ramas lo comprueben y una se olvide. Va antes de las de presencia y coherencia porque un
+    // cuerpo sin nombre falla por el nombre y no por el alcance de una ruta que ni siquiera venía.
+    let name = texto::obligatorio("name", Some(cuerpo.name.as_str()), texto::COTA_NOMBRE)?;
+
     match target_type {
         TipoDeTarget::Directory => {
-            let host_path = exigir_presente("host_path", cuerpo.host_path.as_deref())?;
+            let host_path = texto::obligatorio(
+                "host_path",
+                cuerpo.host_path.as_deref(),
+                texto::COTA_HOST_PATH,
+            )?;
             prohibir("container_name", cuerpo.container_name.as_deref())?;
             prohibir("db_user", cuerpo.db_user.as_deref())?;
             prohibir("db_name", cuerpo.db_name.as_deref())?;
@@ -312,7 +329,7 @@ fn alta_desde(
             exigir_host_path_bajo_la_raiz(raiz, &host_path)?;
 
             Ok(AltaDeTarget {
-                name: cuerpo.name.clone(),
+                name,
                 target_type,
                 container_name: None,
                 db_user: None,
@@ -323,9 +340,9 @@ fn alta_desde(
             })
         }
         TipoDeTarget::Mariadb | TipoDeTarget::Postgresql => {
-            let container_name =
-                exigir_presente("container_name", cuerpo.container_name.as_deref())?;
-            let db_user = exigir_presente("db_user", cuerpo.db_user.as_deref())?;
+            let container_name = contenedor_obligatorio(cuerpo.container_name.as_deref())?;
+            let db_user =
+                texto::obligatorio("db_user", cuerpo.db_user.as_deref(), texto::COTA_DB_USER)?;
 
             let db_password = match &cuerpo.db_password {
                 Some(secreto) if secreto.expose().is_empty() => return Err(vacio("db_password")),
@@ -336,13 +353,17 @@ fn alta_desde(
                 },
             };
 
-            let db_name = opcional_no_vacio("db_name", cuerpo.db_name.as_deref())?;
+            // Un `db_name` ausente **o en blanco** acaba como `NULL`: los dos significan lo mismo
+            // —el volcado global—, y la columna del §3 guarda nulo para lo ausente. Antes se
+            // rechazaba el blanco; desde esta regla se normaliza al nulo, que es lo que el motor lee.
+            let db_name =
+                texto::opcional("db_name", cuerpo.db_name.as_deref(), texto::COTA_DB_NAME)?;
 
             prohibir("host_path", cuerpo.host_path.as_deref())?;
             prohibir("db_path", cuerpo.db_path.as_deref())?;
 
             Ok(AltaDeTarget {
-                name: cuerpo.name.clone(),
+                name,
                 target_type,
                 container_name: Some(container_name),
                 db_user: Some(db_user),
@@ -359,9 +380,9 @@ fn alta_desde(
         // host: el `.db` no se lee del sistema de ficheros de Kesto, se volca desde dentro del
         // contenedor.
         TipoDeTarget::Sqlite => {
-            let container_name =
-                exigir_presente("container_name", cuerpo.container_name.as_deref())?;
-            let db_path = exigir_presente("db_path", cuerpo.db_path.as_deref())?;
+            let container_name = contenedor_obligatorio(cuerpo.container_name.as_deref())?;
+            let db_path =
+                texto::obligatorio("db_path", cuerpo.db_path.as_deref(), texto::COTA_DB_PATH)?;
 
             prohibir("db_user", cuerpo.db_user.as_deref())?;
             prohibir("db_name", cuerpo.db_name.as_deref())?;
@@ -374,7 +395,7 @@ fn alta_desde(
             exigir_db_path_sin_ambiguedad(&db_path)?;
 
             Ok(AltaDeTarget {
-                name: cuerpo.name.clone(),
+                name,
                 target_type,
                 container_name: Some(container_name),
                 db_user: None,
@@ -982,13 +1003,17 @@ mod tests {
         );
     }
 
-    /// 1.29 — Un campo de texto vacío se rechaza nombrando el campo.
+    /// 1.29 — Un campo **obligatorio** de texto vacío se rechaza nombrando el campo.
     ///
-    /// Cubre el requisito de `api-resources` sobre `NULL` y cadena vacía, y la mitad de «exigir»
-    /// del tipo. Un campo informado y vacío no es «no lo informes» —para eso está omitirlo, que es
-    /// el escenario de la 1.28—, sino una cadena vacía, y la columna del §3 guarda `NULL` para lo
-    /// ausente: admitirla escribiría una cadena vacía donde el esquema espera nulo, y el motor
+    /// Cubre el requisito de `api-resources` sobre «un campo obligatorio que tras recortar quede
+    /// vacío es un `400` que nombra el campo». Un campo informado y vacío no es «no lo informes»
+    /// —para eso está omitirlo, que es el escenario de la 1.28—, sino una cadena vacía, y el motor
     /// ejecutaría un `docker exec` con el nombre de un contenedor que es la cadena vacía.
+    ///
+    /// **Solo los obligatorios.** Un opcional —`db_name`— en blanco ya no se rechaza: se guarda como
+    /// `NULL`, que es lo que el §3 significa para «ausente», y tiene su propia prueba (2.5). El
+    /// blanco se prueba con espacios, no con la cadena vacía, para que el rechazo dependa del
+    /// recorte y no de mirar `is_empty()`.
     #[tokio::test]
     async fn un_campo_de_texto_vacio_se_rechaza_nombrando_el_campo() {
         let (directorio, pool, clave) = base_con_clave().await;
@@ -1016,11 +1041,18 @@ mod tests {
                     "name": "target-1-29",
                     "target_type": "mariadb",
                     "container_name": "contenedor",
-                    "db_user": "usuario",
+                    "db_user": "   ",
                     "db_password": "c",
-                    "db_name": "",
                 }),
-                "db_name",
+                "db_user",
+            ),
+            (
+                serde_json::json!({
+                    "name": "target-1-29",
+                    "target_type": "directory",
+                    "host_path": "   ",
+                }),
+                "host_path",
             ),
         ];
 
@@ -1991,5 +2023,432 @@ mod tests {
             guardado, "/backup_sources/var_www",
             "una edición rechazada no puede haber cambiado la fila"
         );
+    }
+
+    // ── Cotas y recorte de los campos de texto (SEC-13) ──────────────────────
+    //
+    // Cubre `api-resources`, requisito «Los campos de texto se recortan y tienen una cota por
+    // campo»: el borde recorta cada campo antes de medirlo y guardarlo, un obligatorio que queda
+    // vacío es un `400` que nombra el campo, un opcional en blanco se guarda como `NULL`, y lo que
+    // supera su cota es un `400` que nombra el campo y **no repite el valor**. El porqué: la tabla
+    // del §3 no acota sus columnas `TEXT`, así que sin esta regla un `bucket` de miles de
+    // caracteres o un `name` de solo espacios entran en la base y reaparecen más tarde.
+
+    /// 2.1 — Un `name` de solo espacios se rechaza nombrando `name`, y no deja fila.
+    #[tokio::test]
+    async fn un_name_en_blanco_contesta_400_nombrando_el_campo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/targets",
+            &cuerpo_de_target("   "),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `name` de solo espacios es un campo vacío: contestó {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "name");
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla tiene que poder contarse");
+        assert_eq!(filas, 0, "un rechazo no puede dejar fila: quedaron {filas}");
+    }
+
+    /// 2.1b — Un cuerpo **sin** la clave `name` contesta `400` nombrando `name`.
+    ///
+    /// Un `name` ausente no es lo mismo que uno en blanco para el extractor: sin
+    /// `#[serde(default)]` el cuerpo lo rechazaría la clase genérica de serde, que **no** nombra el
+    /// campo. Con el defecto declarado, el cuerpo entra al manejador con el nombre vacío y contesta
+    /// el mismo `400` que el blanco —el de [`texto::obligatorio`]—, que sí nombra `name`.
+    #[tokio::test]
+    async fn un_name_ausente_contesta_400_nombrando_el_campo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_target("target-2-1b");
+        if let Some(mapa) = cuerpo_de_la_peticion.as_object_mut() {
+            mapa.remove("name");
+        }
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/targets",
+            &cuerpo_de_la_peticion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un cuerpo sin `name` tiene que rechazarse con un 400 que nombre el campo: contestó \
+             {status} con {cuerpo}"
+        );
+
+        mensaje_que_nombra(&cuerpo, "name");
+
+        let filas = filas_de_targets(&pool).await;
+        assert_eq!(filas, 0, "un rechazo no puede dejar fila: quedaron {filas}");
+    }
+
+    /// 2.2 — Un `name` de 121 caracteres se rechaza sin repetir el valor.
+    #[tokio::test]
+    async fn un_name_por_encima_de_la_cota_contesta_400_sin_repetir_el_valor() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let largo = "n".repeat(121);
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/targets",
+            &cuerpo_de_target(&largo),
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un `name` de 121 caracteres supera su cota de 120: contestó {status} con {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("la envoltura tiene que traer un `message` de texto");
+
+        assert!(
+            mensaje.contains("name"),
+            "el rechazo tiene que nombrar el campo, y el mensaje fue {mensaje:?}"
+        );
+        assert!(
+            !cuerpo.to_string().contains(&largo),
+            "el rechazo no puede repetir el valor recibido: {cuerpo}"
+        );
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla tiene que poder contarse");
+        assert_eq!(filas, 0, "un rechazo no puede dejar fila: quedaron {filas}");
+    }
+
+    /// 2.3 y 2.4 — Cada campo por encima de su cota contesta `400` nombrando el campo.
+    #[tokio::test]
+    async fn un_campo_por_encima_de_su_cota_contesta_400_nombrando_el_campo() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        let casos = [
+            (
+                serde_json::json!({
+                    "name": "target-cota",
+                    "target_type": "mariadb",
+                    "container_name": "a".repeat(129),
+                    "db_user": "usuario",
+                    "db_password": "c",
+                }),
+                "container_name",
+            ),
+            (
+                serde_json::json!({
+                    "name": "target-cota",
+                    "target_type": "mariadb",
+                    "container_name": "contenedor",
+                    "db_user": "u".repeat(64),
+                    "db_password": "c",
+                }),
+                "db_user",
+            ),
+            (
+                serde_json::json!({
+                    "name": "target-cota",
+                    "target_type": "mariadb",
+                    "container_name": "contenedor",
+                    "db_user": "usuario",
+                    "db_password": "c",
+                    "db_name": "d".repeat(64),
+                }),
+                "db_name",
+            ),
+            (
+                serde_json::json!({
+                    "name": "target-cota",
+                    "target_type": "sqlite",
+                    "container_name": "contenedor",
+                    "db_path": format!("/{}", "p".repeat(1024)),
+                }),
+                "db_path",
+            ),
+            (
+                serde_json::json!({
+                    "name": "target-cota",
+                    "target_type": "directory",
+                    "host_path": format!("/srv/{}", "h".repeat(4096)),
+                }),
+                "host_path",
+            ),
+        ];
+
+        for (cuerpo_de_la_peticion, campo) in casos {
+            let respuesta =
+                post_json(router.clone(), "/api/v1/targets", &cuerpo_de_la_peticion).await;
+
+            let status = respuesta.status();
+            let cuerpo = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "el campo `{campo}` por encima de su cota tiene que rechazarse: contestó {status} \
+                 con {cuerpo}"
+            );
+
+            mensaje_que_nombra(&cuerpo, campo);
+
+            let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+                .fetch_one(&pool)
+                .await
+                .expect("la tabla tiene que poder contarse");
+            assert_eq!(
+                filas, 0,
+                "un rechazo por `{campo}` no puede dejar fila: quedaron {filas}"
+            );
+        }
+    }
+
+    /// 2.5 — Un `db_name` informado y en blanco se guarda como `NULL`.
+    #[tokio::test]
+    async fn un_db_name_en_blanco_se_guarda_como_null() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_target("target-2-5");
+        cuerpo_de_la_peticion["db_name"] = serde_json::json!("   ");
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/targets",
+            &cuerpo_de_la_peticion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un `db_name` en blanco es un campo ausente y el alta es válida: contestó {status} con \
+             {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let db_name: Option<String> =
+            sqlx::query_scalar("SELECT db_name FROM backup_targets WHERE id = ?1")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .expect("la fila tiene que estar en el fichero de la base");
+
+        assert!(
+            db_name.is_none(),
+            "un `db_name` en blanco tiene que quedar NULL y no la cadena vacía ni la de espacios: \
+             quedó {db_name:?}"
+        );
+    }
+
+    /// 2.6 — Los campos de texto se guardan recortados.
+    #[tokio::test]
+    async fn los_campos_de_texto_se_guardan_recortados() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let mut cuerpo_de_la_peticion = cuerpo_de_target("  target-2-6  ");
+        cuerpo_de_la_peticion["container_name"] = serde_json::json!("  contenedor-de-pruebas  ");
+        cuerpo_de_la_peticion["db_user"] = serde_json::json!("  usuario-de-pruebas  ");
+        cuerpo_de_la_peticion["db_name"] = serde_json::json!("  base-de-pruebas  ");
+
+        let respuesta = post_json(
+            api_router(estado),
+            "/api/v1/targets",
+            &cuerpo_de_la_peticion,
+        )
+        .await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "los espacios de los extremos no impiden dar de alta: contestó {status} con {cuerpo}"
+        );
+
+        let id = cuerpo["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador que generó la capa de acceso")
+            .to_owned();
+
+        let (name, container_name, db_user, db_name): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT name, container_name, db_user, db_name FROM backup_targets WHERE id = ?1",
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .expect("la fila tiene que estar en el fichero de la base");
+
+        assert_eq!(name, "target-2-6", "el nombre se guarda recortado");
+        assert_eq!(
+            container_name.as_deref(),
+            Some("contenedor-de-pruebas"),
+            "el contenedor se guarda recortado"
+        );
+        assert_eq!(
+            db_user.as_deref(),
+            Some("usuario-de-pruebas"),
+            "el usuario se guarda recortado"
+        );
+        assert_eq!(
+            db_name.as_deref(),
+            Some("base-de-pruebas"),
+            "la base se guarda recortada"
+        );
+    }
+
+    // ── El nombre del contenedor contra Docker (SEC-22) ──────────────────────
+    //
+    // Cubre `api-resources`, requisito «El nombre de un contenedor se valida contra el juego de
+    // caracteres de Docker». El porqué: bollard interpola el nombre **sin codificar** en la ruta de
+    // la petición, así que un nombre con `/`, `..` o `?` mueve la petición a otro punto de la API de
+    // Docker en vez de dar un error de nombre; el juego de Docker no admite ninguno de ésos.
+
+    /// 4.1 — Un `container_name` con caracteres de ruta se rechaza sin tocar la base.
+    #[tokio::test]
+    async fn un_container_name_con_caracteres_de_ruta_se_rechaza() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool.clone(), Arc::clone(&clave)),
+        );
+
+        let router = api_router(estado);
+
+        for malicioso in [
+            "../../v1.40/containers/x",
+            "contenedor/otro",
+            "contenedor?x",
+            "..",
+            "contenedor/",
+        ] {
+            let cuerpo_de_la_peticion = serde_json::json!({
+                "name": "target-4-1",
+                "target_type": "sqlite",
+                "container_name": malicioso,
+                "db_path": "/var/lib/base.db",
+            });
+
+            let respuesta =
+                post_json(router.clone(), "/api/v1/targets", &cuerpo_de_la_peticion).await;
+
+            let status = respuesta.status();
+            let cuerpo = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "`{malicioso}` no puede llegar a la API de Docker: contestó {status} con {cuerpo}"
+            );
+
+            mensaje_que_nombra(&cuerpo, "container_name");
+
+            assert!(
+                !cuerpo.to_string().contains(malicioso),
+                "el rechazo no puede repetir el valor `{malicioso}`: {cuerpo}"
+            );
+        }
+
+        let filas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_targets")
+            .fetch_one(&pool)
+            .await
+            .expect("la tabla tiene que poder contarse");
+        assert_eq!(
+            filas, 0,
+            "ningún rechazo puede dejar fila: quedaron {filas}"
+        );
+    }
+
+    /// 4.2 — Un `container_name` válido para Docker se acepta.
+    #[tokio::test]
+    async fn un_container_name_valido_se_acepta() {
+        let router = api_router(estado_desarrollo().await);
+
+        for valido in ["contenedor_de-la.base-01", "a1b2c3d4"] {
+            let mut cuerpo_de_la_peticion = cuerpo_de_target(&format!("target-4-2-{valido}"));
+            cuerpo_de_la_peticion["container_name"] = serde_json::json!(valido);
+
+            let respuesta =
+                post_json(router.clone(), "/api/v1/targets", &cuerpo_de_la_peticion).await;
+
+            let status = respuesta.status();
+            let cuerpo = body_json(respuesta).await;
+
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "`{valido}` es un nombre de contenedor válido: contestó {status} con {cuerpo}"
+            );
+        }
     }
 }
