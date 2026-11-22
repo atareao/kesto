@@ -54,10 +54,10 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 
 ### 0. Preparación
 
-- [ ] 0.1 Rama `feature/saneamiento-de-dependencias` desde `development`.
-- [ ] 0.2 Change `saneamiento-de-dependencias` (proposal, design, tasks y los deltas de `cadena-de-suministro` y `db`).
-- [ ] 0.3 Este plan.
-- [ ] 0.4 `openspec validate --strict saneamiento-de-dependencias` válido.
+- [x] 0.1 Rama `feature/saneamiento-de-dependencias` desde `development`.
+- [x] 0.2 Change `saneamiento-de-dependencias` (proposal, design, tasks y los deltas de `cadena-de-suministro` y `db`).
+- [x] 0.3 Este plan.
+- [x] 0.4 `openspec validate --strict saneamiento-de-dependencias` válido.
 
 ### 1. RED — la puerta y su cableado, que hoy no existen
 
@@ -99,11 +99,11 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 
 ### 6. Cierre
 
-- [ ] 6.1 `just e2e` verde.
+- [x] 6.1 `just e2e` verde.
 - [x] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
 - [x] 6.3 `docs/ENTORNO.md`, `GIT_FLOW.md` y `AGENTS.md`.
 - [x] 6.4 `@rust-reviewer` sin bloqueantes. Las cinco observaciones del review se aplicaron: (1) los dos ayudantes de pruebas a `&'static str`; (2) el `assert!` de `ANALYZE` invita a re-medir; (3) D9, coherente en pasado; (4) comentario de Dependabot ajustado; (5) toolchain fijada en el job `dependencies`.
-- [ ] 6.5 PR a `development` con `Closes #167`; CI verde; fusionar y cerrar #167 a mano.
-- [ ] 6.6 `just spec-archive saneamiento-de-dependencias`.
-- [ ] 6.7 `plans/PLAN-044.md` → `plans/PLAN-044-COMPLETED.md`.
-- [ ] 6.8 PR del archivado a `development`.
+- [x] 6.5 PR a `development` con `Closes #167`; CI verde; fusionar y cerrar #167 a mano.
+- [x] 6.6 `just spec-archive saneamiento-de-dependencias`.
+- [x] 6.7 `plans/PLAN-044.md` → `plans/PLAN-044-COMPLETED.md`.
+- [x] 6.8 PR del archivado a `development`.
