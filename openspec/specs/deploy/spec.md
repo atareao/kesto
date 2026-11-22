@@ -54,7 +54,7 @@ El servicio SHALL declarar las tres variables de entorno de arranque del §8 —
 - `/etc/nginx:/backup_sources/nginx_config:ro` — otro directorio a respaldar, en solo lectura;
 - `kesto_data:/app/data` — la persistencia interna de la aplicación.
 
-El servicio SHALL declarar además las tres variables del modo OIDC —`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`— y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose up` y su validación `compose config` SHALL negarse a levantar el servicio —sin crear el contenedor— cuando falte cualquiera de ellas: la plantilla de producción NO SHALL poder arrancar en abierto, y `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor de identidad. La plantilla NO SHALL declarar `KESTO_ALLOW_INSECURE`.
+El servicio SHALL declarar además las cuatro variables del modo OIDC —`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` y `OIDC_REDIRECT_URL`— y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose up` y su validación `compose config` SHALL negarse a levantar el servicio —sin crear el contenedor— cuando falte cualquiera de ellas: la plantilla de producción NO SHALL poder arrancar en abierto, y `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor de identidad. La plantilla NO SHALL declarar `KESTO_ALLOW_INSECURE`.
 
 El fichero SHALL declarar el volumen nombrado `kesto_data`. Los tres montajes del host que no son el volumen interno SHALL ser de solo lectura, porque son fuentes de copia y no destinos de escritura.
 
@@ -81,6 +81,12 @@ El fichero SHALL declarar el volumen nombrado `kesto_data`. Los tres montajes de
 - **WHEN** se valida con `compose config`
 - **THEN** SHALL negarse a levantar el servicio
 - **AND** NO SHALL crear el contenedor
+
+#### Scenario: La plantilla no arranca sin la URL de retorno
+- **GIVEN** el fichero `compose.yaml` y un entorno con las tres `OIDC_*` y `KESTO_SECRET` pero sin `OIDC_REDIRECT_URL`
+- **WHEN** se valida con `compose config`
+- **THEN** SHALL negarse a levantar el servicio
+- **AND** el motivo SHALL nombrar `OIDC_REDIRECT_URL`
 
 ### Requirement: El contenedor declara su sonda de salud
 
@@ -303,14 +309,14 @@ El modo de desarrollo —sin proveedor de identidad— SHALL exigir el permiso e
 
 ### Requirement: El despliegue se verifica en la forma de producción
 
-La imagen publicada SHALL verificarse **con proveedor de identidad**: el contenedor SHALL arrancar con las tres variables `OIDC_*`, `KESTO_SECRET`, `BIND_ADDRESS=0.0.0.0:8080` y el puerto publicado, y `GET /api/v1/health` —público— SHALL contestar `200` con `auth_mode: "oidc"` consultado desde fuera del contenedor. El descubrimiento del proveedor NO SHALL ser requisito para arrancar: un emisor inalcanzable solo SHALL avisar, así que la verificación NO SHALL necesitar un proveedor real.
+La imagen publicada SHALL verificarse **con proveedor de identidad**: el contenedor SHALL arrancar con las tres variables `OIDC_*`, `OIDC_REDIRECT_URL` por `https`, `KESTO_SECRET`, `BIND_ADDRESS=0.0.0.0:8080` y el puerto publicado, y `GET /api/v1/health` —público— SHALL contestar `200` con `auth_mode: "oidc"` consultado desde fuera del contenedor. El descubrimiento del proveedor NO SHALL ser requisito para arrancar: un emisor inalcanzable solo SHALL avisar, así que la verificación NO SHALL necesitar un proveedor real.
 
 El modo de desarrollo NO SHALL verificarse con el puerto publicado: con el proceso atado a loopback —lo único que el modo sin autenticación permite— el reenvío del puerto no alcanza al servicio. Ese modo se verifica donde se usa: el binario del e2e y el arnés de pruebas, que declaran el permiso explícito.
 
 La base SQLite SHALL vivir en el volumen nombrado `kesto_data` montado en `/app/data`, de modo que SHALL sobrevivir a la parada y recreación del contenedor: los datos de un despliegue SHALL persistir aunque el contenedor efímero se reemplace.
 
 #### Scenario: El contenedor arranca con proveedor de identidad
-- **GIVEN** un despliegue con `KESTO_MASTER_KEY`, `KESTO_SECRET` y las tres variables `OIDC_*`
+- **GIVEN** un despliegue con `KESTO_MASTER_KEY`, `KESTO_SECRET`, las tres variables `OIDC_*` y `OIDC_REDIRECT_URL` por `https`
 - **WHEN** se levanta el servicio con el puerto publicado
 - **THEN** el contenedor SHALL arrancar
 - **AND** SHALL escuchar en `0.0.0.0:8080`
