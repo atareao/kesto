@@ -128,7 +128,7 @@ El evento describe el **empezó/terminó** con `phase`, y los cuatro contadores 
 
 ## Cómo habilitar / desplegar
 
-No hay nada que activar. La ruta se cuelga del router de negocio como el resto de `/api/v1/*`: **protegida por OIDC** cuando el modo está habilitado, y **abierta** cuando el modo es `Disabled` (sin las tres `OIDC_*`, `/api/v1/*` queda abierto). La acción aparece sola en la pantalla de snapshots del panel; no hay *feature flag*.
+No hay nada que activar. La ruta se cuelga del router de negocio como el resto de `/api/v1/*`: **protegida por OIDC** cuando el modo está habilitado, y **abierta** cuando el modo es `Disabled` (sin ninguna `OIDC_*`, `/api/v1/*` queda abierto). La acción aparece sola en la pantalla de snapshots del panel; no hay *feature flag*.
 
 ## Decisiones
 

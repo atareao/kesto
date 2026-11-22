@@ -300,11 +300,20 @@ services:
       - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:?}
       - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:?}
       - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:?}
+      # Retorno del callback. OBLIGATORIA en modo OIDC y tiene que ser `https`: la
+      # cookie de sesión se emite SIEMPRE con el atributo `Secure`, y un retorno por
+      # `http` haría que el navegador no la devolviera nunca. Ausente, o con un valor
+      # que no sea `https`, el arranque falla nombrando la variable.
+      - OIDC_REDIRECT_URL=${OIDC_REDIRECT_URL:?}
       - KESTO_SECRET=${KESTO_SECRET:?}
       # Raíz bajo la que ha de quedar el `host_path` de un target `directory`.
       # Ruta absoluta; por defecto /backup_sources, que es donde se montan abajo
       # los directorios a respaldar. Presente pero relativa o vacía = error de arranque.
       - KESTO_BACKUP_ROOT=/backup_sources
+      # Opcional: rebaja el borde del `endpoint` para un almacén S3 en claro y en la
+      # propia máquina (laboratorio). `1` concede; `0` o ausente lo niega. Nunca rebaja
+      # el enlace local, la dirección de metadatos ni las credenciales embebidas.
+      # - KESTO_ALLOW_INSECURE_ENDPOINT=1
     volumes:
       # Acceso al socket de Docker del host
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -319,9 +328,13 @@ volumes:
 
 ```
 
-`compose.yaml` reproduce este despliegue y **exige proveedor de identidad**: declara `KESTO_MASTER_KEY`, las tres `OIDC_*` y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose config` —y `podman compose up`— se niegan a levantar el servicio, sin crear el contenedor, cuando falte cualquiera de ellas. El motivo es que sin las `OIDC_*` el modo sería el de **desarrollo**, que exige el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**: con el proceso atado a loopback el reenvío del puerto no alcanza al servicio, así que `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor y el modo de desarrollo no se publica. Los secretos entran siempre por el entorno del host (`.env` o gestor de secretos), nunca escritos en este fichero.
+`compose.yaml` reproduce este despliegue y **exige proveedor de identidad**: declara `KESTO_MASTER_KEY`, las cuatro `OIDC_*` y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose config` —y `podman compose up`— se niegan a levantar el servicio, sin crear el contenedor, cuando falte cualquiera de ellas. El motivo es que sin las `OIDC_*` el modo sería el de **desarrollo**, que exige el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**: con el proceso atado a loopback el reenvío del puerto no alcanza al servicio, así que `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor y el modo de desarrollo no se publica. Los secretos entran siempre por el entorno del host (`.env` o gestor de secretos), nunca escritos en este fichero.
+
+La cuarta `OIDC_*`, `OIDC_REDIRECT_URL`, deja de ser opcional: sin valor por defecto —el que había, `http://localhost:8080/api/v1/auth/callback`, desapareció justo por ser `http`—, en modo OIDC es **obligatoria** y **tiene que ser `https`**. El motivo es que la cookie de sesión se emite **siempre** con el atributo `Secure` —es una cookie de sesión, y una cookie de sesión sin `Secure` viaja en claro—, de modo que un retorno por `http` haría que el navegador no la devolviera nunca: fallar en el arranque es mejor que un panel que no deja entrar. Ausente con las otras tres puestas, o presente con un valor que no sea `https`, el arranque falla nombrando la variable. Configurada **sola**, sin las otras tres, se sigue ignorando en silencio: los tres desenlaces del modo se deciden sobre la presencia de `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`.
 
 **`KESTO_BACKUP_ROOT`** es la raíz bajo la que ha de quedar el `host_path` de un target `directory`. Su valor por defecto es `/backup_sources` —exactamente donde este `compose` monta los directorios a respaldar—, así que la plantilla de referencia no necesita declararla. Es una ruta **absoluta**: presente pero relativa o vacía es **error de arranque** que nombra la variable, en la línea de `RUST_LOG=""` y `BIND_ADDRESS=""`; ausente toma el defecto.
+
+**`KESTO_ALLOW_INSECURE_ENDPOINT`** gobierna si el borde HTTP admite un `endpoint` de repositorio inseguro. Es **opcional** y su defecto es el permiso **negado**: `1` concede; `0` o **ausente** lo niega; cualquier otro valor —**vacío incluido**— es **error de arranque** que nombra la variable. Se lee **siempre**, también en modo OIDC, porque el `endpoint` de un repositorio se valida en los dos modos. Con el permiso, el borde admite un `endpoint` por `http` **y** uno que apunte al loopback —o a un nombre `localhost`/`*.localhost`—: son el mismo caso, «el destino está en mi propia máquina y en claro», que es el laboratorio local y la batería e2e. **No** rebaja nunca la dirección de enlace local (`169.254.0.0/16`, `fe80::/10`), la dirección de metadatos (`169.254.169.254`, `fd00:ec2::254`), la dirección no especificada (`0.0.0.0`, `::`) ni las credenciales embebidas en la URL: esas se rechazan también con el permiso. Sin el permiso, el `endpoint` tiene que ser una URL absoluta con esquema `https` y host. En el `compose` es **opcional** y viaja por el `env_file` (`.env`), no por `environment:` con `:?`.
 
 Los **contenedores de los que se copia** (los targets de base de datos) han de declararse **fuentes de copia** con la etiqueta `io.kesto.backup-source=true` al crearlos: el motor inspecciona el contenedor **antes** de crear ningún `exec` y lo exige, de modo que sin la etiqueta la ejecución acaba en `failed` sin ejecutar nada. La etiqueta viaja con el contenedor y no hay lista de configuración que poblar; el propio `kesto-app` queda denegado por sí solo, porque nadie lo etiqueta. Un origen de ejemplo:
 
