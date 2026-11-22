@@ -61,30 +61,47 @@ const CACHE_DEL_DOCUMENTO: &str = "no-cache";
 pub fn app(state: AppState, panel: impl Into<PathBuf>) -> Router {
     let panel = Arc::new(panel.into());
 
+    // Cabecera HSTS opcional: si el operador configuró `KESTO_HSTS_MAX_AGE`, toda respuesta del
+    // origen —la del panel y la de la API, y también los `404` y `405` de la casa— la lleva. Sin
+    // configurar, el valor es `None` y la capa no inserta nada.
+    let hsts = state
+        .config
+        .hsts_max_age
+        .and_then(|edad| HeaderValue::from_str(&format!("max-age={edad}")).ok());
+
     let router = crate::api::api_router(state).fallback(move |peticion: Request| {
         let panel = Arc::clone(&panel);
 
         async move { atender(&panel, peticion).await }
     });
 
-    con_cabeceras_de_seguridad(router)
+    con_cabeceras_de_seguridad(router, hsts)
 }
 
 /// Añade las cabeceras de seguridad a las respuestas del servidor.
 ///
-/// Son cuatro, y responden a lo que un navegador hace con esta superficie —el panel pinta HTML y
-/// ejecuta el JavaScript de sus assets— y no a lo que espera un cliente de datos:
+/// Son las cinco que describen lo que un navegador hace con esta superficie —el panel pinta HTML y
+/// ejecuta el JavaScript de sus assets— y no lo que espera un cliente de datos:
 ///
 /// - `X-Content-Type-Options: nosniff` corta el sniffing de tipo: sin ella un navegador puede
 ///   ejecutar como script un asset servido con un `Content-Type` que no lo es.
-/// - `Content-Security-Policy: frame-ancestors 'none'` y `X-Frame-Options: DENY` prohíben
-///   enmarcar el panel. Las dos, y no una: `frame-ancestors` es la que manda hoy, y `DENY` es lo
-///   que todavía miran los navegadores que no la implementan. La política se limita a
-///   `frame-ancestors` a propósito —una `default-src` inventada aquí rompería el panel, que
-///   carga sus propios assets y pide estilos en línea— y se amplía cuando haya algo que
-///   restringir de verdad.
+/// - `Content-Security-Policy` es la política completa del origen: cierra con `default-src 'self'`
+///   todo lo que no declare, restringe los scripts a los del propio bundle (`script-src 'self'`, sin
+///   excepciones) y conserva `frame-ancestors 'none'` para prohibir que el panel se enmarque.
+/// - `X-Frame-Options: DENY` refuerza lo anterior. Las dos, y no una: `frame-ancestors` es la que
+///   manda hoy, y `DENY` es lo que todavía miran los navegadores que no la implementan.
 /// - `Referrer-Policy: no-referrer` evita que la URL del panel, que puede llevar el identificador
 ///   de una tarea o de una ejecución, viaje en el `Referer` de una salida a otro origen.
+/// - `Strict-Transport-Security` (opcional) ordena al navegador no volver por HTTP. Se declara aquí
+///   y no en `api_router` porque el origen es uno solo: la HSTS describe la superficie entera
+///   —el panel y la API— y una capa colgada de una sola mitad dejaría a la otra sin la orden.
+///
+/// # Por qué `style-src` lleva `'unsafe-inline'`
+///
+/// Es la única excepción de la política, y es deliberada: antd v5 (`@ant-design/cssinjs`) inyecta
+/// estilos en tiempo de ejecución y los componentes usan atributos `style`, así que una política
+/// sin `'unsafe-inline'` dejaría el panel sin estilos. En `script-src`, en cambio, no hay ninguna
+/// excepción posible: el documento del panel no lleva JavaScript en línea, así que `'self'` basta.
 ///
 /// # Por qué la capa envuelve el router entero
 ///
@@ -101,15 +118,28 @@ pub fn app(state: AppState, panel: impl Into<PathBuf>) -> Router {
 /// Lo que la capa **no** toca: el `Content-Type` y el `Cache-Control` de cada respuesta. Cada
 /// `SetResponseHeaderLayer` fija **su** cabecera y ninguna otra, así que la decisión de tipo y de
 /// caché del servido de ficheros (`ServeFile` y [`cache_de`]) sigue siendo suya.
-fn con_cabeceras_de_seguridad(router: Router) -> Router {
-    router
+///
+/// `hsts` es el valor ya calculado de `KESTO_HSTS_MAX_AGE`, o `None` si el operador no lo
+/// configuró: en ese caso no se declara la capa y ninguna respuesta lleva la cabecera.
+fn con_cabeceras_de_seguridad(router: Router, hsts: Option<HeaderValue>) -> Router {
+    let router = router
         .layer(cabecera(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         ))
         .layer(cabecera(
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("frame-ancestors 'none'"),
+            HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data:; \
+                 connect-src 'self'; \
+                 object-src 'none'; \
+                 base-uri 'self'; \
+                 form-action 'self'; \
+                 frame-ancestors 'none'",
+            ),
         ))
         .layer(cabecera(
             header::X_FRAME_OPTIONS,
@@ -118,7 +148,14 @@ fn con_cabeceras_de_seguridad(router: Router) -> Router {
         .layer(cabecera(
             header::REFERRER_POLICY,
             HeaderValue::from_static("no-referrer"),
-        ))
+        ));
+
+    // La HSTS condicional: sin `KESTO_HSTS_MAX_AGE` no se declara la capa.
+    if let Some(valor) = hsts {
+        router.layer(cabecera(header::STRICT_TRANSPORT_SECURITY, valor))
+    } else {
+        router
+    }
 }
 
 /// Una capa que fija una cabecera de seguridad en toda respuesta.
@@ -255,13 +292,17 @@ mod tests {
     use axum::http::{StatusCode, header};
 
     use super::{PANEL_POR_DEFECTO, app};
+    use crate::config::Config;
     use crate::test_support::{
-        DirectorioDePrueba, body_json, body_text, directorio_de_prueba, estado_desarrollo,
-        estado_oidc, get, header_text, post,
+        DirectorioDePrueba, MASTER_KEY, body_json, body_text, directorio_de_prueba,
+        estado_con_base, estado_desarrollo, estado_oidc, get, header_text, lookup_from, post,
     };
 
     /// El documento del panel de mentira: distinguible para poder afirmar que se sirve **él**.
     const DOCUMENTO: &str = "<!doctype html><html><body><div id=\"root\">panel</div></body></html>";
+
+    /// La política de contenido de la especificación, entera: es lo que tiene que llevar el panel.
+    const CSP_ESPERADA: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'";
 
     /// El asset de mentira, con un hash en el nombre como los que produce Vite.
     const ASSET: &str = "console.log(\"panel\");\n";
@@ -422,6 +463,133 @@ mod tests {
 
         assert_eq!(salud.status(), StatusCode::OK);
         assert_eq!(body_json(salud).await["data"]["auth_mode"], "disabled");
+    }
+
+    /// Escenario «La HSTS cubre también el panel».
+    ///
+    /// La HSTS describe el origen entero, así que tiene que salir tanto por la mitad del panel
+    /// —el documento— como por la de la API. Una capa colgada solo del *fallback*, o dentro de
+    /// `api_router`, dejaría fuera una de las dos.
+    #[tokio::test]
+    async fn la_hsts_cubre_tambien_el_panel() {
+        let panel = panel_de_prueba();
+        let config = Config::from_lookup(&lookup_from(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            // El permiso explícito: esta configuración no trae `OIDC_*`, así que el modo es
+            // `Disabled` y sin el permiso no arrancaría.
+            ("KESTO_ALLOW_INSECURE", "1"),
+            ("KESTO_HSTS_MAX_AGE", "31536000"),
+        ]))
+        .expect("la configuración con HSTS es válida");
+        let router = app(estado_con_base(config).await, panel.ruta());
+
+        for ruta in ["/", "/api/v1/health"] {
+            let respuesta = get(router.clone(), ruta).await;
+
+            assert_eq!(
+                header_text(&respuesta, header::STRICT_TRANSPORT_SECURITY).as_deref(),
+                Some("max-age=31536000"),
+                "la respuesta de {ruta} tiene que llevar la HSTS del origen"
+            );
+        }
+    }
+
+    /// Escenario «Sin HSTS configurada no hay cabecera».
+    ///
+    /// La simetría con [`la_hsts_cubre_tambien_el_panel`]: si allí el recorrido son las dos
+    /// mitades del origen —el panel y la API—, aquí la ausencia se comprueba en esas mismas dos
+    /// más el `404` de la casa, que es por donde se colaría una capa declarada en el sitio
+    /// equivocado. Las tres rutas se afirman también en su código, para que el `404` sea el `404`
+    /// y no una ruta que hoy contesta otra cosa.
+    #[tokio::test]
+    async fn sin_hsts_no_hay_cabecera() {
+        let panel = panel_de_prueba();
+        let router = app(estado_desarrollo().await, panel.ruta());
+
+        for (ruta, esperado) in [
+            ("/", StatusCode::OK),
+            ("/api/v1/health", StatusCode::OK),
+            ("/api/v1/no-existe", StatusCode::NOT_FOUND),
+        ] {
+            let respuesta = get(router.clone(), ruta).await;
+
+            assert_eq!(respuesta.status(), esperado, "la ruta {ruta}");
+
+            assert_eq!(
+                header_text(&respuesta, header::STRICT_TRANSPORT_SECURITY),
+                None,
+                "sin configurar la HSTS no debe haber cabecera en {ruta}"
+            );
+        }
+    }
+
+    /// Escenario «Las cabeceras de seguridad acompañan a toda respuesta del origen».
+    ///
+    /// La CSP deja de ser solo `frame-ancestors` y pasa a ser una política completa: la
+    /// comparación es por **igualdad exacta** con el literal de la especificación, así que una
+    /// regresión que borre `object-src`, `base-uri`, `form-action`, `img-src` o `connect-src`
+    /// —o que añada una directiva— falla aquí. Afirmar directiva a directiva dejaba fuera
+    /// justo las cinco que no se nombraban.
+    #[tokio::test]
+    async fn la_csp_es_una_politica_completa() {
+        let panel = panel_de_prueba();
+        let router = app(estado_desarrollo().await, panel.ruta());
+
+        let respuesta = get(router, "/").await;
+        let csp = header_text(&respuesta, header::CONTENT_SECURITY_POLICY).unwrap_or_default();
+
+        assert_eq!(
+            csp, CSP_ESPERADA,
+            "la CSP del panel no es la política completa de la especificación: {csp:?}"
+        );
+    }
+
+    /// Escenario «La política de scripts no admite código en línea».
+    ///
+    /// `script-src` tiene que valer exactamente `'self'`: con `'unsafe-inline'` o `'unsafe-eval'`
+    /// media política se anula, que es justo lo que una CSP debe cerrar.
+    ///
+    /// La directiva se localiza por su **nombre** —el primer segmento, comparado por igualdad— y no
+    /// con un `starts_with`: así la variante de la familia que también ejecuta scripts
+    /// (`script-src-elem`, `script-src-attr`) no puede pasar por el sitio de la que manda, y la
+    /// negación de las dos fuentes prohibidas se afirma sobre el **valor**, no sobre el segmento
+    /// entero, que era lo que dejaba las comprobaciones sin poder fallar nunca.
+    #[tokio::test]
+    async fn la_csp_no_permite_scripts_en_linea() {
+        let panel = panel_de_prueba();
+        let router = app(estado_desarrollo().await, panel.ruta());
+
+        let respuesta = get(router, "/").await;
+        let csp = header_text(&respuesta, header::CONTENT_SECURITY_POLICY).unwrap_or_default();
+
+        // Las directivas de la familia de los scripts, con su nombre ya separado de su valor: la
+        // comparación por igualdad deja fuera a cualquier vecina que empiece por `script-src`.
+        let de_scripts: Vec<(&str, &str)> = csp
+            .split(';')
+            .filter_map(|segmento| segmento.trim().split_once(char::is_whitespace))
+            .filter(|(nombre, _)| *nombre == "script-src" || nombre.starts_with("script-src-"))
+            .map(|(nombre, valor)| (nombre, valor.trim()))
+            .collect();
+
+        let script_src = de_scripts
+            .iter()
+            .find_map(|(nombre, valor)| (*nombre == "script-src").then_some(*valor))
+            .expect("la CSP del panel tiene que declarar script-src");
+
+        assert_eq!(
+            script_src, "'self'",
+            "script-src tiene que valer exactamente 'self': {csp:?}"
+        );
+
+        // Y ninguna directiva de la familia puede reintroducir lo que `script-src` niega.
+        for (nombre, valor) in &de_scripts {
+            for fuente in valor.split_whitespace() {
+                assert!(
+                    !fuente.starts_with("'unsafe-"),
+                    "{nombre} no puede admitir {fuente}: {csp:?}"
+                );
+            }
+        }
     }
 
     /// Escenario «Una ruta de la API no cae en el fallback».

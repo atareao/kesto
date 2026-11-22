@@ -13,7 +13,8 @@ Da al panel de Kesto su **identidad de marca** (favicons, manifiesto, imagen Ope
 - **Assets**
   - `ui/public/` — `favicon.ico`, `favicon-16/32/48/64.png`, `apple-touch-icon.png`, `android-chrome-192/512.png`, `maskable-icon-512x512.png`, `mstile-150x150.png`, `og-image-dark.png` y `site.webmanifest`. Vite los sirve en la raíz.
   - `ui/src/assets/` — `kesto-icon.png` y `kesto-icon-dark.png` (logo del lateral, variante según modo), importados por el bundle.
-  - `ui/index.html` — `<link rel="icon">`, `<link rel="manifest">`, `msapplication-*`, `<meta name="theme-color">`, meta Open Graph y un **script previo al pintado** que fija `data-tema` (oscuro o la elección guardada) para evitar el destello.
+  - `ui/index.html` — `<link rel="icon">`, `<link rel="manifest">`, `msapplication-*`, `<meta name="theme-color">`, meta Open Graph y una **referencia al arranque de tema previo al pintado** (`<script src="/tema-inicial.js">` síncrono en el `<head>`).
+  - `ui/public/tema-inicial.js` — el **script de arranque de tema** que fija `data-tema` (oscuro o la elección guardada) antes del primer pintado, para evitar el destello. Se sacó de `ui/index.html` a un fichero propio para que la CSP del servidor pueda exigir `script-src 'self'` sin `'unsafe-inline'` ni hashes (FEATURE-045).
 - **Tema**
   - `ui/src/services/useTema.ts` — núcleo: `ModoDeTema`, `CLAVE_DE_TEMA` (`kesto-tema`), `leerTemaGuardado()` (oscuro por defecto, ignora valores inválidos), `ContextoDelTema`, `useTema()` (lanza fuera del proveedor) y `temaDeAntd(modo)` (algoritmo + tokens de marca por modo, incluidos los *component tokens* de `Menu` y `Button`).
   - `ui/src/services/tema.tsx` — `ProveedorDeTema`: contexto `{modo, alternar}`, persiste en `localStorage`, sincroniza `document.documentElement.dataset.tema` y el `<meta name="theme-color">`.
