@@ -14,7 +14,12 @@ El riesgo del salto es de **compilación**, no de datos: el algoritmo del checks
 
 ## D2 · Las excepciones se declaran con motivo, no se silencian
 
-`cargo deny` admite un `ignore` sin motivo, y también apagar la comprobación entera. Se descartan las dos: la lista de excepciones es el **único** sitio donde un lector futuro puede distinguir «este aviso no nos alcanza» de «este aviso lo silenciamos y ya nadie se acordó de por qué». Cada entrada nombra, por tanto, **quién retiene la versión** (`reqsign-core` fija `rsa ^0.9.2`) o **qué camino no se ejecuta** (ECDSA para `crypto-bigint`, el transporte FTP para `suppaftp`), de modo que la excepción se puede refutar con un `cargo tree -i` y se puede retirar en cuanto su causa desaparezca.
+`cargo deny` admite un `ignore` sin motivo, y también apagar la comprobación entera. Se descartan las dos: la lista de excepciones es el **único** sitio donde un lector futuro puede distinguir «este aviso no nos alcanza» de «este aviso lo silenciamos y ya nadie se acordó de por qué». Son **siete** excepciones, y hay que separar dos tipos, porque el motivo que las justifica no es el mismo:
+
+- **Tres por camino no ejecutado o versión retenida por un tercero** —avisos no alcanzables—: `rsa` (el ataque es de descifrado con la clave privada y `reqsign-core` fija `^0.9.2`), `suppaftp` (el transporte FTP nunca se configura) y `crypto-bigint` (las rutas ECDSA no se usan). Cada entrada nombra **quién retiene la versión** o **qué camino no se ejecuta**, de modo que se puede refutar con un `cargo tree -i` y retirar en cuanto su causa desaparezca.
+- **Cuatro por *unmaintained* sin versión que lo cierre** —aquí no hay versión a la que subir—: `async-std` y `pin-utils` caen con la misma cadena FTP sin configurar; `chrono` y `chrono-tz` son dependencia **real** del producto (las fechas y el `tokio-cron-scheduler`) y su salida es una **migración propia a `time`/`jiff`**, fuera del alcance de este change. En estos, el motivo nombra la migración que haría falta y por qué queda fuera.
+
+Cada excepción se puede refutar con un `cargo tree -i` y se puede retirar en cuanto su causa desaparezca.
 
 **Coste aceptado**: una excepción puede quedarse obsoleta —el tercero publica la versión que la cierra y el CI no lo recuerda—, porque `cargo deny` solo comprueba que el aviso siga estando. Lo mitiga Dependabot: la actualización llega como PR y el `ignore` se retira en el mismo PR que sube la dependencia.
 
@@ -41,3 +46,13 @@ Lo que **no** prueba, y conviene decirlo: que el trabajo llegue a ejecutarse —
 ## D7 · El checksum de migración se fija en una prueba de caracterización
 
 La afirmación «el salto no invalida las bases ya desplegadas» se apoya en una propiedad de un tercero —que `sqlx` siga calculando el checksum igual—, y una propiedad de un tercero merece una prueba, no un comentario. La prueba fija el checksum hexadecimal de una migración conocida: si una versión futura cambia el algoritmo, la prueba se pone roja **antes** de que un operador vea un `VersionMismatch` en producción. Se escribe antes del salto y está verde a los dos lados: es un guardián, no un rojo.
+
+## D8 · La receta local de las pruebas de scripts enmascaraba el fallo
+
+La receta `scripts-test` corre la batería en un bucle `for` sin `set -e`, y el código de salida de un bucle es el de su **último** comando: un script en rojo quedaba tapado por el verde de los que vinieran después por orden alfabético, de modo que `just check-all` —el análogo local del CI— podía devolver éxito con una prueba en rojo. Lo destapó la propia fase RED de este change: `dependencias.test.sh` fallaba y la receta salía con `0`. El CI **no** lo sufría, porque su paso de pruebas corre con `bash -e` —el `-e` que GitHub Actions pone por defecto— y ahí el primer fallo corta el paso. La lección es la que recoge el requisito nuevo del delta: **una puerta que devuelve éxito con una prueba en rojo es un adorno**. La receta lleva `set -e` y la comprobación **D** de `scripts/dependencias.test.sh` existe para que nadie lo quite sin que nada lo delate.
+
+## D9 · El grafo de `cargo deny` no incluye `kesto-mcp` (abierto)
+
+`cargo deny` construye su grafo desde los **miembros por defecto** del workspace (`cargo metadata` → `workspace_default_members`), y este repositorio declara el paquete raíz `kesto` y el miembro `kesto-mcp` **sin** `default-members`, así que el defecto es solo el paquete raíz: `cargo deny --locked check` **no ve** `kesto-mcp` ni, por tanto, `rmcp` —justo el crate cuyos tres advisories motivan la tarea 3.2—. Verificado en la fase GREEN: `cargo metadata --locked | jq .workspace_default_members` devuelve solo `kesto`, y `cargo deny --locked --manifest-path kesto-mcp/Cargo.toml check advisories` sí reporta RUSTSEC-2026-0457, -0461 y -0462.
+
+Queda **abierto**, porque contradice el requisito del delta («el CI SHALL ejecutar `cargo deny check` sobre el workspace»): las dos salidas son declarar `default-members = ["kesto", "kesto-mcp"]` en el `[workspace]` del `Cargo.toml` —una línea, y es donde el resto de las herramientas ya mira el workspace entero— o correr `cargo deny` una segunda vez con `--manifest-path kesto-mcp/Cargo.toml`. Ninguna cabe en esta fase: la primera toca `Cargo.toml` (tarea 4) y la segunda, el paso del CI.

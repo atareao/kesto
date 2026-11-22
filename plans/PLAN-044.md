@@ -8,7 +8,7 @@
 
 ## Objetivo
 
-`cargo audit` reporta **10 vulnerabilidades** y **16 avisos** sobre las 612 dependencias del workspace, y no hay ninguna puerta que lo vigile: ni `deny.toml`, ni `cargo audit`/`cargo deny` en el CI, ni Renovate/Dependabot. El bloque cierra los tres avisos **alcanzables**, declara con motivo los tres que no lo son, pone la puerta en el CI y activa Dependabot.
+`cargo audit` reporta **10 vulnerabilidades** y **16 avisos** (11 *unsound*, 4 *unmaintained*, 1 *yanked*) sobre las 612 dependencias del workspace, y no hay ninguna puerta que lo vigile: ni `deny.toml`, ni `cargo audit`/`cargo deny` en el CI, ni Renovate/Dependabot. El bloque cierra los tres avisos **alcanzables**, declara con motivo los **siete** que no lo son (tres no alcanzables y cuatro *unmaintained* sin versión que los cierre), pone la puerta en el CI y activa Dependabot.
 
 | Crate | Advisory | ¿Alcanzable? | Cómo se cierra |
 |---|---|---|---|
@@ -61,17 +61,18 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 
 ### 1. RED — la puerta y su cableado, que hoy no existen
 
-- [ ] 1.1 `scripts/dependencias.test.sh`: prueba estructural (el `deny.toml` con sus cuatro secciones y cada excepción con motivo; el CI con `cargo deny` y `--locked` y con `--workspace` en clippy y test; Dependabot con los tres ecosistemas). Falla hoy: los tres ficheros no existen.
-- [ ] 1.2 Caracterización del checksum de una migración en `src/db/migrate.rs` (verde antes y después del salto).
-- [ ] 1.3 Verificar el rojo: `just scripts-test` falla solo en `dependencias.test.sh`.
+- [x] 1.1 `scripts/dependencias.test.sh`: prueba estructural (el `deny.toml` con sus cuatro secciones y cada excepción con motivo; el CI con `cargo deny` y `--locked` y con `--workspace` en clippy y test; Dependabot con los tres ecosistemas). Falla hoy: los tres ficheros no existen.
+- [x] 1.2 Caracterización del checksum de una migración en `src/db/migrate.rs` (verde antes y después del salto).
+- [x] 1.3 Verificar el rojo: `just scripts-test` falla solo en `dependencias.test.sh`.
 
 ### 2. GREEN — `deny.toml` y la receta
 
-- [ ] 2.1 `deny.toml`: advisories (tres excepciones con motivo), licencias (allowlist explícita), prohibiciones (comodines denegados; duplicidades avisadas, porque las 126 actuales son de terceros) y fuentes (solo crates.io).
-- [ ] 2.2 Receta `just deny` y su encaje en `check-all`.
-- [ ] 2.3 `cargo deny check` verde.
-- [ ] 2.4 `just scripts-test` verde.
-- [ ] 2.5 `docs/COMANDOS.md` documenta la receta.
+- [x] 2.1 `deny.toml`: advisories (**siete** excepciones con motivo: tres avisos no alcanzables y cuatro crates *unmaintained* sin versión que los cierre), licencias (allowlist explícita), prohibiciones (comodines denegados; duplicidades avisadas, porque las 126 actuales son de terceros) y fuentes (solo crates.io).
+- [x] 2.2 Receta `just deny` y su encaje en `check-all`.
+- [x] 2.3 `cargo deny check licenses bans sources` verde. La comprobación entera, `cargo deny check`, no lo puede estar hasta la 4.5: el CVE de SQLite sigue rojo hasta el salto de `sqlx`.
+- [x] 2.4 `just scripts-test` verde.
+- [x] 2.5 `docs/COMANDOS.md` documenta la receta.
+- [x] 2.6 `set -e` en la receta `scripts-test` del `.justfile` (el bucle devolvía el código del último script y enmascaraba un rojo según el orden alfabético).
 
 ### 3. GREEN — los saltos baratos
 
@@ -86,14 +87,14 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 - [ ] 4.2 `libsqlite3-sys` a `0.40.0` dentro del rango que abre `sqlx-sqlite 0.9.1`.
 - [ ] 4.3 Los tres puntos de API: `Migrator` y `Migration::new` en `src/test_support.rs`; los dos `query*()` con cadena no estática.
 - [ ] 4.4 La caracterización del checksum sigue verde.
-- [ ] 4.5 `cargo test --locked --workspace` verde y RUSTSEC-2026-0459 fuera de `cargo deny check advisories`.
+- [ ] 4.5 `cargo test --locked --workspace` verde y `cargo deny check` **entero** verde (RUSTSEC-2026-0459 fuera de los avisos).
 
 ### 5. GREEN — CI y Dependabot
 
-- [ ] 5.1 Job `Dependencies (cargo deny)` en `ci.yml` (`taiki-e/install-action`, `--locked`).
-- [ ] 5.2 `--workspace` en los pasos de análisis y de prueba del CI.
-- [ ] 5.3 `.github/dependabot.yml` con `cargo`, `github-actions` y `npm` en `/ui`.
-- [ ] 5.4 `just scripts-test` y `just check-all` verdes.
+- [x] 5.1 Job `Dependencies (cargo deny)` en `ci.yml` (`taiki-e/install-action`, `--locked`).
+- [x] 5.2 `--workspace` en los pasos de análisis y de prueba del CI.
+- [x] 5.3 `.github/dependabot.yml` con `cargo`, `github-actions` y `npm` en `/ui`.
+- [x] 5.4 `bash scripts/dependencias.test.sh` verde. `just check-all` queda verde al cerrar las tareas 3 y 4, que apagan los avisos alcanzables.
 
 ### 6. Cierre
 

@@ -9,7 +9,8 @@
 | Receta | Qué hace |
 |---|---|
 | `just check` | Los tres checks del CI, en su orden: `cargo fmt --all -- --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --locked`. Ejecútalo antes de cada commit. |
-| `just check-all` | `just check` + los cuatro pasos del panel (`just ui-check`). |
+| `just check-all` | `just check` + la puerta de dependencias (`just deny`) + las pruebas de `scripts/` + los cuatro pasos del panel (`just ui-check`). Es el análogo local del CI entero. |
+| `just deny` | Puerta de la cadena de suministro (`cargo deny check`): avisos de RustSec, licencias, prohibiciones y fuentes, con cada excepción declarada y justificada en `deny.toml`. ⚠️ **La primera vez necesita red** (clona la base de avisos de RustSec), por eso va en `check-all` y **no** en `check`: `check` es lo que se corre antes de cada commit y tiene que poder correr sin conexión. |
 | `just doc` | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`. No está en el CI, pero caza enlaces rotos del rustdoc. |
 | `just e2e` | Batería **e2e** de copia y restauración (issue #86): levanta su propio servidor S3 (SeaweedFS) y exige un motor de contenedores, para los cuatro tipos de origen. Es la feature `e2e`: el job `backend` del CI no la corre. Cuesta minutos. |
 | `just dev` | Backend en local con `RUST_LOG=debug`. El panel va aparte, en otra terminal: `just ui-dev`. |

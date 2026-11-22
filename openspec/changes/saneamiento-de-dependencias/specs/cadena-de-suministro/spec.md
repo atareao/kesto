@@ -4,7 +4,10 @@
 
 ### Requirement: Las dependencias con advisory conocido se cierran o se declaran con su motivo
 
-Ninguna dependencia del workspace SHALL llevar un advisory de RustSec que afecte a código alcanzable. Cuando un advisory no se pueda cerrar —porque un tercero fija la versión, o porque el camino vulnerable no se ejecuta— SHALL declararse como excepción en `deny.toml`, con su identificador y su **motivo** por escrito. El motivo SHALL nombrar la causa —quién retiene la versión, o qué camino no se usa— y NO SHALL limitarse a silenciar el aviso.
+Ninguna dependencia del workspace SHALL llevar un advisory de RustSec que afecte a código alcanzable. Cuando un advisory no se pueda cerrar SHALL declararse como excepción en `deny.toml`, con su identificador y su **motivo** por escrito, y el motivo NO SHALL limitarse a silenciar el aviso. Hay dos tipos de excepción y el motivo SHALL nombrar la causa que corresponde a cada uno:
+
+- un aviso **no alcanzable** —el camino vulnerable no se ejecuta, o un tercero retiene la versión—: el motivo SHALL nombrar **quién retiene la versión** o **qué camino no se usa**;
+- un crate ***unmaintained*** **sin versión que lo cierre**: el motivo SHALL nombrar la **migración** que haría falta para sustituirlo y **por qué queda fuera del alcance**.
 
 Cada excepción SHALL ser refutable contra el árbol con un `cargo tree -i`, y SHALL retirarse en cuanto su causa desaparezca.
 
@@ -19,6 +22,12 @@ Cada excepción SHALL ser refutable contra el árbol con un `cargo tree -i`, y S
 - **WHEN** se ejecuta `cargo deny check advisories`
 - **THEN** SHALL terminar sin error
 - **AND** la entrada de `ignore` SHALL llevar el identificador y un motivo que nombre a `reqsign-core` como quien fija la versión y el descifrado PKCS#1 v1.5 como el camino que no se ejecuta
+
+#### Scenario: Un crate *unmaintained* se declara nombrando la migración que haría falta
+- **GIVEN** el advisory RUSTSEC-2026-0543 sobre `chrono 0.4.45`, que ninguna versión cierra
+- **WHEN** se ejecuta `cargo deny check advisories`
+- **THEN** SHALL terminar sin error
+- **AND** la entrada de `ignore` SHALL llevar el identificador y un motivo que nombre la migración a `time`/`jiff` como salida y su exclusión del alcance de este change
 
 #### Scenario: Un advisory nuevo detiene la comprobación
 - **GIVEN** un advisory que no está declarado en `deny.toml`
@@ -77,3 +86,12 @@ Ninguna actualización SHALL fusionarse sola: cada PR SHALL pasar por la misma p
 - **GIVEN** una propuesta de cambio abierta por Dependabot
 - **WHEN** corre el CI
 - **THEN** SHALL ejecutar los mismos trabajos que en cualquier otra propuesta
+
+### Requirement: Una prueba que falla hace fallar la receta que la ejecuta
+
+Las recetas locales que ejecutan una batería de pruebas SHALL propagar el fallo de cualquiera de sus elementos: el código de salida de la receta NO SHALL depender del orden de la batería ni del último elemento ejecutado. Una receta que devuelve éxito con una prueba en rojo convierte la puerta en un adorno.
+
+#### Scenario: Un script en rojo hace fallar la receta
+- **GIVEN** la batería de `scripts/*.test.sh` con uno de los scripts en rojo
+- **WHEN** se ejecuta la receta que los corre
+- **THEN** SHALL terminar con error

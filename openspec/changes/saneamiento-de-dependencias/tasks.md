@@ -11,17 +11,18 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 
 ## 1. RED — la puerta y su cableado, que hoy no existen
 
-- [ ] 1.1 `scripts/dependencias.test.sh`: prueba estructural del cableado (verificación: falla hoy, porque `deny.toml`, el trabajo del CI y `.github/dependabot.yml` no existen).
-- [ ] 1.2 Prueba de caracterización del checksum de una migración en `src/db/migrate.rs` (verificación: verde antes y después del salto).
-- [ ] 1.3 Verificar el rojo: `just scripts-test` falla en `dependencias.test.sh` y el resto sigue verde.
+- [x] 1.1 `scripts/dependencias.test.sh`: prueba estructural del cableado (verificación: falla hoy, porque `deny.toml`, el trabajo del CI y `.github/dependabot.yml` no existen).
+- [x] 1.2 Prueba de caracterización del checksum de una migración en `src/db/migrate.rs` (verificación: verde antes y después del salto).
+- [x] 1.3 Verificar el rojo: `just scripts-test` falla en `dependencias.test.sh` y el resto sigue verde.
 
 ## 2. GREEN — `deny.toml` y la receta
 
-- [ ] 2.1 `deny.toml` con las cuatro familias: advisories (los tres avisos no alcanzables, con motivo), licencias (allowlist explícita), prohibiciones (comodines denegados, duplicidades avisadas) y fuentes (solo crates.io).
-- [ ] 2.2 Receta `just deny` y su encaje en `check-all` (verificación: `just --list` la muestra).
-- [ ] 2.3 `cargo deny check` en verde con el `deny.toml` nuevo (verificación: termina sin error).
-- [ ] 2.4 El script estructural pasa (verificación: `just scripts-test` sin error).
-- [ ] 2.5 `docs/COMANDOS.md` documenta la receta `deny` y su coste (necesita red la primera vez).
+- [x] 2.1 `deny.toml` con las cuatro familias: advisories (**siete** excepciones con motivo: tres avisos no alcanzables y cuatro crates *unmaintained* sin versión que los cierre), licencias (allowlist explícita), prohibiciones (comodines denegados, duplicidades avisadas) y fuentes (solo crates.io).
+- [x] 2.2 Receta `just deny` y su encaje en `check-all` (verificación: `just --list` la muestra).
+- [x] 2.3 `cargo deny check licenses bans sources` en verde con el `deny.toml` nuevo (verificación: termina sin error). La comprobación **entera**, `cargo deny check`, no puede estar verde hasta la 4.5: el CVE de SQLite sigue rojo hasta el salto de `sqlx`.
+- [x] 2.4 El script estructural pasa (verificación: `just scripts-test` sin error).
+- [x] 2.5 `docs/COMANDOS.md` documenta la receta `deny` y su coste (necesita red la primera vez).
+- [x] 2.6 `set -e` en la receta `scripts-test` del `.justfile`, que enmascaraba el fallo de un script con el verde del último (verificación: la comprobación **D** del script estructural pasa).
 
 ## 3. GREEN — los saltos baratos
 
@@ -36,14 +37,14 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 - [ ] 4.2 `libsqlite3-sys` a `0.40.0` dentro del rango que abre `sqlx-sqlite 0.9.1` (verificación: `cargo tree -i libsqlite3-sys` lo muestra).
 - [ ] 4.3 Los tres puntos de API que señala el compilador: el literal `Migrator` de `src/test_support.rs`, su `Migration::new` y los dos `query*()` con cadena no estática.
 - [ ] 4.4 La caracterización del checksum sigue verde (verificación: la prueba pasa con la versión nueva).
-- [ ] 4.5 `cargo test --locked --workspace` en verde y `cargo deny check advisories` con una excepción menos (verificación: RUSTSEC-2026-0459 ya no aparece).
+- [ ] 4.5 `cargo test --locked --workspace` en verde y `cargo deny check` **entero** en verde, con una excepción menos (verificación: RUSTSEC-2026-0459 ya no aparece y el trabajo de dependencias pasa completo).
 
 ## 5. GREEN — CI y Dependabot
 
-- [ ] 5.1 Job `Dependencies (cargo deny)` en `ci.yml`, con `cargo-deny` por `taiki-e/install-action` y `--locked`.
-- [ ] 5.2 `--workspace` en los pasos de análisis y de prueba del CI.
-- [ ] 5.3 `.github/dependabot.yml` con `cargo`, `github-actions` y `npm` en `/ui`.
-- [ ] 5.4 El script estructural pasa y `just check-all` queda en verde.
+- [x] 5.1 Job `Dependencies (cargo deny)` en `ci.yml`, con `cargo-deny` por `taiki-e/install-action` y `--locked`.
+- [x] 5.2 `--workspace` en los pasos de análisis y de prueba del CI.
+- [x] 5.3 `.github/dependabot.yml` con `cargo`, `github-actions` y `npm` en `/ui`.
+- [x] 5.4 El script estructural pasa (verificación: `bash scripts/dependencias.test.sh` termina con `0`). `just check-all` queda en verde al cerrar las tareas 3 y 4, que son las que apagan los avisos alcanzables.
 
 ## 6. Cierre
 

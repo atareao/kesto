@@ -44,8 +44,9 @@ default:
 # Los tres checks del CI, en su orden. Ejecútalo antes de cada commit
 check: fmt clippy test
 
-# Los tres del backend, las pruebas de `scripts/` y los cuatro del panel
-check-all: check scripts-test ui-check
+# Los tres del backend, la puerta de dependencias, las pruebas de `scripts/` y
+# los cuatro del panel
+check-all: check deny scripts-test ui-check
 
 # Formato: solo comprueba
 fmt:
@@ -67,9 +68,21 @@ clippy:
 test:
     cargo test --locked --workspace
 
-# Pruebas de los scripts de `scripts/` (guard de `latest`, estructura del release)
+# La puerta se corre aparte de `check` a propósito: la primera vez clona la base
+# de avisos de RustSec, así que necesita red, y `check` es lo que se corre antes
+# de cada commit y tiene que poder correr sin conexión.
+#
+# Puerta de la cadena de suministro: avisos, licencias, prohibiciones y fuentes.
+deny:
+    cargo deny check
+
+# `set -e` NO es adorno: sin él, un bucle `for` devuelve el código de salida del
+# ÚLTIMO script, así que uno en rojo se enmascara según el orden alfabético —una
+# puerta que devuelve éxito con una prueba en rojo es un adorno—.
+#
+# Pruebas de los scripts de `scripts/` (guard de `latest`, release, dependencias).
 scripts-test:
-    @for f in scripts/*.test.sh; do echo "── $f"; bash "$f"; done
+    @set -e; for f in scripts/*.test.sh; do echo "── $f"; bash "$f"; done
 
 # Rustdoc: falla con cualquier warning, enlaces rotos incluidos
 doc:

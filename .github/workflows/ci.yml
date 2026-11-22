@@ -68,14 +68,34 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # `--workspace` no es cosmético: sin él Cargo se queda en el paquete raíz y
+      # el crate `kesto-mcp` —donde vive el SDK del MCP— no se mira nunca. Es la
+      # paridad con `just clippy` y `just test` (.justfile).
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Scripts tests
         run: for f in scripts/*.test.sh; do echo "── $f"; bash "$f"; done
+
+  # La puerta de la cadena de suministro. Sin `needs: preflight` a propósito: no
+  # depende de la detección del panel, así que corre en paralelo con el resto.
+  dependencies:
+    name: Dependencies (cargo deny)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Dependencies (advisories, licenses, bans, sources)
+        run: cargo deny --locked check
 
   frontend:
     name: Frontend
