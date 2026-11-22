@@ -76,10 +76,10 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 
 ### 3. GREEN — los saltos baratos
 
-- [ ] 3.1 `zstd 0.13.4` (arrastra `zstd-safe 7.4.x`).
-- [ ] 3.2 `rmcp 3.11.0` en `kesto-mcp`, comprobando sus features.
-- [ ] 3.3 `async-executor 1.14.1`.
-- [ ] 3.4 `cargo test --locked --workspace` en verde.
+- [x] 3.1 `zstd 0.13.4` (arrastra `zstd-safe 7.4.x`).
+- [x] 3.2 `rmcp 3.11.0` en `kesto-mcp`, comprobando sus features.
+- [x] 3.3 `async-executor 1.14.1`.
+- [x] 3.4 `cargo test --locked --workspace` en verde.
 
 ### 4. GREEN — `sqlx 0.9.1` y `libsqlite3-sys` saneado
 

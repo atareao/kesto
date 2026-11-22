@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# `rmcp` 3.5.1 es el SDK oficial del protocolo. Sus features por defecto —`base64`,
+# `rmcp` 3.11.0 es el SDK oficial del protocolo. Sus features por defecto —`base64`,
 # `macros`, `server`— traen los macros `#[tool]`/`#[tool_router]`/`#[tool_handler]` y el
 # aparato de servidor (`schemars` para los esquemas de entrada). A eso se le suman los dos
 # transportes del change: `transport-io` para `stdio` (el defecto) y
@@ -20,7 +20,7 @@ publish = false
 # NO se enciende ningún feature que arrastre el `reqwest` propio de `rmcp` (0.13.x): el
 # cliente HTTP de la API de Kesto usa el `reqwest` 0.12 que ya viaja en el árbol del
 # paquete raíz, para no meter un segundo `reqwest` en el `Cargo.lock`.
-rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.11", features = ["transport-io", "transport-streamable-http-server"] }
 # `axum` sirve el servicio de `Streamable HTTP` (que es un `Service` de tower) y no añade
 # ningún crate nuevo a la caché: es el mismo 0.8.9 que ya usa el paquete raíz.
 axum = { version = "0.8", features = ["tokio"] }
@@ -37,7 +37,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# `schemars` 1.x, el mismo mayor que `rmcp` 3.5.1 usa para sus esquemas: declararlo con el
+# `schemars` 1.x, el mismo mayor que `rmcp` 3.11.0 usa para sus esquemas: declararlo con el
 # mayor equivocado dejaría el `JsonSchema` de los parámetros sin cumplir el bound de `rmcp`.
 schemars = "1"
 thiserror = "2"

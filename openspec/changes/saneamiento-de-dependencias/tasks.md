@@ -26,10 +26,10 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 
 ## 3. GREEN — los saltos baratos
 
-- [ ] 3.1 `zstd 0.13.4` (arrastra `zstd-safe 7.4.x`) (verificación: los avisos de zstd y zstd-safe desaparecen de `cargo deny check advisories`).
-- [ ] 3.2 `rmcp 3.11.0` en `kesto-mcp`, comprobando que `transport-io` y `transport-streamable-http-server` siguen existiendo (verificación: las pruebas de `kesto-mcp` pasan).
-- [ ] 3.3 `async-executor 1.14.1` (verificación: deja de estar *yanked* en `cargo deny check advisories`).
-- [ ] 3.4 `cargo test --locked --workspace` en verde.
+- [x] 3.1 `zstd 0.13.4` (arrastra `zstd-safe 7.4.x`) (verificación: los avisos de zstd y zstd-safe desaparecen de `cargo deny check advisories`).
+- [x] 3.2 `rmcp 3.11.0` en `kesto-mcp`, comprobando que `transport-io` y `transport-streamable-http-server` siguen existiendo (verificación: las pruebas de `kesto-mcp` pasan).
+- [x] 3.3 `async-executor 1.14.1` (verificación: deja de estar *yanked* en `cargo deny check advisories`).
+- [x] 3.4 `cargo test --locked --workspace` en verde.
 
 ## 4. GREEN — `sqlx 0.9.1` y `libsqlite3-sys` saneado
 
