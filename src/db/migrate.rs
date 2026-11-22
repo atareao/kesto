@@ -159,7 +159,7 @@ mod tests {
 
     use sqlx::Row;
     use sqlx::SqlitePool;
-    use sqlx::migrate::Migrator;
+    use sqlx::migrate::{Migration, Migrator};
 
     use crate::db::{abrir, preparar, preparar_con};
     use crate::test_support::{DirectorioDePrueba, config_con_dsn, directorio_de_prueba};
@@ -2155,5 +2155,111 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("los índices deben poder consultarse")
+    }
+
+    /// El checksum con el que `sqlx` identifica una migración, en hexadecimal.
+    ///
+    /// La biblioteca lo guarda como bytes crudos —el `Sha384` del SQL— y así es como lo
+    /// compara contra la fila de `_sqlx_migrations`; aquí solo se pasa a texto para
+    /// poder escribirlo en la tabla de la prueba.
+    fn checksum_en_hexadecimal(migracion: &Migration) -> String {
+        migracion
+            .checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// El checksum de cada migración embebida, fijado contra el `sqlx` de hoy.
+    ///
+    /// Es una prueba de **caracterización**: no afirma comportamiento nuevo, fija el que
+    /// ya hay, y está verde **antes y después** del salto de versión de `sqlx`. Si se
+    /// pone roja es porque cambió una de dos cosas: el algoritmo con el que `sqlx`
+    /// calcula el checksum, o el contenido de una migración **ya aplicada**. Las dos
+    /// merecen que alguien mire, porque `sqlx` compara el checksum de la fila de
+    /// `_sqlx_migrations` con el del fichero embebido y, cuando no cuadra, la base
+    /// desplegada no arranca: un `VersionMismatch` en producción, y sin pantalla donde
+    /// arreglarlo, porque el arranque falla antes de servir.
+    ///
+    /// Los valores salen del propio binario —la biblioteca vigente los imprime—, no de
+    /// una estimación: un checksum inventado no caracterizaría nada.
+    #[test]
+    fn los_checksums_de_las_migraciones_no_cambian() {
+        // (versión, descripción, checksum en hexadecimal). El orden es el de
+        // `migrator().iter()`, que es el de la versión.
+        let esperadas: [(i64, &str, &str); 9] = [
+            (
+                1,
+                "init",
+                "eafe9fb9f5e0c8cb880e78073b13185fb6ae66a42a5bcaf54eceb963250c144795d0aa20080cb4aaa24145cd9d9ef117",
+            ),
+            (
+                2,
+                "indexes",
+                "b42fac880d4cdab97a76085c043cfd1aa28284ca9bbd0f11a00a7b9ae80e21fc7c359bc46cf82a5a8f936a8dc302ddfa",
+            ),
+            (
+                3,
+                "sqlite target",
+                "5ff2028a0929b578a49f849a7d19564daf543fae799ddc0ba2ae30743ead7f7f9193991c6807bbf246de06ea9d3b432f",
+            ),
+            (
+                4,
+                "snapshot id",
+                "3ce304a14d3a1e25a06feaa12eb271a8cf947bc88a2285febce00eefce3e1591cf42bce298a40f291e2857c51eece0f7",
+            ),
+            (
+                5,
+                "nombre de tarea",
+                "2d1f882ec2893660ad69523c9ed8b55ae3febfaad04936db96d29cd6fda2ffea5f96f71833018ff0468d32e686ece86a",
+            ),
+            (
+                6,
+                "restauraciones",
+                "e9526ccaa079e20b03d575d6e771fa8848b7563cf501fd79b292e9f65f5b3d6c44d09df7eefe8893627a1933c313c964",
+            ),
+            (
+                7,
+                "nombre de tarea obligatorio",
+                "56b99d1ef01609a0f9ffa3f91a14769a829d14e8951424b79490fd6da4d4d74e1bb2a2de86499323c5df44965d97bd0c",
+            ),
+            (
+                8,
+                "salud de repositorio",
+                "15081c26072cb64b9c0d29980cb5cfc7933f3f95fb9177ec561a6f77ab56650bcee83129fc8e07b050187d266937893c",
+            ),
+            (
+                9,
+                "api tokens",
+                "5435304fd1405452d7bd3dcd26657937ceb51f287d8d1b5e694e5ee0d7066f9fbc239296c5c5baffc111eb7e0e2a8294",
+            ),
+        ];
+
+        // El migrador en una variable: `iter()` presta las migraciones que viven en él.
+        let migrador = super::migrador();
+        let migraciones: Vec<&Migration> = migrador.iter().collect();
+
+        assert_eq!(
+            migraciones.len(),
+            esperadas.len(),
+            "el número de migraciones embebidas ya no es el de la tabla: si se añadió una, \
+             añádela con su checksum; si no, alguien borró o renumeró una que ya estaba"
+        );
+
+        for (migracion, (version, descripcion, checksum)) in migraciones.into_iter().zip(esperadas)
+        {
+            let real = checksum_en_hexadecimal(migracion);
+            let descripcion_real: &str = &migracion.description;
+
+            assert_eq!(
+                (migracion.version, descripcion_real, real.as_str()),
+                (version, descripcion, checksum),
+                "la migración {} (`{}`) ya no es la que se aplicó en las bases desplegadas: \
+                 cambiar su checksum —el contenido de la migración o el algoritmo que lo \
+                 calcula— haría que `sqlx` la rechazara con un `VersionMismatch` al arrancar",
+                migracion.version,
+                descripcion_real
+            );
+        }
     }
 }
