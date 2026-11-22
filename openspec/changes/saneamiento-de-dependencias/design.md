@@ -1,0 +1,43 @@
+# Design — saneamiento de dependencias y vigilancia de la cadena de suministro
+
+## D1 · `sqlx 0.9.1` ahora, y con `sqlite-bundled` en vez de `sqlite`
+
+El `Cargo.toml` documenta por qué se eligió `0.8.6` y no `0.9.0`: en `0.9.0` la feature `sqlite` expande a `sqlite-bundled + sqlite-deserialize + sqlite-load-extension + sqlite-unlock-notify`, abre `libsqlite3-sys` a `>=0.30.1, <0.38.0` —que resuelve a `0.37.0`, **por debajo del `0.39.0` que cierra el CVE**—, sube `flume` a `0.12.0` y exige MSRV `1.94.0`. El razonamiento era correcto para `0.9.0`: el salto no cerraba el advisory que lo motivaba. **En `0.9.1` el techo sube a `<0.41.0`**, así que el CVE pasa a ser cerrable, y el argumento que decidió la versión deja de sostenerse. Lo que sigue en pie es el MSRV —que se **declara** en lugar de dejarlo en un comentario— y la expansión de features, que se evita declarando `sqlite-bundled`: el equivalente exacto de lo que hacía la feature `sqlite` de `0.8.6`, sin encender la carga de extensiones, el aviso de desbloqueo ni la deserialización de tipos, que Kesto no usa.
+
+Alternativas descartadas:
+
+- **Quedarse en `0.8.6` y declarar el CVE como excepción.** Rechazada: de los diez avisos, este es el único que afecta a código que el producto **siempre** ejecuta —SQLite **es** el almacén—, y declararlo dejaría la puerta abierta sin causa externa que lo justifique (a diferencia de `rsa` o `suppaftp`, aquí no hay tercero que retenga la versión).
+- **`[patch]` de `libsqlite3-sys` a `0.39` sin mover `sqlx`.** Rechazada: `sqlx-sqlite 0.8.x` fija `^0.30.1`, así que el parche queda fuera del rango declarado y la resolución deja de ser reproducible; y el código de `sqlx-sqlite 0.8` no tiene por qué compilar contra la API de la generación `0.39`.
+- **Declarar la feature `sqlite` expandida.** Rechazada: enciende tres capacidades que el producto no usa, y el árbol mínimo es una regla explícita del repositorio.
+
+El riesgo del salto es de **compilación**, no de datos: el algoritmo del checksum (`Sha384` del SQL) es el mismo en las dos versiones, la tabla `_sqlx_migrations` conserva su nombre y su forma por defecto —el renombrado es opt-in por `sqlx.toml`—, y los nombres de `migrations/` (`0001_init.sql` …) ya cumplen la validación nueva. Por eso el cambio de esquema es **ninguno** y no se toca `migrations/`.
+
+## D2 · Las excepciones se declaran con motivo, no se silencian
+
+`cargo deny` admite un `ignore` sin motivo, y también apagar la comprobación entera. Se descartan las dos: la lista de excepciones es el **único** sitio donde un lector futuro puede distinguir «este aviso no nos alcanza» de «este aviso lo silenciamos y ya nadie se acordó de por qué». Cada entrada nombra, por tanto, **quién retiene la versión** (`reqsign-core` fija `rsa ^0.9.2`) o **qué camino no se ejecuta** (ECDSA para `crypto-bigint`, el transporte FTP para `suppaftp`), de modo que la excepción se puede refutar con un `cargo tree -i` y se puede retirar en cuanto su causa desaparezca.
+
+**Coste aceptado**: una excepción puede quedarse obsoleta —el tercero publica la versión que la cierra y el CI no lo recuerda—, porque `cargo deny` solo comprueba que el aviso siga estando. Lo mitiga Dependabot: la actualización llega como PR y el `ignore` se retira en el mismo PR que sube la dependencia.
+
+## D3 · `multiple-versions` avisa; `wildcards` deniega
+
+Hoy hay **126 grupos** de versiones duplicadas, y todos vienen de árboles de terceros: `rustic_core`, `opendal`, `suppaftp`, `wiremock`. Denegar las duplicidades obligaría a un fichero de `skip` con 126 entradas —una lista que nadie lee, que caduca sola y que convierte cualquier bump en una pelea de configuración—. Se queda en `warn`: el aviso sale en el registro del trabajo y se puede leer cuando interesa.
+
+Los comodines son otra cosa: una versión `*` en un `Cargo.toml` es un defecto real —hace que dos máquinas resuelvan árboles distintos— y hoy **no hay ninguno**, así que denegarlos no cuesta nada y cierra la puerta a que aparezca.
+
+## D4 · La puerta es `cargo deny`, no `cargo audit`
+
+`cargo audit` solo mira advisories; `cargo deny` mira cuatro familias —advisories, licencias, prohibiciones y fuentes— con la configuración **versionada en el repositorio**, que es lo que permite revisar las excepciones en el PR. Las licencias y las fuentes no son un adorno: son la comprobación que atrapa a la dependencia nueva que entra con una licencia inesperada o desde un registro ajeno, que es exactamente el tipo de cambio que nadie revisa a mano en un PR de bumps. Se descarta correr las dos: duplicaría el tiempo del trabajo y las dos leen la misma base de avisos, con lo que el segundo par de ojos no añade señal.
+
+## D5 · Dependabot, no Renovate
+
+Dependabot es nativo de GitHub: no exige instalar ninguna aplicación, cubre los tres ecosistemas del repositorio —`cargo` (una entrada en la raíz cubre el workspace entero, `kesto-mcp` incluido), `github-actions` y el `npm` del panel— y su configuración vive en el árbol, junto al resto de la automatización. Renovate agrupa mejor y admite ventanas de fusión más finas, pero necesita la aplicación instalada en el repositorio: una dependencia externa para un proyecto que mantiene sus flujos en ficheros. La agrupación que aquí hace falta —separar los parches de los saltos mayores— se consigue con los `groups` de Dependabot.
+
+## D6 · La prueba del cableado es estructural, y tiene un límite declarado
+
+`scripts/dependencias.test.sh` lee `deny.toml`, `ci.yml` y `.github/dependabot.yml` **como texto** y comprueba la forma: que el `deny.toml` tenga las cuatro secciones y una allowlist no vacía, que cada `ignore` lleve motivo, que el CI ejecute `cargo deny` con `--locked` y que sus pasos de clippy y test lleven `--workspace`, y que Dependabot declare los tres ecosistemas. Sigue el precedente de `scripts/release-image-workflow.test.sh`, que valida la estructura del flujo de publicación.
+
+Lo que **no** prueba, y conviene decirlo: que el trabajo llegue a ejecutarse —eso lo demuestra el CI— ni que la allowlist de licencias esté completa —eso lo demuestra `cargo deny check` corriendo de verdad, en local con `just deny` y en el trabajo—. Lo que atrapa es el modo de fallo que motivó SEC-11: que alguien borre el cableado y la vigilancia desaparezca **sin que nada lo delate**.
+
+## D7 · El checksum de migración se fija en una prueba de caracterización
+
+La afirmación «el salto no invalida las bases ya desplegadas» se apoya en una propiedad de un tercero —que `sqlx` siga calculando el checksum igual—, y una propiedad de un tercero merece una prueba, no un comentario. La prueba fija el checksum hexadecimal de una migración conocida: si una versión futura cambia el algoritmo, la prueba se pone roja **antes** de que un operador vea un `VersionMismatch` en producción. Se escribe antes del salto y está verde a los dos lados: es un guardián, no un rojo.
