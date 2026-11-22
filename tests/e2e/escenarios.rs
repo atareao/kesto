@@ -26,11 +26,11 @@ use reqwest::{Method, StatusCode};
 use serde_json::json;
 
 use super::arnes::{
-    ACCESO_S3, BASE, CLAVE_DE_LA_BASE, Kesto, Motor, Mundo, PLAZO_DE_ARRANQUE,
-    PLAZO_DE_INACTIVIDAD, PLAZO_DE_LA_COPIA, PLAZO_DE_LA_RESTAURACION, Receta, SECRETO_S3, Salida,
-    comparar_arboles, comparar_filas, copiar_arbol, esperar_el_s3, imagen_de_alpine,
-    imagen_de_mariadb, imagen_de_postgres, puerto_libre, resolver_el_socket, sonda_de_mariadb,
-    sonda_de_postgres,
+    ACCESO_S3, BASE, CLAVE_DE_LA_BASE, ESPERA_ENTRE_SONDEOS, Kesto, Motor, Mundo,
+    PLAZO_DE_ARRANQUE, PLAZO_DE_INACTIVIDAD, PLAZO_DE_LA_COPIA, PLAZO_DE_LA_RESTAURACION, Receta,
+    SECRETO_S3, Salida, comparar_arboles, comparar_filas, copiar_arbol, esperar_arranque,
+    esperar_el_s3, imagen_de_alpine, imagen_de_mariadb, imagen_de_postgres, puerto_libre,
+    resolver_el_socket, sonda_de_mariadb, sonda_de_postgres,
 };
 
 // ── La siembra y la comparación ────────────────────────────────────────────
@@ -196,11 +196,30 @@ async fn mariadb_con_etiqueta(mundo: &mut Mundo, sufijo: &str, fuente_de_copia: 
         .await;
 
     let sonda = sonda_de_mariadb();
-    mundo
-        .motor
-        .esperar_orden(&nombre, &sonda.argv(), &sonda.env(), PLAZO_DE_ARRANQUE)
-        .await
-        .unwrap_or_else(|motivo| panic!("{motivo}"));
+    let orden = sonda.argv();
+    let entorno = sonda.env();
+    let argv = orden.as_slice();
+    let env = entorno.as_slice();
+    let motor = &mundo.motor;
+    let contenedor = nombre.as_str();
+
+    // Con supervivencia entre sondeos: el servidor temporal del arranque —que ya tiene la base
+    // creada— se apaga antes del definitivo, así que un acierto único no basta.
+    esperar_arranque(
+        contenedor,
+        argv,
+        PLAZO_DE_ARRANQUE,
+        ESPERA_ENTRE_SONDEOS,
+        move || async move {
+            match motor.ejecutar(contenedor, argv, env).await {
+                Ok(salida) if salida.codigo == 0 => Ok(()),
+                Ok(salida) => Err(format!("código {} · {}", salida.codigo, salida.error)),
+                Err(causa) => Err(causa),
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|motivo| panic!("{motivo}"));
 
     nombre
 }
@@ -283,11 +302,31 @@ async fn postgres_arrancado(mundo: &mut Mundo, sufijo: &str) -> String {
         .await;
 
     let sonda = sonda_de_postgres();
-    mundo
-        .motor
-        .esperar_orden(&nombre, &sonda.argv(), &sonda.env(), PLAZO_DE_ARRANQUE)
-        .await
-        .unwrap_or_else(|motivo| panic!("{motivo}"));
+    let orden = sonda.argv();
+    let entorno = sonda.env();
+    let argv = orden.as_slice();
+    let env = entorno.as_slice();
+    let motor = &mundo.motor;
+    let contenedor = nombre.as_str();
+
+    // El entrypoint oficial de PostgreSQL tiene el mismo servidor temporal que el de MariaDB
+    // —crea `POSTGRES_DB` en él y lo para antes del definitivo—, así que exige la misma
+    // supervivencia entre sondeos.
+    esperar_arranque(
+        contenedor,
+        argv,
+        PLAZO_DE_ARRANQUE,
+        ESPERA_ENTRE_SONDEOS,
+        move || async move {
+            match motor.ejecutar(contenedor, argv, env).await {
+                Ok(salida) if salida.codigo == 0 => Ok(()),
+                Ok(salida) => Err(format!("código {} · {}", salida.codigo, salida.error)),
+                Err(causa) => Err(causa),
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|motivo| panic!("{motivo}"));
 
     // Y se pregunta qué `psql` es: `\restrict` —la segunda capa— existe desde 17.6, y la batería
     // tiene que saber qué cliente está midiendo. Guarda del arranque, no escenario.
@@ -782,6 +821,62 @@ fn la_sonda_de_mariadb_consulta_la_base_sembrable() {
         "la sonda tiene que ser una consulta de verdad: {}",
         sonda.cmd.join(" ")
     );
+}
+
+// ══ Requisito: la espera de arranque no se conforma con el servidor temporal ═
+
+/// Escenario: las sondas que nombran la base exigen la supervivencia del definitivo.
+///
+/// Cubre el escenario «PostgreSQL exige la misma supervivencia que MariaDB» del requisito, y de
+/// paso lo afirma también para MariaDB: itera las dos sondas, porque las dos nombran la base.
+///
+/// Los dos entrypoints oficiales levantan un **servidor temporal** para inicializarse —que ya
+/// tiene la base creada, porque la crea él— y lo apagan antes del definitivo (`--skip-networking`
+/// con `MARIADB_DATABASE` en MariaDB; `docker_temp_server_start` con `listen_addresses=''`,
+/// `docker_setup_db` y `docker_temp_server_stop` en PostgreSQL). La sonda de cada motor **nombra
+/// la base**, y eso la protege del temporal antes de que la base exista, pero no de su tramo
+/// final: por eso ninguno de los dos se da por arrancado con el **primer** acierto, sino que el
+/// acierto tiene que **sobrevivir** a la espera entre sondeos. Aquí se afirma con la sonda de
+/// cada motor y un sondeo simulado que acierta una vez y falla después.
+#[tokio::test]
+async fn las_sondas_que_nombran_la_base_exigen_la_supervivencia_del_definitivo() {
+    const PLAZO_DE_SONDEO: Duration = Duration::from_millis(200);
+    const ESPERA_DE_SONDEO: Duration = Duration::from_millis(20);
+
+    for sonda in [sonda_de_mariadb(), sonda_de_postgres()] {
+        let mut sondeos = 0;
+
+        let desenlace = esperar_arranque(
+            "la base",
+            &sonda.argv(),
+            PLAZO_DE_SONDEO,
+            ESPERA_DE_SONDEO,
+            || {
+                sondeos += 1;
+                let primero = sondeos == 1;
+
+                async move {
+                    if primero {
+                        Ok(())
+                    } else {
+                        Err("el socket no existe".to_owned())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            desenlace.is_err(),
+            "el primer acierto de la sonda de `{}` no basta: {desenlace:?}",
+            sonda.cmd.join(" ")
+        );
+        assert!(
+            sondeos >= 2,
+            "la sonda de `{}` tiene que sondearse al menos dos veces",
+            sonda.cmd.join(" ")
+        );
+    }
 }
 
 // ══ Requisito: batería de punta a punta por tipo de origen ═════════════════
