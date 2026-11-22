@@ -25,6 +25,7 @@ pub mod state;
 mod test_support;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::db::crypto::Clave;
@@ -43,6 +44,14 @@ use crate::state::{AppState, EstadoDeBase};
 /// resolver, que es lo que hace [`apagado_ordenado`]. Uno que se limite a esperar la señal deja el
 /// apagado esperando a un cuerpo sin final, y el proceso acaba con el `SIGKILL` del período de
 /// gracia del orquestador, con los trabajadores del motor a mitad de una copia.
+///
+/// # Por qué con información de conexión
+///
+/// El servicio se construye con `into_make_service_with_connect_info::<SocketAddr>()` y no con
+/// el `Router` a secas: sin ella, la capa del límite de tasa de `GET /api/v1/auth/login` no
+/// tendría de dónde sacar la IP del cliente y contaría todas las peticiones en un mismo cubo
+/// —o, peor, tendría que creerse una cabecera, que el cliente falsifica—. La dirección sale
+/// del socket, que es el único dato de origen que el cliente no puede escribir.
 pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -54,9 +63,13 @@ pub async fn serve(
     // despliegue —`ui/dist` relativa al directorio de trabajo— y no una variable de entorno: el
     // binario y su panel viajan juntos, y un panel que no está deja el `404` de la casa sin
     // impedir el arranque.
-    axum::serve(listener, panel::app(state, panel::PANEL_POR_DEFECTO))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        panel::app(state, panel::PANEL_POR_DEFECTO)
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// El apagado del servidor: espera la señal, **para el planificador**, **cierra el hub** y resuelve.

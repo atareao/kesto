@@ -8,11 +8,11 @@
 
 El modo sin autenticación deja de ser lo que ocurre por omisión y una credencial débil deja de arrancar:
 
-1. **Permiso explícito del modo sin autenticación.** Sin las tres `OIDC_*` el arranque exige `KESTO_ALLOW_INSECURE=1`. `0` o ausente lo niegan; cualquier otro valor —vacío incluido— es error de formato. En modo OIDC la variable ni se consulta.
+1. **Permiso explícito del modo sin autenticación.** Sin ninguna `OIDC_*` el arranque exige `KESTO_ALLOW_INSECURE=1`. `0` o ausente lo niegan; cualquier otro valor —vacío incluido— es error de formato. En modo OIDC la variable ni se consulta.
 2. **Loopback obligatorio en ese modo.** En modo `Disabled` la dirección de escucha tiene que ser de loopback (`127.0.0.0/8` o `::1`); cualquier otra es error de arranque. El defecto de `BIND_ADDRESS` pasa a `127.0.0.1:8080`.
 3. **Credencial débil = puerta de arranque.** `KESTO_MASTER_KEY` (siempre) y `KESTO_SECRET` (en modo OIDC) con menos de 32 caracteres, vacía incluida, impiden el arranque nombrando la variable y el mínimo, nunca el valor.
 4. **La gestión de tokens no se monta sin autenticación.** En modo `Disabled`, `/api/v1/tokens*` contesta `404` con la envoltura, como `/api/v1/auth/*`.
-5. **La plantilla de producción exige proveedor.** `compose.yaml` declara `KESTO_MASTER_KEY`, las tres `OIDC_*` y `KESTO_SECRET` con `${VAR:?}`: sin cualquiera de ellas no levanta el servicio. El smoke test del release pasa a la forma de producción.
+5. **La plantilla de producción exige proveedor.** `compose.yaml` declara `KESTO_MASTER_KEY`, las cuatro `OIDC_*` y `KESTO_SECRET` con `${VAR:?}`: sin cualquiera de ellas no levanta el servicio. El smoke test del release pasa a la forma de producción.
 
 ## Causa / motivo
 

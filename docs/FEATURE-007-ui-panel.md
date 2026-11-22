@@ -89,7 +89,7 @@ Un **único stream SSE global**, `GET /api/v1/events`, con `event: <nombre>` (`e
 
 **Ninguna variable de entorno nueva.** El panel no lee configuración por entorno: la ruta del panel compilado es la constante `PANEL_POR_DEFECTO = "ui/dist"`, **relativa al directorio de trabajo del proceso** — el despliegue deja `ui/dist` al lado del binario y arranca desde ahí. La ruta entra por parámetro en `panel::app` para que las pruebas usen un directorio temporal sin abrir un puerto ni tocar el entorno.
 
-Para levantar todo en dev siguen bastando las de siempre: `KESTO_MASTER_KEY` (obligatoria siempre), `DATABASE_URL`, `BIND_ADDRESS` y `DOCKER_HOST`. Sin ninguna `OIDC_*` el modo es `Disabled` y `/api/v1/health` contesta `auth_mode: "disabled"`, con lo que el panel entra directo. En modo `oidc` hacen falta las tres `OIDC_*` y `KESTO_SECRET`.
+Para levantar todo en dev siguen bastando las de siempre: `KESTO_MASTER_KEY` (obligatoria siempre), `DATABASE_URL`, `BIND_ADDRESS` y `DOCKER_HOST`. Sin ninguna `OIDC_*` el modo es `Disabled` y `/api/v1/health` contesta `auth_mode: "disabled"`, con lo que el panel entra directo. En modo `oidc` hacen falta las `OIDC_*` y `KESTO_SECRET`.
 
 Versiones relevantes del frontal (las fija `ui/package.json`): React **19**, Ant Design **5**, TanStack Query **5**, React Router **7**, Vite **7**, Vitest **5**, TypeScript **5.9**, ESLint **9**.
 

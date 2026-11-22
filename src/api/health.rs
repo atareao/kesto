@@ -32,7 +32,8 @@ mod tests {
     // una segunda fuente de verdad del mismo literal, y cambiar una y no la otra
     // dejaría los dos tests mintiendo en silencio.
     use crate::test_support::{
-        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_de_prueba, get, lookup_from,
+        OIDC_ISSUER_URL, OIDC_REDIRECT_URL, base_con_clave, body_json, body_text, estado_de_prueba,
+        get, lookup_from,
     };
 
     /// Versión que tiene que declarar la salud: la del binario.
@@ -94,6 +95,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
         ])
         .await
     }
@@ -107,6 +109,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
             ("BIND_ADDRESS", BIND_ADDRESS),
             ("DATABASE_URL", DATABASE_URL),
         ])

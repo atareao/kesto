@@ -496,7 +496,7 @@ mod tests {
             "/api/v1/repositories",
             &serde_json::json!({
                 "name": "repositorio-del-stream",
-                "endpoint": destino.to_string_lossy(),
+                "endpoint": crate::test_support::endpoint_de_prueba(destino),
                 "bucket": "cubo-del-stream",
                 "region": "region-de-prueba",
                 "access_key_id": "clave-de-acceso-de-prueba",

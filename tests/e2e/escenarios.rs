@@ -1147,6 +1147,49 @@ async fn el_repositorio_se_crea_contra_s3_real() {
     mundo.cerrar().await;
 }
 
+/// Escenario: el almacén real se verifica con el permiso del `endpoint` declarado.
+///
+/// El `endpoint` del almacén de la batería es `http://127.0.0.1:<puerto>`: esquema en claro y
+/// anfitrión de loopback, que es exactamente el caso que `KESTO_ALLOW_INSECURE_ENDPOINT=1` rebaja.
+/// Sin la variable en el arranque del binario —lo que declara el arnés— el alta del mundo
+/// contestaría `400` y este escenario no tendría repositorio que leer: el `201` del alta es, por
+/// eso, la mitad que mide el permiso, y la otra mitad es que la fila conserve su `endpoint` y que
+/// la comprobación de salud —la que **pregunta al destino**— siga diciendo que el almacén está
+/// bien. Un permiso que dejara pasar el alta pero rompiera la comprobación no serviría de nada.
+#[tokio::test]
+async fn el_almacen_real_se_verifica_con_el_permiso_del_endpoint_declarado() {
+    let mundo = Mundo::nuevo().await;
+
+    let (estado, fila) = mundo.kesto.repositorio(&mundo.repositorio).await;
+
+    assert_eq!(
+        estado,
+        StatusCode::OK,
+        "el mundo tiene que haber dado de alta su repositorio: {fila}"
+    );
+    assert_eq!(
+        fila["data"]["endpoint"], mundo.endpoint,
+        "la fila tiene que conservar el `endpoint` en claro y por loopback del almacén: {fila}"
+    );
+
+    let salud = mundo
+        .kesto
+        .datos(
+            "la salud del almacén real",
+            Method::POST,
+            &format!("/api/v1/repositories/{}/health", mundo.repositorio),
+            None,
+        )
+        .await;
+
+    assert_eq!(
+        salud["health"], "ok",
+        "el almacén real tiene que seguir verificándose con el permiso declarado: {salud}"
+    );
+
+    mundo.cerrar().await;
+}
+
 /// Escenario: el S3 está aislado entre ejecuciones.
 ///
 /// La batería se ejecuta **dos veces** en el mismo proceso —dos mundos completos, cada uno con

@@ -50,7 +50,6 @@ Los mensajes de `ConfigError` nombran la variable y **nunca** su valor, ni el de
 | `DEFAULT_LOG_FILTER` | `"info"` | `pub`: el arranque la usa en vez de repetir un literal propio. Solo se aplica cuando `RUST_LOG` **está ausente**: presente pero en blanco es error de arranque |
 | `DEFAULT_BIND_ADDRESS` | `"0.0.0.0:8080"` | el del §8 |
 | `DEFAULT_DATABASE_URL` | `"sqlite:///app/data/kesto.db"` | el del §8 |
-| `DEFAULT_OIDC_REDIRECT_URL` | `"http://localhost:8080/api/v1/auth/callback"` | callback local, para desarrollar con proveedor |
 | `MIN_CREDENTIAL_LENGTH` | `32` | mínimo que se le exige a una credencial antes de avisar |
 
 ### Secretos

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::auth::limite::LimitadorDeLogin;
 use crate::auth::oidc::Discovery;
 use crate::config::{AuthMode, Config, ConfigError, OidcSettings};
 use crate::db::crypto::Clave;
@@ -21,6 +22,13 @@ use crate::secret::SecretString;
 /// —es el defecto de la plantilla que este change corrige: guardaba la marca de
 /// tiempo y nunca la miraba—.
 pub const STATE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Tope duro de logins pendientes en el mapa.
+///
+/// Con una ventana de cinco minutos, mil veinticuatro entradas sostienen de sobra
+/// el uso legítimo de un despliegue real; el tope está para que un caudal
+/// automatizado no pueda hacer crecer el mapa sin límite.
+pub const MAX_LOGINS: usize = 1024;
 
 /// Un login en curso: el `nonce` emitido y el instante en que se emitió.
 ///
@@ -117,20 +125,32 @@ impl AuthState {
 
     /// Registra un `state` emitido junto a su `nonce` y su marca de tiempo.
     ///
-    /// Purga las entradas caducadas **al insertar**: sin esto el mapa crecería
-    /// con cada login que nadie termina —un `state` que caduca sin consumirse— y
-    /// el proceso acabaría guardando la memoria de intentos abandonados.
-    ///
-    /// AVISO — esto acota el mapa a la ventana del TTL, pero **no le pone un
-    /// tope duro**: un caudal alto de logins dentro de esos cinco minutos lo hace
-    /// crecer sin límite. La spec solo exige purgar por caducidad, así que el
-    /// tope no se implementa aquí; el consumo del `state` en el callback añade la
-    /// purga al consumir, pero tampoco un tope.
+    /// Purga las entradas caducadas **al insertar** y, si aun así el mapa está
+    /// lleno, desaloja la **más antigua** por su marca de tiempo. El tope es
+    /// duro —el mapa no crece con cada intento de entrada que nadie completa— y
+    /// el desalojo es el **último recurso**: rechazar el login nuevo por estar el
+    /// mapa lleno convertiría el tope en una denegación de servicio de
+    /// disponibilidad, y el `state` más antiguo es, de todos, el que menos
+    /// probabilidad tiene de volver.
     pub async fn registrar_login(&self, state: &str, nonce: &str) {
         let ahora = Instant::now();
         let mut logins = self.logins.lock().await;
 
+        // Primero la purga por caducidad: el desalojo solo entra si sigue lleno.
         logins.retain(|_, pendiente| !pendiente.expirado_en(ahora));
+
+        while logins.len() >= MAX_LOGINS {
+            let Some(mas_antigua) = logins
+                .iter()
+                .min_by_key(|(_, pendiente)| pendiente.issued_at)
+                .map(|(clave, _)| clave.clone())
+            else {
+                break;
+            };
+
+            logins.remove(&mas_antigua);
+        }
+
         logins.insert(
             state.to_owned(),
             PendingLogin {
@@ -255,6 +275,12 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Estado de la autenticación: `None` cuando no se monta ninguna capa.
     pub auth: Option<AuthState>,
+    /// Limitador de tasa de la ruta de entrada.
+    ///
+    /// Va en el estado —y tras un `Arc<Mutex<…>>`— porque cada petición recibe un clon del
+    /// estado: sin el `Arc`, cada clon tendría su propio mapa de ventanas y el límite no
+    /// limitaría nada.
+    pub(crate) limite: Arc<Mutex<LimitadorDeLogin>>,
     /// El estado de base: el pool, la clave y las capas de acceso.
     ///
     /// **No** es un `Option`, y no es un detalle de estilo: un estado sin base
@@ -310,6 +336,7 @@ impl AppState {
         Ok(Self {
             config: Arc::new(config),
             auth,
+            limite: Arc::new(Mutex::new(LimitadorDeLogin::new())),
             db,
             motor,
         })
@@ -322,15 +349,16 @@ mod tests {
 
     use time::OffsetDateTime;
 
-    use super::{EstadoDeBase, PendingLogin, STATE_TTL};
+    use super::{AuthState, EstadoDeBase, MAX_LOGINS, PendingLogin, STATE_TTL};
     use crate::config::Config;
     use crate::db::entities::{
         AltaDeEjecucion, AltaDeRepositorio, AltaDeTarea, AltaDeTarget, Estado, TipoDeTarget,
     };
     use crate::secret::SecretString;
     use crate::test_support::{
-        MASTER_KEY, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER_URL, SESSION_SECRET, auth_oidc,
-        base_con_clave, config_con_dsn, estado_de_prueba, lookup_from, nombre_de_tarea_de_prueba,
+        MASTER_KEY, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER_URL, OIDC_REDIRECT_URL,
+        SESSION_SECRET, auth_oidc, base_con_clave, config_con_dsn, estado_de_prueba, lookup_from,
+        nombre_de_tarea_de_prueba,
     };
 
     #[tokio::test]
@@ -377,6 +405,159 @@ mod tests {
         );
     }
 
+    /// Llena el mapa con `MAX_LOGINS` entradas de la marca de tiempo dada.
+    ///
+    /// Se llena a mano —y no con `registrar_login`— para fijar la marca: el tope
+    /// se prueba sobre un mapa ya lleno, sin depender de cuánto tarde un bucle.
+    async fn mapa_lleno(auth: &AuthState, issued_at: Instant, desde: usize) {
+        let mut logins = auth.logins.lock().await;
+        for i in desde..MAX_LOGINS {
+            logins.insert(
+                format!("state-{i}"),
+                PendingLogin {
+                    nonce: format!("nonce-{i}"),
+                    issued_at,
+                },
+            );
+        }
+        assert_eq!(
+            logins.len(),
+            MAX_LOGINS,
+            "el mapa tiene que arrancar lleno en la prueba"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_mapa_de_logins_tiene_un_tope_duro() {
+        // Sin tope, el mapa crecería una entrada por cada login que nadie
+        // completa: es el AVISO que este change cierra.
+        let auth = auth_oidc().await;
+        mapa_lleno(&auth, Instant::now(), 0).await;
+
+        auth.registrar_login("state-de-mas", "nonce-de-mas").await;
+
+        let logins = auth.logins.lock().await;
+
+        assert_eq!(
+            logins.len(),
+            MAX_LOGINS,
+            "el mapa no puede pasar de MAX_LOGINS entradas"
+        );
+        assert!(
+            logins.contains_key("state-de-mas"),
+            "el login nuevo no puede rechazarse por estar el mapa lleno: rechazarlo sería una denegación de servicio de disponibilidad"
+        );
+    }
+
+    #[tokio::test]
+    async fn al_llenarse_el_mapa_se_desaloja_la_mas_antigua() {
+        // La desalojada es la de menor `issued_at`, no una cualquiera: si se
+        // desalojara al azar, el mapa dejaría de ser una cola de antigüedad.
+        let auth = auth_oidc().await;
+
+        let mas_antigua = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("la prueba necesita un uptime mayor que un minuto");
+        {
+            let mut logins = auth.logins.lock().await;
+            logins.insert(
+                "state-mas-antigua".to_owned(),
+                PendingLogin {
+                    nonce: "nonce-mas-antigua".to_owned(),
+                    issued_at: mas_antigua,
+                },
+            );
+        }
+        // El resto, un minuto más nuevas y con la misma marca entre ellas.
+        mapa_lleno(&auth, Instant::now(), 1).await;
+
+        auth.registrar_login("state-de-mas", "nonce-de-mas").await;
+
+        let logins = auth.logins.lock().await;
+
+        assert!(
+            !logins.contains_key("state-mas-antigua"),
+            "la entrada más antigua tenía que ser la desalojada"
+        );
+        assert!(
+            logins.contains_key("state-de-mas"),
+            "la entrada nueva tiene que quedar registrada"
+        );
+        assert_eq!(
+            logins.len(),
+            MAX_LOGINS,
+            "el mapa tiene que seguir lleno, ni más ni menos"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_purga_por_caducidad_va_antes_del_desalojo() {
+        // El desalojo es el último recurso: si la purga deja hueco, no se
+        // desaloja ninguna entrada vigente.
+        let auth = auth_oidc().await;
+
+        let caducada = Instant::now()
+            .checked_sub(STATE_TTL + Duration::from_secs(1))
+            .expect("la purga necesita un uptime mayor que STATE_TTL");
+        {
+            let mut logins = auth.logins.lock().await;
+            logins.insert(
+                "state-caducada".to_owned(),
+                PendingLogin {
+                    nonce: "nonce-caducada".to_owned(),
+                    issued_at: caducada,
+                },
+            );
+        }
+        mapa_lleno(&auth, Instant::now(), 1).await;
+
+        auth.registrar_login("state-de-mas", "nonce-de-mas").await;
+
+        let logins = auth.logins.lock().await;
+
+        assert!(
+            !logins.contains_key("state-caducada"),
+            "la entrada caducada tenía que purgarse"
+        );
+        assert!(
+            logins.contains_key("state-1"),
+            "ninguna entrada vigente puede desalojarse si la purga deja hueco"
+        );
+        assert!(
+            logins.contains_key("state-de-mas"),
+            "la entrada nueva tiene que quedar registrada"
+        );
+        assert_eq!(
+            logins.len(),
+            MAX_LOGINS,
+            "el mapa tiene que quedar lleno y no más"
+        );
+    }
+
+    #[tokio::test]
+    async fn con_el_mapa_lleno_un_state_vigente_se_consume() {
+        // Contrapeso: el tope no puede romper el camino bueno. Consumir un
+        // `state` vigente con el mapa lleno tiene que seguir funcionando.
+        let auth = auth_oidc().await;
+        mapa_lleno(&auth, Instant::now(), 0).await;
+
+        let pendiente = auth
+            .consumir_login("state-7")
+            .await
+            .expect("un state vigente con el mapa lleno tiene que consumirse");
+
+        assert_eq!(
+            pendiente.nonce, "nonce-7",
+            "el nonce devuelto tiene que ser el de la entrada consumida"
+        );
+
+        let logins = auth.logins.lock().await;
+        assert!(
+            !logins.contains_key("state-7"),
+            "el state consumido no puede quedarse en el mapa"
+        );
+    }
+
     #[test]
     fn el_ttl_del_state_es_de_cinco_minutos() {
         // Fija el valor de la constante: la spec dice «más de 5 minutos» y el
@@ -418,6 +599,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
         ]))
         .expect("la configuración OIDC es válida");
 

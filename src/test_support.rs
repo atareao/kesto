@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -59,8 +60,9 @@ pub(crate) const OIDC_ISSUER_URL: &str = "https://idp.example.test/realms/kesto"
 pub(crate) const OIDC_CLIENT_ID: &str = "kesto-panel";
 /// Secreto del cliente OIDC: solo tiene que estar presente.
 pub(crate) const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
-/// URL de retorno por defecto: la del SRS, la que se usa si no se declara otra.
-pub(crate) const OIDC_REDIRECT_URL: &str = "http://localhost:8080/api/v1/auth/callback";
+/// URL de retorno de las pruebas: en modo OIDC tiene que ser `https`, o el
+/// arranque no sale adelante.
+pub(crate) const OIDC_REDIRECT_URL: &str = "https://panel.example.test/api/v1/auth/callback";
 /// Usuario distinguible de la sesión de pruebas.
 pub(crate) const SUB: &str = "usuario-distinguible-1";
 /// Correo distinguible de la sesión de pruebas.
@@ -468,6 +470,25 @@ pub(crate) fn barras_mudas() -> BarrasDelMotor {
     BarrasDelMotor::mudas()
 }
 
+/// La ruta del sistema de ficheros que esconde el `endpoint` de una fila de prueba.
+///
+/// Desde el endurecimiento del borde, el `endpoint` de una fila tiene que ser una URL, así que
+/// el `endpoint` de las pruebas es una URL cuyo **camino** es la ruta de verdad —lo que deja
+/// [`destino_local_de_prueba`]—. Este ayudante deshace el disfraz: es lo que usan
+/// [`abridor_local`] y [`comprobador_local`] para saber dónde abrir el repositorio, y lo que
+/// pide una prueba que necesite la ruta —para escribir un fichero donde el motor espera un
+/// directorio— en vez de recomponerla por su cuenta.
+///
+/// Un valor que **no** sea una URL con anfitrión se devuelve tal cual: es lo que deja
+/// [`acceso_local`], que no pasa por el borde y sigue hablando de rutas peladas, y es lo que
+/// mantiene funcionando a las pruebas del motor y de la biblioteca sin tocarlas.
+pub(crate) fn ruta_del_endpoint(endpoint: &str) -> PathBuf {
+    match url::Url::parse(endpoint) {
+        Ok(url) if url.has_host() => PathBuf::from(url.path()),
+        _ => PathBuf::from(endpoint),
+    }
+}
+
 /// El abridor de repositorios del motor, para las pruebas: abre un repositorio **local**.
 ///
 /// El motor abre su repositorio con un puntero a función que entra por los ajustes, y sin este
@@ -475,18 +496,18 @@ pub(crate) fn barras_mudas() -> BarrasDelMotor {
 /// —cola, hilo, archivado, fila— se recorre contra un directorio del sistema de ficheros, sin red,
 /// sin credenciales y sin motor de contenedores, que es lo que permite que corra en el CI.
 ///
-/// La ruta del repositorio sale del `endpoint` del [`Acceso`](crate::rustic::Acceso): es lo que
-/// [`acceso_local`] deja ahí, y por eso un aparato de prueba solo tiene que escribir esa ruta en la
-/// fila del §3 para que el motor abra **ese** repositorio. Y es un `fn` y no un cierre porque el
-/// tipo que el motor acepta es un puntero a función: lo que se inyecta no puede llevar dentro ni
-/// una credencial ni una ruta escondida.
+/// La ruta del repositorio sale del **camino** del `endpoint` del [`Acceso`](crate::rustic::Acceso),
+/// que es lo que traduce [`ruta_del_endpoint`]: es lo que [`acceso_local`] deja ahí, y por eso un
+/// aparato de prueba solo tiene que escribir esa ruta en la fila del §3 para que el motor abra
+/// **ese** repositorio. Y es un `fn` y no un cierre porque el tipo que el motor acepta es un puntero
+/// a función: lo que se inyecta no puede llevar dentro ni una credencial ni una ruta escondida.
 pub(crate) fn abridor_local(
     acceso: &crate::rustic::Acceso,
     barras: BarrasDelMotor,
 ) -> Result<(crate::rustic::Repositorio, crate::rustic::PuestaEnMarcha), crate::rustic::Error> {
     crate::rustic::poner_en_marcha_con(
         acceso,
-        backends_locales(Path::new(&acceso.endpoint)),
+        backends_locales(&ruta_del_endpoint(&acceso.endpoint)),
         barras,
     )
 }
@@ -496,8 +517,9 @@ pub(crate) fn abridor_local(
 /// Es el gemelo de [`abridor_local`] en el otro punto de inyección de los ajustes: sin él, las
 /// pruebas de las dos rutas de comprobación del §5 tendrían que hablar con un S3 de verdad —que no
 /// hay—, y lo que hay que medir es el camino de la capa HTTP —leer la fila, comprobar, anotar y
-/// devolver—, no el backend. La ruta del repositorio sale del `endpoint` del `Acceso`, igual que en
-/// el abridor, así que un aparato de prueba solo tiene que escribir esa ruta en la fila.
+/// devolver—, no el backend. La ruta del repositorio sale del **camino** del `endpoint` del
+/// `Acceso` —lo que traduce [`ruta_del_endpoint`]—, igual que en el abridor, así que un aparato de
+/// prueba solo tiene que escribir esa ruta en la fila.
 ///
 /// Llama a [`salud_del_repositorio_con`](crate::rustic::salud_del_repositorio_con) —el gancho de
 /// solo lectura del módulo de la biblioteca, sin tope porque un destino local contesta en el acto—
@@ -508,7 +530,7 @@ pub(crate) fn comprobador_local(
 ) -> Result<crate::rustic::LoQueContestaElDestino, crate::rustic::Error> {
     crate::rustic::salud_del_repositorio_con(
         acceso,
-        backends_locales(Path::new(&acceso.endpoint)),
+        backends_locales(&ruta_del_endpoint(&acceso.endpoint)),
         barras,
     )
 }
@@ -614,9 +636,13 @@ pub(crate) fn destino_de_s3_que_se_traga_la_peticion() -> String {
 ///
 /// El alta de un repositorio dejó de ser un apunte: desde el change `backup-engine` **habla con el
 /// destino** —lo inicializa o conecta con él—, así que el `endpoint` de una fila de prueba tiene que
-/// ser una ruta de verdad donde [`abridor_local`] pueda abrir un repositorio. Un `endpoint` de
-/// mentira (`https://s3.example.test/…`) haría fallar el alta por destino inalcanzable, que es
+/// llevar el camino de una ruta de verdad donde [`abridor_local`] pueda abrir un repositorio. Un
+/// `endpoint` cuyo camino no exista haría fallar el alta por destino inalcanzable, que es
 /// justamente lo que ese camino tiene que hacer.
+///
+/// Lo que devuelve es una URL `https` **con el camino real dentro**: el borde solo admite URLs, así
+/// que la ruta va disfrazada de camino y quien necesite la ruta pelada la pide a
+/// [`ruta_del_endpoint`], que es lo que deshace el disfraz.
 ///
 /// La guarda del directorio se **retiene** hasta que el proceso de pruebas termina, y ése es el
 /// motivo de que este ayudante exista en vez de que cada prueba se monte el suyo: el alta ocurre
@@ -629,7 +655,21 @@ pub(crate) fn destino_local_de_prueba(nombre: &str) -> String {
 
     retener(directorio);
 
-    ruta.to_string_lossy().into_owned()
+    // El `endpoint` va disfrazado de URL porque el borde lo exige: desde el endurecimiento de
+    // la superficie, una fila no admite un `endpoint` que no sea una URL. El anfitrión es de
+    // mentira y **nadie lo resuelve**: el motor de las pruebas es el abridor local, que saca del
+    // camino la ruta de verdad —es lo que hace [`ruta_del_endpoint`]—.
+    format!("https://destino.local{}", ruta.to_string_lossy())
+}
+
+/// El `endpoint` de prueba para una ruta que **ya existe** en el sistema de ficheros.
+///
+/// Es la forma de [`destino_local_de_prueba`] para quien ya tiene el directorio —lo creó
+/// [`directorio_de_prueba`], o lo trae un ayudante— y no quiere que se le cree otro. Desde el
+/// endurecimiento del borde el `endpoint` de una fila tiene que ser una URL, así que la ruta viaja
+/// dentro del camino del mismo anfitrión fingido, y [`ruta_del_endpoint`] la saca de ahí.
+pub(crate) fn endpoint_de_prueba(ruta: &Path) -> String {
+    format!("https://destino.local{}", ruta.to_string_lossy())
 }
 
 /// Abre el repositorio local del directorio dado, con la biblioteca y sin pasar por el
@@ -966,6 +1006,27 @@ pub(crate) fn config_con_dsn_y_raiz_de_copias(dsn: &str, raiz: &str) -> Config {
     .expect("la configuración de prueba con base de datos es válida")
 }
 
+/// Configuración de prueba que **rebaja** el borde del `endpoint`.
+///
+/// Es [`config_con_dsn`] con `KESTO_ALLOW_INSECURE_ENDPOINT=1`: la única diferencia es que el
+/// borde admite un `endpoint` por `http` y contra el loopback, que es el caso del laboratorio
+/// local y el de la batería e2e. Vive aquí y no en la prueba porque el permiso es una variable de
+/// entorno y es el arnés quien sabe cómo se declaran.
+pub(crate) fn config_con_dsn_y_endpoint_inseguro(dsn: &str) -> Config {
+    Config::from_lookup(&lookup_from(&[
+        ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_ALLOW_INSECURE", "1"),
+        ("KESTO_ALLOW_INSECURE_ENDPOINT", "1"),
+        ("BIND_ADDRESS", BIND_ADDRESS),
+        ("DATABASE_URL", dsn),
+        (
+            "KESTO_BACKUP_ROOT",
+            texto_de_raiz(raiz_de_copias_del_arnes()),
+        ),
+    ]))
+    .expect("la configuración de prueba con el permiso del endpoint es válida")
+}
+
 /// Directorio temporal, pool con el esquema del §3 ya aplicado y la clave de cifrado.
 ///
 /// Es el punto de partida que comparten las pruebas de la capa de acceso: base **de
@@ -1214,6 +1275,7 @@ pub(crate) fn lookup_oidc_con_emisor(emisor: &str, dsn: &str) -> impl Lookup + u
         ("OIDC_ISSUER_URL", emisor),
         ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
         ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+        ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn),
     ]
@@ -1412,6 +1474,53 @@ async fn request(router: Router, metodo: Method, uri: &str) -> Response {
 /// Lanza un `GET` contra `router` sin abrir un socket.
 pub(crate) async fn get(router: Router, uri: &str) -> Response {
     request(router, Method::GET, uri).await
+}
+
+/// Lanza un `GET` con una cabecera añadida, sin abrir un socket.
+///
+/// Existe para las pruebas del límite de tasa: necesitan mandar una cabecera que el
+/// cliente controla —`X-Forwarded-For`— y comprobar que **no** se tiene en cuenta
+/// ni acaba en el cuerpo de la respuesta.
+pub(crate) async fn get_con_cabecera(
+    router: Router,
+    uri: &str,
+    nombre: header::HeaderName,
+    valor: &str,
+) -> Response {
+    let peticion = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(nombre, valor)
+        .body(Body::empty())
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `GET` fingiendo una conexión desde `origen`, sin abrir un socket.
+///
+/// En producción la IP del cliente la pone `into_make_service_with_connect_info`, que inserta un
+/// `ConnectInfo<SocketAddr>` en las extensiones de la petición. Aquí se inserta a mano para poder
+/// ejercitar el límite de tasa **por IP real** sin abrir un puerto: es la única forma de simular
+/// dos sockets distintos en una prueba.
+pub(crate) async fn get_con_conexion(router: Router, uri: &str, origen: SocketAddr) -> Response {
+    let mut peticion = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("petición de prueba válida");
+
+    peticion
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(origen));
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
 }
 
 /// Lanza un `POST` sin cuerpo contra `router` sin abrir un socket.
