@@ -195,3 +195,21 @@ El caso **literalmente** fuera de la raíz no llega a la batería: el borde HTTP
 - **WHEN** se lanza la copia
 - **THEN** la ejecución SHALL acabar en `failed`
 - **AND** NO SHALL crearse instantánea en el repositorio
+
+### Requirement: La batería declara el permiso de endpoints inseguros
+
+El arnés de la batería SHALL declarar `KESTO_ALLOW_INSECURE_ENDPOINT=1` en el entorno del binario que arranca, porque su almacén real —SeaweedFS— escucha en `http://127.0.0.1:<puerto>`: sin el permiso, la validación del `endpoint` rechazaría todos los altas de repositorio de la batería y los escenarios que dependen de un almacén real dejarían de poder correr.
+
+La batería SHALL seguir verificando el almacén real —crear el repositorio contra él, aislarlo entre ejecuciones y copiar y restaurar a través suyo—, de modo que el permiso sea lo único que cambia y NO SHALL perderse cobertura.
+
+#### Scenario: El almacén real se sigue verificando con el permiso declarado
+- **GIVEN** la batería arrancada con `KESTO_ALLOW_INSECURE_ENDPOINT=1`
+- **WHEN** se ejecuta el escenario que crea un repositorio contra el almacén real
+- **THEN** SHALL contestar `201`
+- **AND** el escenario NO SHALL fallar por la validación del `endpoint`
+
+#### Scenario: El aislamiento entre ejecuciones no depende del permiso
+- **GIVEN** dos ejecuciones seguidas de la batería sobre el mismo almacén
+- **WHEN** la segunda crea su repositorio
+- **THEN** NO SHALL encontrar los datos de la primera
+- **AND** el permiso declarado NO SHALL cambiar el aislamiento

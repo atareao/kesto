@@ -128,9 +128,9 @@
 
 ## 7. Cierre
 
-- [ ] 7.1 `just check-all` (backend y panel) en verde (verificación: termina sin error).
-- [ ] 7.2 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas).
-- [ ] 7.3 PR a `development` con `Closes #163`, `Closes #165` y `Closes #166` (verificación: el PR abre con los tres cierres y el CI en verde).
-- [ ] 7.4 Fusionado el PR: `just spec-archive endurecimiento-superficie-api` (verificación: el delta entra en `openspec/specs/`).
-- [ ] 7.5 `plans/PLAN-043.md` → `plans/PLAN-043-COMPLETED.md` (verificación: `git mv` hecho).
-- [ ] 7.6 Issue de seguimiento para la resolución del nombre del `endpoint` (verificación: el issue existe y nombra el hallazgo).
+- [x] 7.1 `just check-all` (backend y panel) en verde (verificación: termina sin error).
+- [x] 7.2 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas).
+- [x] 7.3 PR a `development` con `Closes #163`, `Closes #165` y `Closes #166` (verificación: el PR abre con los tres cierres y el CI en verde).
+- [x] 7.4 Fusionado el PR: `just spec-archive endurecimiento-superficie-api` (verificación: el delta entra en `openspec/specs/`).
+- [x] 7.5 `plans/PLAN-043.md` → `plans/PLAN-043-COMPLETED.md` (verificación: `git mv` hecho).
+- [x] 7.6 Issue de seguimiento para la resolución del nombre del `endpoint` (verificación: el issue existe y nombra el hallazgo).
