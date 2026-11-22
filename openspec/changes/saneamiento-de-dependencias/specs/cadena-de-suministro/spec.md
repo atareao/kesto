@@ -56,6 +56,11 @@ Las licencias SHALL estar en una allowlist **explícita**: una licencia que apar
 - **THEN** SHALL avisar
 - **AND** NO SHALL fallar
 
+#### Scenario: Un aviso fuera del crate raíz detiene el CI
+- **GIVEN** un aviso sobre un crate que NO es dependencia del crate raíz, sino de otro miembro del workspace
+- **WHEN** corre el trabajo de dependencias
+- **THEN** SHALL fallar nombrando el aviso y el crate
+
 ### Requirement: El CI compila y prueba todos los miembros del workspace
 
 Los pasos de análisis y de prueba del CI SHALL cubrir **todos** los miembros del workspace, de modo que `kesto-mcp` —donde vive el SDK del MCP— NO SHALL quedar sin compilar ni sin probar. Lo que el CI ejecuta SHALL coincidir con lo que ejecutan las recetas locales: una divergencia entre ambos deja fuera del CI justo lo que el desarrollador sí comprueba.

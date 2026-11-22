@@ -23,6 +23,7 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 - [x] 2.4 El script estructural pasa (verificación: `just scripts-test` sin error).
 - [x] 2.5 `docs/COMANDOS.md` documenta la receta `deny` y su coste (necesita red la primera vez).
 - [x] 2.6 `set -e` en la receta `scripts-test` del `.justfile`, que enmascaraba el fallo de un script con el verde del último (verificación: la comprobación **D** del script estructural pasa).
+- [x] 2.7 `--workspace` en la invocación de `cargo deny` —job del CI y receta `deny`—: sin él el grafo arranca en el paquete raíz y `kesto-mcp`, con `rmcp` dentro, quedaba fuera de la puerta, que salía verde sin mirarlo (D11). Lo destapó la revisión del bloque; lo vigilan las comprobaciones **B** y **E** de `scripts/dependencias.test.sh`.
 
 ## 3. GREEN — los saltos baratos
 
@@ -49,8 +50,8 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 ## 6. Cierre
 
 - [ ] 6.1 `just e2e` en verde.
-- [ ] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
-- [ ] 6.3 `docs/ENTORNO.md` (versiones y MSRV), `GIT_FLOW.md` (la tabla del CI) y `AGENTS.md` (el gate y la paridad del workspace).
+- [x] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
+- [x] 6.3 `docs/ENTORNO.md` (versiones y MSRV), `GIT_FLOW.md` (la tabla del CI) y `AGENTS.md` (el gate y la paridad del workspace).
 - [ ] 6.4 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas).
 - [ ] 6.5 PR a `development` con `Closes #167`; CI en verde; fusionar y cerrar #167 a mano.
 - [ ] 6.6 `just spec-archive saneamiento-de-dependencias` (verificación: el delta entra en `openspec/specs/`).

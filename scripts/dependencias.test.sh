@@ -4,10 +4,10 @@
 #
 # Comprueban la FORMA de los cuatro ficheros que sostienen la vigilancia: `deny.toml`
 # en la raíz, con sus cuatro familias y sus excepciones justificadas; el trabajo
-# `Dependencies (cargo deny)` del CI —con `--locked` y con los pasos de clippy y de
-# test cubriendo el workspace entero—; `.github/dependabot.yml`, con los tres
-# ecosistemas del repositorio; y la receta `scripts-test` del `.justfile`, que
-# ejecuta esta misma batería. No necesitan red.
+# `Dependencies (cargo deny)` del CI —con `--workspace` y `--locked`, y con los pasos
+# de clippy y de test cubriendo el workspace entero—; `.github/dependabot.yml`, con
+# los tres ecosistemas del repositorio; y las recetas `deny` y `scripts-test` del
+# `.justfile`. No necesitan red.
 #
 # Sigue el precedente de `scripts/release-image-workflow.test.sh`, que valida la
 # estructura del flujo de publicación: los tres ficheros se leen COMO TEXTO y no se
@@ -187,15 +187,24 @@ else
   bad "ci.yml no tiene ningún trabajo con 'name: Dependencies (cargo deny)'"
 fi
 
-# La puerta se corre con el lockfile congelado: sin `--locked`, el trabajo puede
-# resolver una versión que no es la del PR. En `cargo deny` el flag es GLOBAL, así
-# que va ANTES del subcomando —`cargo deny --locked check`—: `cargo deny check
-# --locked` sale con código 2. La aserción acepta las dos formas porque lo que
-# exige es que `cargo deny`, `check` y `--locked` vayan en la MISMA línea.
-if tiene_re "${ci}" 'cargo deny --locked check|cargo deny check.*--locked'; then
-  ok "ci.yml ejecuta 'cargo deny --locked check' (el lockfile congelado)"
+# La puerta se corre sobre el workspace ENTERO y con el lockfile congelado.
+#
+# `--locked`: sin él, el trabajo puede resolver una versión que no es la del PR.
+# `--workspace`: el manifiesto raíz es un PAQUETE, no un virtual, así que sin el
+# flag el grafo arranca en `kesto` y `kesto-mcp` —y con él `rmcp`— queda fuera.
+# En `cargo deny` los dos flags son GLOBALES, así que van ANTES del subcomando
+# —`cargo deny --workspace --locked check`—: `cargo deny check --locked` sale con
+# código 2. La aserción no fija el orden de los flags, pero exige los DOS en la
+# MISMA línea que la invocación.
+linea_deny=""
+if [ -f "${ci}" ]; then
+  linea_deny="$(grep -E '^[[:space:]]*run:.*cargo deny' "${ci}" || true)"
+fi
+
+if contiene "${linea_deny}" '--workspace' && contiene "${linea_deny}" '--locked'; then
+  ok "ci.yml ejecuta 'cargo deny --workspace --locked check' (workspace entero y lockfile congelado)"
 else
-  bad "ci.yml no ejecuta 'cargo deny --locked check' (una línea con 'cargo deny' y 'check' tiene que llevar también '--locked')"
+  bad "ci.yml: la línea de 'cargo deny … check' tiene que llevar '--workspace' (si no, 'kesto-mcp' y, con él, 'rmcp' quedan fuera del grafo) y '--locked' (si no, se juzga una versión que no es la del PR)"
 fi
 
 # `--workspace` en los dos pasos del backend: sin él, Cargo se queda en el paquete
@@ -281,6 +290,23 @@ if contiene "${cuerpo_scripts_test}" 'set[[:space:]]+-e' \
   ok ".justfile: la receta 'scripts-test' propaga el fallo ('set -e')"
 else
   bad ".justfile: la receta 'scripts-test' no lleva 'set -e' (ni ejecuta cada script con 'bash -e'): sin eso su código de salida es el del último script y un rojo se enmascara según el orden alfabético"
+fi
+
+# ── E. La receta `deny` del `.justfile` cubre el workspace ───────────────────
+# El espejo local de la puerta del CI. Si la receta no lleva `--workspace`, la
+# comprobación que el desarrollador corre en local mira un grafo más pequeño que
+# el del CI —el mismo defecto que la comprobación B vigila en el trabajo—, y su
+# verde no dice nada sobre `kesto-mcp` ni sobre `rmcp`.
+
+cuerpo_deny=""
+if [ -f "${justfile}" ]; then
+  cuerpo_deny="$(receta "${justfile}" deny)"
+fi
+
+if contiene "${cuerpo_deny}" 'cargo deny.*--workspace'; then
+  ok ".justfile: la receta 'deny' cubre el workspace (cargo deny --workspace)"
+else
+  bad ".justfile: la receta 'deny' no lleva '--workspace' (línea con 'cargo deny --workspace'): sin él el grafo arranca en el paquete raíz y 'kesto-mcp' —y con él 'rmcp'— quedaría fuera"
 fi
 
 exit "${fail}"

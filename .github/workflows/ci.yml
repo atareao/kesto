@@ -94,8 +94,11 @@ jobs:
         with:
           tool: cargo-deny
 
+      # `--workspace` is not cosmetic here: the root manifest is a package, not a
+      # virtual one, so without the flag the crate graph starts at that single root
+      # and `kesto-mcp` (and with it `rmcp`) never enters it.
       - name: Dependencies (advisories, licenses, bans, sources)
-        run: cargo deny --locked check
+        run: cargo deny --workspace --locked check
 
   frontend:
     name: Frontend

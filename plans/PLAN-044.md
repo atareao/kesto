@@ -73,6 +73,7 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 - [x] 2.4 `just scripts-test` verde.
 - [x] 2.5 `docs/COMANDOS.md` documenta la receta.
 - [x] 2.6 `set -e` en la receta `scripts-test` del `.justfile` (el bucle devolvía el código del último script y enmascaraba un rojo según el orden alfabético).
+- [x] 2.7 `--workspace` en la invocación de `cargo deny` (job del CI y receta `deny`): sin él el grafo arranca en el paquete raíz y `kesto-mcp` —con `rmcp`— quedaba fuera de una puerta que salía verde sin mirarlo (D11); lo vigilan las comprobaciones B y E del script estructural.
 
 ### 3. GREEN — los saltos baratos
 
@@ -99,8 +100,8 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 ### 6. Cierre
 
 - [ ] 6.1 `just e2e` verde.
-- [ ] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
-- [ ] 6.3 `docs/ENTORNO.md`, `GIT_FLOW.md` y `AGENTS.md`.
+- [x] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
+- [x] 6.3 `docs/ENTORNO.md`, `GIT_FLOW.md` y `AGENTS.md`.
 - [ ] 6.4 `@rust-reviewer` sin bloqueantes.
 - [ ] 6.5 PR a `development` con `Closes #167`; CI verde; fusionar y cerrar #167 a mano.
 - [ ] 6.6 `just spec-archive saneamiento-de-dependencias`.

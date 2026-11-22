@@ -73,8 +73,13 @@ test:
 # de cada commit y tiene que poder correr sin conexión.
 #
 # Puerta de la cadena de suministro: avisos, licencias, prohibiciones y fuentes.
+#
+# `--workspace` no es cosmético: el manifiesto raíz es un PAQUETE (`[package] name =
+# "kesto"` junto a `[workspace]`), no un manifiesto virtual, así que `cargo deny`
+# arranca el grafo desde esa única raíz y deja fuera a `kesto-mcp` —que no es
+# dependencia suya— y, con él, a `rmcp`. Con el flag entran los tres crates.
 deny:
-    cargo deny check
+    cargo deny --workspace --locked check
 
 # `set -e` NO es adorno: sin él, un bucle `for` devuelve el código de salida del
 # ÚLTIMO script, así que uno en rojo se enmascara según el orden alfabético —una

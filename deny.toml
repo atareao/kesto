@@ -9,10 +9,12 @@
 # dependencia nueva que entra con una licencia inesperada o desde un registro
 # ajeno, justo el cambio que nadie revisa a mano en un PR de bumps.
 #
-# Se corre con `cargo deny --locked check` (receta `just deny`, job
+# Se corre con `cargo deny --workspace --locked check` (receta `just deny`, job
 # `Dependencies (cargo deny)` del CI). El `--locked` no es cosmético: sin él la
 # comprobación resolvería el árbol por su cuenta y podría juzgar una versión que
-# no es la del PR.
+# no es la del PR. Y `--workspace` tampoco: el manifiesto raíz es un PAQUETE, no
+# un virtual, así que sin el flag el grafo arranca en `kesto` y `kesto-mcp` —con
+# `rmcp` dentro— queda fuera, con lo que la puerta saldría verde sin mirarlo.
 #
 # Toda excepción de este fichero lleva su MOTIVO por escrito y es refutable
 # contra el árbol con `cargo tree -i <crate>`. Es el único sitio donde un lector

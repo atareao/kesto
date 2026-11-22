@@ -45,7 +45,7 @@ Y la vigilancia tiene un agujero de forma: **el CI no compila ni prueba `kesto-m
 
 ### El CI vigila la cadena de suministro y cubre el workspace entero
 
-- Job nuevo `Dependencies (cargo deny)` en `ci.yml`, con `cargo-deny` instalado por `taiki-e/install-action` —la convención del repositorio— y `--locked`.
+- Job nuevo `Dependencies (cargo deny)` en `ci.yml`, con `cargo-deny` instalado por `taiki-e/install-action` —la convención del repositorio—, `--locked` y **`--workspace`**: el manifiesto raíz es un paquete y no un virtual, así que sin el flag el grafo arranca en `kesto` y `kesto-mcp` —que no es dependencia suya— queda fuera, con `rmcp` dentro (D11).
 - `cargo clippy --workspace --all-targets` y `cargo test --locked --workspace`: la paridad con `just clippy`/`just test` y la cobertura de `kesto-mcp`.
 - `set -e` en la receta `scripts-test` del `.justfile`: sin él, el bucle devolvía el código de salida del último script, así que un rojo se enmascaraba según el orden alfabético.
 
