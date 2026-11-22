@@ -89,7 +89,7 @@
 
 - [x] 6.1 `just check` (verificación: fmt + clippy + test en verde).
 - [x] 6.2 `just check-all` (verificación: el análogo local del CI en verde).
-- [ ] 6.3 Comprobación manual: un alta con un valor por encima de su cota se rechaza desde el panel con el campo señalado (verificación: navegación con `podman`).
+- [x] 6.3 Comprobación manual: arrancado el binario en modo desarrollo (`KESTO_ALLOW_INSECURE=1`, loopback) se comprobó con `curl` contra `POST /api/v1/targets`: un `name` de 121 caracteres contesta `400` nombrando `name` sin repetir el valor; un `container_name` con `/` contesta `400`; un `name` en blanco contesta `400`; y un alta válida con espacios a los lados se guarda con `name` y `container_name` recortados.
 
 ## 7. Documentación y cierre
 

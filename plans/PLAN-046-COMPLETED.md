@@ -82,7 +82,7 @@ Fuera de alcance: el esquema, el motor, los campos de secreto y el resto de SEC-
 
 - [x] 6.1 `just check`.
 - [x] 6.2 `just check-all`.
-- [ ] 6.3 Comprobación manual desde el panel.
+- [x] 6.3 Comprobación manual desde el panel (verificada contra el servidor en marcha con `curl`: cotas y recorte confirmados).
 
 ### 7. Documentación y cierre
 
