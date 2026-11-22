@@ -2210,7 +2210,7 @@ mod tests {
     fn los_checksums_de_las_migraciones_no_cambian() {
         // (versión, descripción, checksum en hexadecimal). El orden es el de
         // `migrator().iter()`, que es el de la versión.
-        let esperadas: [(i64, &str, &str); 9] = [
+        let esperadas: [(i64, &str, &str); 10] = [
             (
                 1,
                 "init",
@@ -2255,6 +2255,11 @@ mod tests {
                 9,
                 "api tokens",
                 "5435304fd1405452d7bd3dcd26657937ceb51f287d8d1b5e694e5ee0d7066f9fbc239296c5c5baffc111eb7e0e2a8294",
+            ),
+            (
+                10,
+                "sesiones revocadas",
+                "74973b5396df54585f90f56d5d729c459ac3491e94a009e8ce63cccaca98ca7bb4edb8dc428cf16ce36a8eadebf5ad8e",
             ),
         ];
 
