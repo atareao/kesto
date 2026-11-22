@@ -179,8 +179,10 @@ pub const PLAZO_DE_INACTIVIDAD: Duration = Duration::from_secs(300);
 
 /// La sonda que da por arrancada una base: la orden y el entorno que la acompañan.
 ///
-/// Es una función pura con forma de par de listas, para que los escenarios «la espera de una
-/// base no se conforma con que escuche» puedan afirmarla sin levantar nada.
+/// Es una función pura con forma de par de listas, para que las pruebas de las sondas puedan
+/// afirmarla sin levantar nada. Ojo: el «la sonda nombra la base» que introdujo el #170 **no**
+/// está en ningún spec —vive en las pruebas de `escenarios.rs` y en el `CHANGELOG`—, así que
+/// estas pruebas no citan ningún escenario de spec que las respalde.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sonda {
     /// El comando y sus argumentos.
@@ -871,6 +873,124 @@ fn creador(contenedor: &ContainerSummary) -> Option<u32> {
 /// el barrido recoge.
 fn proceso_vivo(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+// ── La espera de arranque de un motor ──────────────────────────────────────
+
+/// La espera entre los dos sondeos que confirman un arranque: **2 s**.
+///
+/// # De dónde sale el número
+///
+/// Es la **ventana del servidor temporal** medida sobre las imágenes de la batería —lo que tarda
+/// el entrypoint desde que le crea la base al temporal hasta que lo apaga—, 5 corridas por motor
+/// en máquina ociosa:
+///
+/// | Motor | Ventanas medidas (ms) | Máximo |
+/// |---|---|---|
+/// | MariaDB (`mariadb:11`) | 31 · 26 · 25 · 28 · 25 | **31** |
+/// | PostgreSQL (`postgres:18-alpine`) | 134 · 137 · 133 · 148 · 131 | **148** |
+///
+/// Los dos segundos son **~13× el máximo medido**: no es el valor de la ventana, es una holgura
+/// deliberada. La suite levanta contenedores en paralelo y la máquina puede estar cargada, y lo
+/// que se gana con el margen —no confundir el temporal con el definitivo— vale más que la espera.
+///
+/// El coste se paga **una vez por arranque de contenedor**: la espera va entre los dos sondeos de
+/// la confirmación, no antes de cada sondeo, así que no escala con el número de intentos.
+pub const ESPERA_ENTRE_SONDEOS: Duration = Duration::from_secs(2);
+
+/// Espera a que un motor esté arrancado **de verdad**: la sonda tiene que acertar **dos veces**,
+/// separadas por `espera`, y solo entonces se da el arranque por bueno.
+///
+/// # Por qué un acierto no basta
+///
+/// Las imágenes oficiales de MariaDB y de PostgreSQL levantan un **servidor temporal** para
+/// inicializarse —que **ya tiene la base creada**, porque la crea él— y lo apagan antes de
+/// arrancar el definitivo: MariaDB lo arranca con `--skip-networking` y PostgreSQL con
+/// `listen_addresses=''`, y en los dos casos el temporal crea la base del `MARIADB_DATABASE` /
+/// `POSTGRES_DB` antes de apagarse. La sonda **nombra la base** ([`sonda_de_mariadb`],
+/// [`sonda_de_postgres`]), y eso la protege del temporal *antes* de que la base exista, pero no
+/// de su tramo final: un acierto único puede ser contra un servidor que se apaga un instante
+/// después, y quien siembra entonces se encuentra el socket ausente (`ERROR 2002`, `ENOENT`).
+/// Exigir que el acierto se **repita** tras una espera distingue al definitivo —que sigue en
+/// pie— del temporal, que ya no está.
+///
+/// Es la espera que usan los dos motores con servidor temporal, y **no** la de un arranque que
+/// no lo tenga: [`Motor::esperar_orden`] se queda como está para lo demás —el `alpine` con el
+/// cliente SQLite, sin servidor—, y esta espera no le añade a ese caso una latencia ni un modo
+/// de fallo que no le corresponden.
+///
+/// # Por qué el sondeo y la espera se inyectan
+///
+/// El **sondeo** llega como clausura y la **espera** como parámetro —no como constantes leídas
+/// dentro—, igual que el `reintentar` del #141 recibe el «intento»: así una prueba simula la
+/// secuencia entera —acierto durante el temporal, fallo después, acierto estable al final— sin
+/// contenedores y sin esperar la espera de producción, marcando la que quiere medir y contando
+/// cuántas veces se sondeó. El `tokio::time` vive **solo aquí**, en el borde que duerme de
+/// verdad; el resto es el bucle y su contrato.
+///
+/// # El plazo acota el primer acierto, no la confirmación
+///
+/// `plazo` es el presupuesto visible para que la sonda acierte **por primera vez**; la
+/// confirmación —la espera y el segundo sondeo— dispone de su propia holgura, acotada por
+/// `espera`. Por eso el límite interno del bucle es `plazo + espera` y no `plazo`: si el
+/// definitivo aparece al final del plazo, su acierto **se confirma** en vez de fallar por unos
+/// milisegundos. La espera entre sondeos no consume el plazo.
+///
+/// # Errors
+///
+/// Con el **último motivo** que dio el sondeo cuando vence el límite, nombrando el contenedor,
+/// la orden y `plazo` (el presupuesto visible) —el mismo contrato que [`Motor::esperar_orden`]—
+/// en vez de dar el arranque por bueno.
+pub async fn esperar_arranque<F, Fut>(
+    contenedor: &str,
+    cmd: &[&str],
+    plazo: Duration,
+    espera: Duration,
+    mut sonda: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let inicio = Instant::now();
+    // El presupuesto visible es `plazo`, pero la confirmación de un acierto que llegue justo al
+    // final necesita su propia holgura: por eso el bucle se corta en `plazo + espera`.
+    let limite = plazo + espera;
+    let mut ultimo = String::new();
+
+    loop {
+        let confirmado = match sonda().await {
+            // El servidor contestó: para darlo por definitivo tiene que seguir en pie después de
+            // la espera. El temporal del arranque se apaga justo aquí, así que no confirma.
+            Ok(()) => {
+                tokio::time::sleep(espera).await;
+
+                match sonda().await {
+                    Ok(()) => true,
+                    Err(motivo) => {
+                        ultimo = motivo;
+                        false
+                    }
+                }
+            }
+            Err(motivo) => {
+                ultimo = motivo;
+                false
+            }
+        };
+
+        if confirmado {
+            return Ok(());
+        }
+
+        if inicio.elapsed() >= limite {
+            return Err(format!(
+                "`{contenedor}` no respondió a `{cmd:?}` en {plazo:?}: {ultimo}"
+            ));
+        }
+
+        tokio::time::sleep(espera).await;
+    }
 }
 
 // ── El servidor S3 ─────────────────────────────────────────────────────────
@@ -1795,6 +1915,10 @@ mod tests {
     /// que la batería pierda segundos esperándolo.
     const ESPERA_DE_PRUEBA: Duration = Duration::from_millis(20);
 
+    /// El plazo de arranque de las pruebas: corto, para que un sondeo que nunca sobrevive
+    /// agote el plazo en milisegundos en vez de en los 180 s de [`PLAZO_DE_ARRANQUE`].
+    const PLAZO_DE_PRUEBA: Duration = Duration::from_millis(200);
+
     /// Un contador de llamadas compartido con la clausura del intento.
     fn contador_de_llamadas() -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
         let llamadas = Rc::new(Cell::new(0));
@@ -1929,6 +2053,190 @@ mod tests {
             transcurrido >= minimo,
             "con 3 intentos y una espera de {ESPERA_DE_PRUEBA:?} el backoff acumula al menos \
              {minimo:?} entre reintentos y pasaron {transcurrido:?}"
+        );
+    }
+
+    // ══ Requisito: la espera de arranque no se conforma con el servidor temporal ══
+
+    /// Escenario: el servidor temporal no da la base por arrancada.
+    ///
+    /// El temporal del entrypoint oficial contesta con la base ya creada y se apaga un instante
+    /// después: un único acierto no puede dar el arranque por bueno, porque el que contestó ya
+    /// no está cuando llega la siembra. Aquí el sondeo acierta la primera vez y falla después
+    /// —el temporal que se apaga—, así que el ayudante tiene que seguir sondeando y, agotado el
+    /// plazo, fallar con el último motivo en vez de devolver un `Ok` que no le corresponde.
+    #[tokio::test]
+    async fn el_servidor_temporal_no_da_el_arranque_por_bueno() {
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO_DE_PRUEBA,
+            ESPERA_DE_PRUEBA,
+            move || {
+                let sondeo = para_la_sonda.get();
+                para_la_sonda.set(sondeo + 1);
+
+                async move {
+                    if sondeo == 0 {
+                        // El temporal contesta una vez, con la base ya creada…
+                        Ok(())
+                    } else {
+                        // …y se apaga: el socket desaparece.
+                        Err("ERROR 2002: el socket no existe".to_owned())
+                    }
+                }
+            },
+        )
+        .await;
+
+        let motivo =
+            desenlace.expect_err("un acierto que no sobrevive no da el arranque por bueno");
+
+        assert!(
+            motivo.contains("ERROR 2002"),
+            "el motivo tiene que ser el último del sondeo, no un ok: {motivo}"
+        );
+        assert!(
+            sondeos.get() >= 2,
+            "el ayudante tiene que exigir un segundo sondeo y solo hizo {}",
+            sondeos.get()
+        );
+    }
+
+    /// Escenario: el servidor definitivo da la base por arrancada.
+    ///
+    /// El definitivo sigue en pie, así que su acierto se repite: el ayudante sondea **dos veces**
+    /// separadas por la espera y da el arranque por bueno. El número de sondeos es exactamente el
+    /// mínimo —no se sondea de más una vez confirmado—.
+    #[tokio::test]
+    async fn el_servidor_definitivo_da_el_arranque_por_bueno_tras_dos_sondeos() {
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO_DE_PRUEBA,
+            ESPERA_DE_PRUEBA,
+            move || {
+                para_la_sonda.set(para_la_sonda.get() + 1);
+
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert!(
+            desenlace.is_ok(),
+            "el definitivo, que sigue en pie, da el arranque por bueno: {desenlace:?}"
+        );
+        assert_eq!(
+            sondeos.get(),
+            2,
+            "dos aciertos separados por la espera son el mínimo: no se sondea de más"
+        );
+    }
+
+    /// Escenario: la espera entre sondeos es la inyectada, no una constante interna.
+    ///
+    /// La espera llega **inyectada** como parámetro, no como una constante leída dentro: con una
+    /// espera marcada **muy por debajo** de la de producción ([`ESPERA_ENTRE_SONDEOS`], 2 s) y un
+    /// sondeo que falla la primera vez, el ayudante la consume antes del segundo sondeo. Se
+    /// afirman **las dos cotas**: transcurrió al menos la inyectada y bastante menos que la de
+    /// producción. Si el ayudante ignorase el parámetro y leyera la constante interna, la cota
+    /// superior fallaría —con 2 s por espera, dos esperas son ~4 s—, así que la prueba sí
+    /// discrimina. La cota inferior no introduce flakiness, como en el backoff del #141: la carga
+    /// de la máquina solo puede aumentar el tiempo transcurrido, nunca reducirlo.
+    #[tokio::test]
+    async fn la_espera_entre_sondeos_es_la_inyectada() {
+        const ESPERA_INYECTADA: Duration = Duration::from_millis(20);
+        // Muy por debajo de la de producción: así una implementación que leyera la constante
+        // interna (2 s) se delata en la cota superior.
+        const COTA_SUPERIOR: Duration = Duration::from_millis(500);
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let inicio = Instant::now();
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO_DE_PRUEBA,
+            ESPERA_INYECTADA,
+            move || {
+                let sondeo = para_la_sonda.get();
+                para_la_sonda.set(sondeo + 1);
+
+                async move {
+                    if sondeo == 0 {
+                        Err("todavía no".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        let transcurrido = inicio.elapsed();
+
+        assert!(
+            desenlace.is_ok(),
+            "el segundo acierto da el arranque: {desenlace:?}"
+        );
+        assert!(
+            transcurrido >= ESPERA_INYECTADA,
+            "la espera entre sondeos es la inyectada ({ESPERA_INYECTADA:?}) y pasaron \
+             {transcurrido:?}"
+        );
+        assert!(
+            transcurrido < COTA_SUPERIOR,
+            "la espera inyectada ({ESPERA_INYECTADA:?}) tiene que mandar sobre la de producción \
+             ({ESPERA_ENTRE_SONDEOS:?}), y pasaron {transcurrido:?}"
+        );
+        assert!(sondeos.get() >= 2, "hubo al menos un segundo sondeo");
+    }
+
+    /// Escenario: agotado el plazo, se falla en voz alta.
+    ///
+    /// Con un sondeo que nunca sobrevive, el ayudante no devuelve un ok silencioso: vencido el
+    /// plazo falla nombrando el contenedor, la orden y el plazo —el mismo contrato que
+    /// [`Motor::esperar_orden`]— con el **último** motivo que dio el sondeo.
+    #[tokio::test]
+    async fn agotado_el_plazo_falla_con_el_ultimo_motivo() {
+        const PLAZO: Duration = Duration::from_millis(150);
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO,
+            ESPERA_DE_PRUEBA,
+            move || {
+                let sondeo = para_la_sonda.get();
+                para_la_sonda.set(sondeo + 1);
+
+                async move { Err(format!("intento {sondeo}")) }
+            },
+        )
+        .await;
+
+        let motivo = desenlace.expect_err("agotado el plazo no se da el arranque por bueno");
+        let ultimo = format!("intento {}", sondeos.get().saturating_sub(1));
+
+        assert!(
+            motivo.contains("maria"),
+            "el motivo nombra el contenedor: {motivo}"
+        );
+        assert!(
+            motivo.contains("mariadb"),
+            "el motivo nombra la orden: {motivo}"
+        );
+        assert!(
+            motivo.contains("150ms"),
+            "el motivo nombra el plazo: {motivo}"
+        );
+        assert!(
+            motivo.contains(&ultimo),
+            "el motivo es el último del sondeo (`{ultimo}`), no uno anterior: {motivo}"
         );
     }
 }
