@@ -102,7 +102,7 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 - [ ] 6.1 `just e2e` verde.
 - [x] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
 - [x] 6.3 `docs/ENTORNO.md`, `GIT_FLOW.md` y `AGENTS.md`.
-- [ ] 6.4 `@rust-reviewer` sin bloqueantes.
+- [x] 6.4 `@rust-reviewer` sin bloqueantes. Las cinco observaciones del review se aplicaron: (1) los dos ayudantes de pruebas a `&'static str`; (2) el `assert!` de `ANALYZE` invita a re-medir; (3) D9, coherente en pasado; (4) comentario de Dependabot ajustado; (5) toolchain fijada en el job `dependencies`.
 - [ ] 6.5 PR a `development` con `Closes #167`; CI verde; fusionar y cerrar #167 a mano.
 - [ ] 6.6 `just spec-archive saneamiento-de-dependencias`.
 - [ ] 6.7 `plans/PLAN-044.md` → `plans/PLAN-044-COMPLETED.md`.

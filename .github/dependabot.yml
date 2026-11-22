@@ -30,8 +30,11 @@ updates:
       parches:
         patterns: ["*"]
         update-types: ["patch"]
-      # Los saltos de versión van aparte y uno por PR: un `3.0.0` merece su
-      # propia lectura, no viajar pegado a un `0.1.2`.
+      # Los saltos de versión van aparte de los parches: cada grupo llega en su
+      # propio PR, así que un `3.0.0` no viaja pegado a un `0.1.2`. Lo que este
+      # grupo **sí** junta es el resto de saltos —todos los minor y major en un
+      # mismo PR—, y es a propósito: lo que el spec pide es que un parche no se
+      # mezcle con un salto de versión, no que cada salto tenga su propio PR.
       saltos:
         patterns: ["*"]
         update-types: ["minor", "major"]

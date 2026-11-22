@@ -52,7 +52,7 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 - [ ] 6.1 `just e2e` en verde.
 - [x] 6.2 `docs/FEATURE-044-saneamiento-de-dependencias.md`.
 - [x] 6.3 `docs/ENTORNO.md` (versiones y MSRV), `GIT_FLOW.md` (la tabla del CI) y `AGENTS.md` (el gate y la paridad del workspace).
-- [ ] 6.4 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas).
+- [x] 6.4 Revisión de `@rust-reviewer` sin bloqueantes (verificación: las observaciones aplicadas o contestadas). Las cinco observaciones se aplicaron: (1) los dos ayudantes de pruebas a `&'static str`; (2) el `assert!` de `ANALYZE` invita a re-medir; (3) D9, coherente en pasado; (4) comentario de Dependabot ajustado; (5) toolchain fijada en el job `dependencies`.
 - [ ] 6.5 PR a `development` con `Closes #167`; CI en verde; fusionar y cerrar #167 a mano.
 - [ ] 6.6 `just spec-archive saneamiento-de-dependencias` (verificación: el delta entra en `openspec/specs/`).
 - [ ] 6.7 `plans/PLAN-044.md` → `plans/PLAN-044-COMPLETED.md` (verificación: `git mv` hecho).

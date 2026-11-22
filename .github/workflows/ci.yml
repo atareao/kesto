@@ -89,6 +89,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
