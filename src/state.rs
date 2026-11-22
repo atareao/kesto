@@ -11,7 +11,9 @@ use crate::auth::limite::LimitadorDeLogin;
 use crate::auth::oidc::Discovery;
 use crate::config::{AuthMode, Config, ConfigError, OidcSettings};
 use crate::db::crypto::Clave;
-use crate::db::entities::{Ejecuciones, Repositorios, Restauraciones, Tareas, Targets, Tokens};
+use crate::db::entities::{
+    Ejecuciones, Repositorios, Restauraciones, SesionesRevocadas, Tareas, Targets, Tokens,
+};
 use crate::engine::Motor;
 use crate::secret::SecretString;
 
@@ -244,6 +246,11 @@ pub struct EstadoDeBase {
     /// que descifrar —guarda el hash, no el token—, y pasarle una clave que no usa sugeriría que
     /// ahí se cifra algo.
     pub tokens: Arc<Tokens>,
+    /// La capa de acceso de `sesiones_revocadas`: los `jti` de las sesiones cerradas antes de
+    /// su caducidad, para que el *gate* las rechace.
+    ///
+    /// Tampoco recibe la clave: el `jti` es un identificador, no una credencial.
+    pub sesiones: Arc<SesionesRevocadas>,
 }
 
 impl EstadoDeBase {
@@ -262,6 +269,7 @@ impl EstadoDeBase {
             ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
             restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
             tokens: Arc::new(Tokens::nuevo(pool.clone())),
+            sesiones: Arc::new(SesionesRevocadas::nuevo(pool.clone())),
             pool,
             clave,
         }

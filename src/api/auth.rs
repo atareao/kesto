@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::api::response::{ApiResponse, Data};
 use crate::auth::middleware::SessionIdentity;
-use crate::auth::session::SESSION_COOKIE_NAME;
+use crate::auth::session::{SESSION_COOKIE_NAME, SESSION_LIFETIME};
 use crate::auth::{oidc, session};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -228,11 +228,30 @@ pub struct CallbackParams {
 
 /// `POST /api/v1/auth/logout` — protegida.
 ///
-/// Borra la cookie de sesión —la **misma** cookie, con el mismo `Path` y con
-/// `Max-Age=0`— y contesta la envoltura. Se declara como `POST` y no como `GET`
-/// porque cambia estado: un `GET` lo dispararían un enlace, un prefetch o una
-/// imagen.
-pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse) {
+/// Revoca la sesión **ante el servidor** y borra la cookie de sesión —la **misma**
+/// cookie, con el mismo `Path` y con `Max-Age=0`—, y contesta la envoltura. Se
+/// declara como `POST` y no como `GET` porque cambia estado: un `GET` lo
+/// dispararían un enlace, un prefetch o una imagen.
+///
+/// La revocación es lo que hace efectivo el cierre: sin ella, la firma del JWT
+/// seguiría valiendo hasta su `exp` y una cookie copiada seguiría sirviendo. Se
+/// revoca el `jti` de la sesión que el *gate* **ya verificó** —la ruta está tras el
+/// *gate*, sin sesión no se llega al manejador—, así que no se vuelve a leer ni a
+/// verificar la cookie.
+pub async fn logout(
+    State(estado): State<AppState>,
+    Extension(identidad): Extension<SessionIdentity>,
+    jar: CookieJar,
+) -> Response {
+    if let Err(error) = estado
+        .db
+        .sesiones
+        .revocar(&identidad.jti, exp_de_la_revocacion())
+        .await
+    {
+        return AppError::Database(error).into_response();
+    }
+
     // La `Set-Cookie` de borrado viaja por el propio frasco de la petición: es
     // lo que hace que la respuesta lleve la cabecera y la envoltura a la vez.
     let jar = jar.add(cookie_de_borrado());
@@ -241,6 +260,19 @@ pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse) {
         jar,
         ApiResponse::new(StatusCode::OK, "sesión cerrada", Data::None),
     )
+        .into_response()
+}
+
+/// El `exp` con el que el cierre guarda una revocación.
+///
+/// La identidad verificada no lleva el `exp` del token —el *gate* no expone la vigencia, para
+/// no invitar a recomprobarla en cada manejador—, así que el cierre no puede copiar el del JWT.
+/// Usa el fin de la vida máxima de una sesión **desde ahora**, que nunca es anterior al `exp`
+/// real —la sesión no llevaba viva más que su vida entera—, así que la revocación jamás se purga
+/// mientras la cookie podría seguir presentándose. El lado seguro es retenerla de más, no de
+/// menos: una revocación purgada demasiado pronto dejaría servir una cookie cerrada.
+fn exp_de_la_revocacion() -> u64 {
+    jsonwebtoken::get_current_timestamp() + SESSION_LIFETIME.as_secs()
 }
 
 /// `GET /api/v1/auth/session` — protegida.
@@ -287,7 +319,7 @@ mod tests {
     use crate::error::AppError;
     use crate::test_support::{
         EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SUB, body_json, body_text, callback_url,
-        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc_con_emisor, get,
+        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc, estado_oidc_con_emisor, get,
         get_con_cabecera, get_con_conexion, get_with_cookie, header_text, login_state_y_nonce,
         parametros_de_consulta, post, post_with_cookie, proveedor_falso::ACCESS_TOKEN,
         proveedor_falso::IdToken, proveedor_falso::ProveedorFalso, router_oidc,
@@ -539,6 +571,55 @@ mod tests {
         );
     }
 
+    /// 4.1/4.2 — El cierre **revoca** la sesión además de borrar la cookie: la misma cookie,
+    /// reutilizada después, contesta `401`; y el cierre sigue contestando `200` con la
+    /// `Set-Cookie` de borrado.
+    #[tokio::test]
+    async fn la_cookie_cerrada_deja_de_servir() {
+        let router = router_oidc().await;
+        let cookie = cookie_de_sesion();
+
+        let cierre = post_with_cookie(router.clone(), "/api/v1/auth/logout", &cookie).await;
+
+        assert_eq!(
+            cierre.status(),
+            StatusCode::OK,
+            "el cierre tiene que atenderse"
+        );
+
+        // El cierre sigue devolviendo la cookie de borrado (contrapeso 4.2).
+        let cabecera = header_text(&cierre, header::SET_COOKIE)
+            .expect("el cierre tiene que traer una Set-Cookie de borrado");
+
+        assert!(
+            cabecera.starts_with(&format!("{SESSION_COOKIE_NAME}=;")),
+            "la cookie de borrado debe dejar el valor vacío: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Max-Age=0"),
+            "la cookie de borrado debe llevar Max-Age=0: {cabecera}"
+        );
+
+        // Y la misma cookie, reutilizada, ya no sirve: el servidor la revocó.
+        let reutilizada = get_with_cookie(router, "/api/v1/auth/session", &cookie).await;
+
+        assert_eq!(
+            reutilizada.status(),
+            StatusCode::UNAUTHORIZED,
+            "una cookie cerrada no puede seguir sirviendo en una ruta protegida"
+        );
+
+        let cuerpo = body_json(reutilizada).await;
+
+        assert_eq!(cuerpo["status"], 401);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 401 debe traer un mensaje: {cuerpo}"
+        );
+    }
+
     #[tokio::test]
     async fn sin_sesion_el_cierre_no_se_atiende() {
         // Escenario 1.34.
@@ -629,6 +710,42 @@ mod tests {
         assert!(
             !cuerpo.to_string().contains("eyJ"),
             "la sesión no debe devolver el JWT: {cuerpo}"
+        );
+    }
+
+    /// El `jti` de la sesión **no** sale en `GET /api/v1/auth/session`: la respuesta sigue
+    /// siendo `sub` y `email`. El `jti` es la clave de revocación y no tiene por qué viajar
+    /// al cliente, que ya lo lleva dentro de su propia cookie firmada.
+    #[tokio::test]
+    async fn la_respuesta_de_la_sesion_no_publica_el_jti() {
+        let estado = estado_oidc().await;
+        let auth = estado
+            .auth
+            .as_ref()
+            .expect("en modo Oidc hay estado de autenticación");
+        let token = crate::auth::session::issue(&auth.secret, SUB.to_owned(), EMAIL.to_owned())
+            .expect("la emisión de la sesión de prueba no puede fallar");
+        let claims = crate::auth::session::verify(&auth.secret, &token)
+            .expect("el token emitido debe verificar");
+
+        let respuesta = get_with_cookie(
+            api_router(estado),
+            "/api/v1/auth/session",
+            &session_cookie_header(&token),
+        )
+        .await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let texto = body_text(respuesta).await;
+
+        assert!(
+            !texto.contains(&claims.jti),
+            "la respuesta de la sesión publicó el `jti`: {texto}"
+        );
+        assert!(
+            texto.contains(SUB) && texto.contains(EMAIL),
+            "la respuesta de la sesión tiene que llevar sub y email: {texto}"
         );
     }
 

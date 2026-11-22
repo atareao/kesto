@@ -56,6 +56,18 @@ Un `sqlite3` que no soporte `-safe` **hace fallar la restauración** en vez de d
 
 **El residual aceptado: `COPY … FROM PROGRAM`.** Es SQL, no un metacomando: `\restrict` no lo corta y exige superusuario —o el rol `pg_execute_server_program`— en el servidor destino. Los targets suelen usar un usuario administrador, así que el vector es real, pero **no se corta recortando privilegios que la restauración necesita** (crear bases, roles, extensiones). Se acepta y se documenta; su sitio natural es la separación de privilegio del motor.
 
+## Identidad y frontera de confianza
+
+Kesto asume **un único operador de confianza**: no hay roles ni *scopes*. La identidad de la sesión es solo la del proveedor —`sub` y `email`— y el JWT de sesión (`Claims`, `src/auth/session.rs`) lleva exactamente `sub`, `email`, `iat`, `exp` y `jti`, con `deny_unknown_fields`: un *claim* de rol o de permiso **no cabe** en la sesión y hace que la cookie no verifique. Toda ruta protegida queda disponible para cualquier sesión válida porque, con un solo operador, no hay nada que distinguir.
+
+La ausencia de autorización es **deliberada, no un hueco**: no existe hoy ningún modelo de rol, scope ni permiso. Si algún día aparecen varios operadores, es aquí donde hay que ampliar la frontera con un modelo de autorización; hasta entonces, cualquier código que exija un rol de sesión es un error de diseño.
+
+### El cierre de sesión revoca
+
+La sesión es un JWT **sin estado** firmado con `KESTO_SECRET`: su firma sola no permite cerrarla antes de que `exp` llegue —ocho horas, `SESSION_LIFETIME`—. Por eso la sesión lleva un **`jti`** único por emisión y el cierre de sesión lo **revoca en el servidor**: `POST /api/v1/auth/logout` registra ese `jti` en la tabla `sesiones_revocadas` (`migrations/0010_sesiones_revocadas.sql`), de modo que **una copia de la cookie deja de servir** aunque se conserve. El *gate* (`src/auth/middleware.rs`) rechaza con `401` —el mismo `SIN_SESION`, sin distinguir el motivo— cualquier cookie cuyo `jti` esté revocado.
+
+La revocación se purga por caducidad al escribir, así que la tabla solo guarda lo que aún protege. El `jti` es **obligatorio**: una cookie emitida antes de este cambio no decodifica y el *gate* la rechaza, así que **el despliegue cierra las sesiones vivas**; es el precio de poder revocar y está previsto.
+
 ## Restricciones de diseño que un agente rompería por defecto
 
 - **Un worker secuencial por repositorio S3**, no un task de Tokio por job. `rustic_core` toma un lock exclusivo del repositorio: paralelizar backups del mismo repo los bloquea entre sí. Cola MPSC + un worker por `repository_id`.
