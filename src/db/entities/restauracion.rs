@@ -543,15 +543,19 @@ mod tests {
 
     /// Las columnas del índice dado, en su orden.
     async fn columnas_del_indice(pool: &SqlitePool, indice: &str) -> Vec<String> {
-        sqlx::query(&format!("PRAGMA index_info('{indice}')"))
-            .fetch_all(pool)
-            .await
-            .expect("el `PRAGMA index_info` debe poder leerse")
-            .iter()
-            .map(|fila| {
-                sqlx::Row::try_get(fila, "name").expect("la columna del índice tiene nombre")
-            })
-            .collect()
+        // `AssertSqlSafe` porque el nombre del índice se interpola y un `PRAGMA` no
+        // admite valor enlazado. Es seguro por construcción: el único llamador de este
+        // módulo de pruebas pasa el literal `"idx_restore_executions_status_started_at"`
+        // y ningún nombre llega de fuera (`saneamiento-de-dependencias`).
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA index_info('{indice}')"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("el `PRAGMA index_info` debe poder leerse")
+        .iter()
+        .map(|fila| sqlx::Row::try_get(fila, "name").expect("la columna del índice tiene nombre"))
+        .collect()
     }
 
     /// 0.2 — La migración crea la tabla, sus columnas, su `CHECK`, su clave foránea y su índice.

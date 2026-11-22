@@ -33,11 +33,11 @@ Issue **#167 (SEC-11)**. Rama `feature/saneamiento-de-dependencias` (desde `deve
 
 ## 4. GREEN — `sqlx 0.9.1` y `libsqlite3-sys` saneado
 
-- [ ] 4.1 `Cargo.toml`: `sqlx 0.9.1`, features con `sqlite-bundled` en vez de `sqlite`, `rust-version = "1.94"` y el bloque de comentarios actualizado con el motivo nuevo.
-- [ ] 4.2 `libsqlite3-sys` a `0.40.0` dentro del rango que abre `sqlx-sqlite 0.9.1` (verificación: `cargo tree -i libsqlite3-sys` lo muestra).
-- [ ] 4.3 Los tres puntos de API que señala el compilador: el literal `Migrator` de `src/test_support.rs`, su `Migration::new` y los dos `query*()` con cadena no estática.
-- [ ] 4.4 La caracterización del checksum sigue verde (verificación: la prueba pasa con la versión nueva).
-- [ ] 4.5 `cargo test --locked --workspace` en verde y `cargo deny check` **entero** en verde, con una excepción menos (verificación: RUSTSEC-2026-0459 ya no aparece y el trabajo de dependencias pasa completo).
+- [x] 4.1 `Cargo.toml`: `sqlx 0.9.1`, features con `sqlite-bundled` en vez de `sqlite`, `rust-version = "1.94"` y el bloque de comentarios actualizado con el motivo nuevo.
+- [x] 4.2 `libsqlite3-sys` a `0.40.0` dentro del rango que abre `sqlx-sqlite 0.9.1` (verificación: `cargo tree -i libsqlite3-sys` lo muestra).
+- [x] 4.3 Los tres puntos de API que señala el compilador: el literal `Migrator` de `src/test_support.rs`, su `Migration::new` y los dos `query*()` con cadena no estática. (El compilador señala además `run_direct`, que en `0.9` pasa a `(Option<i64>, &mut C, bool)`: `None` y `false` son el par que `run` le pasa.)
+- [x] 4.4 La caracterización del checksum sigue verde (verificación: la prueba pasa con la versión nueva).
+- [x] 4.5 `cargo test --locked --workspace` en verde y `cargo deny check` **entero** en verde, con una excepción menos (verificación: RUSTSEC-2026-0459 ya no aparece y el trabajo de dependencias pasa completo). Nota: RUSTSEC-2026-0459 **no estaba** en el `ignore` —las siete excepciones son otros avisos—, así que desaparece por el salto y no hay entrada que retirar. El salto sube además el SQLite empaquetado de 3.46.0 a 3.54.1, y eso movió el planificador bajo `ANALYZE`: la caracterización del plan de la `0004` se volvió a medir y pasa a fijar el acceso indexado (`!SCAN e`) en vez de una puerta concreta, con las aserciones del bloque sin estadísticas y del filtro suelto intactas (D10). Mordida comprobada: con un `DROP INDEX idx_job_executions_snapshot_id` tras el migrador la prueba se pone roja.
 
 ## 5. GREEN — CI y Dependabot
 

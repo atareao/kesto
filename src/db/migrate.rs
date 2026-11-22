@@ -68,9 +68,11 @@ pub async fn aplicar(pool: &SqlitePool, migrator: &Migrator) -> Result<(), DbErr
     // futuro sin `Send` demostrable cuando esto se encadena dentro de un `tokio::spawn`
     // (el `implementation of Acquire is not general enough` que la propia `sqlx`
     // documenta como motivo de que `run_direct` exista). Con la conexión concreta, el
-    // futuro es `Send` y el arranque puede montarse en él.
+    // futuro es `Send` y el arranque puede montarse en él. En `0.9` `run_direct` recibe
+    // además la versión objetivo y el «saltar»: `None` y `false` son el par exacto que
+    // `run` le pasa, así que el camino sigue siendo el de antes del salto.
     let resultado = migrator
-        .run_direct(&mut *conexion)
+        .run_direct(None, &mut *conexion, false)
         .await
         .map_err(|causa| DbError::Migracion { causa });
 
@@ -272,7 +274,12 @@ mod tests {
 
     /// El plan que SQLite usaría para una consulta, como texto.
     async fn plan_de(pool: &SqlitePool, consulta: &str) -> String {
-        let filas = sqlx::query(consulta)
+        // `AssertSqlSafe` porque la cadena no es estática: `sqlx 0.9` solo implementa
+        // `SqlSafeStr` para `&'static str` y obliga a auditar el resto. Aquí el SQL es
+        // seguro por construcción —sale de las constantes `&str` de este mismo módulo de
+        // pruebas y de `EXPLAIN QUERY PLAN`, que no interpola ningún valor— y la consulta
+        // que se ejecuta es la misma que antes del salto (`saneamiento-de-dependencias`).
+        let filas = sqlx::query(sqlx::AssertSqlSafe(consulta))
             .fetch_all(pool)
             .await
             .unwrap_or_else(|error| panic!("el plan de `{consulta}` no puede fallar: {error}"));
@@ -1942,15 +1949,20 @@ mod tests {
     ///   `json_each` no le da un valor por el que buscar, y sin estadísticas nadie le ha dicho que
     ///   la clave sea única.
     /// * **Con estadísticas** —`ANALYZE` sobre un histórico con la forma de verdad, casi todas
-    ///   las ejecuciones con su instantánea— las **dos** entran por el índice. Y la forma de la
-    ///   columna importa: con una columna casi toda a `NULL`, `ANALYZE` mide muchos registros por
-    ///   clave y el planificador prefiere el camino viejo. Por eso el histórico que se siembra
-    ///   abajo deja la instantánea también en las ejecuciones que no la tienen, que son la
-    ///   excepción —una copia que falló antes de anotarla—, y no al revés.
+    ///   las ejecuciones con su instantánea— las **dos** siguen entrando en `e` **por un
+    ///   índice**, y cuál elige el planificador es cosa de la versión de SQLite: con la de este
+    ///   árbol (3.54.1) es `idx_job_executions_job_id`, y con la anterior (3.46.0) era el índice
+    ///   de la `0004`. Lo que la prueba fija aquí es el acceso **indexado** —un `SCAN e` sería el
+    ///   hallazgo—; la puerta concreta que el índice nuevo abre cuando es la única sigue medida
+    ///   en el bloque de arriba, sin estadísticas, y en el filtro suelto. La forma de la columna
+    ///   sigue importando por lo mismo de siempre: el histórico que se siembra abajo deja la
+    ///   instantánea también en las ejecuciones que no la tienen, que son la excepción —una copia
+    ///   que falló antes de anotarla—, y no al revés.
     ///
     /// El plan medido va anotado junto a cada aserción, como en 1.15, 1.16 y 1.17, y los
     /// literales de `EXPLAIN QUERY PLAN` no son API estable: si un salto de SQLite los cambia, lo
-    /// que hay que rehacer es la medición, no la migración.
+    /// que hay que rehacer es la medición, no la migración. Ya pasó una vez, con el 3.46.0 →
+    /// 3.54.1 del change `saneamiento-de-dependencias` (D10).
     #[tokio::test]
     async fn la_migracion_0004_indexa_el_snapshot_id() {
         // El texto literal de `SQL_OBJETIVO_DE_LA_INSTANTANEA` y de
@@ -2068,11 +2080,25 @@ mod tests {
             "el filtro por `snapshot_id` sigue recorriendo la tabla entera: {suelto}"
         );
 
-        // Con estadísticas, las dos entran por el índice. Medido: DE_UNA queda en `SCAN t`,
-        // `SEARCH e USING INDEX idx_job_executions_snapshot_id (snapshot_id=?)` y `SEARCH j` por su
-        // clave primaria; DE_LOTE añade el `LIST SUBQUERY` del `json_each` con el mismo `SEARCH e`
-        // por el índice. La `ANALYZE` cambia el esquema —crea `sqlite_stat1`—, así que la medición
-        // vuelve a ir sobre un pool nuevo, por lo mismo de antes.
+        // Con estadísticas, las dos siguen entrando en `e` **por un índice**, y cuál de ellos
+        // elige el planificador es cosa de la versión de SQLite: Medido con el empaquetado de
+        // este árbol —3.54.1, `libsqlite3-sys 0.40.0`—, bajo `ANALYZE` el join arranca por
+        // `idx_backup_jobs_repository_id` y alcanza `e` por `idx_job_executions_job_id`:
+        //   DE_UNA  SEARCH j USING INDEX idx_backup_jobs_repository_id (repository_id=?)
+        //           SCAN t
+        //           SEARCH e USING INDEX idx_job_executions_job_id (job_id=?)
+        //   DE_LOTE lo mismo más el `LIST SUBQUERY 1` del `json_each`, su `SCAN json_each VIRTUAL
+        //           TABLE INDEX 1:` y un `CREATE BLOOM FILTER`; las dos cierran con
+        //           `USE TEMP B-TREE FOR ORDER BY`
+        // Con el 3.46.0 de `libsqlite3-sys 0.30.1` las dos nombraban
+        // `idx_job_executions_snapshot_id`; las dos puertas son indexadas, así que el cambio de
+        // versión no quita ningún acceso indexado y lo que la prueba tiene que cazar aquí es un
+        // `SCAN e`. La puerta que el índice nuevo abre **cuando es la única** sigue medida arriba,
+        // sin estadísticas y en el filtro suelto, y esas aserciones no se tocan. Si un salto de
+        // SQLite vuelve a mover esto, lo que hay que rehacer es esta medición, no la migración
+        // (D10 del change `saneamiento-de-dependencias`).
+        // La `ANALYZE` cambia el esquema —crea `sqlite_stat1`—, así que la medición vuelve a ir
+        // sobre un pool nuevo, por lo mismo de antes.
         sqlx::query("ANALYZE")
             .execute(&pool)
             .await
@@ -2086,8 +2112,12 @@ mod tests {
         for (nombre, consulta) in [("la de una instantánea", DE_UNA), ("la del lote", DE_LOTE)] {
             let plan = plan_de(&pool, &format!("EXPLAIN QUERY PLAN {consulta}")).await;
             assert!(
-                plan.contains("idx_job_executions_snapshot_id"),
-                "con estadísticas, el plan de {nombre} debería entrar por el índice nuevo: {plan}"
+                !plan.contains("SCAN e"),
+                "con estadísticas, el plan de {nombre} recorre `job_executions` entera: {plan}"
+            );
+            assert!(
+                plan.contains("idx_job_executions_job_id"),
+                "con estadísticas, el plan de {nombre} no entra en `e` por su clave foránea: {plan}"
             );
         }
 

@@ -83,11 +83,11 @@ Y un agujero de forma: **el CI no compila ni prueba `kesto-mcp`** (`ci.yml:72` y
 
 ### 4. GREEN — `sqlx 0.9.1` y `libsqlite3-sys` saneado
 
-- [ ] 4.1 `Cargo.toml`: `sqlx 0.9.1` con `sqlite-bundled` (no `sqlite`), `rust-version = "1.94"` y el bloque de comentarios actualizado.
-- [ ] 4.2 `libsqlite3-sys` a `0.40.0` dentro del rango que abre `sqlx-sqlite 0.9.1`.
-- [ ] 4.3 Los tres puntos de API: `Migrator` y `Migration::new` en `src/test_support.rs`; los dos `query*()` con cadena no estática.
-- [ ] 4.4 La caracterización del checksum sigue verde.
-- [ ] 4.5 `cargo test --locked --workspace` verde y `cargo deny check` **entero** verde (RUSTSEC-2026-0459 fuera de los avisos).
+- [x] 4.1 `Cargo.toml`: `sqlx 0.9.1` con `sqlite-bundled` (no `sqlite`), `rust-version = "1.94"` y el bloque de comentarios actualizado.
+- [x] 4.2 `libsqlite3-sys` a `0.40.0` dentro del rango que abre `sqlx-sqlite 0.9.1`.
+- [x] 4.3 Los tres puntos de API: `Migrator` y `Migration::new` en `src/test_support.rs`; los dos `query*()` con cadena no estática. (Cuatro en realidad: el compilador señala además `run_direct`, que en `0.9` pasa a `(Option<i64>, &mut C, bool)`.)
+- [x] 4.4 La caracterización del checksum sigue verde.
+- [x] 4.5 `cargo test --locked --workspace` verde y `cargo deny check` **entero** verde (RUSTSEC-2026-0459 fuera de los avisos). El salto sube el SQLite empaquetado de 3.46.0 a 3.54.1 y movió el planificador bajo `ANALYZE`: la caracterización del plan de la `0004` se volvió a medir y fija el acceso indexado en vez de una puerta concreta (D10), sin tocar el bloque sin estadísticas ni el filtro suelto.
 
 ### 5. GREEN — CI y Dependabot
 

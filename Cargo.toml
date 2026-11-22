@@ -12,6 +12,10 @@ resolver = "3"
 name = "kesto"
 version = "0.17.0"
 edition = "2024"
+# The floor `sqlx 0.9.1` imposes. Declared here so a toolchain below it fails at
+# resolve time with the number in hand, instead of the floor being discovered by
+# breaking -- which is how it went unnoticed until this change.
+rust-version = "1.94"
 description = "Lightweight backup orchestrator in a container: dumps MariaDB/PostgreSQL and host directories into rustic repositories on S3, with a live React panel."
 license = "MIT"
 repository = "https://github.com/atareao/kesto"
@@ -65,25 +69,35 @@ urlencoding = "2.1.3"
 url = "2.5.8"
 
 # Persistence (db-schema): SQLite through sqlx, plus the RustCrypto stack that
-# seals the three secret columns at rest. Same rule as above -- every version is
-# one already present in this machine's Cargo cache, because this repository must
-# build with no connection. Read these notes before touching a version.
+# seals the three secret columns at rest. The rule was that every version here is
+# one already present in this machine's Cargo cache, because this repository had
+# to build with no connection. `sqlx 0.9.1` is the exception: the cache held
+# 0.9.0, not 0.9.1, so the bump below was resolved with the network on and
+# `Cargo.lock` carries it. Read these notes before touching a version.
 #
-# `sqlx` 0.8.6, NOT 0.9.0. Both resolve offline, so the cache is not the
-# discriminator: the tree is. In 0.9.0 the `sqlite` feature stops being an alias
-# of "bundled" and expands to `sqlite-bundled + sqlite-deserialize +
-# sqlite-load-extension + sqlite-unlock-notify`, which opens `libsqlite3-sys` to
-# `>=0.30.1, <0.38.0` (resolving to 0.37.0) and raises `flume` to 0.12.0; it also
-# demands MSRV 1.94.0. 0.8.6 requires `^0.30.1` and its `sqlite` is bundled and
-# nothing else. None of that is needed for an embedded database with WAL.
+# `sqlx` 0.9.1, NOT 0.8.6. 0.8.6 was pinned to keep `libsqlite3-sys` out of the
+# advisory that SQLite -- Kesto's store -- carries: in 0.9.0 the `sqlite` feature
+# stops being an alias of "bundled" and expands to `sqlite-bundled +
+# sqlite-deserialize + sqlite-load-extension + sqlite-unlock-notify`, which opens
+# `libsqlite3-sys` to `>=0.30.1, <0.38.0` (resolving to 0.37.0) -- BELOW the
+# 0.39.0 that closes RUSTSEC-2026-0459 (CVE-2026-119375). 0.9.1 raises that
+# ceiling to `<0.41.0`, so the CVE is closable and the argument that decided the
+# old version no longer holds. The feature is declared as `sqlite-bundled`, the
+# EXACT equivalent of what `sqlite` did in 0.8.6 (same `_sqlite` +
+# `sqlx-sqlite/bundled` + `sqlx-macros?/sqlite` expansion): the SQLite compiled
+# into the binary, with the extension loading, the unlock notification and the
+# deserialization left off because Kesto does not use them. What still holds is
+# the MSRV: 0.9.1 demands 1.94.0, so it is declared with `rust-version` in
+# `[package]` rather than left in a comment.
 #
 # `default-features = false` is NOT cosmetic: sqlx's default is
 # ["any", "macros", "migrate", "json"], and `any` pulls in the MySQL and
 # PostgreSQL drivers this project does not use. The six features are the minimum:
-# `runtime-tokio` because the runtime is Tokio, `sqlite` because it is the only
-# backend, `migrate` for `sqlx::migrate!()`, `macros` because the macro and
+# `runtime-tokio` because the runtime is Tokio, `sqlite-bundled` because it is
+# the only backend and it is the SQLite compiled into the binary (see above),
+# `migrate` for `sqlx::migrate!()`, `macros` because the macro and
 # `FromRow` live there, `time` because the `Encode`/`Decode` impls for `time` sit
-# behind it -- in 0.8.6 `time` itself is an optional dependency of `sqlx-core` and
+# behind it -- `time` itself is an optional dependency of `sqlx-core` and
 # `sqlx-sqlite`, so the feature is what brings the impls in -- and `uuid` for the
 # same reason.
 #
@@ -98,15 +112,15 @@ url = "2.5.8"
 # `time`, NOT `chrono`: `time` is already in the active tree -- `cookie` (through
 # axum-extra) and `simple_asn1` (through jsonwebtoken) both pull it -- so `chrono`
 # would be a second date family for nothing. The `time` feature below is what
-# turns the `Encode`/`Decode` impls on: in 0.8.6 `time` is an OPTIONAL dependency
-# of both `sqlx-core` and `sqlx-sqlite`, so without that feature the date columns
-# do not map.
+# turns the `Encode`/`Decode` impls on: `time` is an OPTIONAL dependency of both
+# `sqlx-core` and `sqlx-sqlite`, so without that feature the date columns do not
+# map.
 #
 # `uuid` with `v4`, to generate identifiers in the access layer. WARNING: `sqlx`
 # writes a `Uuid` as a 16-byte BLOB and SRS section 3 says `id TEXT`, so the
 # access layer stores `uuid::fmt::Hyphenated`. Do not add any feature that
 # changes that behaviour.
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "time", "uuid"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros", "time", "uuid"] }
 aes-gcm = "0.10.3"
 hkdf = "0.12.4"
 sha2 = "0.10.9"

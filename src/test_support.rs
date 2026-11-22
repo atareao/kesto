@@ -30,6 +30,7 @@ use rustic_core::{
     RepositoryOptions, SnapshotOptions, WriteBackend,
     jiff::{Timestamp, Zoned, tz::TimeZone},
 };
+use sqlx::SqlStr;
 use sqlx::SqlitePool;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use tower::ServiceExt;
@@ -1202,19 +1203,21 @@ pub(crate) fn estado_de_prueba_con_comprobador(
 /// tocar las migraciones de verdad del repositorio: el migrador embebido está en
 /// verde por construcción, así que ese camino solo se puede recorrer inyectando
 /// uno que falle.
+///
+/// Se arma con [`Migrator::with_migrations`], el camino que el propio `sqlx`
+/// ofrece para un migrador en tiempo de ejecución: en `0.9` el literal del struct
+/// ya no compila —ganó `table_name` y `create_schemas`— y el constructor deja los
+/// demás campos en su defecto. `locking` pasa de `false` a su defecto `true`, y en
+/// SQLite da igual: allí `lock`/`unlock` son no-ops (`sqlx-sqlite`), así que el
+/// camino que la prueba mide —la migración que falla— es el mismo.
 pub(crate) fn migrador_roto() -> Migrator {
-    Migrator {
-        migrations: Cow::Owned(vec![Migration::new(
-            1,
-            Cow::Borrowed("rota"),
-            MigrationType::Simple,
-            Cow::Borrowed("ESTO NO ES SQL"),
-            false,
-        )]),
-        ignore_missing: false,
-        locking: false,
-        no_tx: false,
-    }
+    Migrator::with_migrations(vec![Migration::new(
+        1,
+        Cow::Borrowed("rota"),
+        MigrationType::Simple,
+        SqlStr::from_static("ESTO NO ES SQL"),
+        false,
+    )])
 }
 
 /// Estado con la autenticación apagada: el modo de desarrollo.
