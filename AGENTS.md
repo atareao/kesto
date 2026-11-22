@@ -17,8 +17,8 @@
 
 | Receta | Qué hace |
 |---|---|
-| `just check` | Los tres checks del CI, en su orden: `cargo fmt --all -- --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --locked`. Ejecútalo antes de cada commit. |
-| `just check-all` | `just check` + los cuatro pasos del panel (`just ui-check`). |
+| `just check` | Los tres checks del CI, en su orden y sobre el **workspace** entero: `cargo fmt --all -- --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --locked --workspace`. Ejecútalo antes de cada commit. |
+| `just check-all` | `just check` + la puerta de dependencias (`just deny` = `cargo deny --workspace check`) + las pruebas de `scripts/` + los cuatro pasos del panel (`just ui-check`). Es el análogo local del CI entero. |
 | `just check-spec` | Puerta del protocolo SDD: falla si no hay change proposal activo en `openspec/changes/`. |
 
 ## Reglas de git flow (obligatorio)
@@ -29,7 +29,7 @@
 - Formateo **antes** de cada commit: `cargo fmt --all` → `cargo clippy -- -D warnings` → `cargo test`; en `ui/`: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test`. Si el formateo toca ficheros, commit aparte (`🎨 style: apply formatting`).
 - Nunca hagas `git commit` directo en `main`: ahí solo entran PRs de release desde `development`.
 
-**Pipeline:** **Un merge a `main` ES una release.** No se etiqueta a mano: `release-prepare` decide el bump desde los conventional commits (`feat` → minor, `!:` / `BREAKING CHANGE` → major, resto → patch) y empuja el tag, que es lo que dispara `release.yml`. El CI corre lo mismo que `just check`: repítelo antes de cada push. Workflows, secretos y ramas, en `GIT_FLOW.md`.
+**Pipeline:** **Un merge a `main` ES una release.** No se etiqueta a mano: `release-prepare` decide el bump desde los conventional commits (`feat` → minor, `!:` / `BREAKING CHANGE` → major, resto → patch) y empuja el tag, que es lo que dispara `release.yml`. El CI corre lo mismo que `just check` **sobre el workspace entero** (`--workspace`), más la puerta de dependencias `cargo deny --workspace check` (en local, `just deny`): repítelo antes de cada push. Workflows, secretos y ramas, en `GIT_FLOW.md`.
 
 ## Planes y documentación — regla fija
 

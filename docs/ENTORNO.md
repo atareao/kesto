@@ -65,7 +65,7 @@
 
 | Herramienta | Estado |
 |---|---|
-| Rust / Cargo | 1.97 · `edition = "2024"` (exige ≥ 1.85) |
+| Rust / Cargo | 1.97 · `edition = "2024"` · MSRV declarado `1.94` en `Cargo.toml` (`rust-version`, lo exige `sqlx 0.9.1`); el CI usa `stable` |
 | Node / pnpm | v24.22.1 · pnpm 12.15.0 (npm 12.2.1) |
 | Contenedores | **no hay `docker` ni `/var/run/docker.sock`**; Podman 6.1.4 con API Docker-compatible en `unix:///run/user/1000/podman/podman.sock` (`/_ping` → 200, `/containers/json` responde) |
 | CLI | `just` 1.59.0 · `openspec` 1.13.2 · `codegraph` 0.7.9 · `gh` 2.102.1 (autenticado como `atareao`) · `vampus` 0.4.8 · `git-cliff` 2.14.2 |
@@ -73,6 +73,19 @@
 - **Podman en local, Docker en producción** (decisión tomada el 2026-10-24). En dev, bollard apunta al socket de podman con la ruta configurable (`DOCKER_HOST`); nunca al de Docker. El compose de producción (§8) sigue montando `/var/run/docker.sock`.
 - Cualquier comando `docker ...` falla en esta máquina: usa `podman ...`.
 - **La versión de API de bollard se fija en la llamada, no se deja deducir**: `Cliente::conectar` construye el motor con `Docker::connect_with_socket(socket, segundos, bollard::API_DEFAULT_VERSION)` —`src/docker/cliente.rs:68`— y nunca con `connect_with_defaults()`, porque una deducción contra un motor que no es Docker (podman) o contra una versión distinta es exactamente el sitio donde un cliente se atasca en la negociación, y esos fallos aparecen más tarde y más lejos de su causa; el rustdoc de `Cliente::conectar` guarda el resto, incluido que hoy ese prefijo no llega al cable y que si algún día hace falta otra versión lo que toca es negociar, no subir la constante.
+
+### Dependencias del workspace (fijadas por `Cargo.lock`)
+
+Las que cambian de versión con el saneamiento de dependencias (issue #167, SEC-11; detalle en `docs/FEATURE-044-saneamiento-de-dependencias.md`). El resto de versiones vive en `Cargo.toml`/`Cargo.lock`, que son la fuente de verdad:
+
+| Crate | Versión | Por qué |
+|---|---|---|
+| `sqlx` | `0.9.1` | Salto desde `0.8.6`: en `0.9.1` el techo de `libsqlite3-sys` sube a `<0.41.0` y el CVE de SQLite pasa a ser cerrable. La feature es `sqlite-bundled` (no `sqlite`, que en `0.9` enciende extensiones, deserialización y aviso de desbloqueo). Exige el MSRV declarado `1.94` |
+| `libsqlite3-sys` | `0.40.0` | El SQLite **empaquetado y compilado en el binario**, dentro del rango que abre `sqlx-sqlite 0.9.1`. Sube el motor de **SQLite 3.46.0 a 3.54.1** y cierra RUSTSEC-2026-0459 (CVE-2026-119375) |
+| `rmcp` | `3.11` | SDK del servidor MCP (`kesto-mcp`), de `3.5.1` a `3.11.0`: cierra RUSTSEC-2026-0457/0461/0462 |
+
+- El **MSRV declarado es `1.94`** (`rust-version` en `Cargo.toml`): `sqlx 0.9.1` lo exige. El CI usa `stable`; el entorno local, `1.97`. Un toolchain por debajo de `1.94` falla al resolver, con el número en la mano.
+- `zstd 0.13.4` / `zstd-safe 7.4.1` y `async-executor 1.14.1` son parches del mismo change (cierre de avisos y salida del *yanked*).
 
 ## Batería e2e — entorno que necesita
 
