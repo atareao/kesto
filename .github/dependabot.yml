@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Kesto — Dependabot: las actualizaciones llegan por PR revisable (issue #167)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Dependabot y no Renovate: es nativo de GitHub —no exige instalar ninguna
+# aplicación en el repositorio— y su configuración vive en el árbol, junto al
+# resto de la automatización. La agrupación que aquí hace falta —separar los
+# parches de los saltos de versión— se consigue con sus `groups`.
+#
+# NINGUNA actualización se fusiona sola: aquí no hay `auto-merge` ni nada que lo
+# permita, así que cada PR de Dependabot pasa por la misma puerta que un cambio
+# escrito a mano —los trabajos de `ci.yml`, `cargo deny` incluido—. Y al revés:
+# el `ignore` de `deny.toml` se retira en el mismo PR que sube la dependencia
+# que lo justificaba, que es lo que evita que una excepción se quede obsoleta
+# sin que nadie se entere.
+version: 2
+
+updates:
+  # `cargo`: UNA entrada en la raíz cubre el workspace entero —`kesto-mcp`
+  # incluido—, así que no hace falta una por crate.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "⬆️ deps"
+    groups:
+      # Los parches van juntos: son los que se revisan en bloque.
+      parches:
+        patterns: ["*"]
+        update-types: ["patch"]
+      # Los saltos de versión van aparte de los parches: cada grupo llega en su
+      # propio PR, así que un `3.0.0` no viaja pegado a un `0.1.2`. Lo que este
+      # grupo **sí** junta es el resto de saltos —todos los minor y major en un
+      # mismo PR—, y es a propósito: lo que el spec pide es que un parche no se
+      # mezcle con un salto de versión, no que cada salto tenga su propio PR.
+      saltos:
+        patterns: ["*"]
+        update-types: ["minor", "major"]
+
+  # Las acciones de los flujos. El `directory` de este ecosistema es siempre la
+  # raíz: las acciones no viven en una carpeta del repositorio.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "⬆️ deps"
+    groups:
+      parches:
+        patterns: ["*"]
+        update-types: ["patch"]
+      saltos:
+        patterns: ["*"]
+        update-types: ["minor", "major"]
+
+  # El panel. Hoy `pnpm audit` sale limpio, pero eso es una foto, no una
+  # propiedad: esta entrada es lo que hace que siga siéndolo.
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "⬆️ deps"
+    groups:
+      parches:
+        patterns: ["*"]
+        update-types: ["patch"]
+      saltos:
+        patterns: ["*"]
+        update-types: ["minor", "major"]

@@ -1,0 +1,130 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Kesto — puerta de la cadena de suministro (issue #167, SEC-11)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# `cargo deny` y no `cargo audit`: audit solo mira avisos; deny mira cuatro
+# familias —avisos, licencias, prohibiciones y fuentes— con la configuración
+# VERSIONADA en el repositorio, que es lo que permite revisar cada excepción en
+# el PR. Las licencias y las fuentes no son adorno: son lo que atrapa a la
+# dependencia nueva que entra con una licencia inesperada o desde un registro
+# ajeno, justo el cambio que nadie revisa a mano en un PR de bumps.
+#
+# Se corre con `cargo deny --workspace --locked check` (receta `just deny`, job
+# `Dependencies (cargo deny)` del CI). El `--locked` no es cosmético: sin él la
+# comprobación resolvería el árbol por su cuenta y podría juzgar una versión que
+# no es la del PR. Y `--workspace` tampoco: el manifiesto raíz es un PAQUETE, no
+# un virtual, así que sin el flag el grafo arranca en `kesto` y `kesto-mcp` —con
+# `rmcp` dentro— queda fuera, con lo que la puerta saldría verde sin mirarlo.
+#
+# Toda excepción de este fichero lleva su MOTIVO por escrito y es refutable
+# contra el árbol con `cargo tree -i <crate>`. Es el único sitio donde un lector
+# futuro distingue «este aviso no nos alcanza» de «lo silenciamos y ya nadie se
+# acordó de por qué». Retírala en cuanto su causa desaparezca: Dependabot abre el
+# PR del bump y el `ignore` se va en el mismo PR.
+
+# ── Avisos de RustSec ──────────────────────────────────────────────────────
+#
+# Los tres primeros son los avisos NO alcanzables que este change declara en vez
+# de silenciar; los cuatro siguientes son crates *unmaintained*, que RustSec
+# reporta como error y que no tienen versión que los cierre.
+[advisories]
+ignore = [
+    # `rsa 0.9.10`. El ataque (Marvin) es de DESCIFRADO PKCS#1 v1.5 con la clave
+    # privada, y Kesto solo VERIFICA firmas RS256 con la clave PÚBLICA
+    # (`src/auth/oidc.rs`); el único otro uso es exportar un PEM en el proveedor
+    # falso de pruebas. Y no es cerrable por decisión propia: `reqsign-core
+    # 3.3.2` —que entra por `rustic_backend`— fija `rsa ^0.9.2`, así que subir a
+    # `0.10` exige cambiar de cliente de almacenamiento. Refutable:
+    # `cargo tree -i rsa`.
+    { id = "RUSTSEC-2023-0071", reason = "Marvin es un ataque de descifrado PKCS#1 v1.5 con la clave privada y Kesto solo verifica firmas RS256 con la pública; además reqsign-core fija rsa ^0.9.2, así que no se puede subir a 0.10 sin cambiar de cliente de almacenamiento (cargo tree -i rsa)" },
+
+    # `suppaftp 8.0.5`. Llega por `opendal-service-ftp → opendal →
+    # rustic_backend`, y el transporte FTP NUNCA se configura: Kesto habla S3 y
+    # el `endpoint` de un repositorio rechaza cualquier esquema que no sea
+    # `http`/`https` (`src/rustic/endpoint.rs`). Cerrarlo pide `suppaftp 10`, que
+    # arrastra un salto mayor de `opendal` por un camino que no se ejecuta.
+    # Refutable: `cargo tree -i suppaftp`.
+    { id = "RUSTSEC-2026-0271", reason = "llega por opendal-service-ftp -> opendal -> rustic_backend y el transporte FTP nunca se configura: Kesto habla S3 y el endpoint de un repositorio rechaza cualquier esquema que no sea http/https (src/rustic/endpoint.rs); cerrarlo pide suppaftp 10, que arrastra un salto mayor de opendal (cargo tree -i suppaftp)" },
+
+    # `crypto-bigint 0.5.5`. Entra por las rutas ECDSA de `jsonwebtoken`
+    # (`p256`/`p384` → `elliptic-curve` → `crypto-bigint`) y Kesto solo usa
+    # `RS256` (`src/auth/oidc.rs`) y `HS256`. Cerrarlo pediría `jsonwebtoken 12`,
+    # que mete en el árbol una segunda generación de `sha2`/`hmac` por un camino
+    # que no se ejecuta. Refutable: `cargo tree -i crypto-bigint`.
+    { id = "RUSTSEC-2026-0387", reason = "entra por las rutas ECDSA de jsonwebtoken (p256/p384 -> elliptic-curve -> crypto-bigint) y Kesto solo usa RS256 (src/auth/oidc.rs) y HS256; cerrarlo pide jsonwebtoken 12, que mete una segunda generación de sha2/hmac por un camino que no se ejecuta (cargo tree -i crypto-bigint)" },
+
+    # `async-std 1.13.2`. Descontinuado, y llega por la misma cadena FTP
+    # (`suppaftp → async-std`) que no se configura. El aviso cubre todas las
+    # versiones —no hay una que lo cierre— y el único consumidor es un
+    # transporte que Kesto no enciende. Refutable: `cargo tree -i async-std`.
+    { id = "RUSTSEC-2025-0052", reason = "descontinuado, y llega por la misma cadena FTP (suppaftp -> async-std) que no se configura; el aviso cubre todas las versiones y el único consumidor es un transporte que Kesto no enciende (cargo tree -i async-std)" },
+
+    # `chrono 0.4.45`. Descontinuado en TODAS sus versiones («No safe upgrade is
+    # available»). chrono SÍ es dependencia directa —las fechas del producto— y
+    # sustituirlo por `time` o `jiff` es una migración propia, fuera del alcance
+    # de este change; aquí no hay versión que subir, así que el `ignore` no es
+    # una comodidad. Refutable: `cargo tree -i chrono`.
+    { id = "RUSTSEC-2026-0543", reason = "descontinuado en todas sus versiones (no safe upgrade); chrono sí es dependencia directa (fechas) y sustituirlo por time o jiff es una migración propia, fuera del alcance de este change: no hay versión que subir (cargo tree -i chrono)" },
+
+    # `chrono-tz 0.10.4`. Descontinuado, arrastrado por `tokio-cron-scheduler`
+    # (el programador de trabajos). Cae cuando caiga chrono, en la misma
+    # migración a `time`/`jiff`. Refutable: `cargo tree -i chrono-tz`.
+    { id = "RUSTSEC-2026-0555", reason = "descontinuado, arrastrado por tokio-cron-scheduler (el programador de trabajos); cae cuando caiga chrono, en la misma migración a time/jiff (cargo tree -i chrono-tz)" },
+
+    # `pin-utils 0.1.1`. Descontinuado (el repositorio se archivó), arrastrado
+    # por `async-std` en la cadena FTP sin configurar. Refutable:
+    # `cargo tree -i pin-utils`.
+    { id = "RUSTSEC-2026-0441", reason = "descontinuado (repositorio archivado), arrastrado por async-std en la cadena FTP sin configurar (cargo tree -i pin-utils)" },
+]
+
+# ── Licencias ──────────────────────────────────────────────────────────────
+#
+# Allowlist EXPLÍCITA: es el conjunto de licencias que el árbol ELIGE hoy —un crate
+# con `MIT OR Apache-2.0` no obliga a admitir las dos—, obtenido con
+# `cargo deny list` y confirmado con `cargo deny check licenses`. Una licencia que
+# no esté aquí hace fallar la comprobación a propósito: la dependencia nueva con
+# licencia inesperada es justo lo que hay que ver en el PR. Añádela solo tras leer
+# la licencia, no para que pase.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",
+    "MIT-0",
+]
+# `confidence-threshold` se queda en su defecto (0.8) a propósito: bajarlo
+# taparía la licencia que el escáner no reconoce, que es precisamente la que hay
+# que mirar a mano. Si un crate no se puede determinar, la salida es un
+# `[[licenses.clarify]]` con la expresión de su repositorio y su porqué, nunca
+# aflojar este umbral.
+
+# ── Prohibiciones ──────────────────────────────────────────────────────────
+[bans]
+# Los comodines se DENIEGAN: una versión `*` en un `Cargo.toml` hace que dos
+# máquinas resuelvan árboles distintos, y hoy no hay ninguno, así que cerrar la
+# puerta no cuesta nada.
+wildcards = "deny"
+# Las duplicidades solo AVISAN, y es una decisión, no un descuido: hoy hay 126
+# grupos de versiones duplicadas y TODOS vienen de árboles de terceros
+# (`rustic_core`, `opendal`, `wiremock`). Denegarlas obligaría a un `skip` de
+# 126 entradas —una lista que nadie lee, que caduca sola y que convierte
+# cualquier bump en una pelea de configuración—. En `warn`, el aviso sale en el
+# registro del trabajo y se lee cuando interesa.
+multiple-versions = "warn"
+
+# ── Fuentes ────────────────────────────────────────────────────────────────
+#
+# Aquí solo se usa crates.io: un registro ajeno o un repositorio git hacen
+# fallar la comprobación en vez de colarse en el árbol sin que nadie lo vea.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

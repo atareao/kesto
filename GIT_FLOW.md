@@ -110,7 +110,7 @@ git commit -m "🎨 style: apply formatting"
 
 | Workflow | Cuándo | Qué |
 |---|---|---|
-| `ci.yml` | PR y push a `development`/`main` | `preflight` → `backend` (fmt, clippy, test) → `frontend` (se salta mientras no exista `ui/`) |
+| `ci.yml` | PR y push a `development`/`main` | `preflight` → `backend` (fmt, clippy, test, sobre el workspace) → `dependencies` (`cargo deny --workspace`, en paralelo) → `frontend` (se salta mientras no exista `ui/`) |
 | `release-prepare.yml` | push a `main` | versión, changelog y tag |
 | `release.yml` | tag `v*` | imagen a GHCR, crate a crates.io, GitHub Release |
 
@@ -163,7 +163,7 @@ gh pr create --base development --head feature/<nombre>
 
 | Workflow | Se dispara con | Hace |
 |---|---|---|
-| `ci.yml` | PR y push a `development`/`main` | `preflight` detecta el árbol → `backend` (`fmt --check`, `clippy -D warnings`, `test --locked`) → `frontend` (npm o pnpm según el lockfile) |
+| `ci.yml` | PR y push a `development`/`main` | `preflight` detecta el árbol → `backend` (`fmt --check`, `clippy -D warnings --workspace`, `test --locked --workspace`) → `dependencies` (`cargo deny --workspace --locked check`) → `frontend` (npm o pnpm según el lockfile) |
 | `release-prepare.yml` | push a `main` (solo eso) | bump con vampus, CHANGELOG con git-cliff, tag `vX.Y.Z`, sincroniza `development` |
 | `release.yml` | tag `v*` | imagen multi-arquitectura a `ghcr.io/atareao/kesto` + crate a crates.io + GitHub Release |
 
@@ -174,7 +174,7 @@ Lo que hay que saber antes de tocarlo:
 - **El job `frontend` del CI se salta solo** mientras no exista `ui/package.json`, y elige npm o pnpm por el lockfile presente. No hace falta tocarlo cuando llegue la UI.
 - **Secretos necesarios antes de la primera release**: `GH_PAT` (PAT con `contents: write`) y `CARGO_REGISTRY_TOKEN`. Sin `GH_PAT` el tag no dispara `release.yml`, porque un tag empujado con el `GITHUB_TOKEN` por defecto no dispara workflows.
 - La versión vive en **tres sitios** que deben ir sincronizados: `Cargo.toml`, la entrada `[[package]]` de `Cargo.lock` y `.vampus.yml:current_version`. `release-prepare` los resincroniza y falla en alto si vampus no sube nada; si lo tocas a mano, toca los tres.
-- El CI corre exactamente `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` y `cargo test --locked`: replica esos comandos antes de cada push para no descubrir el fallo en el PR.
+- El CI corre exactamente `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` y `cargo test --locked --workspace`, **más** el job `Dependencies (cargo deny)` (`cargo deny --workspace --locked check`): replica esos comandos antes de cada push para no descubrir el fallo en el PR. El `--workspace` no es cosmético: sin él Cargo se queda en el paquete raíz y `kesto-mcp` no se mira —y en el job de dependencias pasa lo mismo, porque el manifiesto raíz es un paquete y no un virtual: sin el flag el grafo arranca en `kesto` y `kesto-mcp`, con `rmcp` dentro, queda fuera de la puerta—. En local, `just check` encadena los tres primeros sobre el workspace y `just deny` corre la puerta de dependencias.
 
 ## Planes y documentación — regla fija
 
