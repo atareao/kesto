@@ -34,6 +34,14 @@ const INTENTO_INVALIDO: &str = "el intento de entrada no es válido";
 /// flujo.
 const CALLBACK_INCOMPLETO: &str = "el callback no trae los parámetros del flujo";
 
+/// Mensaje con el que se rechaza un login pendiente sin `code_verifier` PKCE.
+///
+/// Un login emitido antes de que existiera PKCE —o uno cuyo registro se haya
+/// corrompido— no puede canjearse: canjearlo sin verifier entregaría una sesión
+/// sin la prueba de posesión que PKCE exige, así que se falla en alto en vez de
+/// degradar el flujo.
+const LOGIN_SIN_VERIFIER: &str = "el login pendiente no trae el code_verifier de PKCE";
+
 /// Destino de la vuelta tras el callback: la raíz del panel.
 ///
 /// El panel (`ui/`) todavía no existe —llega con su propio change—, así que la
@@ -65,10 +73,11 @@ pub async fn login(State(state): State<AppState>) -> Response {
 
     let solicitud = oidc::build_authorization_url(auth.settings.as_ref(), &discovery);
 
-    // El `state` se guarda con su marca de tiempo y junto al `nonce` emitido: el
-    // callback comparará ese `nonce` con el del ID token al verificar. La
-    // respuesta no emite cookie: la sesión llega con el callback.
-    auth.registrar_login(&solicitud.state, &solicitud.nonce)
+    // El `state` se guarda con su marca de tiempo, el `nonce` emitido y el
+    // `code_verifier` PKCE: el callback los usa para verificar el ID token y
+    // para enviar al `token_endpoint`. La respuesta no emite cookie: la sesión
+    // llega con el callback.
+    auth.registrar_login(&solicitud.state, &solicitud.nonce, &solicitud.code_verifier)
         .await;
 
     redireccion_302(&solicitud.url)
@@ -161,12 +170,27 @@ pub async fn callback(
         Err(error) => return error.into_response(),
     };
 
-    let id_token = match oidc::canjear_codigo(auth.settings.as_ref(), &discovery, code).await {
+    // Sin `code_verifier` no se canjea: un login que no lo trae —uno emitido
+    // antes de PKCE, o un registro corrupto— se rechaza aquí, antes de tocar el
+    // `token_endpoint`, en vez de degradar el flujo a uno sin prueba de posesión.
+    if pendiente.code_verifier.is_empty() {
+        return AppError::Unauthorized(LOGIN_SIN_VERIFIER.to_owned()).into_response();
+    }
+
+    let id_token = match oidc::canjear_codigo(
+        auth.settings.as_ref(),
+        &discovery,
+        code,
+        &pendiente.code_verifier,
+    )
+    .await
+    {
         Ok(id_token) => id_token,
         Err(error) => return error.into_response(),
     };
 
     let identidad = match oidc::verificar_id_token(
+        auth,
         auth.settings.as_ref(),
         &discovery,
         &id_token,

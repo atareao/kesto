@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::api::contenido;
 use crate::api::extract::Json;
 use crate::api::response::{ApiResponse, Data};
-use crate::db::entities::{AltaDeToken, Scope, TokenDeApi, hash_de_token};
+use crate::db::entities::{AltaDeToken, Scope, TokenDeApi};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -282,7 +282,7 @@ pub async fn alta(
         .tokens
         .alta(AltaDeToken {
             name,
-            token_hash: hash_de_token(&en_claro),
+            en_claro: en_claro.clone(),
             scopes,
             expires_at,
         })
@@ -421,7 +421,8 @@ mod tests {
         assert_eq!(filas[0].scopes, vec![Scope::Read]);
         assert_eq!(
             filas[0].token_hash,
-            hash_de_token(&en_claro),
+            hash_de_token(&en_claro, estado.db.clave.api_token_key())
+                .expect("el hash de prueba no puede fallar"),
             "la fila no guardó el hash del token entregado"
         );
         assert_ne!(
@@ -448,7 +449,10 @@ mod tests {
             "el listado no puede devolver el valor en claro: {texto}"
         );
         assert!(
-            !texto.contains(&hash_de_token(&en_claro)),
+            !texto.contains(
+                &hash_de_token(&en_claro, estado.db.clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar")
+            ),
             "el listado no puede devolver el hash: {texto}"
         );
         assert!(
@@ -526,7 +530,10 @@ mod tests {
         let fila = estado
             .db
             .tokens
-            .buscar_por_hash(&hash_de_token(&en_claro))
+            .buscar_por_hash(
+                &hash_de_token(&en_claro, estado.db.clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no falla")
             .expect("el token tiene que estar");
@@ -574,7 +581,10 @@ mod tests {
         let fila = estado
             .db
             .tokens
-            .buscar_por_hash(&hash_de_token(&en_claro))
+            .buscar_por_hash(
+                &hash_de_token(&en_claro, estado.db.clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no falla")
             .expect("la fila tiene que seguir en la base para poder auditarla");
@@ -608,7 +618,10 @@ mod tests {
         let fila = estado
             .db
             .tokens
-            .buscar_por_hash(&hash_de_token(&en_claro))
+            .buscar_por_hash(
+                &hash_de_token(&en_claro, estado.db.clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no falla")
             .expect("el token tiene que estar");

@@ -6,8 +6,10 @@
 //! no hay ningún secreto cifrado en reposo como en `repositories` o `backup_targets`: no hay
 //! nada que descifrar porque no hay nada que valga la pena descifrar.
 //!
-//! Por eso esta capa **no recibe la clave**: no tiene ninguna columna secreta, y pasarle una
-//! que no usa sugeriría que aquí se cifra algo.
+//! Por eso esta capa **no cifra nada en reposo**: no hay ninguna columna secreta que
+//! descifrar. Sí recibe, en cambio, la clave HMAC con la que se hashean los tokens al alta
+//! y al verificar, porque el hash no es un SHA-256 pelado sino un HMAC con la clave derivada
+//! de `KESTO_MASTER_KEY`: así quien lea la tabla no puede precomputar hashes de tokens.
 //!
 //! `scopes` es el vocabulario cerrado del permiso —`read` y `run`— y viaja como el texto que
 //! el `CHECK` del DDL acepta: `read`, `run` o `read,run`, en ese orden canónico. La capa
@@ -15,12 +17,12 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteRow;
 use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::db::DbError;
 
@@ -182,8 +184,8 @@ impl std::fmt::Debug for TokenDeApi {
 pub struct AltaDeToken {
     /// Nombre con el que su dueño reconoce el token.
     pub name: String,
-    /// Hash del token; el valor en claro no entra aquí.
-    pub token_hash: String,
+    /// Valor en claro del token; se hashea internamente con la clave HMAC de `Tokens`.
+    pub en_claro: String,
     /// Permisos concedidos.
     pub scopes: Vec<Scope>,
     /// Cuándo deja de valer; `None` si no caduca.
@@ -192,14 +194,14 @@ pub struct AltaDeToken {
 
 /// El `Debug` **redacta** el hash, igual que el de [`TokenDeApi`].
 ///
-/// Un alta lleva el mismo material que la fila —el hash con el que se verifica un token
-/// entrante—, así que imprimirlo entero sería la misma fuga por otro camino: una traza de un
-/// alta fallida no es sitio para él. El resto del alta sí se imprime.
+/// Un alta lleva el valor en claro del token —el que se convierte en el hash de la fila—,
+/// así que imprimirlo entero sería una fuga: una traza de un alta fallida no es sitio para
+/// él. El resto del alta sí se imprime.
 impl std::fmt::Debug for AltaDeToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AltaDeToken")
             .field("name", &self.name)
-            .field("token_hash", &"redactado")
+            .field("en_claro", &"redactado")
             .field("scopes", &self.scopes)
             .field("expires_at", &self.expires_at)
             .finish()
@@ -208,13 +210,29 @@ impl std::fmt::Debug for AltaDeToken {
 
 /// El hash con el que se guarda y se verifica un token.
 ///
-/// Es **SHA-256** del valor en claro, codificado en base64: determinista —el mismo token da
-/// siempre el mismo hash, que es lo que permite verificar uno entrante sin guardar el
-/// original— y de un solo sentido, así que de la columna no se recupera el token. No lleva
-/// sal: el valor en claro ya es aleatorio y largo, y una sal por fila obligaría a leer la
-/// fila para poder verificar, que es justo lo que el hash evita.
-pub fn hash_de_token(en_claro: &str) -> String {
-    STANDARD.encode(Sha256::digest(en_claro.as_bytes()))
+/// Es un **HMAC-SHA256** del valor en claro con la clave `kesto/api-tokens/v1`
+/// derivada de `KESTO_MASTER_KEY`, codificado en base64: determinista —el mismo
+/// token con la misma clave da siempre el mismo hash, que es lo que permite
+/// verificar uno entrante sin guardar el original— y de un solo sentido, así que de
+/// la columna no se recupera el token. No lleva sal: el valor en claro ya es
+/// aleatorio y largo, y una sal por fila obligaría a leer la fila para poder
+/// verificar, que es justo lo que el hash evita. La clave HMAC impide que un atacante
+/// con acceso de lectura a la tabla pueda precomputar hashes de tokens.
+///
+/// Devuelve `Result` aunque `HMAC-SHA256` acepte claves de **cualquier** longitud
+/// —y por tanto, con las claves de 32 bytes que derivamos, el error sea
+/// inalcanzable—: degradar a un hash vacío sería peor que fallar, porque un hash
+/// vacío casaría con un token vacío. Quien llama propaga el fallo con `?`.
+pub fn hash_de_token(en_claro: &str, key: &[u8]) -> Result<String, DbError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|causa| DbError::ClaveDeTokenInservible { causa })?;
+    mac.update(en_claro.as_bytes());
+
+    Ok(STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 /// La capa de acceso de `api_tokens`.
@@ -222,6 +240,13 @@ pub fn hash_de_token(en_claro: &str) -> String {
 /// **No** recibe la clave de cifrado: no tiene ninguna columna secreta que descifrar.
 pub struct Tokens {
     pool: SqlitePool,
+    /// Clave HMAC-SHA256 derivada de `KESTO_MASTER_KEY` con etiqueta
+    /// `kesto/api-tokens/v1`. Se usa para hashear los tokens al alta y verificar
+    /// uno entrante.
+    ///
+    /// Va en un [`Zeroizing`] porque es material secreto: la política del crate es
+    /// borrarlo al caer, igual que la clave de cifrado de `Clave`.
+    hmac_key: Zeroizing<[u8; 32]>,
 }
 
 // Las sentencias, como constantes: `DbError::Consulta` lleva el texto de la consulta, así que
@@ -267,8 +292,15 @@ const CONSULTA_MAPEO: &str = "mapeo de la fila de api_tokens";
 
 impl Tokens {
     /// Construye la capa de acceso sobre un pool.
-    pub fn nuevo(pool: SqlitePool) -> Self {
-        Tokens { pool }
+    ///
+    /// La clave entra por valor y se envuelve en [`Zeroizing`] aquí: el campo de la
+    /// capa —el que vive todo el proceso— queda bajo la política de borrado del
+    /// crate.
+    pub fn nuevo(pool: SqlitePool, hmac_key: [u8; 32]) -> Self {
+        Tokens {
+            pool,
+            hmac_key: Zeroizing::new(hmac_key),
+        }
     }
 
     /// Da de alta un token y devuelve la fila tal y como quedó.
@@ -288,7 +320,7 @@ impl Tokens {
             // BLOB de 16 bytes y el DDL dice `TEXT`.
             .bind(id.hyphenated().to_string())
             .bind(&alta.name)
-            .bind(&alta.token_hash)
+            .bind(hash_de_token(&alta.en_claro, &self.hmac_key[..])?)
             .bind(scopes)
             // La fecha se normaliza a UTC **al enlazarla**: el `Encode` de `time` conserva el
             // desplazamiento del valor y el §3 dice que las fechas son UTC, así que un llamante
@@ -405,7 +437,9 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::{AltaDeToken, Scope, Tokens, hash_de_token, scopes_a_texto};
-    use crate::test_support::{DirectorioDePrueba, base_con_clave};
+    use crate::db::crypto::Clave;
+    use crate::secret::SecretString;
+    use crate::test_support::{DirectorioDePrueba, MASTER_KEY, base_con_clave};
 
     /// Valor en claro distinguible y largo: si aparece en una salida, la salida es el fallo.
     const EN_CLARO: &str = "kesto_en-claro-distinguible-0000000000000001";
@@ -414,8 +448,8 @@ mod tests {
 
     /// La capa sobre una base de prueba migrada, con la guarda del directorio viva.
     async fn capa() -> (DirectorioDePrueba, SqlitePool, Tokens) {
-        let (directorio, pool, _clave) = base_con_clave().await;
-        let tokens = Tokens::nuevo(pool.clone());
+        let (directorio, pool, clave) = base_con_clave().await;
+        let tokens = Tokens::nuevo(pool.clone(), *clave.api_token_key());
 
         (directorio, pool, tokens)
     }
@@ -428,7 +462,7 @@ mod tests {
     fn alta(en_claro: &str, nombre: &str, scopes: &[Scope]) -> AltaDeToken {
         AltaDeToken {
             name: nombre.to_owned(),
-            token_hash: hash_de_token(en_claro),
+            en_claro: en_claro.to_owned(),
             scopes: scopes.to_vec(),
             expires_at: None,
         }
@@ -455,7 +489,8 @@ mod tests {
 
         assert_eq!(
             guardado,
-            hash_de_token(EN_CLARO),
+            hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                .expect("el hash de prueba no puede fallar"),
             "la fila no guardó el hash del token"
         );
         assert_ne!(
@@ -465,7 +500,10 @@ mod tests {
 
         // Se verifica por el hash del token entrante, y un token distinto no casa.
         let encontrado = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda por hash no puede fallar")
             .expect("el token recién dado de alta debe encontrarse por su hash");
@@ -480,7 +518,10 @@ mod tests {
 
         assert!(
             tokens
-                .buscar_por_hash(&hash_de_token(OTRO_EN_CLARO))
+                .buscar_por_hash(
+                    &hash_de_token(OTRO_EN_CLARO, &tokens.hmac_key[..])
+                        .expect("el hash de prueba no puede fallar")
+                )
                 .await
                 .expect("la búsqueda no puede fallar")
                 .is_none(),
@@ -499,7 +540,10 @@ mod tests {
             .expect("anotar el uso no puede fallar");
 
         let usado = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe seguir");
@@ -520,7 +564,10 @@ mod tests {
         );
 
         let revocado = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("la fila revocada sigue en la base para poder auditarla");
@@ -597,7 +644,10 @@ mod tests {
 
         // La ida y vuelta: el texto vuelve a ser el conjunto del enum.
         let releido = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe estar");
@@ -646,7 +696,10 @@ mod tests {
         let impreso = format!("{dado_de_alta:?}");
 
         assert!(
-            !impreso.contains(&hash_de_token(EN_CLARO)),
+            !impreso.contains(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar")
+            ),
             "el `Debug` publicó el hash del token: {impreso}"
         );
         assert!(
@@ -691,23 +744,62 @@ mod tests {
     /// 3.1 — El `Debug` del alta tampoco publica el hash, igual que el de la entidad.
     #[test]
     fn el_debug_del_alta_no_publica_el_hash() {
+        let clave = Clave::desde_maestra(&SecretString::new(MASTER_KEY.to_owned()));
         let impreso = format!(
             "{:?}",
             AltaDeToken {
                 name: "agente".to_owned(),
-                token_hash: hash_de_token(EN_CLARO),
+                en_claro: EN_CLARO.to_owned(),
                 scopes: vec![Scope::Read],
                 expires_at: None,
             }
         );
 
         assert!(
-            !impreso.contains(&hash_de_token(EN_CLARO)),
+            !impreso.contains(
+                &hash_de_token(EN_CLARO, clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar")
+            ),
             "el `Debug` del alta publicó el hash: {impreso}"
         );
         assert!(
             impreso.contains("redactado"),
             "el `Debug` del alta no dice que el hash está redactado: {impreso}"
+        );
+    }
+
+    /// 2.3 — El hash no se reproduce sin el secreto de servidor.
+    ///
+    /// Es la razón de ser del HMAC: sin la clave no se precomputa. Dos maestras
+    /// distintas dan dos claves distintas —y hashes distintos del mismo valor—, y el
+    /// hash tampoco es el SHA-256 pelado del valor, que cualquiera calcularía.
+    #[test]
+    fn el_hash_no_se_reproduce_sin_el_secreto_de_servidor() {
+        // Otra maestra, distinta de `MASTER_KEY`: la clave HMAC derivada cambia.
+        const OTRA_MAESTRA: &str = "otra-maestra-de-prueba-para-el-hash-de-tokens-0000000000";
+
+        let clave_a = Clave::desde_maestra(&SecretString::new(MASTER_KEY.to_owned()));
+        let clave_b = Clave::desde_maestra(&SecretString::new(OTRA_MAESTRA.to_owned()));
+
+        let con_a = hash_de_token(EN_CLARO, clave_a.api_token_key())
+            .expect("el hash de prueba no puede fallar");
+        let con_b = hash_de_token(EN_CLARO, clave_b.api_token_key())
+            .expect("el hash de prueba no puede fallar");
+
+        assert_ne!(
+            con_a, con_b,
+            "con otro secreto de servidor el hash del mismo valor tiene que cambiar"
+        );
+
+        // Y no es el SHA-256 pelado del valor: sin el secreto no se reproduce.
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let pelado =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(EN_CLARO.as_bytes()));
+
+        assert_ne!(
+            con_a, pelado,
+            "el hash no puede ser el SHA-256 sin clave: se reproduciría sin el secreto"
         );
     }
 }

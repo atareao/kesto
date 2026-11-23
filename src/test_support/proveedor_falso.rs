@@ -25,6 +25,8 @@
 //! firma `HS256` cuyo secreto HMAC son los bytes públicos del proveedor, que es
 //! la confusión de algoritmo.
 
+use std::sync::{Arc, Mutex};
+
 use base64::Engine as _;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -32,7 +34,7 @@ use rsa::RsaPrivateKey;
 use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use serde::{Deserialize, Serialize};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use crate::test_support::{EMAIL, SUB};
 
@@ -57,6 +59,14 @@ pub(crate) const KID: &str = "kesto-clave-de-prueba";
 /// se publica, de modo que el rechazo no puede venir de la firma —cuadra— sino
 /// de que la clave que la cabecera nombra no está en el conjunto.
 pub(crate) const KID_AJENO: &str = "kid-que-el-jwks-no-publica";
+
+/// `kid` de la clave que el proveedor publica **tras** una rotación.
+///
+/// Es distinto de [`KID`] a propósito: reproduce una rotación de claves del
+/// proveedor, en la que el `kid` que la verificación tenía cacheado deja de
+/// resolver y solo una recarga del `jwks_uri` encuentra el nuevo. Es lo que
+/// ejercita el camino **positivo** de la recarga perezosa.
+pub(crate) const KID_ROTADO: &str = "kesto-clave-rotada";
 
 /// Token de acceso del proveedor: distinguible para que buscarlo en el log o en
 /// la cookie sea concluyente.
@@ -125,6 +135,32 @@ pub(crate) struct ProveedorFalso {
     /// `HS256` con el material que conoce, convencido de que la verificación
     /// leerá el algoritmo de la cabecera.
     clave_confusa: EncodingKey,
+    /// Último ID token que el `token_endpoint` debe devolver.
+    ///
+    /// El `token_endpoint` se monta **una sola vez** en [`Self::servir`] y lee
+    /// este valor en cada petición. Montar un mock nuevo por cada token dejaría
+    /// el primero en pie —`wiremock` evalúa en orden de montaje— y el segundo
+    /// login recibiría el token del primero.
+    token_actual: Arc<Mutex<Option<String>>>,
+    /// Error forzado del `token_endpoint`, si lo hay: gana sobre `token_actual`.
+    token_error: Arc<Mutex<Option<(u16, String)>>>,
+    /// Cuerpo del último POST recibido en el `token_endpoint`.
+    ///
+    /// El canje del código manda `code_verifier` en el cuerpo —no en la consulta—,
+    /// así que capturarlo es la única forma de comprobar que viaja de verdad y con
+    /// el valor que toca: la petición no se puede leer desde fuera de `wiremock`.
+    ultimo_cuerpo_del_canje: Arc<Mutex<Option<String>>>,
+    /// El JWKS que el `jwks_uri` sirve **ahora mismo**.
+    ///
+    /// Va en estado compartido —y no en un mock estático— para poder **rotar** la
+    /// clave en caliente: [`Self::rotar_clave`] lo reescribe y el mock, que lo lee
+    /// en cada petición, pasa a servir el nuevo sin volver a montarse.
+    jwks_publicado: Arc<Mutex<JwkSet>>,
+    /// Clave privada con la que se firma tras una rotación, si la hubo.
+    ///
+    /// Es el par que [`Self::rotar_clave`] genera y publica; hasta entonces no
+    /// hay ninguna y [`Self::firmar_con_clave_rotada`] falla en alto.
+    clave_rotada: Arc<Mutex<Option<EncodingKey>>>,
 }
 
 impl ProveedorFalso {
@@ -155,9 +191,69 @@ impl ProveedorFalso {
             .mount(&server)
             .await;
 
+        // El JWKS se sirve desde estado compartido: leerlo en cada petición es lo
+        // que permite rotar la clave sin montar un mock nuevo —`wiremock` evaluaría
+        // en orden de montaje y el primero seguiría ganando—.
+        let jwks_publicado = Arc::new(Mutex::new(JwkSet {
+            keys: vec![jwk_publico(&clave, KID)],
+        }));
+        let jwks_para_mock = Arc::clone(&jwks_publicado);
         Mock::given(method("GET"))
             .and(path(RUTA_JWKS))
-            .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&clave)))
+            .respond_with(move |_peticion: &Request| {
+                let jwks = jwks_para_mock
+                    .lock()
+                    .expect("el mutex del JWKS público no puede envenenarse")
+                    .clone();
+                ResponseTemplate::new(200).set_body_json(jwks)
+            })
+            .mount(&server)
+            .await;
+
+        // El `token_endpoint` se monta **una sola vez** y lee el token de un
+        // estado compartido: así una prueba puede cambiar el ID token entre dos
+        // logins sin que el mock anterior siga ganando por orden de montaje.
+        let token_actual = Arc::new(Mutex::new(None));
+        let token_error = Arc::new(Mutex::new(None));
+        let token_actual_para_mock = Arc::clone(&token_actual);
+        let token_error_para_mock = Arc::clone(&token_error);
+        let ultimo_cuerpo_del_canje = Arc::new(Mutex::new(None));
+        let cuerpo_para_mock = Arc::clone(&ultimo_cuerpo_del_canje);
+
+        Mock::given(method("POST"))
+            .and(path(RUTA_TOKEN))
+            .respond_with(move |peticion: &Request| {
+                // El cuerpo se captura **antes** de decidir la respuesta: así queda
+                // registrado también cuando el canje contesta un error, que es
+                // cuando más interesa saber qué se envió.
+                *cuerpo_para_mock
+                    .lock()
+                    .expect("el mutex del cuerpo del canje no puede envenenarse") =
+                    Some(String::from_utf8_lossy(&peticion.body).into_owned());
+
+                if let Some((estado, cuerpo)) = token_error_para_mock
+                    .lock()
+                    .expect("el mutex del error del token no puede envenenarse")
+                    .clone()
+                {
+                    return ResponseTemplate::new(estado).set_body_string(cuerpo);
+                }
+
+                match token_actual_para_mock
+                    .lock()
+                    .expect("el mutex del ID token no puede envenenarse")
+                    .clone()
+                {
+                    Some(id_token) => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id_token": id_token,
+                        "access_token": ACCESS_TOKEN,
+                        "token_type": "Bearer",
+                        "expires_in": 600,
+                    })),
+                    None => ResponseTemplate::new(400)
+                        .set_body_string("el token_endpoint no tiene un ID token configurado"),
+                }
+            })
             .mount(&server)
             .await;
 
@@ -167,12 +263,73 @@ impl ProveedorFalso {
             clave,
             clave_no_publicada,
             clave_confusa: EncodingKey::from_secret(&clave_publica),
+            token_actual,
+            token_error,
+            ultimo_cuerpo_del_canje,
+            jwks_publicado,
+            clave_rotada: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Firma un ID token `RS256` con la clave que el JWKS **sí** publica.
     pub(crate) fn firmar(&self, claims: &IdToken) -> String {
         firmar_con(&self.clave, claims)
+    }
+
+    /// El JWKS que el proveedor publica **ahora mismo**, listo para precargar una caché.
+    ///
+    /// Se construye con la misma clave que firma los tokens válidos, así que un
+    /// test puede sembrar `AuthState.jwks_cache` y comprobar que la verificación
+    /// usa la caché sin volver a pedir el `jwks_uri`. Tras [`Self::rotar_clave`]
+    /// devuelve el conjunto **nuevo**.
+    pub(crate) fn jwks_publico(&self) -> JwkSet {
+        self.jwks_publicado
+            .lock()
+            .expect("el mutex del JWKS público no puede envenenarse")
+            .clone()
+    }
+
+    /// Publica en caliente un **segundo** par RSA y lo deja listo para firmar.
+    ///
+    /// El `jwks_uri` pasa a servir un conjunto con un `kid` distinto
+    /// ([`KID_ROTADO`]): reproduce una rotación de claves del proveedor, en la que
+    /// el `kid` que la verificación tenía **cacheado** deja de resolver y solo una
+    /// recarga del `jwks_uri` lo encuentra. Es lo que ejercita el camino positivo
+    /// de la recarga perezosa. Después, [`Self::firmar_con_clave_rotada`] firma
+    /// con la clave nueva.
+    pub(crate) fn rotar_clave(&self) {
+        let (clave, _) = generar_clave();
+
+        *self
+            .jwks_publicado
+            .lock()
+            .expect("el mutex del JWKS público no puede envenenarse") = JwkSet {
+            keys: vec![jwk_publico(&clave, KID_ROTADO)],
+        };
+        *self
+            .clave_rotada
+            .lock()
+            .expect("el mutex de la clave rotada no puede envenenarse") = Some(clave);
+    }
+
+    /// Firma un ID token `RS256` con la clave publicada tras [`Self::rotar_clave`].
+    ///
+    /// La cabecera lleva [`KID_ROTADO`], que el JWKS **viejo** —el que la
+    /// verificación tiene cacheado— no publicaba: la resolución por `kid` solo
+    /// funciona tras recargar el `jwks_uri`.
+    pub(crate) fn firmar_con_clave_rotada(&self, claims: &IdToken) -> String {
+        let guard = self
+            .clave_rotada
+            .lock()
+            .expect("el mutex de la clave rotada no puede envenenarse");
+        let clave = guard
+            .as_ref()
+            .expect("hay que llamar a `rotar_clave` antes de firmar con la clave rotada");
+
+        let mut cabecera = Header::new(Algorithm::RS256);
+        cabecera.kid = Some(KID_ROTADO.to_owned());
+
+        encode(&cabecera, claims, clave).expect("el ID token de prueba debe firmarse")
     }
 
     /// Firma un ID token `RS256` a partir de claims crudos.
@@ -243,18 +400,14 @@ impl ProveedorFalso {
     /// el ID token verificado sobra— y el escenario 1.38 comprobará que no acaba
     /// ni en el log ni en la cookie.
     pub(crate) async fn montar_token_endpoint(&self, id_token: &str) {
-        let cuerpo = serde_json::json!({
-            "id_token": id_token,
-            "access_token": ACCESS_TOKEN,
-            "token_type": "Bearer",
-            "expires_in": 600,
-        });
-
-        Mock::given(method("POST"))
-            .and(path(RUTA_TOKEN))
-            .respond_with(ResponseTemplate::new(200).set_body_json(cuerpo))
-            .mount(&self.server)
-            .await;
+        *self
+            .token_actual
+            .lock()
+            .expect("el mutex del ID token no puede envenenarse") = Some(id_token.to_owned());
+        *self
+            .token_error
+            .lock()
+            .expect("el mutex del error del token no puede envenenarse") = None;
     }
 
     /// Monta el `token_endpoint` para que conteste un error con el cuerpo dado.
@@ -265,11 +418,11 @@ impl ProveedorFalso {
     /// las arrastra al log. Kesto ni lee ese cuerpo: solo mira el código de
     /// estado.
     pub(crate) async fn montar_token_endpoint_con_error(&self, estado: u16, cuerpo: &str) {
-        Mock::given(method("POST"))
-            .and(path(RUTA_TOKEN))
-            .respond_with(ResponseTemplate::new(estado).set_body_string(cuerpo))
-            .mount(&self.server)
-            .await;
+        *self
+            .token_error
+            .lock()
+            .expect("el mutex del error del token no puede envenenarse") =
+            Some((estado, cuerpo.to_owned()));
     }
 
     /// Cuántas peticiones de descubrimiento han llegado al proveedor.
@@ -286,6 +439,18 @@ impl ProveedorFalso {
     /// llegar a canjear nada, así que este contador tiene que quedarse en cero.
     pub(crate) async fn peticiones_al_token(&self) -> usize {
         self.peticiones_a(RUTA_TOKEN).await
+    }
+
+    /// El cuerpo del último POST recibido en el `token_endpoint`, si lo hubo.
+    ///
+    /// Devuelve el formulario tal cual llegó —`application/x-www-form-urlencoded`—,
+    /// sin decodificar: quien lo lea decide cómo partirlo. Es lo que permite
+    /// comprobar que el canje manda `code_verifier` y con qué valor.
+    pub(crate) fn cuerpo_del_canje(&self) -> Option<String> {
+        self.ultimo_cuerpo_del_canje
+            .lock()
+            .expect("el mutex del cuerpo del canje no puede envenenarse")
+            .clone()
     }
 
     /// Cuántas peticiones han ido a un endpoint `userinfo`, si lo hubiera.
@@ -311,6 +476,20 @@ impl ProveedorFalso {
             .unwrap_or_default()
             .iter()
             .filter(|peticion| peticion.url.path() == ruta)
+            .count()
+    }
+
+    /// Cuenta las peticiones al endpoint `jwks_uri`.
+    ///
+    /// Es lo que prueba el escenario 1.14: un `error` del proveedor rechaza sin
+    /// llegar a canjear nada, así que este contador tiene que quedarse en cero.
+    pub(crate) async fn peticiones_al_jwks(&self) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|peticion| peticion.url.path() == RUTA_JWKS)
             .count()
     }
 }
@@ -344,18 +523,18 @@ fn generar_clave() -> (EncodingKey, Vec<u8>) {
     (EncodingKey::from_rsa_der(&der), publica)
 }
 
-/// Publica la clave pública de `clave` como JWKS, con su `kid`.
+/// Publica la clave pública de `clave` como JWK, con el `kid` dado.
 ///
 /// Se usa `Jwk::from_encoding_key`, que extrae el módulo y el exponente y los
 /// codifica en base64url sin relleno —como exige el RFC 7518—, de modo que la
 /// misma biblioteca que firma y verifica construye la clave que publica. Nada
 /// se codifica a mano.
-fn jwks(clave: &EncodingKey) -> serde_json::Value {
+fn jwk_publico(clave: &EncodingKey, kid: &str) -> Jwk {
     let mut jwk = Jwk::from_encoding_key(clave, Algorithm::RS256)
         .expect("la clave pública de prueba debe poder publicarse como JWK");
-    jwk.common.key_id = Some(KID.to_owned());
+    jwk.common.key_id = Some(kid.to_owned());
 
-    serde_json::to_value(JwkSet { keys: vec![jwk] }).expect("el JWKS de prueba debe serializarse")
+    jwk
 }
 
 /// Firma `claims` con `clave` y el `kid` del proveedor.
