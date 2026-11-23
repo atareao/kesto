@@ -25,6 +25,8 @@
 //! firma `HS256` cuyo secreto HMAC son los bytes públicos del proveedor, que es
 //! la confusión de algoritmo.
 
+use std::sync::{Arc, Mutex};
+
 use base64::Engine as _;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -32,7 +34,7 @@ use rsa::RsaPrivateKey;
 use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use serde::{Deserialize, Serialize};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use crate::test_support::{EMAIL, SUB};
 
@@ -125,6 +127,21 @@ pub(crate) struct ProveedorFalso {
     /// `HS256` con el material que conoce, convencido de que la verificación
     /// leerá el algoritmo de la cabecera.
     clave_confusa: EncodingKey,
+    /// Último ID token que el `token_endpoint` debe devolver.
+    ///
+    /// El `token_endpoint` se monta **una sola vez** en [`Self::servir`] y lee
+    /// este valor en cada petición. Montar un mock nuevo por cada token dejaría
+    /// el primero en pie —`wiremock` evalúa en orden de montaje— y el segundo
+    /// login recibiría el token del primero.
+    token_actual: Arc<Mutex<Option<String>>>,
+    /// Error forzado del `token_endpoint`, si lo hay: gana sobre `token_actual`.
+    token_error: Arc<Mutex<Option<(u16, String)>>>,
+    /// Cuerpo del último POST recibido en el `token_endpoint`.
+    ///
+    /// El canje del código manda `code_verifier` en el cuerpo —no en la consulta—,
+    /// así que capturarlo es la única forma de comprobar que viaja de verdad y con
+    /// el valor que toca: la petición no se puede leer desde fuera de `wiremock`.
+    ultimo_cuerpo_del_canje: Arc<Mutex<Option<String>>>,
 }
 
 impl ProveedorFalso {
@@ -161,18 +178,81 @@ impl ProveedorFalso {
             .mount(&server)
             .await;
 
+        // El `token_endpoint` se monta **una sola vez** y lee el token de un
+        // estado compartido: así una prueba puede cambiar el ID token entre dos
+        // logins sin que el mock anterior siga ganando por orden de montaje.
+        let token_actual = Arc::new(Mutex::new(None));
+        let token_error = Arc::new(Mutex::new(None));
+        let token_actual_para_mock = Arc::clone(&token_actual);
+        let token_error_para_mock = Arc::clone(&token_error);
+        let ultimo_cuerpo_del_canje = Arc::new(Mutex::new(None));
+        let cuerpo_para_mock = Arc::clone(&ultimo_cuerpo_del_canje);
+
+        Mock::given(method("POST"))
+            .and(path(RUTA_TOKEN))
+            .respond_with(move |peticion: &Request| {
+                // El cuerpo se captura **antes** de decidir la respuesta: así queda
+                // registrado también cuando el canje contesta un error, que es
+                // cuando más interesa saber qué se envió.
+                *cuerpo_para_mock
+                    .lock()
+                    .expect("el mutex del cuerpo del canje no puede envenenarse") =
+                    Some(String::from_utf8_lossy(&peticion.body).into_owned());
+
+                if let Some((estado, cuerpo)) = token_error_para_mock
+                    .lock()
+                    .expect("el mutex del error del token no puede envenenarse")
+                    .clone()
+                {
+                    return ResponseTemplate::new(estado).set_body_string(cuerpo);
+                }
+
+                match token_actual_para_mock
+                    .lock()
+                    .expect("el mutex del ID token no puede envenenarse")
+                    .clone()
+                {
+                    Some(id_token) => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id_token": id_token,
+                        "access_token": ACCESS_TOKEN,
+                        "token_type": "Bearer",
+                        "expires_in": 600,
+                    })),
+                    None => ResponseTemplate::new(400)
+                        .set_body_string("el token_endpoint no tiene un ID token configurado"),
+                }
+            })
+            .mount(&server)
+            .await;
+
         Self {
             server,
             issuer,
             clave,
             clave_no_publicada,
             clave_confusa: EncodingKey::from_secret(&clave_publica),
+            token_actual,
+            token_error,
+            ultimo_cuerpo_del_canje,
         }
     }
 
     /// Firma un ID token `RS256` con la clave que el JWKS **sí** publica.
     pub(crate) fn firmar(&self, claims: &IdToken) -> String {
         firmar_con(&self.clave, claims)
+    }
+
+    /// El JWKS que el proveedor publica, listo para precargar una caché.
+    ///
+    /// Se construye con la misma clave que firma los tokens válidos, así que un
+    /// test puede sembrar `AuthState.jwks_cache` y comprobar que la verificación
+    /// usa la caché sin volver a pedir el `jwks_uri`.
+    pub(crate) fn jwks_publico(&self) -> JwkSet {
+        let mut jwk = Jwk::from_encoding_key(&self.clave, Algorithm::RS256)
+            .expect("la clave pública de prueba debe poder publicarse como JWK");
+        jwk.common.key_id = Some(KID.to_owned());
+
+        JwkSet { keys: vec![jwk] }
     }
 
     /// Firma un ID token `RS256` a partir de claims crudos.
@@ -243,18 +323,14 @@ impl ProveedorFalso {
     /// el ID token verificado sobra— y el escenario 1.38 comprobará que no acaba
     /// ni en el log ni en la cookie.
     pub(crate) async fn montar_token_endpoint(&self, id_token: &str) {
-        let cuerpo = serde_json::json!({
-            "id_token": id_token,
-            "access_token": ACCESS_TOKEN,
-            "token_type": "Bearer",
-            "expires_in": 600,
-        });
-
-        Mock::given(method("POST"))
-            .and(path(RUTA_TOKEN))
-            .respond_with(ResponseTemplate::new(200).set_body_json(cuerpo))
-            .mount(&self.server)
-            .await;
+        *self
+            .token_actual
+            .lock()
+            .expect("el mutex del ID token no puede envenenarse") = Some(id_token.to_owned());
+        *self
+            .token_error
+            .lock()
+            .expect("el mutex del error del token no puede envenenarse") = None;
     }
 
     /// Monta el `token_endpoint` para que conteste un error con el cuerpo dado.
@@ -265,11 +341,11 @@ impl ProveedorFalso {
     /// las arrastra al log. Kesto ni lee ese cuerpo: solo mira el código de
     /// estado.
     pub(crate) async fn montar_token_endpoint_con_error(&self, estado: u16, cuerpo: &str) {
-        Mock::given(method("POST"))
-            .and(path(RUTA_TOKEN))
-            .respond_with(ResponseTemplate::new(estado).set_body_string(cuerpo))
-            .mount(&self.server)
-            .await;
+        *self
+            .token_error
+            .lock()
+            .expect("el mutex del error del token no puede envenenarse") =
+            Some((estado, cuerpo.to_owned()));
     }
 
     /// Cuántas peticiones de descubrimiento han llegado al proveedor.
@@ -286,6 +362,18 @@ impl ProveedorFalso {
     /// llegar a canjear nada, así que este contador tiene que quedarse en cero.
     pub(crate) async fn peticiones_al_token(&self) -> usize {
         self.peticiones_a(RUTA_TOKEN).await
+    }
+
+    /// El cuerpo del último POST recibido en el `token_endpoint`, si lo hubo.
+    ///
+    /// Devuelve el formulario tal cual llegó —`application/x-www-form-urlencoded`—,
+    /// sin decodificar: quien lo lea decide cómo partirlo. Es lo que permite
+    /// comprobar que el canje manda `code_verifier` y con qué valor.
+    pub(crate) fn cuerpo_del_canje(&self) -> Option<String> {
+        self.ultimo_cuerpo_del_canje
+            .lock()
+            .expect("el mutex del cuerpo del canje no puede envenenarse")
+            .clone()
     }
 
     /// Cuántas peticiones han ido a un endpoint `userinfo`, si lo hubiera.
@@ -313,9 +401,21 @@ impl ProveedorFalso {
             .filter(|peticion| peticion.url.path() == ruta)
             .count()
     }
-}
 
-/// Genera un par RSA real y devuelve la clave privada como clave de firma.
+    /// Cuenta las peticiones al endpoint `jwks_uri`.
+    ///
+    /// Es lo que prueba el escenario 1.14: un `error` del proveedor rechaza sin
+    /// llegar a canjear nada, así que este contador tiene que quedarse en cero.
+    pub(crate) async fn peticiones_al_jwks(&self) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|peticion| peticion.url.path() == RUTA_JWKS)
+            .count()
+    }
+}
 ///
 /// A 2048 bits, que es el mínimo que la verificación `RS256` de `jsonwebtoken`
 /// espera. La clave se exporta en PKCS#1 DER porque es lo que acepta
