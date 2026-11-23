@@ -131,7 +131,7 @@ async fn con_token(
     let token = match estado
         .db
         .tokens
-        .buscar_por_hash(&hash_de_token(en_claro))
+        .buscar_por_hash(&hash_de_token(en_claro, estado.db.clave.api_token_key()))
         .await
     {
         Ok(Some(token)) => token,
@@ -428,7 +428,7 @@ mod tests {
             .tokens
             .alta(AltaDeToken {
                 name: "token-de-prueba".to_owned(),
-                token_hash: hash_de_token(&en_claro),
+                en_claro: en_claro.clone(),
                 scopes: scopes.to_vec(),
                 expires_at: None,
             })
@@ -621,7 +621,7 @@ mod tests {
         let fila = estado
             .db
             .tokens
-            .buscar_por_hash(&hash_de_token(&revocado))
+            .buscar_por_hash(&hash_de_token(&revocado, estado.db.clave.api_token_key()))
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe estar");
@@ -638,7 +638,7 @@ mod tests {
             .tokens
             .alta(AltaDeToken {
                 name: "caducado".to_owned(),
-                token_hash: hash_de_token(&caducado),
+                en_claro: caducado.clone(),
                 scopes: vec![Scope::Read],
                 expires_at: Some(datetime!(2020-01-01 00:00:00 UTC)),
             })
