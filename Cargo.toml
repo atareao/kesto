@@ -68,6 +68,16 @@ urlencoding = "2.1.3"
 # adds no new crate to `Cargo.lock` -- only the edge.
 url = "2.5.8"
 
+# `hmac` 0.12 (generic-array, casa con `sha2` 0.10 ya en el árbol; la 0.13 usa
+# hybrid-array y forca un segundo `digest`/`crypto-common`). Se declara directo
+# porque la tokenización HMAC-SHA256 de `hash_de_token` lo necesita por nombre.
+hmac = "0.12.1"
+
+# `subtle` 2.x: comparación en tiempo constante para el `nonce` del ID token.
+# Ya está en el árbol como dependencia transitiva (de `aes-gcm`), pero se
+# declara directa para que el código que la use no dependa de una re-exportación.
+subtle = "2.6.1"
+
 # Persistence (db-schema): SQLite through sqlx, plus the RustCrypto stack that
 # seals the three secret columns at rest. The rule was that every version here is
 # one already present in this machine's Cargo cache, because this repository had

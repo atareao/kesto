@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use jsonwebtoken::jwk::JwkSet;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
@@ -25,6 +26,13 @@ use crate::secret::SecretString;
 /// tiempo y nunca la miraba—.
 pub const STATE_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// TTL de la caché JWKS: 1 hora.
+///
+/// El JWKS se descarga del proveedor y se cachea. Si el proveedor rota sus
+/// claves, un `kid` nuevo no estará en la caché vieja; el TTL acota el tiempo
+/// que una clave revocada puede seguir aceptándose.
+pub const JWKS_TTL: Duration = Duration::from_secs(60 * 60);
+
 /// Tope duro de logins pendientes en el mapa.
 ///
 /// Con una ventana de cinco minutos, mil veinticuatro entradas sostienen de sobra
@@ -32,15 +40,18 @@ pub const STATE_TTL: Duration = Duration::from_secs(5 * 60);
 /// automatizado no pueda hacer crecer el mapa sin límite.
 pub const MAX_LOGINS: usize = 1024;
 
-/// Un login en curso: el `nonce` emitido y el instante en que se emitió.
+/// Un login en curso: el `nonce` emitido, el `code_verifier` PKCE y el instante en que se emitió.
 ///
-/// El `nonce` se guarda **junto** al `state` y no en un mapa aparte: el callback
-/// lo compara con el del ID token al verificar, y con la asociación hecha
-/// —`state → (nonce, instante)`— esa comparación no depende de nada más.
+/// El `nonce` y el `code_verifier` se guardan **junto** al `state`: el callback
+/// los usa para comparar con el ID token y para enviar al `token_endpoint`. Con
+/// la asociación hecha —`state → (nonce, code_verifier, instante)`— ninguna de
+/// las dos comparaciones depende de nada más.
 #[derive(Debug, Clone)]
 pub struct PendingLogin {
     /// `nonce` que viajó en la petición de autorización.
     pub nonce: String,
+    /// `code_verifier` PKCE: se envía en el canje del código al `token_endpoint`.
+    pub code_verifier: String,
     /// Instante de emisión, para aplicar el TTL.
     pub issued_at: Instant,
 }
@@ -55,6 +66,12 @@ impl PendingLogin {
         ahora.saturating_duration_since(self.issued_at) >= STATE_TTL
     }
 }
+
+/// Caché JWKS con su instante de expiración.
+///
+/// Se guarda como `Option<(JwkSet, Instant)>`: el `JwkSet` y el instante en que
+/// caduca. `None` significa que no hay caché o que ha caducado.
+type JwksCache = Arc<RwLock<Option<(JwkSet, Instant)>>>;
 
 /// Por qué se rechaza un `state` al consumirlo en el callback.
 ///
@@ -99,7 +116,13 @@ pub struct AuthState {
     /// varios logins pueden leer la caché a la vez sin estorbarse. Se escribe
     /// solo cuando llega el primer resultado.
     pub(crate) discovery: Arc<RwLock<Option<Discovery>>>,
-    /// Logins en curso: `state → (nonce, instante de emisión)`.
+    /// Caché JWKS con TTL: `None` hasta que se descarga o hasta que caduca.
+    ///
+    /// Se guarda junto a `discovery` y se reutiliza entre verificaciones del ID
+    /// token. Si al verificar llega un `kid` que la caché no conoce, se fuerza
+    /// una recarga del JWKS.
+    pub(crate) jwks_cache: JwksCache,
+    /// Logins en curso: `state → (nonce, code_verifier, instante de emisión)`.
     ///
     /// Tras un [`Mutex`] porque insertar y purgar son mutaciones: el mapa no
     /// puede crecer sin límite con cada intento de entrada que nadie completa.
@@ -120,6 +143,7 @@ impl AuthState {
             secret,
             settings: Arc::new(settings),
             discovery: Arc::new(RwLock::new(None)),
+            jwks_cache: Arc::new(RwLock::new(None)),
             logins: Arc::new(Mutex::new(HashMap::new())),
             consumidos: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -134,7 +158,7 @@ impl AuthState {
     /// mapa lleno convertiría el tope en una denegación de servicio de
     /// disponibilidad, y el `state` más antiguo es, de todos, el que menos
     /// probabilidad tiene de volver.
-    pub async fn registrar_login(&self, state: &str, nonce: &str) {
+    pub async fn registrar_login(&self, state: &str, nonce: &str, code_verifier: Option<&str>) {
         let ahora = Instant::now();
         let mut logins = self.logins.lock().await;
 
@@ -157,6 +181,7 @@ impl AuthState {
             state.to_owned(),
             PendingLogin {
                 nonce: nonce.to_owned(),
+                code_verifier: code_verifier.unwrap_or("").to_owned(),
                 issued_at: ahora,
             },
         );
@@ -268,7 +293,7 @@ impl EstadoDeBase {
             tareas: Arc::new(Tareas::nuevo(pool.clone())),
             ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
             restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
-            tokens: Arc::new(Tokens::nuevo(pool.clone())),
+            tokens: Arc::new(Tokens::nuevo(pool.clone(), *clave.api_token_key())),
             sesiones: Arc::new(SesionesRevocadas::nuevo(pool.clone())),
             pool,
             clave,
@@ -388,13 +413,15 @@ mod tests {
                 "state-caducado".to_owned(),
                 PendingLogin {
                     nonce: "nonce-caducado".to_owned(),
+                    code_verifier: String::new(),
                     issued_at: hace,
                 },
             );
             assert_eq!(logins.len(), 1, "el mapa arranca con la entrada caducada");
         }
 
-        auth.registrar_login("state-nuevo", "nonce-nuevo").await;
+        auth.registrar_login("state-nuevo", "nonce-nuevo", None)
+            .await;
 
         let logins = auth.logins.lock().await;
 
@@ -424,6 +451,7 @@ mod tests {
                 format!("state-{i}"),
                 PendingLogin {
                     nonce: format!("nonce-{i}"),
+                    code_verifier: String::new(),
                     issued_at,
                 },
             );
@@ -442,7 +470,8 @@ mod tests {
         let auth = auth_oidc().await;
         mapa_lleno(&auth, Instant::now(), 0).await;
 
-        auth.registrar_login("state-de-mas", "nonce-de-mas").await;
+        auth.registrar_login("state-de-mas", "nonce-de-mas", None)
+            .await;
 
         let logins = auth.logins.lock().await;
 
@@ -472,6 +501,7 @@ mod tests {
                 "state-mas-antigua".to_owned(),
                 PendingLogin {
                     nonce: "nonce-mas-antigua".to_owned(),
+                    code_verifier: String::new(),
                     issued_at: mas_antigua,
                 },
             );
@@ -479,7 +509,8 @@ mod tests {
         // El resto, un minuto más nuevas y con la misma marca entre ellas.
         mapa_lleno(&auth, Instant::now(), 1).await;
 
-        auth.registrar_login("state-de-mas", "nonce-de-mas").await;
+        auth.registrar_login("state-de-mas", "nonce-de-mas", None)
+            .await;
 
         let logins = auth.logins.lock().await;
 
@@ -513,13 +544,15 @@ mod tests {
                 "state-caducada".to_owned(),
                 PendingLogin {
                     nonce: "nonce-caducada".to_owned(),
+                    code_verifier: String::new(),
                     issued_at: caducada,
                 },
             );
         }
         mapa_lleno(&auth, Instant::now(), 1).await;
 
-        auth.registrar_login("state-de-mas", "nonce-de-mas").await;
+        auth.registrar_login("state-de-mas", "nonce-de-mas", None)
+            .await;
 
         let logins = auth.logins.lock().await;
 

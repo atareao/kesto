@@ -5,15 +5,21 @@
 //! intenta, lo que el `login` necesita para redirigir al proveedor, y lo que el
 //! `callback` necesita para convertir el retorno en una identidad verificada.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
+use base64::Engine as _;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+use rand::Rng;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use urlencoding;
 
 use crate::config::OidcSettings;
 use crate::error::AppError;
 use crate::state::AuthState;
+use crate::state::JWKS_TTL;
 
 /// Ruta del documento de descubrimiento, relativa al emisor.
 const RUTA_DESCUBRIMIENTO: &str = "/.well-known/openid-configuration";
@@ -149,16 +155,35 @@ pub struct AuthorizationRequest {
     pub state: String,
     /// `nonce` emitido: viaja al proveedor para compararlo con el del ID token.
     pub nonce: String,
+    /// `code_verifier` PKCE: se guarda para enviarlo en el canje del código.
+    pub code_verifier: String,
 }
 
-/// Construye la URL de autorización y genera el `state` y el `nonce`.
+/// Construye la URL de autorización y genera el `state`, `nonce` y el PKCE.
 ///
 /// Los valores añadidos a la URL van codificados. El `state` y el `nonce` son
-/// de 32 caracteres aleatorios y distintos en cada petición.
+/// de 32 caracteres aleatorios y distintos en cada petición. El `code_verifier`
+/// es generado con alta entropía (43-128 caracteres) y su `code_challenge`
+/// es el SHA-256 base64url sin relleno.
 pub fn build_authorization_url(
     settings: &OidcSettings,
     discovery: &Discovery,
 ) -> AuthorizationRequest {
+    let code_verifier: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(128)
+        .map(char::from)
+        .collect();
+
+    let mut hasher = Sha256::new();
+    hasher.update(code_verifier.as_bytes());
+    // `base64url` **sin relleno**, como exige el RFC 7636 para `S256`: el
+    // proveedor compara este valor con el `base64url(SHA-256(code_verifier))` que
+    // él calcula, así que un alfabeto distinto (el estándar usa `+` y `/`)
+    // rompería el canje.
+    let code_challenge_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
+
     let state = token_aleatorio();
     let nonce = token_aleatorio();
 
@@ -169,6 +194,8 @@ pub fn build_authorization_url(
         ("scope", SCOPE),
         ("state", state.as_str()),
         ("nonce", nonce.as_str()),
+        ("code_challenge", code_challenge_b64.as_str()),
+        ("code_challenge_method", "S256"),
     ];
 
     // Cada valor va codificado: el `redirect_uri` lleva `:` y `/`, que sin
@@ -205,6 +232,7 @@ pub fn build_authorization_url(
         url: format!("{}{separador}{consulta}", discovery.authorization_endpoint),
         state,
         nonce,
+        code_verifier,
     }
 }
 
@@ -286,13 +314,14 @@ const ID_TOKEN_INVALIDO: &str = "el ID token no es válido";
 /// Canjea el código de autorización en el `token_endpoint`.
 ///
 /// Devuelve el ID token **sin verificar**: verificar es el paso siguiente y no
-/// se mezcla con el canje. El `client_secret` viaja en el **cuerpo** del POST
-/// —`application/x-www-form-urlencoded`—, nunca en la cadena de consulta, y no
-/// se interpola en ningún registro.
+/// se mezcla con el canje. El `client_secret` y el `code_verifier` viajan en el
+/// **cuerpo** del POST —`application/x-www-form-urlencoded`—, nunca en la
+/// cadena de consulta, y no se interpola en ningún registro.
 pub async fn canjear_codigo(
     settings: &OidcSettings,
     discovery: &Discovery,
     code: &str,
+    code_verifier: &str,
 ) -> Result<String, AppError> {
     let cliente = reqwest::Client::builder()
         .timeout(INTERCAMBIO_TIMEOUT)
@@ -307,6 +336,7 @@ pub async fn canjear_codigo(
         ("redirect_uri", settings.redirect_url.as_str()),
         ("client_id", settings.client_id.as_str()),
         ("client_secret", settings.client_secret.expose()),
+        ("code_verifier", code_verifier),
     ];
 
     let respuesta = cliente
@@ -334,6 +364,29 @@ pub async fn canjear_codigo(
         .map_err(|error| {
             AppError::BadGateway(format!("la respuesta del canje no es válida: {error}"))
         })
+}
+
+/// Obtiene el JWKS con caché y recarga perezosa por kid ausente.
+async fn fetch_jwks_cached(
+    auth_state: &AuthState,
+    discovery: &Discovery,
+) -> Result<JwkSet, AppError> {
+    // Intento de caché
+    {
+        let cache_result = auth_state.jwks_cache.read().await;
+        if let Some((jwks, expires_at)) = &*cache_result {
+            let cache_valido = Instant::now() < *expires_at;
+            if cache_valido {
+                return Ok(jwks.clone());
+            }
+        }
+    } // read guard dropped here
+
+    // Forzar recarga
+    let jwks = fetch_jwks(&discovery.jwks_uri).await?;
+    let expires_at = Instant::now() + JWKS_TTL;
+    *auth_state.jwks_cache.write().await = Some((jwks.clone(), expires_at));
+    Ok(jwks)
 }
 
 /// Pide el JWKS contra el que se verifica el ID token.
@@ -381,15 +434,12 @@ fn rechazar_id_token(causa: &str) -> AppError {
 /// Cualquier fallo rechaza con [`AppError::Unauthorized`]: no hay sesión que
 /// emitir.
 pub async fn verificar_id_token(
+    auth_state: &AuthState,
     settings: &OidcSettings,
     discovery: &Discovery,
     id_token: &str,
     nonce_esperado: &str,
 ) -> Result<IdentidadVerificada, AppError> {
-    let jwks = fetch_jwks(&discovery.jwks_uri).await?;
-
-    // El `kid` de la cabecera elige la clave del conjunto. Sin `kid`, o con uno
-    // que el JWKS no publica, no hay clave con la que verificar.
     let cabecera = match decode_header(id_token) {
         Ok(cabecera) => cabecera,
         Err(error) => {
@@ -401,10 +451,25 @@ pub async fn verificar_id_token(
     let Some(kid) = cabecera.kid else {
         return Err(rechazar_id_token("el ID token no declara kid"));
     };
-    let Some(jwk) = jwks.find(&kid) else {
-        return Err(rechazar_id_token(
-            "el ID token va firmado con una clave que el jwks_uri no publica",
-        ));
+
+    // Busca el `kid` en el JWKS. Si no está, forzamos recarga ignorando el TTL.
+    let mut jwks = fetch_jwks_cached(auth_state, discovery).await?;
+    let jwk = match jwks.find(&kid) {
+        Some(jwk) => jwk,
+        None => {
+            jwks = fetch_jwks(&discovery.jwks_uri).await?;
+            let expires_at = Instant::now() + JWKS_TTL;
+            *auth_state.jwks_cache.write().await = Some((jwks.clone(), expires_at));
+            // Buscar de nuevo en el JWKS recargado
+            match jwks.find(&kid) {
+                Some(jwk2) => jwk2,
+                None => {
+                    return Err(rechazar_id_token(
+                        "el ID token va firmado con una clave que el jwks_uri no publica",
+                    ));
+                }
+            }
+        }
     };
     let clave = match DecodingKey::from_jwk(jwk) {
         Ok(clave) => clave,
@@ -436,9 +501,8 @@ pub async fn verificar_id_token(
         }
     };
 
-    // El `nonce` ata este ID token al login que lo pidió y cierra la repetición.
-    // `jsonwebtoken` no lo valida, así que se compara aquí.
-    if datos.claims.nonce != nonce_esperado {
+    // Comparar nonce constant-time
+    if !comparar_nonce(&datos.claims.nonce, nonce_esperado) {
         return Err(rechazar_id_token(
             "el nonce del ID token no es el emitido en el login",
         ));
@@ -462,17 +526,25 @@ pub async fn verificar_id_token(
     })
 }
 
+/// Compara dos nonces usando tiempo constante para evitar ataques de temporización.
+fn comparar_nonce(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
 #[cfg(test)]
 mod tests {
     use axum::Router;
     use axum::http::{StatusCode, header};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
 
-    use super::{Discovery, MARGEN_DE_RELOJ, build_authorization_url};
+    use super::{Discovery, MARGEN_DE_RELOJ, build_authorization_url, verificar_id_token};
     use crate::api::api_router;
     use crate::auth::session;
     use crate::config::OidcSettings;
     use crate::secret::SecretString;
-    use crate::state::{PendingLogin, RechazoState, STATE_TTL};
+    use crate::state::{JWKS_TTL, PendingLogin, RechazoState, STATE_TTL};
     use crate::test_support::{
         EMAIL, OIDC_CLIENT_ID, OIDC_REDIRECT_URL, SESSION_SECRET, SUB, auth_oidc, callback_url,
         capturar_log, estado_oidc_con_emisor, get, header_text, login_state_y_nonce,
@@ -495,8 +567,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn la_redireccion_lleva_los_seis_parametros() {
-        // Escenario 1.7.
+    async fn la_redireccion_lleva_los_parametros_oidc() {
+        // Escenario 1.7 (actualizado con PKCE S256).
         let proveedor = ProveedorFalso::servir().await;
         let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
@@ -512,16 +584,18 @@ mod tests {
         // decodificándose a los mismos valores, así que una aserción solo sobre lo
         // ya decodificado no notaría el cambio. Y el recuento por `&` es lo que
         // hace caer el test ante un parámetro de más (un `prompt=none`, por
-        // ejemplo): serían siete.
+        // ejemplo): serían nueve.
         let consulta = location
             .split_once('?')
             .map(|(_, consulta)| consulta)
             .expect("la redirección debe traer cadena de consulta");
 
+        // 6 parámetros base (response_type, client_id, redirect_uri, scope, state,
+        // nonce) + 2 de PKCE (code_challenge, code_challenge_method) = 8.
         assert_eq!(
             consulta.split('&').count(),
-            6,
-            "la redirección debe llevar exactamente seis parámetros: {location}"
+            8,
+            "la redirección debe llevar exactamente ocho parámetros: {location}"
         );
         assert!(
             location.contains(
@@ -576,6 +650,127 @@ mod tests {
                 .get("nonce")
                 .is_some_and(|nonce| !nonce.is_empty()),
             "falta el nonce: {location}"
+        );
+
+        // PKCE S256: code_challenge (base64url sin relleno del SHA-256 del verifier)
+        // y code_challenge_method=S256.
+        let code_challenge = parametros
+            .get("code_challenge")
+            .expect("la redirección debe traer code_challenge PKCE");
+        assert!(
+            !code_challenge.is_empty(),
+            "code_challenge no puede estar vacío: {location}"
+        );
+        assert!(
+            !code_challenge.contains('='),
+            "code_challenge no debe llevar relleno base64: {location}"
+        );
+        assert!(
+            !code_challenge.contains('/') && !code_challenge.contains('+'),
+            "code_challenge debe ser base64url (sin '/' ni '+'): {location}"
+        );
+
+        let code_challenge_method = parametros
+            .get("code_challenge_method")
+            .expect("la redirección debe traer code_challenge_method PKCE");
+        assert_eq!(
+            code_challenge_method, "S256",
+            "code_challenge_method debe ser S256: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_canje_presenta_el_code_verifier_del_challenge() {
+        // Escenario PKCE (spec, líneas 120-124): el canje presenta la prueba de
+        // posesión. Se comprueba en fuerte —no basta con que el cuerpo lleve
+        // *algún* `code_verifier`—: el que viaja en el POST al `token_endpoint`
+        // tiene que ser la **preimagen** del `code_challenge` que se pidió en la
+        // redirección. Si el canje mandara otro valor, o ninguno, un proveedor
+        // real rompería el canje con `invalid_grant`.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        // Un solo login: el `code_challenge` tiene que salir de la **misma**
+        // redirección que emitió el `state`, o el cotejo no probaría nada.
+        let location = location_del_login(router.clone()).await;
+        let parametros = parametros_de_consulta(&location);
+        let state = parametros
+            .get("state")
+            .expect("la redirección del login debe traer state")
+            .clone();
+        let nonce = parametros
+            .get("nonce")
+            .expect("la redirección del login debe traer nonce")
+            .clone();
+        let code_challenge = parametros
+            .get("code_challenge")
+            .expect("la redirección debe traer code_challenge PKCE")
+            .clone();
+
+        let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&claims))
+            .await;
+
+        let respuesta = get(router, &callback_url(&state, "codigo")).await;
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::FOUND,
+            "un canje con PKCE correcto debe completar el flujo"
+        );
+
+        let cuerpo = proveedor
+            .cuerpo_del_canje()
+            .expect("el canje debe haber enviado un cuerpo al token_endpoint");
+        // El cuerpo es `application/x-www-form-urlencoded`; se reusa el mismo
+        // analizador de la consulta anteponiendo un `?`.
+        let campos = parametros_de_consulta(&format!("?{cuerpo}"));
+        let verifier = campos
+            .get("code_verifier")
+            .expect("el canje debe enviar el code_verifier al token_endpoint");
+
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        let esperado = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        assert_eq!(
+            esperado, code_challenge,
+            "el code_verifier enviado debe ser la preimagen del code_challenge de la redirección"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_login_sin_code_verifier_no_se_canjea() {
+        // Escenario PKCE (spec, líneas 120-124): un pendiente sin `code_verifier`
+        // —uno emitido antes de PKCE, o un registro corrupto— se rechaza **antes**
+        // de tocar el `token_endpoint`, en vez de degradar el flujo a uno sin
+        // prueba de posesión. Se inyecta el pendiente a mano porque ningún login
+        // de hoy emite uno vacío.
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = estado_oidc_con_emisor(&proveedor.issuer).await;
+
+        let auth = estado
+            .auth
+            .as_ref()
+            .expect("el modo Oidc construye estado de autenticación");
+        auth.logins.lock().await.insert(
+            "login-sin-verifier".to_owned(),
+            PendingLogin {
+                nonce: "nonce-sin-verifier".to_owned(),
+                code_verifier: String::new(),
+                issued_at: Instant::now(),
+            },
+        );
+
+        let router = api_router(estado);
+        // El `token_endpoint` está montado por defecto por el arnés: si el
+        // callback llegara a canjear, el contador subiría.
+        let respuesta = get(router, &callback_url("login-sin-verifier", "codigo")).await;
+
+        assert_rechazo_sin_cookie(respuesta).await;
+        assert_eq!(
+            proveedor.peticiones_al_token().await,
+            0,
+            "un pendiente sin code_verifier no puede llegar a canjear el código"
         );
     }
 
@@ -750,6 +945,7 @@ mod tests {
                 "state-caducado".to_owned(),
                 PendingLogin {
                     nonce: "nonce-caducado".to_owned(),
+                    code_verifier: String::new(),
                     issued_at: hace,
                 },
             );
@@ -801,6 +997,7 @@ mod tests {
                 "pendiente-caducado".to_owned(),
                 PendingLogin {
                     nonce: "nonce-caducado".to_owned(),
+                    code_verifier: String::new(),
                     issued_at: hace,
                 },
             );
@@ -1315,6 +1512,124 @@ mod tests {
             proveedor.peticiones_a_userinfo().await,
             0,
             "no se puede pedir userinfo: el ID token verificado sobra"
+        );
+    }
+
+    // ── JWKS Cache con TTL ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn el_jwks_se_cachea_y_se_reutiliza() {
+        // Escenario: el JWKS se descarga una vez y se reutiliza.
+        // El proveedor cuenta peticiones al JWKS.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        // Primer login: debe descargar el JWKS
+        let (state1, nonce1) = login_state_y_nonce(router.clone()).await;
+        let claims1 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce1);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&claims1))
+            .await;
+
+        let respuesta1 = get(router.clone(), &callback_url(&state1, "codigo1")).await;
+        assert_eq!(respuesta1.status(), StatusCode::FOUND);
+
+        let peticiones_jwks_1 = proveedor.peticiones_al_jwks().await;
+
+        // Segundo login: debe reutilizar el JWKS cacheado
+        let (state2, nonce2) = login_state_y_nonce(router.clone()).await;
+        let claims2 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce2);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&claims2))
+            .await;
+
+        let respuesta2 = get(router, &callback_url(&state2, "codigo2")).await;
+        assert_eq!(respuesta2.status(), StatusCode::FOUND);
+
+        let peticiones_jwks_2 = proveedor.peticiones_al_jwks().await;
+
+        // El JWKS solo se pidió una vez (o el contador no incrementó)
+        assert_eq!(
+            peticiones_jwks_2, peticiones_jwks_1,
+            "el JWKS debe cachearse y no pedirse de nuevo"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_kid_desconocido_fuerza_recarga_jwks() {
+        // Escenario: si al verificar llega un `kid` que la caché no conoce,
+        // se fuerza una recarga del JWKS antes de rechazar.
+        // El proveedor falso tiene dos claves: KID (publicada) y KID_AJENA (no publicada).
+        // Primero se cachea el JWKS con KID, luego se presenta un token con KID_AJENA.
+        // La recarga debe traer el mismo JWKS (KID sigue siendo el único publicado),
+        // así que el kid sigue ausente y la verificación falla.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        // Primer login: cachea el JWKS con KID
+        let (state1, nonce1) = login_state_y_nonce(router.clone()).await;
+        let claims1 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce1);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&claims1))
+            .await;
+
+        let respuesta1 = get(router.clone(), &callback_url(&state1, "codigo1")).await;
+        assert_eq!(respuesta1.status(), StatusCode::FOUND);
+
+        // Segundo login: token firmado con clave no publicada (mismo KID_AJENA)
+        // La cabecera llevará kid=KID_AJENA, que no está en el JWKS cacheado.
+        let (state2, nonce2) = login_state_y_nonce(router.clone()).await;
+        let claims2 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce2);
+        // Firmar con clave que el JWKS NO publica (usa kid=KID_AJENA)
+        let token2 = proveedor.firmar_con_clave_ajena(&claims2);
+        proveedor.montar_token_endpoint(&token2).await;
+
+        let respuesta2 = get(router, &callback_url(&state2, "codigo2")).await;
+
+        // Debe fallar: el kid sigue ausente tras recargar
+        assert_rechazo_sin_cookie(respuesta2).await;
+    }
+
+    #[tokio::test]
+    async fn una_recarga_fallida_con_cache_fresca_no_tumba_la_verificacion() {
+        // Escenario de la spec: con un JWKS cacheado válido, un `jwks_uri`
+        // inalcanzable no impide verificar un ID token que la caché puede servir.
+        let proveedor = ProveedorFalso::servir().await;
+        let auth = auth_oidc().await;
+
+        // Sembrar la caché con el JWKS real y una caducidad fresca.
+        *auth.jwks_cache.write().await =
+            Some((proveedor.jwks_publico(), Instant::now() + JWKS_TTL));
+
+        // Un `jwks_uri` que nadie escucha: si `verificar_id_token` intentara
+        // recargar, la verificación fallaría.
+        let discovery = Discovery {
+            authorization_endpoint: format!("{}/authorize", proveedor.issuer),
+            token_endpoint: format!("{}/token", proveedor.issuer),
+            jwks_uri: "http://127.0.0.1:1/jwks".to_owned(),
+        };
+        let settings = OidcSettings {
+            issuer: proveedor.issuer.clone(),
+            client_id: OIDC_CLIENT_ID.to_owned(),
+            client_secret: SecretString::new("secreto-de-prueba".to_owned()),
+            redirect_url: OIDC_REDIRECT_URL.to_owned(),
+        };
+
+        let nonce = "nonce-cache-fresca";
+        let claims = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, nonce);
+        let id_token = proveedor.firmar(&claims);
+
+        let identidad = verificar_id_token(&auth, &settings, &discovery, &id_token, nonce)
+            .await
+            .expect("la caché fresca debe bastar aunque el jwks_uri no responda");
+
+        assert_eq!(
+            identidad.sub, SUB,
+            "la identidad debe venir del token cacheado"
+        );
+        assert_eq!(
+            identidad.email, EMAIL,
+            "el email debe venir del token cacheado"
         );
     }
 }
