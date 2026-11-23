@@ -127,13 +127,13 @@ async fn con_token(
     next: Next,
 ) -> Response {
     // Se busca por el hash: la base no guarda el valor en claro, así que lo único que se puede
-    // preguntar es por el hash del token entrante.
-    let token = match estado
-        .db
-        .tokens
-        .buscar_por_hash(&hash_de_token(en_claro, estado.db.clave.api_token_key()))
-        .await
-    {
+    // preguntar es por el hash del token entrante. Hashear es un HMAC que no puede fallar con
+    // nuestra clave de 32 bytes, pero el fallo se propaga —y no se degrada a un hash vacío—.
+    let hash = match hash_de_token(en_claro, estado.db.clave.api_token_key()) {
+        Ok(hash) => hash,
+        Err(error) => return AppError::Database(error).into_response(),
+    };
+    let token = match estado.db.tokens.buscar_por_hash(&hash).await {
         Ok(Some(token)) => token,
         Ok(None) => return AppError::Unauthorized(TOKEN_QUE_NO_VALE.to_owned()).into_response(),
         Err(error) => return AppError::Database(error).into_response(),
@@ -621,7 +621,10 @@ mod tests {
         let fila = estado
             .db
             .tokens
-            .buscar_por_hash(&hash_de_token(&revocado, estado.db.clave.api_token_key()))
+            .buscar_por_hash(
+                &hash_de_token(&revocado, estado.db.clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe estar");

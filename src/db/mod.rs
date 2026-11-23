@@ -221,6 +221,20 @@ pub enum DbError {
     /// El mensaje del error de cifrado no publica el valor, así que éste tampoco.
     #[error(transparent)]
     Cifrado(#[from] crate::db::crypto::ErrorDeCifrado),
+
+    /// La clave HMAC con la que se hashea un token de API no es utilizable.
+    ///
+    /// `HMAC-SHA256` acepta claves de **cualquier** longitud, así que con las claves
+    /// de 32 bytes derivadas de `KESTO_MASTER_KEY` este error es inalcanzable:
+    /// existe para no degradar en silencio a un hash vacío —que casaría con un token
+    /// vacío— si algún día se pasara una clave que `hmac` rechace. El mensaje **no
+    /// publica** la clave, solo la causa que informa `hmac`.
+    #[error("la clave HMAC de los tokens de API no es utilizable: {causa}")]
+    ClaveDeTokenInservible {
+        /// Motivo, tal y como lo informa `hmac`.
+        #[source]
+        causa: hmac::digest::InvalidLength,
+    },
 }
 
 /// Ruta del fichero de la base a partir del DSN.

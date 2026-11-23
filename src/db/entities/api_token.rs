@@ -6,8 +6,10 @@
 //! no hay ningún secreto cifrado en reposo como en `repositories` o `backup_targets`: no hay
 //! nada que descifrar porque no hay nada que valga la pena descifrar.
 //!
-//! Por eso esta capa **no recibe la clave**: no tiene ninguna columna secreta, y pasarle una
-//! que no usa sugeriría que aquí se cifra algo.
+//! Por eso esta capa **no cifra nada en reposo**: no hay ninguna columna secreta que
+//! descifrar. Sí recibe, en cambio, la clave HMAC con la que se hashean los tokens al alta
+//! y al verificar, porque el hash no es un SHA-256 pelado sino un HMAC con la clave derivada
+//! de `KESTO_MASTER_KEY`: así quien lea la tabla no puede precomputar hashes de tokens.
 //!
 //! `scopes` es el vocabulario cerrado del permiso —`read` y `run`— y viaja como el texto que
 //! el `CHECK` del DDL acepta: `read`, `run` o `read,run`, en ese orden canónico. La capa
@@ -216,19 +218,21 @@ impl std::fmt::Debug for AltaDeToken {
 /// aleatorio y largo, y una sal por fila obligaría a leer la fila para poder
 /// verificar, que es justo lo que el hash evita. La clave HMAC impide que un atacante
 /// con acceso de lectura a la tabla pueda precomputar hashes de tokens.
-pub fn hash_de_token(en_claro: &str, key: &[u8]) -> String {
+///
+/// Devuelve `Result` aunque `HMAC-SHA256` acepte claves de **cualquier** longitud
+/// —y por tanto, con las claves de 32 bytes que derivamos, el error sea
+/// inalcanzable—: degradar a un hash vacío sería peor que fallar, porque un hash
+/// vacío casaría con un token vacío. Quien llama propaga el fallo con `?`.
+pub fn hash_de_token(en_claro: &str, key: &[u8]) -> Result<String, DbError> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
-    // `new_from_slice` **no puede fallar** con HMAC: acepta cualquier longitud de
-    // clave. Aun así no se usa `expect` —no hay pánicos en producción—: el brazo
-    // de error es inalcanzable y devuelve la cadena vacía, que el `CHECK` de la
-    // tabla rechazaría antes de guardarla.
-    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
-        return String::new();
-    };
+
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|causa| DbError::ClaveDeTokenInservible { causa })?;
     mac.update(en_claro.as_bytes());
-    STANDARD.encode(mac.finalize().into_bytes())
+
+    Ok(STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 /// La capa de acceso de `api_tokens`.
@@ -316,7 +320,7 @@ impl Tokens {
             // BLOB de 16 bytes y el DDL dice `TEXT`.
             .bind(id.hyphenated().to_string())
             .bind(&alta.name)
-            .bind(hash_de_token(&alta.en_claro, &self.hmac_key[..]))
+            .bind(hash_de_token(&alta.en_claro, &self.hmac_key[..])?)
             .bind(scopes)
             // La fecha se normaliza a UTC **al enlazarla**: el `Encode` de `time` conserva el
             // desplazamiento del valor y el §3 dice que las fechas son UTC, así que un llamante
@@ -485,7 +489,8 @@ mod tests {
 
         assert_eq!(
             guardado,
-            hash_de_token(EN_CLARO, &tokens.hmac_key[..]),
+            hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                .expect("el hash de prueba no puede fallar"),
             "la fila no guardó el hash del token"
         );
         assert_ne!(
@@ -495,7 +500,10 @@ mod tests {
 
         // Se verifica por el hash del token entrante, y un token distinto no casa.
         let encontrado = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO, &tokens.hmac_key[..]))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda por hash no puede fallar")
             .expect("el token recién dado de alta debe encontrarse por su hash");
@@ -510,7 +518,10 @@ mod tests {
 
         assert!(
             tokens
-                .buscar_por_hash(&hash_de_token(OTRO_EN_CLARO, &tokens.hmac_key[..]))
+                .buscar_por_hash(
+                    &hash_de_token(OTRO_EN_CLARO, &tokens.hmac_key[..])
+                        .expect("el hash de prueba no puede fallar")
+                )
                 .await
                 .expect("la búsqueda no puede fallar")
                 .is_none(),
@@ -529,7 +540,10 @@ mod tests {
             .expect("anotar el uso no puede fallar");
 
         let usado = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO, &tokens.hmac_key[..]))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe seguir");
@@ -550,7 +564,10 @@ mod tests {
         );
 
         let revocado = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO, &tokens.hmac_key[..]))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("la fila revocada sigue en la base para poder auditarla");
@@ -627,7 +644,10 @@ mod tests {
 
         // La ida y vuelta: el texto vuelve a ser el conjunto del enum.
         let releido = tokens
-            .buscar_por_hash(&hash_de_token(EN_CLARO, &tokens.hmac_key[..]))
+            .buscar_por_hash(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe estar");
@@ -676,7 +696,10 @@ mod tests {
         let impreso = format!("{dado_de_alta:?}");
 
         assert!(
-            !impreso.contains(&hash_de_token(EN_CLARO, &tokens.hmac_key[..])),
+            !impreso.contains(
+                &hash_de_token(EN_CLARO, &tokens.hmac_key[..])
+                    .expect("el hash de prueba no puede fallar")
+            ),
             "el `Debug` publicó el hash del token: {impreso}"
         );
         assert!(
@@ -733,12 +756,50 @@ mod tests {
         );
 
         assert!(
-            !impreso.contains(&hash_de_token(EN_CLARO, clave.api_token_key())),
+            !impreso.contains(
+                &hash_de_token(EN_CLARO, clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar")
+            ),
             "el `Debug` del alta publicó el hash: {impreso}"
         );
         assert!(
             impreso.contains("redactado"),
             "el `Debug` del alta no dice que el hash está redactado: {impreso}"
+        );
+    }
+
+    /// 2.3 — El hash no se reproduce sin el secreto de servidor.
+    ///
+    /// Es la razón de ser del HMAC: sin la clave no se precomputa. Dos maestras
+    /// distintas dan dos claves distintas —y hashes distintos del mismo valor—, y el
+    /// hash tampoco es el SHA-256 pelado del valor, que cualquiera calcularía.
+    #[test]
+    fn el_hash_no_se_reproduce_sin_el_secreto_de_servidor() {
+        // Otra maestra, distinta de `MASTER_KEY`: la clave HMAC derivada cambia.
+        const OTRA_MAESTRA: &str = "otra-maestra-de-prueba-para-el-hash-de-tokens-0000000000";
+
+        let clave_a = Clave::desde_maestra(&SecretString::new(MASTER_KEY.to_owned()));
+        let clave_b = Clave::desde_maestra(&SecretString::new(OTRA_MAESTRA.to_owned()));
+
+        let con_a = hash_de_token(EN_CLARO, clave_a.api_token_key())
+            .expect("el hash de prueba no puede fallar");
+        let con_b = hash_de_token(EN_CLARO, clave_b.api_token_key())
+            .expect("el hash de prueba no puede fallar");
+
+        assert_ne!(
+            con_a, con_b,
+            "con otro secreto de servidor el hash del mismo valor tiene que cambiar"
+        );
+
+        // Y no es el SHA-256 pelado del valor: sin el secreto no se reproduce.
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let pelado =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(EN_CLARO.as_bytes()));
+
+        assert_ne!(
+            con_a, pelado,
+            "el hash no puede ser el SHA-256 sin clave: se reproduciría sin el secreto"
         );
     }
 }
