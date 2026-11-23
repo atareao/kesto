@@ -60,6 +60,14 @@ pub(crate) const KID: &str = "kesto-clave-de-prueba";
 /// de que la clave que la cabecera nombra no está en el conjunto.
 pub(crate) const KID_AJENO: &str = "kid-que-el-jwks-no-publica";
 
+/// `kid` de la clave que el proveedor publica **tras** una rotación.
+///
+/// Es distinto de [`KID`] a propósito: reproduce una rotación de claves del
+/// proveedor, en la que el `kid` que la verificación tenía cacheado deja de
+/// resolver y solo una recarga del `jwks_uri` encuentra el nuevo. Es lo que
+/// ejercita el camino **positivo** de la recarga perezosa.
+pub(crate) const KID_ROTADO: &str = "kesto-clave-rotada";
+
 /// Token de acceso del proveedor: distinguible para que buscarlo en el log o en
 /// la cookie sea concluyente.
 pub(crate) const ACCESS_TOKEN: &str = "access-token-del-proveedor-distinguible";
@@ -142,6 +150,17 @@ pub(crate) struct ProveedorFalso {
     /// así que capturarlo es la única forma de comprobar que viaja de verdad y con
     /// el valor que toca: la petición no se puede leer desde fuera de `wiremock`.
     ultimo_cuerpo_del_canje: Arc<Mutex<Option<String>>>,
+    /// El JWKS que el `jwks_uri` sirve **ahora mismo**.
+    ///
+    /// Va en estado compartido —y no en un mock estático— para poder **rotar** la
+    /// clave en caliente: [`Self::rotar_clave`] lo reescribe y el mock, que lo lee
+    /// en cada petición, pasa a servir el nuevo sin volver a montarse.
+    jwks_publicado: Arc<Mutex<JwkSet>>,
+    /// Clave privada con la que se firma tras una rotación, si la hubo.
+    ///
+    /// Es el par que [`Self::rotar_clave`] genera y publica; hasta entonces no
+    /// hay ninguna y [`Self::firmar_con_clave_rotada`] falla en alto.
+    clave_rotada: Arc<Mutex<Option<EncodingKey>>>,
 }
 
 impl ProveedorFalso {
@@ -172,9 +191,22 @@ impl ProveedorFalso {
             .mount(&server)
             .await;
 
+        // El JWKS se sirve desde estado compartido: leerlo en cada petición es lo
+        // que permite rotar la clave sin montar un mock nuevo —`wiremock` evaluaría
+        // en orden de montaje y el primero seguiría ganando—.
+        let jwks_publicado = Arc::new(Mutex::new(JwkSet {
+            keys: vec![jwk_publico(&clave, KID)],
+        }));
+        let jwks_para_mock = Arc::clone(&jwks_publicado);
         Mock::given(method("GET"))
             .and(path(RUTA_JWKS))
-            .respond_with(ResponseTemplate::new(200).set_body_json(jwks(&clave)))
+            .respond_with(move |_peticion: &Request| {
+                let jwks = jwks_para_mock
+                    .lock()
+                    .expect("el mutex del JWKS público no puede envenenarse")
+                    .clone();
+                ResponseTemplate::new(200).set_body_json(jwks)
+            })
             .mount(&server)
             .await;
 
@@ -234,6 +266,8 @@ impl ProveedorFalso {
             token_actual,
             token_error,
             ultimo_cuerpo_del_canje,
+            jwks_publicado,
+            clave_rotada: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -242,17 +276,60 @@ impl ProveedorFalso {
         firmar_con(&self.clave, claims)
     }
 
-    /// El JWKS que el proveedor publica, listo para precargar una caché.
+    /// El JWKS que el proveedor publica **ahora mismo**, listo para precargar una caché.
     ///
     /// Se construye con la misma clave que firma los tokens válidos, así que un
     /// test puede sembrar `AuthState.jwks_cache` y comprobar que la verificación
-    /// usa la caché sin volver a pedir el `jwks_uri`.
+    /// usa la caché sin volver a pedir el `jwks_uri`. Tras [`Self::rotar_clave`]
+    /// devuelve el conjunto **nuevo**.
     pub(crate) fn jwks_publico(&self) -> JwkSet {
-        let mut jwk = Jwk::from_encoding_key(&self.clave, Algorithm::RS256)
-            .expect("la clave pública de prueba debe poder publicarse como JWK");
-        jwk.common.key_id = Some(KID.to_owned());
+        self.jwks_publicado
+            .lock()
+            .expect("el mutex del JWKS público no puede envenenarse")
+            .clone()
+    }
 
-        JwkSet { keys: vec![jwk] }
+    /// Publica en caliente un **segundo** par RSA y lo deja listo para firmar.
+    ///
+    /// El `jwks_uri` pasa a servir un conjunto con un `kid` distinto
+    /// ([`KID_ROTADO`]): reproduce una rotación de claves del proveedor, en la que
+    /// el `kid` que la verificación tenía **cacheado** deja de resolver y solo una
+    /// recarga del `jwks_uri` lo encuentra. Es lo que ejercita el camino positivo
+    /// de la recarga perezosa. Después, [`Self::firmar_con_clave_rotada`] firma
+    /// con la clave nueva.
+    pub(crate) fn rotar_clave(&self) {
+        let (clave, _) = generar_clave();
+
+        *self
+            .jwks_publicado
+            .lock()
+            .expect("el mutex del JWKS público no puede envenenarse") = JwkSet {
+            keys: vec![jwk_publico(&clave, KID_ROTADO)],
+        };
+        *self
+            .clave_rotada
+            .lock()
+            .expect("el mutex de la clave rotada no puede envenenarse") = Some(clave);
+    }
+
+    /// Firma un ID token `RS256` con la clave publicada tras [`Self::rotar_clave`].
+    ///
+    /// La cabecera lleva [`KID_ROTADO`], que el JWKS **viejo** —el que la
+    /// verificación tiene cacheado— no publicaba: la resolución por `kid` solo
+    /// funciona tras recargar el `jwks_uri`.
+    pub(crate) fn firmar_con_clave_rotada(&self, claims: &IdToken) -> String {
+        let guard = self
+            .clave_rotada
+            .lock()
+            .expect("el mutex de la clave rotada no puede envenenarse");
+        let clave = guard
+            .as_ref()
+            .expect("hay que llamar a `rotar_clave` antes de firmar con la clave rotada");
+
+        let mut cabecera = Header::new(Algorithm::RS256);
+        cabecera.kid = Some(KID_ROTADO.to_owned());
+
+        encode(&cabecera, claims, clave).expect("el ID token de prueba debe firmarse")
     }
 
     /// Firma un ID token `RS256` a partir de claims crudos.
@@ -444,18 +521,18 @@ fn generar_clave() -> (EncodingKey, Vec<u8>) {
     (EncodingKey::from_rsa_der(&der), publica)
 }
 
-/// Publica la clave pública de `clave` como JWKS, con su `kid`.
+/// Publica la clave pública de `clave` como JWK, con el `kid` dado.
 ///
 /// Se usa `Jwk::from_encoding_key`, que extrae el módulo y el exponente y los
 /// codifica en base64url sin relleno —como exige el RFC 7518—, de modo que la
 /// misma biblioteca que firma y verifica construye la clave que publica. Nada
 /// se codifica a mano.
-fn jwks(clave: &EncodingKey) -> serde_json::Value {
+fn jwk_publico(clave: &EncodingKey, kid: &str) -> Jwk {
     let mut jwk = Jwk::from_encoding_key(clave, Algorithm::RS256)
         .expect("la clave pública de prueba debe poder publicarse como JWK");
-    jwk.common.key_id = Some(KID.to_owned());
+    jwk.common.key_id = Some(kid.to_owned());
 
-    serde_json::to_value(JwkSet { keys: vec![jwk] }).expect("el JWKS de prueba debe serializarse")
+    jwk
 }
 
 /// Firma `claims` con `clave` y el `kid` del proveedor.

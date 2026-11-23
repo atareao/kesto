@@ -14,7 +14,6 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use urlencoding;
 
 use crate::config::OidcSettings;
 use crate::error::AppError;
@@ -366,7 +365,12 @@ pub async fn canjear_codigo(
         })
 }
 
-/// Obtiene el JWKS con caché y recarga perezosa por kid ausente.
+/// Devuelve el JWKS de la caché si sigue vigente; si no, lo recarga.
+///
+/// La **recarga perezosa por `kid` ausente** no vive aquí —esta función no conoce
+/// el `kid`— sino en [`verificar_id_token`]: si el `kid` del token no resuelve en
+/// el conjunto cacheado, fuerza una recarga con [`recargar_jwks`] antes de
+/// rechazar. Esta capa solo resuelve la mitad de la **caducidad** (el TTL).
 async fn fetch_jwks_cached(
     auth_state: &AuthState,
     discovery: &Discovery,
@@ -382,7 +386,16 @@ async fn fetch_jwks_cached(
         }
     } // read guard dropped here
 
-    // Forzar recarga
+    recargar_jwks(auth_state, discovery).await
+}
+
+/// Recarga el JWKS ignorando el TTL y lo deja en la caché con una caducidad nueva.
+///
+/// Es la mitad que comparten [`fetch_jwks_cached`] —cuando la caché está
+/// caducada— y [`verificar_id_token`] —cuando el `kid` del token no resuelve en
+/// la caché vigente y hay que forzar la recarga—: pide el conjunto, lo cachea y
+/// lo devuelve.
+async fn recargar_jwks(auth_state: &AuthState, discovery: &Discovery) -> Result<JwkSet, AppError> {
     let jwks = fetch_jwks(&discovery.jwks_uri).await?;
     let expires_at = Instant::now() + JWKS_TTL;
     *auth_state.jwks_cache.write().await = Some((jwks.clone(), expires_at));
@@ -457,9 +470,7 @@ pub async fn verificar_id_token(
     let jwk = match jwks.find(&kid) {
         Some(jwk) => jwk,
         None => {
-            jwks = fetch_jwks(&discovery.jwks_uri).await?;
-            let expires_at = Instant::now() + JWKS_TTL;
-            *auth_state.jwks_cache.write().await = Some((jwks.clone(), expires_at));
+            jwks = recargar_jwks(auth_state, discovery).await?;
             // Buscar de nuevo en el JWKS recargado
             match jwks.find(&kid) {
                 Some(jwk2) => jwk2,
@@ -1557,16 +1568,16 @@ mod tests {
 
     #[tokio::test]
     async fn un_kid_desconocido_fuerza_recarga_jwks() {
-        // Escenario: si al verificar llega un `kid` que la caché no conoce,
-        // se fuerza una recarga del JWKS antes de rechazar.
-        // El proveedor falso tiene dos claves: KID (publicada) y KID_AJENA (no publicada).
-        // Primero se cachea el JWKS con KID, luego se presenta un token con KID_AJENA.
-        // La recarga debe traer el mismo JWKS (KID sigue siendo el único publicado),
-        // así que el kid sigue ausente y la verificación falla.
+        // Escenario: si al verificar llega un `kid` que la caché no conoce, se
+        // fuerza una recarga del JWKS **antes** de rechazar. El token va firmado
+        // con la clave publicada pero con `kid = KID_AJENO`, que el `jwks_uri` no
+        // publica: la firma cuadraría, así que el rechazo solo puede venir de que
+        // el `kid` no resuelve, y a esa comprobación solo se llega pasando por la
+        // recarga. Sin la recarga, el contador de JWKS no subiría.
         let proveedor = ProveedorFalso::servir().await;
         let router = router_oidc_con_emisor(&proveedor.issuer).await;
 
-        // Primer login: cachea el JWKS con KID
+        // Primer login: cachea el JWKS con KID.
         let (state1, nonce1) = login_state_y_nonce(router.clone()).await;
         let claims1 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce1);
         proveedor
@@ -1576,18 +1587,72 @@ mod tests {
         let respuesta1 = get(router.clone(), &callback_url(&state1, "codigo1")).await;
         assert_eq!(respuesta1.status(), StatusCode::FOUND);
 
-        // Segundo login: token firmado con clave no publicada (mismo KID_AJENA)
-        // La cabecera llevará kid=KID_AJENA, que no está en el JWKS cacheado.
+        let jwks_antes = proveedor.peticiones_al_jwks().await;
+
+        // Segundo login: token con un `kid` que el JWKS no publica. La firma es
+        // legítima —la hace la clave publicada—: lo que no resuelve es el `kid`.
         let (state2, nonce2) = login_state_y_nonce(router.clone()).await;
-        let claims2 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce2);
-        // Firmar con clave que el JWKS NO publica (usa kid=KID_AJENA)
-        let token2 = proveedor.firmar_con_clave_ajena(&claims2);
+        let token2 = proveedor.firmar_con_kid_ajeno(&claims_completos(&proveedor, &nonce2));
         proveedor.montar_token_endpoint(&token2).await;
 
         let respuesta2 = get(router, &callback_url(&state2, "codigo2")).await;
 
-        // Debe fallar: el kid sigue ausente tras recargar
         assert_rechazo_sin_cookie(respuesta2).await;
+        assert_eq!(
+            proveedor.peticiones_al_jwks().await,
+            jwks_antes + 1,
+            "un `kid` que la caché no conoce tiene que forzar exactamente una recarga del JWKS"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_kid_que_aparece_tras_recargar_emite_sesion() {
+        // Camino **positivo** de la recarga (spec auth:29): el `kid` aparece tras
+        // recargar y el ID token se verifica y emite sesión. Se reproduce con una
+        // rotación de claves del proveedor: el `kid` nuevo no está en la caché
+        // —que aún tiene el viejo—, así que la verificación recarga y lo encuentra.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        // Primer login: cachea el JWKS **viejo** (solo con KID).
+        let (state1, nonce1) = login_state_y_nonce(router.clone()).await;
+        let claims1 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce1);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar(&claims1))
+            .await;
+
+        let respuesta1 = get(router.clone(), &callback_url(&state1, "codigo1")).await;
+        assert_eq!(respuesta1.status(), StatusCode::FOUND);
+
+        let jwks_antes = proveedor.peticiones_al_jwks().await;
+
+        // El proveedor rota su clave: publica un `kid` ([`KID_ROTADO`]) que la
+        // caché no conoce y pasa a firmar con el par nuevo.
+        proveedor.rotar_clave();
+
+        // Segundo login: el ID token va firmado con la clave **nueva**.
+        let (state2, nonce2) = login_state_y_nonce(router.clone()).await;
+        let claims2 = IdToken::valido(&proveedor.issuer, OIDC_CLIENT_ID, &nonce2);
+        proveedor
+            .montar_token_endpoint(&proveedor.firmar_con_clave_rotada(&claims2))
+            .await;
+
+        let respuesta2 = get(router, &callback_url(&state2, "codigo2")).await;
+
+        assert_eq!(
+            respuesta2.status(),
+            StatusCode::FOUND,
+            "un `kid` que aparece tras recargar debe verificar el ID token y emitir sesión"
+        );
+        let jwt = token_de_set_cookie(&respuesta2)
+            .expect("la sesión debe emitirse tras la recarga del JWKS");
+        session::verify(&SecretString::new(SESSION_SECRET.to_owned()), &jwt)
+            .expect("la cookie emitida debe verificar con KESTO_SECRET");
+        assert_eq!(
+            proveedor.peticiones_al_jwks().await,
+            jwks_antes + 1,
+            "el `kid` ausente debe forzar exactamente una recarga del JWKS antes de emitir la sesión"
+        );
     }
 
     #[tokio::test]
