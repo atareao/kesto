@@ -493,6 +493,8 @@ impl ProveedorFalso {
             .count()
     }
 }
+
+/// Genera un par RSA real y devuelve la clave privada como clave de firma.
 ///
 /// A 2048 bits, que es el mínimo que la verificación `RS256` de `jsonwebtoken`
 /// espera. La clave se exporta en PKCS#1 DER porque es lo que acepta
