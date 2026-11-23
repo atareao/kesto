@@ -77,12 +77,8 @@ pub async fn login(State(state): State<AppState>) -> Response {
     // `code_verifier` PKCE: el callback los usa para verificar el ID token y
     // para enviar al `token_endpoint`. La respuesta no emite cookie: la sesión
     // llega con el callback.
-    auth.registrar_login(
-        &solicitud.state,
-        &solicitud.nonce,
-        Some(&solicitud.code_verifier),
-    )
-    .await;
+    auth.registrar_login(&solicitud.state, &solicitud.nonce, &solicitud.code_verifier)
+        .await;
 
     redireccion_302(&solicitud.url)
 }

@@ -310,7 +310,7 @@ fn derivar(maestra: &SecretString, etiqueta: &[u8]) -> [u8; 32] {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{Clave, ETIQUETA, ErrorDeCifrado, PREFIJO};
+    use super::{API_TOKEN_ETIQUETA, Clave, ETIQUETA, ErrorDeCifrado, PREFIJO};
     use crate::secret::SecretString;
     use crate::test_support::capturar_log;
 
@@ -633,11 +633,26 @@ mod tests {
             "dos derivaciones con la misma maestra y la misma etiqueta difieren"
         );
 
-        let con_otra_etiqueta = super::derivar(&maestra, b"kesto/secrets/otra");
+        let con_otra_etiqueta = super::derivar(&maestra, API_TOKEN_ETIQUETA);
 
         assert_ne!(
             primera, con_otra_etiqueta,
             "cambiar la etiqueta no cambió la clave derivada"
+        );
+
+        // Las dos etiquetas del crate son **distintas**: usar la de los secretos para
+        // los tokens de API ataría la rotación de una a la de la otra y un cambio en
+        // cualquiera dejaría de ser un cambio de etiqueta para ser una pérdida.
+        assert_ne!(
+            API_TOKEN_ETIQUETA, ETIQUETA,
+            "la etiqueta de los tokens de API no puede ser la de los secretos en reposo"
+        );
+
+        // La etiqueta de los tokens es **literal**, igual que la de los secretos: los
+        // hashes ya guardados dejarían de validar si cambiara.
+        assert_eq!(
+            API_TOKEN_ETIQUETA, b"kesto/api-tokens/v1",
+            "la etiqueta de los tokens de API cambió: los hashes guardados dejarían de validar"
         );
 
         // La etiqueta es **literal**: no basta con que «acabe en `v1`». Cambiarla

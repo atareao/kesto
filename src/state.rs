@@ -149,7 +149,12 @@ impl AuthState {
         }
     }
 
-    /// Registra un `state` emitido junto a su `nonce` y su marca de tiempo.
+    /// Registra un `state` emitido junto a su `nonce`, el `code_verifier` de PKCE y
+    /// su marca de tiempo.
+    ///
+    /// El `code_verifier` entra por valor prestado y **siempre**: quien registra un
+    /// login lo emitió con PKCE, así que un pendiente sin él solo nace de un registro
+    /// corrupto o de un sembrado de test, no de esta llamada.
     ///
     /// Purga las entradas caducadas **al insertar** y, si aun así el mapa está
     /// lleno, desaloja la **más antigua** por su marca de tiempo. El tope es
@@ -158,7 +163,7 @@ impl AuthState {
     /// mapa lleno convertiría el tope en una denegación de servicio de
     /// disponibilidad, y el `state` más antiguo es, de todos, el que menos
     /// probabilidad tiene de volver.
-    pub async fn registrar_login(&self, state: &str, nonce: &str, code_verifier: Option<&str>) {
+    pub async fn registrar_login(&self, state: &str, nonce: &str, code_verifier: &str) {
         let ahora = Instant::now();
         let mut logins = self.logins.lock().await;
 
@@ -181,7 +186,7 @@ impl AuthState {
             state.to_owned(),
             PendingLogin {
                 nonce: nonce.to_owned(),
-                code_verifier: code_verifier.unwrap_or("").to_owned(),
+                code_verifier: code_verifier.to_owned(),
                 issued_at: ahora,
             },
         );
@@ -293,6 +298,11 @@ impl EstadoDeBase {
             tareas: Arc::new(Tareas::nuevo(pool.clone())),
             ejecuciones: Arc::new(Ejecuciones::nuevo(pool.clone(), clave.clone())),
             restauraciones: Arc::new(Restauraciones::nuevo(pool.clone())),
+            // `Tokens` guarda su **propia** copia de la clave HMAC —vive todo el
+            // proceso y no puede tomar prestada la de `Clave`—, así que el `*`
+            // hace una copia transitoria en la pila que no va en un `Zeroizing`.
+            // Es inevitable mientras la capa tenga la clave por valor: `nuevo` la
+            // envuelve acto seguido, y la copia intermedia desaparece al volver.
             tokens: Arc::new(Tokens::nuevo(pool.clone(), *clave.api_token_key())),
             sesiones: Arc::new(SesionesRevocadas::nuevo(pool.clone())),
             pool,
@@ -394,6 +404,15 @@ mod tests {
         nombre_de_tarea_de_prueba,
     };
 
+    /// Registra un pendiente **sin** `code_verifier`.
+    ///
+    /// `registrar_login` en producción siempre recibe el verifier de PKCE; los tests
+    /// de purga y de tope no tienen ninguno —no llegan al callback—, así que lo dejan
+    /// vacío desde aquí en vez de repetir el literal.
+    async fn registrar_sin_verifier(auth: &AuthState, state: &str, nonce: &str) {
+        auth.registrar_login(state, nonce, "").await;
+    }
+
     #[tokio::test]
     async fn la_purga_descarta_las_entradas_caducadas() {
         // Tarea 3.5: el mapa de `state`/`nonce` no crece sin límite. Borrar el
@@ -420,8 +439,7 @@ mod tests {
             assert_eq!(logins.len(), 1, "el mapa arranca con la entrada caducada");
         }
 
-        auth.registrar_login("state-nuevo", "nonce-nuevo", None)
-            .await;
+        registrar_sin_verifier(&auth, "state-nuevo", "nonce-nuevo").await;
 
         let logins = auth.logins.lock().await;
 
@@ -470,8 +488,7 @@ mod tests {
         let auth = auth_oidc().await;
         mapa_lleno(&auth, Instant::now(), 0).await;
 
-        auth.registrar_login("state-de-mas", "nonce-de-mas", None)
-            .await;
+        registrar_sin_verifier(&auth, "state-de-mas", "nonce-de-mas").await;
 
         let logins = auth.logins.lock().await;
 
@@ -509,8 +526,7 @@ mod tests {
         // El resto, un minuto más nuevas y con la misma marca entre ellas.
         mapa_lleno(&auth, Instant::now(), 1).await;
 
-        auth.registrar_login("state-de-mas", "nonce-de-mas", None)
-            .await;
+        registrar_sin_verifier(&auth, "state-de-mas", "nonce-de-mas").await;
 
         let logins = auth.logins.lock().await;
 
@@ -551,8 +567,7 @@ mod tests {
         }
         mapa_lleno(&auth, Instant::now(), 1).await;
 
-        auth.registrar_login("state-de-mas", "nonce-de-mas", None)
-            .await;
+        registrar_sin_verifier(&auth, "state-de-mas", "nonce-de-mas").await;
 
         let logins = auth.logins.lock().await;
 
