@@ -192,6 +192,10 @@ jobs:
           docker pull "$ALPINE_IMAGE"
           docker pull "$S3_IMAGE"
 
+      - name: Build kesto-motor
+        # La batería e2e lanza los dos binarios: `cargo test --features e2e` solo construye la API.
+        run: cargo build --locked --features motor --bin kesto-motor
+
       # Los dos pasos que ejecutan la batería van por un tubo —para que el registro quede en el
       # artefacto—, y el desenlace de un tubo es el del **último** comando: sin `pipefail`, un
       # fallo de la batería saldría con el cero del `tee` y el job quedaría en verde. Lo exige
