@@ -2174,9 +2174,12 @@ impl ContenedorDePrueba {
     ///
     /// Es lo que hace falta para medir el confinamiento de punta a punta: el motor inspecciona
     /// el contenedor, no ve la etiqueta y **no le crea ningún `exec`**.
-    #[expect(
-        dead_code,
-        reason = "solo lo usan las pruebas del transporte con bollard, que no se compilan en la API"
+    #[cfg_attr(
+        feature = "motor",
+        expect(
+            dead_code,
+            reason = "solo lo usan las pruebas del transporte con bollard, que no se compilan en la API"
+        )
     )]
     pub(crate) async fn sin_etiqueta_de_fuente(prueba: &str) -> Self {
         Self::con_etiquetas(prueba, false).await

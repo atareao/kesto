@@ -17,27 +17,31 @@
 //! tiene que seguir vivo mientras se drena su salida**. Está medido y contado en
 //! [`Cliente::ejecutar`], y hay una prueba marcada `#[ignore]` que lo fija.
 
-#[cfg(feature = "motor")]
+#[cfg(any(feature = "motor", test))]
 mod cliente;
-#[cfg(feature = "motor")]
+#[cfg(any(feature = "motor", test))]
 pub use cliente::Cliente;
+// Estos dos ayudantes solo los llama el servidor IPC del motor; las pruebas del
+// cliente los importan directamente del módulo, así que no hace falta reexportarlos.
 #[cfg(feature = "motor")]
 pub(crate) use cliente::{codigo_de_salida, exigir_la_etiqueta_de_fuente};
 
-// La API —también al compilar sus pruebas— usa el cliente IPC real: `cfg(test)`
-// no puede cambiar el transporte entregado, o las pruebas pasarían sobre un
-// cliente que no es el que se envía. `bollard` solo se compila en el motor.
-#[cfg(not(feature = "motor"))]
+// El arnés de pruebas (`src/test_support.rs`, los tests de `engine`) usa el
+// cliente real contra el socket de Podman: con `cfg(test)` tiene que compilarse
+// el mismo transporte bollard que usa el motor, o las pruebas `#[ignore]`
+// intentarían hablar con Docker por el canal IPC y se colgarían. La API de
+// producción —sin `motor` y sin `test`— sigue usando solo el cliente IPC.
+#[cfg(not(any(feature = "motor", test)))]
 mod ipc_cliente;
-#[cfg(not(feature = "motor"))]
+#[cfg(not(any(feature = "motor", test)))]
 pub use ipc_cliente::Cliente;
 
-/// Causa del fallo, según el proceso: el error de la biblioteca en el motor,
-/// el del canal IPC en la API.
-#[cfg(feature = "motor")]
+/// Causa del fallo, según el proceso: el error de la biblioteca en el motor y
+/// en el arnés de pruebas, el del canal IPC en la API de producción.
+#[cfg(any(feature = "motor", test))]
 type CausaDelMotor = bollard::errors::Error;
 /// Causa del fallo en la API, que no enlaza la biblioteca del daemon.
-#[cfg(not(feature = "motor"))]
+#[cfg(not(any(feature = "motor", test)))]
 type CausaDelMotor = crate::ipc::Error;
 
 use std::time::Duration;
@@ -333,7 +337,7 @@ pub enum Error {
     },
 }
 
-#[cfg(feature = "motor")]
+#[cfg(any(feature = "motor", test))]
 impl Error {
     /// Traduce un fallo del motor que se refiere a un contenedor concreto.
     ///
