@@ -3464,86 +3464,6 @@ mod tests {
             "el bucket se guarda recortado, sin los espacios de los extremos"
         );
     }
-<<<<<<< Updated upstream
-||||||| Stash base
-
-    /// El listado de repositorios debe responder con paginación.
-    ///
-    /// El endpoint `GET /api/v1/repositories` debe aceptar los parámetros de
-    /// consulta `limit` y `offset` y devolver un **wrapper** con `items`
-    /// (el trozo de la página) y `total` (el número de filas en la tabla),
-    /// en lugar de un array plano. Esta prueba queda en rojo porque la
-    /// implementación actual devuelve un array sin paginar.
-    #[tokio::test]
-    async fn el_listado_de_repositorios_debe_responder_con_paginacion() {
-        let router = api_router(estado_desarrollo().await).clone();
-
-        // Damos de alta dos repositorios para tener algo que paginar.
-        for nombre in ["repo-pag-uno", "repo-pag-dos"] {
-            let respuesta = post_json(
-                router.clone(),
-                "/api/v1/repositories",
-                &cuerpo_de_alta(nombre),
-            )
-            .await;
-
-            assert_eq!(
-                respuesta.status(),
-                StatusCode::CREATED,
-                "el alta de `{nombre}` tiene que contestar 201"
-            );
-        }
-
-        // Pedimos una página con `limit` y `offset`.
-        let respuesta = get(router, "/api/v1/repositories?limit=1&offset=0").await;
-
-        let status = respuesta.status();
-        let cuerpo = body_json(respuesta).await;
-
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "el listado paginado tiene que contestar 200; contestó {status} con {cuerpo}"
-        );
-
-        // La respuesta debe ser un **objeto** con `items` y `total`, no un array plano.
-        let data = cuerpo["data"].as_object().unwrap_or_else(|| {
-            panic!(
-                "el listado paginado tiene que traer un objeto en `data` con `items` y \
-                     `total`, y llegó {cuerpo}"
-            )
-        });
-
-        assert!(
-            data.contains_key("items"),
-            "el wrapper de paginación tiene que llevar la clave `items`: {cuerpo}"
-        );
-        assert!(
-            data.contains_key("total"),
-            "el wrapper de paginación tiene que llevar la clave `total`: {cuerpo}"
-        );
-
-        let items = data["items"]
-            .as_array()
-            .unwrap_or_else(|| panic!("`items` tiene que ser un array: {cuerpo}"));
-
-        assert_eq!(
-            items.len(),
-            1,
-            "con `limit=1` la página tiene que traer un solo elemento, y llegó {}: {cuerpo}",
-            items.len()
-        );
-
-        let total = data["total"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("`total` tiene que ser un número: {cuerpo}"));
-
-        assert_eq!(
-            total, 2,
-            "con dos repositorios en la tabla, `total` tiene que ser 2: {cuerpo}"
-        );
-    }
-=======
 
     /// El listado de repositorios debe responder con paginación.
     ///
@@ -3835,5 +3755,4 @@ mod tests {
             "editar con endpoint inseguro sin permiso ha de contestar 400"
         );
     }
->>>>>>> Stashed changes
 }
