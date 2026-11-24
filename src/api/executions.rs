@@ -33,6 +33,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::api::contenido;
+use crate::api::error_sanitizer::sanitize_error_message;
 use crate::api::extract::Query;
 use crate::api::response::ApiResponse;
 use crate::db::entities::{Ejecucion, Estado, FiltroDeEjecuciones, PaginaDeEjecuciones};
@@ -217,7 +218,7 @@ impl EjecucionDelCable {
             snapshot_id: fila.snapshot_id.clone(),
             bytes_processed: fila.bytes_processed,
             bytes_uploaded: fila.bytes_uploaded,
-            error_message: fila.error_message.clone(),
+            error_message: sanitize_error_message(fila.error_message.as_deref())?,
             started_at: formatear(fila.started_at)?,
             finished_at: fila.finished_at.map(formatear).transpose()?,
             job_name,
@@ -1284,6 +1285,202 @@ mod tests {
                 .unwrap_or_default(),
             2,
             "y la segunda, otras dos: {segunda}"
+        );
+    }
+
+    /// SEC-15: error_message es null cuando la ejecución no tiene error.
+    ///
+    /// Cubre el spec delta `executions-error_message`: cuando la ejecución fue exitosa,
+    /// el campo `error_message` tiene que ser `null` en la respuesta JSON.
+    #[tokio::test]
+    async fn error_message_es_null_cuando_no_hay_error() {
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+        let _ejecucion = sembrar_ejecucion(&estado, tarea, Estado::Success, base, 1000).await;
+
+        let respuesta = get(
+            api_router(estado),
+            &format!("/api/v1/executions?job_id={tarea}"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado contesta {status} para ejecución exitosa"
+        );
+
+        let filas = cuerpo["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
+
+        assert_eq!(filas.len(), 1, "solo una ejecución");
+        assert_eq!(
+            filas[0]["error_message"],
+            serde_json::Value::Null,
+            "error_message ha de ser null cuando no hay error: {cuerpo}"
+        );
+    }
+
+    /// SEC-15: error_message con credenciales debe contestar 400.
+    ///
+    /// Cubre el spec delta `executions-error_message`: si el motor devuelve un error_message
+    /// que contiene `password=` o `secret=`, la API debe contestar `400` con un mensaje
+    /// de validación.
+    #[tokio::test]
+    async fn error_message_con_credenciales_contesta_400() {
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        // Siembra una ejecución con error_message que contiene datos sensibles.
+        let _fila = estado
+            .db
+            .ejecuciones
+            .alta(AltaDeEjecucion {
+                job_id: tarea,
+                status: Estado::Failed,
+                snapshot_id: Some("snapshot-de-prueba-00000000000000000001".to_owned()),
+                bytes_processed: 500,
+                bytes_uploaded: 250,
+                error_message: Some("Password 'admin' failed for db user".to_owned()),
+                started_at: base,
+                finished_at: Some(base + Duration::seconds(30)),
+            })
+            .await
+            .expect("la ejecución de prueba se da de alta");
+
+        let respuesta = get(
+            api_router(estado),
+            &format!("/api/v1/executions?job_id={tarea}"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        // La validación aún no está implementada: el error_message se devuelve tal cual.
+        // Este test debería fallar (ROJO) hasta que se añada el saneado.
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "error_message con datos sensibles tiene que contestar 400: {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("el 400 tiene que traer mensaje")
+            .to_owned();
+
+        assert!(
+            mensaje.contains("error_message"),
+            "el mensaje ha de nombrar el campo error_message: {mensaje}"
+        );
+        assert!(
+            !mensaje.contains("Password") && !mensaje.contains("admin"),
+            "el mensaje no ha de contener credenciales: {mensaje}"
+        );
+    }
+
+    /// SEC-15: error_message vacío se trata como sin error.
+    ///
+    /// Cubre el spec delta `executions-error_message`: si el motor devuelve
+    /// `error_message: ""`, la API debe tratarlo como `null` y contestar `200`.
+    #[tokio::test]
+    async fn error_message_vacio_es_sin_error() {
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        // Siembra una ejecución con error_message vacío.
+        let _fila = estado
+            .db
+            .ejecuciones
+            .alta(AltaDeEjecucion {
+                job_id: tarea,
+                status: Estado::Failed,
+                snapshot_id: Some("snapshot-de-prueba-00000000000000000001".to_owned()),
+                bytes_processed: 500,
+                bytes_uploaded: 250,
+                error_message: Some("".to_owned()),
+                started_at: base,
+                finished_at: Some(base + Duration::seconds(30)),
+            })
+            .await
+            .expect("la ejecución de prueba se da de alta");
+
+        let respuesta = get(
+            api_router(estado),
+            &format!("/api/v1/executions?job_id={tarea}"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "error_message vacío ha de contestar 200: {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]["executions"]
+            .as_array()
+            .expect("el listado tiene que traer `executions` como array");
+
+        assert_eq!(filas.len(), 1, "solo una ejecución");
+        assert_eq!(
+            filas[0]["error_message"],
+            serde_json::Value::Null,
+            "error_message vacío ha de ser null: {cuerpo}"
+        );
+    }
+
+    /// SEC-15: error_message no contiene patrones de stack trace.
+    ///
+    /// Cubre el spec delta `executions-error_message`: si el motor devuelve un error_message
+    /// que parece un stack trace, la API debe contestar `400`.
+    #[tokio::test]
+    async fn error_message_sin_stack_trace() {
+        let (estado, _directorio) = estado_con_base().await;
+        let tarea = sembrar_tarea(&estado).await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        // Siembra una ejecución con error_message que parece un stack trace.
+        let _fila = estado
+            .db
+            .ejecuciones
+            .alta(AltaDeEjecucion {
+                job_id: tarea,
+                status: Estado::Failed,
+                snapshot_id: Some("snapshot-de-prueba-00000000000000000001".to_owned()),
+                bytes_processed: 500,
+                bytes_uploaded: 250,
+                error_message: Some("Stack trace at module.rs:42 in main".to_owned()),
+                started_at: base,
+                finished_at: Some(base + Duration::seconds(30)),
+            })
+            .await
+            .expect("la ejecución de prueba se da de alta");
+
+        let respuesta = get(
+            api_router(estado),
+            &format!("/api/v1/executions?job_id={tarea}"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        // La validación aún no está implementada.
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "error_message con stack trace tiene que contestar 400: {cuerpo}"
         );
     }
 }
