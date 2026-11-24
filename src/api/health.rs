@@ -6,18 +6,16 @@ use axum::http::StatusCode;
 use crate::api::response::{ApiResponse, Data};
 use crate::state::AppState;
 
-/// `GET /api/v1/health`, sin sesión: contesta la versión y el modo de autenticación.
+/// `GET /api/v1/health`, sin sesión: contesta solo el estado.
 ///
-/// No declara la dirección de escucha, ni la cadena de base de datos, ni el
-/// emisor OIDC: es un endpoint sin autenticar.
-pub async fn health(State(state): State<AppState>) -> ApiResponse {
+/// No declara la versión, ni el modo de autenticación, ni la dirección de
+/// escucha, ni la cadena de base de datos, ni el emisor OIDC: es un endpoint
+/// sin autenticar que no filtra metadatos.
+pub async fn health(State(_state): State<AppState>) -> ApiResponse {
     ApiResponse::new(
         StatusCode::OK,
         "servicio en marcha",
-        Data::Some(serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "auth_mode": state.config.auth.as_str(),
-        })),
+        Data::Some(serde_json::json!({})),
     )
 }
 
@@ -35,9 +33,6 @@ mod tests {
         OIDC_ISSUER_URL, OIDC_REDIRECT_URL, base_con_clave, body_json, body_text, estado_de_prueba,
         get, lookup_from,
     };
-
-    /// Versión que tiene que declarar la salud: la del binario.
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
 
     /// Clave maestra larga, para que ningún aviso se cuele en la respuesta.
     const MASTER_KEY: &str = "clave-maestra-distinguible-000000000000000000000000000000000000";
@@ -127,7 +122,6 @@ mod tests {
         let cuerpo = body_json(respuesta).await;
 
         assert_eq!(cuerpo["status"], 200);
-        assert_eq!(cuerpo["data"]["version"], VERSION);
         assert!(
             cuerpo["message"]
                 .as_str()
@@ -137,12 +131,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn la_salud_no_debe_incluir_version_auth_mode() {
+        let respuesta = get(api_router(desarrollo().await), "/api/v1/health").await;
+        let cuerpo = body_json(respuesta).await;
+
+        let datos = cuerpo["data"]
+            .as_object()
+            .expect("data debe ser un objeto JSON");
+
+        assert!(
+            !datos.contains_key("version"),
+            "data no debe contener la clave version: {cuerpo}"
+        );
+        assert!(
+            !datos.contains_key("auth_mode"),
+            "data no debe contener la clave auth_mode: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
     async fn la_salud_declara_el_modo_de_autenticacion() {
+        // auth_mode no debe estar en data tras el cambio de SEC-21.
         let cuerpo = body_json(get(api_router(desarrollo().await), "/api/v1/health").await).await;
-        assert_eq!(cuerpo["data"]["auth_mode"], "disabled");
+        assert!(
+            !cuerpo["data"]
+                .as_object()
+                .expect("data debe ser un objeto JSON")
+                .contains_key("auth_mode"),
+            "data no debe contener la clave auth_mode: {cuerpo}"
+        );
 
         let cuerpo = body_json(get(api_router(con_oidc().await), "/api/v1/health").await).await;
-        assert_eq!(cuerpo["data"]["auth_mode"], "oidc");
+        assert!(
+            !cuerpo["data"]
+                .as_object()
+                .expect("data debe ser un objeto JSON")
+                .contains_key("auth_mode"),
+            "data no debe contener la clave auth_mode: {cuerpo}"
+        );
     }
 
     #[tokio::test]
@@ -180,10 +206,12 @@ mod tests {
             .collect();
         claves.sort();
 
+        // Tras SEC-21, `data` no lleva `version` ni `auth_mode`, así que el conjunto de claves
+        // es vacío.
         assert_eq!(
             claves,
-            ["auth_mode", "version"],
-            "la salud debe limitar su cuerpo a la versión y el modo de autenticación: {cuerpo}"
+            Vec::<String>::new(),
+            "la salud debe limitar su cuerpo a un objeto vacío: {cuerpo}"
         );
     }
 

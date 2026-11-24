@@ -23,7 +23,7 @@
 //! están **implementadas** en el módulo 2 del change `api-endpoints`.
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
@@ -32,13 +32,65 @@ use uuid::Uuid;
 
 use crate::api::contenido;
 use crate::api::extract::Json;
-use crate::api::response::{ApiResponse, Data};
+use crate::api::response::{ApiResponse, Data, PaginatedResponse};
 use crate::api::texto;
 use crate::db::entities::{AltaDeTarget, Target, TipoDeTarget};
 use crate::engine::frontera::{self, FronteraError};
 use crate::error::AppError;
 use crate::secret::SecretString;
 use crate::state::AppState;
+
+/// Parámetros de consulta para listados paginados.
+///
+/// `limit` por defecto `50`, tope `200`; `offset` por defecto `0`. Valida que `limit` esté en
+/// `1..=200` y que `offset` no sea negativo; devuelve `400` en caso contrario.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsultaDelCable {
+    /// Cuántas filas devolver como máximo.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Cuántas filas saltar.
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// Límite de paginación por defecto.
+const LIMITE_POR_DEFECTO: i64 = 50;
+
+/// Límite máximo de paginación.
+const LIMITE_MAXIMO: i64 = 200;
+
+/// Parámetros de consulta para listados paginados.
+///
+/// `limit` por defecto `50`, tope `200`; `offset` por defecto `0`. Valida que `limit` esté en
+/// `1..=200` y que `offset` no sea negativo; devuelve `400` en caso contrario.
+impl ConsultaDelCable {
+    /// Valida la paginación y la resuelve a sus dos números, o contesta `400` nombrando el campo.
+    pub fn paginacion(&self) -> Result<(i64, i64), AppError> {
+        let limite = match self.limit {
+            Some(valor) if !(1..=LIMITE_MAXIMO).contains(&valor) => {
+                return Err(AppError::InvalidInput(format!(
+                    "el campo `limit` de la consulta tiene que ser un número entre 1 y {LIMITE_MAXIMO}"
+                )));
+            }
+            Some(valor) => valor,
+            None => LIMITE_POR_DEFECTO,
+        };
+
+        let desplazamiento = match self.offset {
+            Some(valor) if valor < 0 => {
+                return Err(AppError::InvalidInput(
+                    "el campo `offset` de la consulta no puede ser negativo".to_owned(),
+                ));
+            }
+            Some(valor) => valor,
+            None => 0,
+        };
+
+        Ok((limite, desplazamiento))
+    }
+}
 
 /// Las cinco rutas del recurso, para colgar de la mitad de negocio.
 pub fn router() -> Router<AppState> {
@@ -413,7 +465,12 @@ fn alta_desde(
 /// Una tabla sin filas es un listado de cero elementos y **no** un recurso ausente: contesta `200`
 /// con el array vacío en `data`, que es lo que el panel puede pintar; un `404` diría que el
 /// recurso no existe, y `/targets` existe siempre.
-pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppError> {
+pub async fn listado(
+    State(state): State<AppState>,
+    Query(consulta): Query<ConsultaDelCable>,
+) -> Result<ApiResponse, AppError> {
+    let (limite, desplazamiento) = consulta.paginacion()?;
+
     let filas = state.db.targets.listar().await?;
 
     let vistas: Vec<TargetDelCable> = filas
@@ -421,10 +478,28 @@ pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppEr
         .map(TargetDelCable::desde)
         .collect::<Result<_, _>>()?;
 
+    let total = vistas.len() as i64;
+    let pagina: Vec<TargetDelCable> = vistas
+        .into_iter()
+        .skip(desplazamiento as usize)
+        .take(limite as usize)
+        .collect();
+
     Ok(ApiResponse::new(
         StatusCode::OK,
         "targets listados",
-        contenido(&vistas)?,
+        Data::Paginated(PaginatedResponse::new(
+            pagina
+                .into_iter()
+                .map(|v| {
+                    serde_json::to_value(v)
+                        .map_err(|e| AppError::Other(format!("error serializando: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            total,
+            limite,
+            desplazamiento,
+        )),
     ))
 }
 
@@ -2450,5 +2525,70 @@ mod tests {
                 "`{valido}` es un nombre de contenedor válido: contestó {status} con {cuerpo}"
             );
         }
+    }
+
+    /// El listado de targets tiene que responder con paginación.
+    ///
+    /// `GET /api/v1/targets` tiene que aceptar `limit`/`offset` y devolver una envoltura con
+    /// `items` —la página— y `total` —el número de filas sin paginar—: un array plano no
+    /// permite al panel partir el listado ni saber cuántas páginas quedan.
+    ///
+    /// Este test está en fase RED a propósito: la implementación actual contesta con el array
+    /// plano en `data` —sin `items` ni `total`—, así que la primera aserción falla.
+    #[tokio::test]
+    async fn el_listado_de_targets_debe_responder_con_paginacion() {
+        let router = api_router(estado_desarrollo().await);
+
+        for i in 0..3 {
+            let respuesta = post_json(
+                router.clone(),
+                "/api/v1/targets",
+                &cuerpo_de_target(&format!("target-paginacion-{i:02}")),
+            )
+            .await;
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::CREATED,
+                "el alta {} tiene que contestar 201 para poder paginar el listado",
+                i
+            );
+        }
+
+        let respuesta = get(router, "/api/v1/targets?limit=2&offset=0").await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado tiene que contestar 200, y contestó {status} con {cuerpo}"
+        );
+
+        let data = cuerpo["data"]
+            .as_object()
+            .expect("el listado tiene que devolver una envoltura de paginación en `data`");
+
+        assert!(
+            data.contains_key("items") && data.contains_key("total"),
+            "el listado tiene que traer `items` y `total`, y trajo {cuerpo}"
+        );
+
+        let items = data["items"]
+            .as_array()
+            .expect("`items` tiene que ser un array");
+        let total = data["total"]
+            .as_i64()
+            .expect("`total` tiene que ser un número");
+
+        assert_eq!(
+            items.len(),
+            2,
+            "con `limit=2` el listado tiene que devolver 2 items, y devolvió {}: {cuerpo}",
+            items.len()
+        );
+        assert_eq!(
+            total, 3,
+            "el `total` tiene que ser el número de filas sin paginar (3), y fue {total}: {cuerpo}"
+        );
     }
 }

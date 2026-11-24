@@ -1,5 +1,4 @@
 //! Prueba de integración del **arranque real** del binario de Kesto.
-//!
 //! El `SHALL` «la aplicación SHALL intentar el descubrimiento del proveedor al
 //! arrancar … SHALL arrancar igualmente con un aviso» vive en `src/main.rs`, que
 //! ningún test unitario toca: el escenario 1.5 prueba `descubrimiento_al_arrancar`
@@ -724,10 +723,13 @@ fn un_socket_de_docker_inalcanzable_no_impide_arrancar_y_el_motor_va_antes_del_l
         )
     });
 
-    assert_eq!(
-        cuerpo["data"]["auth_mode"], "disabled",
-        "la salud contestó `200` pero no declaró el modo de autenticación de esta prueba: se esperaba \
-         el modo `Disabled`, que es el de un arranque sin las tres `OIDC_*`. Cuerpo:\n{}",
+    assert!(
+        !cuerpo["data"]
+            .as_object()
+            .expect("data debe ser objeto")
+            .contains_key("auth_mode"),
+        "la salud contestó `200` pero declaró `auth_mode` en `data`: en este arranque sin socket el \
+         modo de autenticación no debe figurar. Cuerpo:\n{}",
         salud.cuerpo
     );
 

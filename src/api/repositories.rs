@@ -24,7 +24,7 @@
 //! el `PUT`, que sigue sin hablar con el destino, lo dice en el suyo.
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::api::extract::Json;
-use crate::api::response::{ApiResponse, Data};
+use crate::api::response::{ApiResponse, Data, PaginatedResponse};
 use crate::api::texto;
 use crate::api::{contenido, del_motor, del_motor_en_el_alta};
 use crate::db::entities::{AltaDeRepositorio, Repositorio, SaludDeRepositorio};
@@ -41,6 +41,54 @@ use crate::error::AppError;
 use crate::rustic::{Acceso, PuestaEnMarcha};
 use crate::secret::SecretString;
 use crate::state::AppState;
+
+/// Parámetros de consulta para listados paginados.
+///
+/// `limit` por defecto `50`, tope `200`; `offset` por defecto `0`. Valida que `limit` esté en
+/// `1..=200` y que `offset` no sea negativo; devuelve `400` en caso contrario.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsultaDelCable {
+    /// Cuántas filas devolver como máximo.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Cuántas filas saltar.
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// Límite de paginación por defecto.
+const LIMITE_POR_DEFECTO: i64 = 50;
+
+/// Límite máximo de paginación.
+const LIMITE_MAXIMO: i64 = 200;
+
+impl ConsultaDelCable {
+    /// Valida la paginación y la resuelve a sus dos números, o contesta `400` nombrando el campo.
+    pub fn paginacion(&self) -> Result<(i64, i64), AppError> {
+        let limite = match self.limit {
+            Some(valor) if !(1..=LIMITE_MAXIMO).contains(&valor) => {
+                return Err(AppError::InvalidInput(format!(
+                    "el campo `limit` de la consulta tiene que ser un número entre 1 y {LIMITE_MAXIMO}"
+                )));
+            }
+            Some(valor) => valor,
+            None => LIMITE_POR_DEFECTO,
+        };
+
+        let desplazamiento = match self.offset {
+            Some(valor) if valor < 0 => {
+                return Err(AppError::InvalidInput(
+                    "el campo `offset` de la consulta no puede ser negativo".to_owned(),
+                ));
+            }
+            Some(valor) => valor,
+            None => 0,
+        };
+
+        Ok((limite, desplazamiento))
+    }
+}
 
 /// Las siete rutas del recurso, para colgar de la mitad de negocio.
 ///
@@ -417,7 +465,12 @@ fn resolver_secreto(
 /// listado sí lo tiene: el suyo, aunque sea de longitud cero. Un `null` obligaría al panel a
 /// tratar «no hay repositorios» como un error, que es el estado normal de un Kesto recién
 /// instalado.
-pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppError> {
+pub async fn listado(
+    State(state): State<AppState>,
+    Query(consulta): Query<ConsultaDelCable>,
+) -> Result<ApiResponse, AppError> {
+    let (limite, desplazamiento) = consulta.paginacion()?;
+
     let filas = state.db.repositorios.listar().await?;
 
     let vistas: Vec<RepositorioDelCable> = filas
@@ -425,10 +478,28 @@ pub async fn listado(State(state): State<AppState>) -> Result<ApiResponse, AppEr
         .map(RepositorioDelCable::desde)
         .collect::<Result<_, _>>()?;
 
+    let total = vistas.len() as i64;
+    let pagina: Vec<RepositorioDelCable> = vistas
+        .into_iter()
+        .skip(desplazamiento as usize)
+        .take(limite as usize)
+        .collect();
+
     Ok(ApiResponse::new(
         StatusCode::OK,
         "repositorios listados",
-        contenido(&vistas)?,
+        Data::Paginated(PaginatedResponse::new(
+            pagina
+                .into_iter()
+                .map(|v| {
+                    serde_json::to_value(v)
+                        .map_err(|e| AppError::Other(format!("error serializando: {e}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            total,
+            limite,
+            desplazamiento,
+        )),
     ))
 }
 
@@ -1295,9 +1366,9 @@ mod tests {
             "el listado tiene que contestar 200; contestó {status} con {cuerpo}"
         );
 
-        let filas = cuerpo["data"].as_array().unwrap_or_else(|| {
-            panic!("el listado tiene que traer un array en `data`, y llegó {cuerpo}")
-        });
+        let filas = cuerpo["data"].as_object().expect("data debe ser objeto")["items"]
+            .as_array()
+            .expect("items debe ser array");
 
         assert!(
             filas.iter().any(|fila| fila["name"] == "repo-1-7"),
@@ -1328,9 +1399,9 @@ mod tests {
              {status} con {cuerpo}"
         );
 
-        let filas = cuerpo["data"]
+        let filas = cuerpo["data"].as_object().expect("data")["items"]
             .as_array()
-            .unwrap_or_else(|| panic!("el listado vacío tiene que traer un array en `data`, no un `null`, y llegó {cuerpo}"));
+            .expect("items debe ser array");
 
         assert!(
             filas.is_empty(),
@@ -2982,9 +3053,9 @@ mod tests {
         assert_eq!(respuesta.status(), StatusCode::OK);
 
         let cuerpo = body_json(respuesta).await;
-        let elementos = cuerpo["data"]
+        let elementos = cuerpo["data"].as_object().expect("data")["items"]
             .as_array()
-            .expect("el listado tiene que traer un array en `data`");
+            .expect("items debe ser array");
 
         assert_eq!(
             elementos.len(),
@@ -3462,6 +3533,83 @@ mod tests {
         assert_eq!(
             bucket, "cubo-3-3",
             "el bucket se guarda recortado, sin los espacios de los extremos"
+        );
+    }
+
+    /// El listado de repositorios debe responder con paginación.
+    ///
+    /// El endpoint `GET /api/v1/repositories` debe aceptar los parámetros de
+    /// consulta `limit` y `offset` y devolver un **wrapper** con `items`
+    /// (el trozo de la página) y `total` (el número de filas en la tabla),
+    /// en lugar de un array plano. Esta prueba queda en rojo porque la
+    /// implementación actual devuelve un array sin paginar.
+    #[tokio::test]
+    async fn el_listado_de_repositorios_debe_responder_con_paginacion() {
+        let router = api_router(estado_desarrollo().await).clone();
+
+        // Damos de alta dos repositorios para tener algo que paginar.
+        for nombre in ["repo-pag-uno", "repo-pag-dos"] {
+            let respuesta = post_json(
+                router.clone(),
+                "/api/v1/repositories",
+                &cuerpo_de_alta(nombre),
+            )
+            .await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::CREATED,
+                "el alta de `{nombre}` tiene que contestar 201"
+            );
+        }
+
+        // Pedimos una página con `limit` y `offset`.
+        let respuesta = get(router, "/api/v1/repositories?limit=1&offset=0").await;
+
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado paginado tiene que contestar 200; contestó {status} con {cuerpo}"
+        );
+
+        // La respuesta debe ser un **objeto** con `items` y `total`, no un array plano.
+        let data = cuerpo["data"].as_object().unwrap_or_else(|| {
+            panic!(
+                "el listado paginado tiene que traer un objeto en `data` con `items` y \
+                     `total`, y llegó {cuerpo}"
+            )
+        });
+
+        assert!(
+            data.contains_key("items"),
+            "el wrapper de paginación tiene que llevar la clave `items`: {cuerpo}"
+        );
+        assert!(
+            data.contains_key("total"),
+            "el wrapper de paginación tiene que llevar la clave `total`: {cuerpo}"
+        );
+
+        let items = data["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`items` tiene que ser un array: {cuerpo}"));
+
+        assert_eq!(
+            items.len(),
+            1,
+            "con `limit=1` la página tiene que traer un solo elemento, y llegó {}: {cuerpo}",
+            items.len()
+        );
+
+        let total = data["total"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("`total` tiene que ser un número: {cuerpo}"));
+
+        assert_eq!(
+            total, 2,
+            "con dos repositorios en la tabla, `total` tiene que ser 2: {cuerpo}"
         );
     }
 }
