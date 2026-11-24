@@ -30,6 +30,14 @@ pub struct Cliente {
 }
 
 impl Cliente {
+    /// El cliente del daemon, para el proceso privilegiado.
+    #[cfg(feature = "motor")]
+    pub(crate) fn docker(&self) -> &Docker {
+        &self.docker
+    }
+}
+
+impl Cliente {
     /// Conecta con el socket indicado.
     ///
     /// `socket` acepta las dos formas: `unix://<ruta>` y la ruta pelada —la biblioteca
@@ -501,7 +509,7 @@ impl Cliente {
     /// fuente de copia —el motivo lo nombra—, y los errores del transporte
     /// ([`Error::MotorContesta`], [`Error::MotorNoContesta`]) si la inspección no se pudo
     /// completar, que es un desenlace **distinto** y no se confunde con el de la etiqueta.
-    async fn exigir_fuente_de_copia(&self, contenedor: &str) -> Result<(), Error> {
+    pub(crate) async fn exigir_fuente_de_copia(&self, contenedor: &str) -> Result<(), Error> {
         let inspeccion = self
             .docker
             .inspect_container(contenedor, None::<InspectContainerOptions>)
@@ -660,7 +668,7 @@ fn opciones_con_entrada(orden: &Orden) -> CreateExecOptions<&str> {
 /// hueco de defensa y no un fallo reproducido: lo que se cierra es la pregunta, no el caso.
 /// Un `running` que el motor **no** informe (`None`) no se lee como «sigue en marcha»: no
 /// saberlo no es saber que sí, y ese desenlace ya está cubierto por el `exit_code` ausente.
-fn codigo_de_salida(estado: &ExecInspectResponse) -> Option<i32> {
+pub(crate) fn codigo_de_salida(estado: &ExecInspectResponse) -> Option<i32> {
     if estado.running == Some(true) {
         return None;
     }
@@ -686,7 +694,7 @@ fn codigo_de_salida(estado: &ExecInspectResponse) -> Option<i32> {
 ///
 /// Devuelve [`Error::ContenedorNoEsFuenteDeCopia`] cuando el contenedor no lleva la etiqueta con
 /// el valor exigido. El motivo lo nombra, que es lo que el operador necesita para recrearlo bien.
-fn exigir_la_etiqueta_de_fuente(
+pub(crate) fn exigir_la_etiqueta_de_fuente(
     contenedor: &str,
     inspeccion: &ContainerInspectResponse,
 ) -> Result<(), Error> {
@@ -720,7 +728,7 @@ impl std::fmt::Debug for Cliente {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "motor")))]
 mod tests {
     use std::collections::HashMap;
     use std::future::Future;

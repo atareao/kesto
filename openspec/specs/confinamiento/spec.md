@@ -102,7 +102,7 @@ El contenedor del target SHALL disponer de `readlink` —lo traen busybox y core
 
 El motor SHALL inspeccionar el contenedor de un target antes de crear ningún `exec` y SHALL exigir que lleve la etiqueta `io.kesto.backup-source` con el valor `true`. Sin la etiqueta, la ejecución SHALL quedar en `failed` con un motivo que nombre el contenedor, y NO SHALL crearse el `exec`.
 
-La comprobación SHALL aplicarse en el **único punto** por el que pasan todos los `exec` de bollard —el cliente del daemon—, de modo que ningún camino del motor pueda saltársela.
+La comprobación SHALL aplicarse en el **único punto** por el que pasan todos los `exec` de bollard —el cliente del daemon—, de modo que ningún camino del motor pueda saltársela. Tras la separación de privilegios, ese cliente vive en el proceso `kesto-motor`: la comprobación SHALL ejecutarse allí, antes de cualquier llamada a bollard, y SHALL NOT delegarse en la API ni sustituirse por la lista blanca del IPC. El error que vuelve a la API SHALL NOT filtrar credenciales ni rutas de socket.
 
 Es **fail-closed**: sin etiqueta no se ejecuta nada, y no hay una lista que poblar ni un valor por defecto permisivo. La declaración viaja con el contenedor, así que quien lo crea decide si es fuente de copia y no hay dos sitios que mantener en sincronía. Y el propio contenedor de Kesto queda denegado por sí solo, porque nadie lo etiqueta: no hace falta cablear su nombre, que cambiaría con cualquier renombrado del despliegue.
 
@@ -133,3 +133,10 @@ Es **fail-closed**: sin etiqueta no se ejecuta nada, y no hay una lista que pobl
 - **WHEN** se ejecuta la restauración
 - **THEN** SHALL acabar en `failed`
 - **AND** NO SHALL crearse ningún `exec`
+
+#### Scenario: La etiqueta se comprueba en el motor tras el IPC
+- **GIVEN** una solicitud `CrearExec` o `IniciarExec` legítima enviada por la API, y un contenedor sin la etiqueta
+- **WHEN** el motor la atiende
+- **THEN** el motor SHALL inspeccionar el contenedor y rechazar la operación antes de crear el `exec`
+- **AND** la ejecución SHALL acabar en `failed` nombrando el contenedor
+- **AND** el error devuelto a la API SHALL NOT contener credenciales ni la ruta del socket

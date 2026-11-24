@@ -15,11 +15,18 @@ pub mod db;
 pub mod docker;
 pub mod engine;
 pub mod error;
+pub mod ipc;
+pub mod motor;
 pub mod panel;
 pub mod rustic;
 pub mod scheduler;
 pub mod secret;
 pub mod state;
+
+// El motor incluido en la API con `feature = "motor"` reutiliza la misma
+// frontera de rutas; el binario `kesto-motor` la incluye por `#[path]`.
+#[cfg(feature = "motor")]
+pub use engine::frontera;
 
 #[cfg(test)]
 mod test_support;
@@ -362,10 +369,10 @@ async fn main() -> std::process::ExitCode {
     //    mismo «abrir, migrar y solo entonces» que rige la base—; y nada de lo que sirve el
     //    §5 —ni una copia, ni el explorador de instantáneas— existe antes del motor.
     //
-    //    El socket sale de la configuración —`DOCKER_HOST`, con la ruta del §8 de defecto—,
-    //    y no del entorno del proceso: es la misma lectura inyectada que el resto, y es lo
+    //    El socket sale de la configuración —la ruta IPC compartida con el motor— y no
+    //    del entorno del proceso: es la misma lectura inyectada que el resto, y es lo
     //    que deja que una prueba quiera otro socket sin tocar el entorno.
-    let ajustes = Ajustes::nuevos(config.docker_host.clone())
+    let ajustes = Ajustes::nuevos(config.motor_socket.clone())
         .con_raiz_de_copias(config.raiz_de_copias.clone());
     // La espera de la parada se lee **antes** de mover los ajustes al motor, porque es el
     // número con el que el apagado de más abajo acota su espera, y de ahí no se puede leer.

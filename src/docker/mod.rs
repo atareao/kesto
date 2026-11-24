@@ -17,13 +17,32 @@
 //! tiene que seguir vivo mientras se drena su salida**. Está medido y contado en
 //! [`Cliente::ejecutar`], y hay una prueba marcada `#[ignore]` que lo fija.
 
+#[cfg(feature = "motor")]
 mod cliente;
+#[cfg(feature = "motor")]
+pub use cliente::Cliente;
+#[cfg(feature = "motor")]
+pub(crate) use cliente::{codigo_de_salida, exigir_la_etiqueta_de_fuente};
+
+// La API —también al compilar sus pruebas— usa el cliente IPC real: `cfg(test)`
+// no puede cambiar el transporte entregado, o las pruebas pasarían sobre un
+// cliente que no es el que se envía. `bollard` solo se compila en el motor.
+#[cfg(not(feature = "motor"))]
+mod ipc_cliente;
+#[cfg(not(feature = "motor"))]
+pub use ipc_cliente::Cliente;
+
+/// Causa del fallo, según el proceso: el error de la biblioteca en el motor,
+/// el del canal IPC en la API.
+#[cfg(feature = "motor")]
+type CausaDelMotor = bollard::errors::Error;
+/// Causa del fallo en la API, que no enlaza la biblioteca del daemon.
+#[cfg(not(feature = "motor"))]
+type CausaDelMotor = crate::ipc::Error;
 
 use std::time::Duration;
 
 use thiserror::Error;
-
-pub use cliente::Cliente;
 
 /// La etiqueta con la que un contenedor se declara **fuente de copia**.
 ///
@@ -172,7 +191,7 @@ pub enum Error {
         socket: String,
         /// Causa, tal y como la informa la biblioteca.
         #[source]
-        causa: bollard::errors::Error,
+        causa: CausaDelMotor,
     },
 
     /// El motor contestó con un error de su propia API al operar con un contenedor.
@@ -203,7 +222,7 @@ pub enum Error {
         contenedor: String,
         /// Causa, tal y como la informa la biblioteca.
         #[source]
-        causa: bollard::errors::Error,
+        causa: CausaDelMotor,
     },
 
     /// El `exec` no dejó ningún flujo del que leer.
@@ -314,6 +333,7 @@ pub enum Error {
     },
 }
 
+#[cfg(feature = "motor")]
 impl Error {
     /// Traduce un fallo del motor que se refiere a un contenedor concreto.
     ///
@@ -322,7 +342,7 @@ impl Error {
     /// de [`Error::MotorNoContesta`]. Se distinguen porque no se arreglan igual: lo
     /// primero es el motor diciendo que no a algo concreto, lo segundo es no haber podido
     /// preguntarle.
-    fn del_contenedor(contenedor: &str, causa: bollard::errors::Error) -> Self {
+    pub(crate) fn del_contenedor(contenedor: &str, causa: bollard::errors::Error) -> Self {
         match causa {
             bollard::errors::Error::DockerResponseServerError {
                 status_code,
@@ -341,7 +361,7 @@ impl Error {
 
     /// Traduce un fallo del motor que **no** se refiere a ningún contenedor: la conexión
     /// inicial y la comprobación de que el motor contesta.
-    fn del_socket(socket: &str, causa: bollard::errors::Error) -> Self {
+    pub(crate) fn del_socket(socket: &str, causa: bollard::errors::Error) -> Self {
         match causa {
             // La biblioteca comprueba que la ruta existe **antes** de abrir nada, así que
             // este fallo es «no hay socket ahí» y no un problema de transporte: se
@@ -357,21 +377,24 @@ impl Error {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "motor")))]
 mod tests {
     use std::time::Duration;
 
+    #[cfg(feature = "motor")]
     use bollard::errors::Error as ErrorDelMotor;
 
     use super::{Canal, Error, Orden};
 
     /// El mensaje que el motor da cuando el contenedor no existe, **medido** contra el
     /// Podman de esta máquina: el nombre del contenedor viaja dentro, entrecomillado.
+    #[cfg(feature = "motor")]
     const MENSAJE_DEL_404: &str =
         "no container with name or ID \"mi-contenedor\" found: no such container";
 
     /// El mensaje que el motor da cuando el `exec` se pide sin ningún `attach`, también
     /// medido: es un `500` del motor, no un fallo del comando.
+    #[cfg(feature = "motor")]
     const MENSAJE_DEL_500: &str = "must provide at least one stream to attach to: invalid argument";
 
     /// Un 404 del motor se traduce a nuestro error y **el motivo nombra el contenedor**.
@@ -379,6 +402,7 @@ mod tests {
     /// Es el requisito que impide que un contenedor mal escrito se lea como un fallo de
     /// volcado: el motivo tiene que llevar el nombre, y no se delega en el texto del motor
     /// —que hoy lo lleva— porque ese texto es suyo.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_404_del_motor_nombra_el_contenedor() {
         let medida = ErrorDelMotor::DockerResponseServerError {
@@ -420,6 +444,7 @@ mod tests {
     /// Es la mitad que de verdad se prueba: con el mensaje medido, un código que se limitara
     /// a copiarlo pasaría la prueba de arriba sin poner nada de su parte. Aquí el mensaje no
     /// lleva el nombre y el motivo lo tiene que llevar igual.
+    #[cfg(feature = "motor")]
     #[test]
     fn el_motivo_nombra_el_contenedor_aunque_el_motor_no_lo_haga() {
         let medida = ErrorDelMotor::DockerResponseServerError {
@@ -439,6 +464,7 @@ mod tests {
     ///
     /// Se distingue del 404 porque no significan lo mismo: el 404 dice que el contenedor no
     /// está, y el 500 —el que midió el `attach` ausente— dice que la petición no se entendió.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_500_del_motor_conserva_su_codigo_y_su_mensaje() {
         let medida = ErrorDelMotor::DockerResponseServerError {
@@ -472,6 +498,7 @@ mod tests {
     /// Es la diferencia entre «el motor dijo que no» y «no se pudo preguntar». Inventar un
     /// `status_code` para lo segundo mandaría a buscar un contenedor inexistente cuando el
     /// problema es el transporte.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_fallo_que_no_es_del_servidor_se_conserva_como_causa() {
         let error = Error::del_contenedor("mi-contenedor", ErrorDelMotor::RequestTimeoutError);
@@ -487,6 +514,7 @@ mod tests {
     }
 
     /// Un socket que no existe se reconoce como tal, y el motivo nombra la ruta pedida.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_socket_inexistente_se_reconoce_por_su_ruta() {
         let error = Error::del_socket(

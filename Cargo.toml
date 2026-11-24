@@ -219,7 +219,10 @@ base64 = "0.22.1"
 # fixed: no existing version line was changed to square the tree, because the
 # deduplication decision belongs to whoever owns the engine change. Read this
 # before touching a version in either block.
-bollard = "0.18.1"
+# El daemon de contenedores vive detrás de la feature `motor`: la API no enlaza
+# `bollard` y solo el binario `kesto-motor`, que es el único que monta el socket
+# del daemon, activa esta dependencia.
+bollard = { version = "0.18.1", optional = true }
 rustic_core = "0.13.0"
 rustic_backend = { version = "0.7.0", default-features = false, features = ["opendal"] }
 futures-util = "0.3.34"
@@ -307,10 +310,13 @@ chrono = "0.4"
 # carries the extension trait. Same play as `base64` and `futures-util` above, and the
 # same consequence: a crate in `[dependencies]` is already available to tests, so it is
 # not repeated under `[dev-dependencies]`.
-tower-http = { version = "0.6.11", features = ["fs", "set-header"] }
+tower-http = { version = "0.6.11", features = ["fs", "set-header", "catch-panic"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [features]
+# El proceso con privilegio sobre el daemon de contenedores. La API se compila
+# sin él: no enlaza `bollard` y habla con el motor por el socket IPC.
+motor = ["dep:bollard"]
 # La batería de punta a punta del issue #86. Es una feature y no un simple fichero de
 # `tests/` porque su arnés levanta contenedores, un servidor S3 y el propio binario: nada
 # de eso puede correr en el job `backend` del CI, que no tiene motor de contenedores. Con
@@ -319,12 +325,25 @@ tower = { version = "0.5.3", features = ["util"] }
 # `--features e2e`.
 e2e = []
 
+[[bin]]
+name = "kesto-motor"
+path = "src/bin/kesto-motor.rs"
+required-features = ["motor"]
+
 [[test]]
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e"]
 
 [dev-dependencies]
+# Las pruebas del transporte del motor y la batería e2e ejercitan el daemon
+# directamente; el arnés de pruebas (`src/test_support.rs`) usa `bollard` solo
+# para crear y borrar contenedores de prueba. Cargo no permite condicionar una
+# dev-dependency a una feature, pero esto no cambia el transporte de la API:
+# con `cfg(test)` y sin la feature `motor`, `src/docker/mod.rs` entrega siempre
+# `src/docker/ipc_cliente.rs`, nunca `cliente.rs`. El binario `kesto` no enlaza
+# `bollard`; compruébalo con `cargo tree -p kesto --bin kesto`.
+bollard = "0.18.1"
 http-body-util = "0.1"
 # `log` entra **solo** para las pruebas, y por un motivo concreto: el puente `log` → `tracing`
 # que la prueba 1.37 («la contraseña no sale en el registro») tiene que montar por su cuenta,
