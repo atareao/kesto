@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-24
+specs:
+  - specs/api/executions-error_message.spec.md
+  - specs/docker/socket-security.spec.md

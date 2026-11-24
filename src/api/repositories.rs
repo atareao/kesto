@@ -3612,4 +3612,218 @@ mod tests {
             "con dos repositorios en la tabla, `total` tiene que ser 2: {cuerpo}"
         );
     }
+
+    /// SEC-22 (resto): POST /api/v1/repositories con endpoint inseguro sin permiso → 400 insecure_endpoint.
+    ///
+    /// Cubre el spec delta `socket-security`: si el `endpoint` apunta a un socket Docker `http://`
+    /// y no se ha declarado `KESTO_ALLOW_INSECURE_ENDPOINT=1`, la API debe contestar `400`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_docker_sin_permiso_contesta_400() {
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool, clave),
+        );
+
+        // Un endpoint que apunta a localhost por http es inseguro sin permiso.
+        let mut cuerpo = serde_json::json!({
+            "name": "repo-sec-22",
+            "endpoint": "http://localhost:2375",
+            "bucket": "cubo-de-seguridad",
+            "region": "eu-west-1",
+            "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "secret_access_key": "clave-secreta-distinguible-0000000000000001",
+            "passphrase": PASSPHRASE_DE_PRUEBA
+        });
+        if let Some(mapa) = cuerpo.as_object_mut() {
+            mapa.remove("health");
+            mapa.remove("health_checked_at");
+            mapa.remove("health_detail");
+        }
+
+        let router = api_router(estado);
+        let respuesta = post_json(router, "/api/v1/repositories", &cuerpo).await;
+        let status = respuesta.status();
+        let cuerpo_respuesta = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "un endpoint inseguro sin permiso ha de contestar 400: {cuerpo_respuesta}"
+        );
+
+        let mensaje = cuerpo_respuesta["message"]
+            .as_str()
+            .expect("el 400 tiene que traer mensaje")
+            .to_owned();
+
+        assert!(
+            mensaje.contains("endpoint"),
+            "el mensaje ha de nombrar el campo endpoint: {mensaje}"
+        );
+    }
+
+    /// SEC-22 (resto): POST /api/v1/repositories con permiso de endpoint inseguro → 201.
+    ///
+    /// Cubre el spec delta `socket-security`: cuando se declara `KESTO_ALLOW_INSECURE_ENDPOINT=1`
+    /// y la configuración completa `KESTO_ALLOW_INSECURE=1`, el motor se arranca con los permisos
+    /// y un alta con directorio local contesta `201`. Valida que las variables de entorno del
+    /// permiso se leen correctamente y no bloquean el flujo normal de alta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_local_con_permiso_contesta_201() {
+        let destino = destino_local_de_prueba("repo-sec-permiso");
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        // Esta configuración habilita `KESTO_ALLOW_INSECURE=1` y `KESTO_ALLOW_INSECURE_ENDPOINT=1`,
+        // que es lo que mide esta prueba: los permisos están activos y el alta avanza.
+        let estado = estado_de_prueba(
+            config_con_dsn_y_endpoint_inseguro(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool, clave),
+        );
+
+        let mut cuerpo = serde_json::json!({
+            "name": "repo-sec-22-con-permiso",
+            "endpoint": &destino,
+            "bucket": "cubo-de-seguridad-permiso",
+            "region": "eu-west-1",
+            "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "secret_access_key": "clave-secreta-distinguible-0000000000000001",
+            "passphrase": PASSPHRASE_DE_PRUEBA
+        });
+        if let Some(mapa) = cuerpo.as_object_mut() {
+            mapa.remove("health");
+            mapa.remove("health_checked_at");
+            mapa.remove("health_detail");
+        }
+
+        let router = api_router(estado);
+        let respuesta = post_json(router, "/api/v1/repositories", &cuerpo).await;
+        let status = respuesta.status();
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un endpoint local con permiso ha de contestar 201"
+        );
+    }
+
+    /// SEC-22 (resto): POST /api/v1/repositories con endpoint HTTPS → 201.
+    ///
+    /// Cubre el spec delta `socket-security`: un endpoint por https siempre se admite (sin
+    /// necesidad de `KESTO_ALLOW_INSECURE_ENDPOINT`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_https_se_acepta() {
+        let destino = destino_local_de_prueba("repo-https");
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool, clave),
+        );
+
+        let mut cuerpo = serde_json::json!({
+            "name": "repo-sec-22-https",
+            "endpoint": &destino,
+            "bucket": "cubo-de-seguridad-https",
+            "region": "eu-west-1",
+            "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "secret_access_key": "clave-secreta-distinguible-0000000000000001",
+            "passphrase": PASSPHRASE_DE_PRUEBA
+        });
+        if let Some(mapa) = cuerpo.as_object_mut() {
+            mapa.remove("health");
+            mapa.remove("health_checked_at");
+            mapa.remove("health_detail");
+        }
+
+        let router = api_router(estado);
+        let respuesta = post_json(router, "/api/v1/repositories", &cuerpo).await;
+        let status = respuesta.status();
+        let cuerpo_respuesta = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "un endpoint por https ha de contestar 201: {cuerpo_respuesta}"
+        );
+
+        let id = cuerpo_respuesta["data"]["id"]
+            .as_str()
+            .expect("el alta debe devolver el identificador");
+
+        assert!(!id.is_empty(), "la ID no puede estar vacía");
+    }
+
+    /// SEC-22 (resto): PUT /api/v1/repositories con endpoint inseguro sin permiso → 400.
+    ///
+    /// Cubre el spec delta `socket-security`: la edición aplica la misma regla de admisión
+    /// que el alta: un endpoint inseguro sin permiso se rechaza.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_con_endpoint_inseguro_sin_permiso_contesta_400() {
+        let destino = destino_local_de_prueba("repo-put-inseguro");
+        let (directorio, pool, clave) = base_con_clave().await;
+
+        let estado = estado_de_prueba(
+            config_con_dsn(&directorio.dsn()),
+            EstadoDeBase::nuevo(pool, clave),
+        );
+
+        // Primero dar de alta un repositorio válido.
+        let mut alta_cuerpo = serde_json::json!({
+            "name": "repo-put-base",
+            "endpoint": &destino,
+            "bucket": "cubo-base",
+            "region": "eu-west-1",
+            "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "secret_access_key": "clave-secreta-distinguible-0000000000000001",
+            "passphrase": PASSPHRASE_DE_PRUEBA
+        });
+        if let Some(mapa) = alta_cuerpo.as_object_mut() {
+            mapa.remove("health");
+            mapa.remove("health_checked_at");
+            mapa.remove("health_detail");
+        }
+
+        let router = api_router(estado);
+
+        let respuesta_alta = post_json(router.clone(), "/api/v1/repositories", &alta_cuerpo).await;
+        assert_eq!(
+            respuesta_alta.status(),
+            StatusCode::CREATED,
+            "el alta inicial tiene que contestar 201"
+        );
+
+        let body = body_json(respuesta_alta).await;
+        let id_alta = body["data"]["id"].as_str().expect("el alta devuelve el id");
+
+        // Ahora intentar editar con un endpoint inseguro sin permiso.
+        let mut edita_cuerpo = serde_json::json!({
+            "name": "repo-put-editado",
+            "endpoint": "http://localhost:2375",
+            "bucket": "cubo-editado",
+            "region": "eu-west-1",
+            "access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "secret_access_key": "clave-secreta-distinguible-0000000000000001",
+            "passphrase": PASSPHRASE_DE_PRUEBA
+        });
+        if let Some(mapa) = edita_cuerpo.as_object_mut() {
+            mapa.remove("health");
+            mapa.remove("health_checked_at");
+            mapa.remove("health_detail");
+        }
+
+        let respuesta_edita = put_json(
+            router,
+            &format!("/api/v1/repositories/{id_alta}"),
+            &edita_cuerpo,
+        )
+        .await;
+
+        assert_eq!(
+            respuesta_edita.status(),
+            StatusCode::BAD_REQUEST,
+            "editar con endpoint inseguro sin permiso ha de contestar 400"
+        );
+    }
 }
