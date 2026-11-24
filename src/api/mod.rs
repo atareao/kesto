@@ -1,6 +1,7 @@
 //! API HTTP de Kesto: el router de `/api/v1` y la partición de su superficie.
 
 pub mod auth;
+pub mod error_sanitizer;
 pub mod events;
 pub mod executions;
 pub mod extract;
@@ -607,7 +608,12 @@ mod tests {
 
         let cuerpo = body_json(respuesta).await;
 
-        assert_eq!(cuerpo["data"]["auth_mode"], "oidc");
+        // SEC-21: data ya no incluye auth_mode
+        let data_objeto = cuerpo["data"].as_object().expect("data debe ser un objeto");
+        assert!(
+            !data_objeto.contains_key("auth_mode"),
+            "data no debe tener auth_mode tras SEC-21"
+        );
     }
 
     #[tokio::test]

@@ -462,7 +462,13 @@ mod tests {
         let salud = get(router, "/api/v1/health").await;
 
         assert_eq!(salud.status(), StatusCode::OK);
-        assert_eq!(body_json(salud).await["data"]["auth_mode"], "disabled");
+        assert!(
+            body_json(salud).await["data"]
+                .as_object()
+                .expect("data")
+                .get("auth_mode")
+                .is_none()
+        );
     }
 
     /// Escenario «La HSTS cubre también el panel».
@@ -798,6 +804,12 @@ mod tests {
 
         let cuerpo = body_json(respuesta).await;
 
-        assert_eq!(cuerpo["data"]["auth_mode"], "disabled");
+        assert!(
+            cuerpo["data"]
+                .as_object()
+                .expect("data")
+                .get("auth_mode")
+                .is_none()
+        )
     }
 }
