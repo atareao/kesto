@@ -69,13 +69,15 @@ fn status_code(raw: u16) -> StatusCode {
     StatusCode::from_u16(raw).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// Contenido de una respuesta: ausente o un valor JSON.
+/// Contenido de una respuesta: ausente, un valor JSON, o una respuesta paginada.
 #[derive(Debug, Clone)]
 pub enum Data {
     /// Sin contenido: se serializa como `null`.
     None,
     /// Un valor JSON.
     Some(serde_json::Value),
+    /// Una respuesta paginada con metadatos de paginación.
+    Paginated(PaginatedResponse<serde_json::Value>),
 }
 
 impl Serialize for Data {
@@ -86,6 +88,40 @@ impl Serialize for Data {
         match self {
             Self::None => serializer.serialize_none(),
             Self::Some(valor) => valor.serialize(serializer),
+            Self::Paginated(paginado) => paginado.serialize(serializer),
+        }
+    }
+}
+
+/// Respuesta paginada común para los listados.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedResponse<T> {
+    /// Elementos de la página actual.
+    pub items: Vec<T>,
+    /// Total de elementos sin paginar.
+    pub total: i64,
+    /// Límite aplicado.
+    pub limit: i64,
+    /// Desplazamiento aplicado.
+    pub offset: i64,
+    /// Página siguiente si existe.
+    pub next_page: Option<usize>,
+}
+
+impl<T> PaginatedResponse<T> {
+    /// Construye una respuesta paginada.
+    pub fn new(items: Vec<T>, total: i64, limit: i64, offset: i64) -> Self {
+        let next_page = if offset + limit < total {
+            Some(((offset + limit) / limit) as usize)
+        } else {
+            None
+        };
+        Self {
+            items,
+            total,
+            limit,
+            offset,
+            next_page,
         }
     }
 }
