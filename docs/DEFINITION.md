@@ -310,21 +310,45 @@ services:
       # Ruta absoluta; por defecto /backup_sources, que es donde se montan abajo
       # los directorios a respaldar. Presente pero relativa o vacía = error de arranque.
       - KESTO_BACKUP_ROOT=/backup_sources
+      # Canal IPC con el motor de copias. La API NO ve el socket del daemon.
+      - KESTO_MOTOR_SOCKET=/run/kesto/motor.sock
       # Opcional: rebaja el borde del `endpoint` para un almacén S3 en claro y en la
       # propia máquina (laboratorio). `1` concede; `0` o ausente lo niega. Nunca rebaja
       # el enlace local, la dirección de metadatos ni las credenciales embebidas.
       # - KESTO_ALLOW_INSECURE_ENDPOINT=1
     volumes:
-      # Acceso al socket de Docker del host
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Directorios del host a respaldar (modo lectura)
+      # Canal IPC compartido con el proceso privilegiado; NO el socket de Docker.
+      - kesto_ipc:/run/kesto
+      # Directorios del host a respaldar (modo lectura), bajo KESTO_BACKUP_ROOT.
       - /var/www:/backup_sources/var_www:ro
       - /etc/nginx:/backup_sources/nginx_config:ro
       # Persistencia interna de la app (DB SQLite)
       - kesto_data:/app/data
 
+  # Proceso privilegiado: el único que monta el socket del daemon y puede crear
+  # `exec` en los contenedores fuente. Su UID de par tiene que ser el de `kesto`.
+  kesto-motor:
+    image: kesto:latest
+    container_name: kesto-motor
+    restart: always
+    entrypoint: ["/app/kesto-motor"]
+    user: "10001:10001"
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - KESTO_MOTOR_SOCKET=/run/kesto/motor.sock
+      - KESTO_API_UID=10001
+      - KESTO_BACKUP_ROOT=/backup_sources
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - kesto_ipc:/run/kesto
+      - /var/www:/backup_sources/var_www:ro
+      - /etc/nginx:/backup_sources/nginx_config:ro
+    # El gid del dueño del socket del daemon depende del host (`getent group docker`).
+
 volumes:
   kesto_data:
+  kesto_ipc:
 
 ```
 
@@ -332,7 +356,9 @@ volumes:
 
 La cuarta `OIDC_*`, `OIDC_REDIRECT_URL`, deja de ser opcional: sin valor por defecto —el que había, `http://localhost:8080/api/v1/auth/callback`, desapareció justo por ser `http`—, en modo OIDC es **obligatoria** y **tiene que ser `https`**. El motivo es que la cookie de sesión se emite **siempre** con el atributo `Secure` —es una cookie de sesión, y una cookie de sesión sin `Secure` viaja en claro—, de modo que un retorno por `http` haría que el navegador no la devolviera nunca: fallar en el arranque es mejor que un panel que no deja entrar. Ausente con las otras tres puestas, o presente con un valor que no sea `https`, el arranque falla nombrando la variable. Configurada **sola**, sin las otras tres, se sigue ignorando en silencio: los tres desenlaces del modo se deciden sobre la presencia de `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`.
 
-**`KESTO_BACKUP_ROOT`** es la raíz bajo la que ha de quedar el `host_path` de un target `directory`. Su valor por defecto es `/backup_sources` —exactamente donde este `compose` monta los directorios a respaldar—, así que la plantilla de referencia no necesita declararla. Es una ruta **absoluta**: presente pero relativa o vacía es **error de arranque** que nombra la variable, en la línea de `RUST_LOG=""` y `BIND_ADDRESS=""`; ausente toma el defecto.
+**`KESTO_BACKUP_ROOT`** es la raíz bajo la que ha de quedar el `host_path` de un target `directory`. Su valor por defecto es `/backup_sources` —exactamente donde este `compose` monta los directorios a respaldar en **los dos servicios**—, así que la plantilla de referencia no necesita declararla. Es una ruta **absoluta**: presente pero relativa o vacía es **error de arranque** que nombra la variable, en la línea de `RUST_LOG=""` y `BIND_ADDRESS=""`; ausente toma el defecto. La API valida el `host_path` contra esta raíz y el motor repite el confinamiento antes del `exec`: si cambias la raíz hay que declararla en `kesto` y en `kesto-motor` y montar las mismas fuentes bajo ella en ambos, o el motor rechazará rutas que la API aceptó.
+
+**`KESTO_MOTOR_SOCKET`** y **`KESTO_API_UID`** definen el canal entre los dos procesos. La primera la leen la API y el motor, y apunta al mismo fichero del volumen `kesto_ipc` (`/run/kesto/motor.sock` por defecto): la API solo entrega órdenes por ahí y **nunca** lee `DOCKER_HOST`; el motor enlaza el socket y atiende exclusivamente al UID de la API. `KESTO_API_UID` la lee **solo el motor**, es obligatoria y ha de ser un UID numérico: ausente o no numérico impide el arranque, sin modo degradado que acepte a otro par. En el `compose` se fija a `10001`, el mismo UID con el que corre `kesto`. El socket del daemon se monta únicamente en `kesto-motor`, en solo lectura.
 
 **`KESTO_ALLOW_INSECURE_ENDPOINT`** gobierna si el borde HTTP admite un `endpoint` de repositorio inseguro. Es **opcional** y su defecto es el permiso **negado**: `1` concede; `0` o **ausente** lo niega; cualquier otro valor —**vacío incluido**— es **error de arranque** que nombra la variable. Se lee **siempre**, también en modo OIDC, porque el `endpoint` de un repositorio se valida en los dos modos. Con el permiso, el borde admite un `endpoint` por `http` **y** uno que apunte al loopback —o a un nombre `localhost`/`*.localhost`—: son el mismo caso, «el destino está en mi propia máquina y en claro», que es el laboratorio local y la batería e2e. **No** rebaja nunca la dirección de enlace local (`169.254.0.0/16`, `fe80::/10`), la dirección de metadatos (`169.254.169.254`, `fd00:ec2::254`), la dirección no especificada (`0.0.0.0`, `::`) ni las credenciales embebidas en la URL: esas se rechazan también con el permiso. Sin el permiso, el `endpoint` tiene que ser una URL absoluta con esquema `https` y host. En el `compose` es **opcional** y viaja por el `env_file` (`.env`), no por `environment:` con `:?`.
 
