@@ -39,9 +39,14 @@ services:
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?falta OIDC_CLIENT_SECRET}
       OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL:?falta OIDC_REDIRECT_URL}
       KESTO_SECRET: ${KESTO_SECRET:?falta KESTO_SECRET}
+      # Ruta compartida con el motor; la API NO ve el socket del daemon.
+      KESTO_MOTOR_SOCKET: /run/kesto/motor.sock
+      # Raíz confinada de los targets `directory`: la API valida el host_path
+      # contra ella y el motor repite la comprobación antes del `exec`.
+      KESTO_BACKUP_ROOT: /backup_sources
     volumes:
-      # Socket del daemon para el `exec` de bollard, en solo lectura.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Canal IPC con el proceso privilegiado.
+      - kesto_ipc:/run/kesto
       # Fuentes de copia de ejemplo del §8, en solo lectura.
       - /var/www:/backup_sources/var_www:ro
       - /etc/nginx:/backup_sources/nginx_config:ro
@@ -55,8 +60,34 @@ services:
     # sin configurar nada. En local lo cubre `just run` con `--userns=keep-id`.
     group_add: ["${DOCKER_GID:-10001}"]
 
+  # Proceso privilegiado: el único que monta el socket del daemon y que puede
+  # crear `exec` en los contenedores fuente. La API solo ve el socket IPC.
+  kesto-motor:
+    image: ghcr.io/atareao/kesto:latest
+    container_name: kesto-motor
+    restart: always
+    user: "10001:10001"
+    entrypoint: ["/app/kesto-motor"]
+    environment:
+      RUST_LOG: info
+      KESTO_MOTOR_SOCKET: /run/kesto/motor.sock
+      # UID del proceso de la API: el motor rechaza cualquier otro par IPC.
+      KESTO_API_UID: "10001"
+      # Misma raíz que la API (src/motor/config.rs): el motor la vuelve a
+      # aplicar a las fuentes `directory` antes de abrir el `exec`.
+      KESTO_BACKUP_ROOT: /backup_sources
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - kesto_ipc:/run/kesto
+      # Las fuentes confinadas tienen que existir también aquí: sin estos
+      # montajes el motor no vería los host_path que la API validó.
+      - /var/www:/backup_sources/var_www:ro
+      - /etc/nginx:/backup_sources/nginx_config:ro
+    group_add: ["${DOCKER_GID:-10001}"]
+
 volumes:
   kesto_data:
+  kesto_ipc:
 
 # ---
 # Ejemplo de fuente SQLite (§4): un servicio autoalojado cuya base vive DENTRO

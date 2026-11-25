@@ -1059,7 +1059,10 @@ pub async fn esperar_el_s3(endpoint: &str, plazo: Duration) -> Result<(), String
 
 /// El binario de Kesto arrancado para una prueba, con su base de datos y su puerto.
 pub struct Kesto {
+    /// API: es la que la prueba interroga por HTTP.
     hijo: Child,
+    /// Proceso privilegiado que enlaza el socket IPC y habla con el daemon de contenedores.
+    motor: Child,
     raiz: PathBuf,
     /// Puerto donde escucha.
     pub puerto: u16,
@@ -1068,11 +1071,35 @@ pub struct Kesto {
 
 impl Drop for Kesto {
     fn drop(&mut self) {
-        // El proceso muere pase lo que pase, incluso si la prueba entró en pánico.
+        // El proceso muere pase lo que pase, incluso si la prueba entró en pánico. La API
+        // primero: si el motor desapareciera antes, una petición en curso vería el IPC roto.
         let _ = self.hijo.kill();
         let _ = self.hijo.wait();
+        let _ = self.motor.kill();
+        let _ = self.motor.wait();
         let _ = std::fs::remove_dir_all(&self.raiz);
     }
+}
+
+/// Plazo para que `kesto-motor` enlace el socket IPC antes de arrancar la API.
+const PLAZO_DE_SOCKET_MOTOR: Duration = Duration::from_secs(10);
+
+/// UID numérico del proceso de prueba.
+///
+/// El motor comprueba `SO_PEERCRED` contra este valor: si la API hija corriera con otro UID,
+/// cada orden por el IPC sería rechazada. La prueba y la API son el mismo usuario, así que
+/// basta con leer el primer campo de la línea `Uid:` de `/proc/self/status`.
+fn uid_del_proceso() -> Result<u32, String> {
+    let estado = std::fs::read_to_string("/proc/self/status")
+        .map_err(|causa| format!("no se pudo leer `/proc/self/status`: {causa}"))?;
+    let uid = estado
+        .lines()
+        .find_map(|linea| linea.strip_prefix("Uid:"))
+        .and_then(|resto| resto.split_whitespace().next())
+        .ok_or_else(|| "`/proc/self/status` no tiene la línea `Uid:`".to_owned())?;
+
+    uid.parse::<u32>()
+        .map_err(|causa| format!("el UID `{uid}` de `/proc/self/status` no es válido: {causa}"))
 }
 
 impl Kesto {
@@ -1096,14 +1123,20 @@ impl Kesto {
     ///
     /// # Errors
     ///
-    /// Si el proceso no arranca o no llega a contestar la salud.
+    /// Si el motor no enlaza su socket IPC, o si el proceso no arranca o no llega a contestar
+    /// la salud.
     pub async fn arrancar(socket: &str, raiz_de_copias: &Path) -> Result<Self, String> {
         let puerto = puerto_libre();
         let raiz = std::env::temp_dir().join(format!("kesto-e2e-binario-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&raiz)
             .map_err(|causa| format!("no se pudo crear `{}`: {causa}", raiz.display()))?;
 
-        let registro = File::create(raiz.join("kesto.log"))
+        // Socket IPC privado de este escenario: el motor lo enlaza y la API lo abre.
+        let socket_motor = raiz.join("motor.sock");
+        let uid_api = uid_del_proceso()?;
+
+        let registro_ruta = raiz.join("kesto.log");
+        let registro = File::create(&registro_ruta)
             .map_err(|causa| format!("no se pudo abrir el registro de la prueba: {causa}"))?;
 
         let raiz_de_copias = raiz_de_copias
@@ -1115,6 +1148,64 @@ impl Kesto {
                 )
             })?
             .to_owned();
+
+        // Se clona antes de lanzar nada: así un fallo de clonado no deja un proceso huérfano.
+        let registro_motor_salida = registro
+            .try_clone()
+            .map_err(|causa| format!("no se pudo duplicar el registro del motor: {causa}"))?;
+        let registro_motor_error = registro
+            .try_clone()
+            .map_err(|causa| format!("no se pudo duplicar el registro del motor: {causa}"))?;
+        let registro_api_salida = registro
+            .try_clone()
+            .map_err(|causa| format!("no se pudo duplicar el registro: {causa}"))?;
+
+        // `cargo test --features e2e` no construye el motor: tiene `required-features = ["motor"]`.
+        let motor_bin =
+            std::env::var("KESTO_MOTOR_BIN").unwrap_or_else(|_| "target/debug/kesto-motor".into());
+        let mut motor = Command::new(&motor_bin)
+            .env_clear()
+            .env(ENV_DOCKER_HOST, socket)
+            .env("KESTO_MOTOR_SOCKET", socket_motor.as_os_str())
+            // `SO_PEERCRED` del API hijo tiene que coincidir con este UID.
+            .env("KESTO_API_UID", uid_api.to_string())
+            .env("KESTO_BACKUP_ROOT", &raiz_de_copias)
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(registro_motor_salida)
+            .stderr(registro_motor_error)
+            .spawn()
+            .map_err(|causa| {
+                format!(
+                    "no se pudo lanzar `{motor_bin}` (define `KESTO_MOTOR_BIN` si no está en \
+                     `target/debug/`): {causa}"
+                )
+            })?;
+
+        // La API solo conoce el IPC: arrancarla antes de que exista el socket la dejaría
+        // incapaz de copiar, aunque `/api/v1/health` contestara.
+        let inicio = Instant::now();
+        while !socket_motor.exists() {
+            if let Some(estado) = motor.try_wait().map_err(|causa| {
+                format!("no se pudo comprobar el estado de `{motor_bin}`: {causa}")
+            })? {
+                return Err(format!(
+                    "`{motor_bin}` terminó con {estado} antes de crear `{}`: mira `{}`",
+                    socket_motor.display(),
+                    registro_ruta.display()
+                ));
+            }
+            if inicio.elapsed() >= PLAZO_DE_SOCKET_MOTOR {
+                let _ = motor.kill();
+                let _ = motor.wait();
+                return Err(format!(
+                    "el socket IPC `{}` no apareció en {PLAZO_DE_SOCKET_MOTOR:?}: mira `{}`",
+                    socket_motor.display(),
+                    registro_ruta.display()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let hijo = Command::new(env!("CARGO_BIN_EXE_kesto"))
             // `env_clear` deja la prueba hermética: lo que el binario ve es solo lo de aquí.
@@ -1129,16 +1220,14 @@ impl Kesto {
             )
             .env("KESTO_BACKUP_ROOT", raiz_de_copias)
             .env("RUST_LOG", "info")
-            .env(ENV_DOCKER_HOST, socket)
+            .env("KESTO_MOTOR_SOCKET", socket_motor.as_os_str())
             .stdin(Stdio::null())
-            .stdout(
-                registro
-                    .try_clone()
-                    .map_err(|causa| format!("no se pudo duplicar el registro: {causa}"))?,
-            )
+            .stdout(registro_api_salida)
             .stderr(registro)
             .spawn()
             .map_err(|causa| {
+                let _ = motor.kill();
+                let _ = motor.wait();
                 format!(
                     "no se pudo lanzar el binario de Kesto (`{}`): {causa}",
                     env!("CARGO_BIN_EXE_kesto")
@@ -1152,6 +1241,7 @@ impl Kesto {
 
         let kesto = Self {
             hijo,
+            motor,
             raiz,
             puerto,
             cliente,

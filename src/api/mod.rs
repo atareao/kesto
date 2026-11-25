@@ -28,6 +28,7 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::time::Instant;
+use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::api::response::Data;
 use crate::auth::limite::IP_CENTINELA;
@@ -231,6 +232,7 @@ pub fn api_router(state: AppState) -> Router {
         .method_not_allowed_fallback(metodo_no_permitido)
         .layer(axum::middleware::from_fn(trazar))
         .with_state(state)
+        .layer(CatchPanicLayer::custom(respuesta_tras_panico))
 }
 
 /// La mitad protegida: las rutas de negocio, con el *gate* de sesión colgado.
@@ -308,6 +310,14 @@ pub(crate) async fn not_found() -> AppError {
 /// a los métodos que no son de lectura.
 pub(crate) async fn metodo_no_permitido() -> AppError {
     AppError::MethodNotAllowed("el método no está permitido en esta ruta".to_owned())
+}
+
+/// Convierte un pánico de un handler en el `500` de siempre.
+///
+/// El valor del pánico se descarta: puede contener credenciales o rutas del
+/// despliegue, y la respuesta de un `5xx` nunca las publica.
+fn respuesta_tras_panico(_: Box<dyn std::any::Any + Send>) -> axum::response::Response {
+    AppError::Other(String::from("pánico al atender la petición")).into_response()
 }
 
 /// El `404` de una tarea que no está, con un solo texto para las cuatro rutas que la buscan.
@@ -790,6 +800,28 @@ mod tests {
             serde_json::from_str(&texto).expect("el 401 debe traer JSON en el cuerpo");
 
         assert_eq!(cuerpo["status"], 401);
+    }
+
+    async fn panico() -> &'static str {
+        panic!("secreto-de-la-prueba")
+    }
+
+    #[tokio::test]
+    async fn un_panico_de_un_handler_no_llega_al_socket() {
+        let router = Router::new()
+            .route("/api/v1/panico", axum::routing::get(panico))
+            .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+                super::respuesta_tras_panico,
+            ));
+
+        let respuesta = get(router, "/api/v1/panico").await;
+
+        assert_eq!(respuesta.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let texto = body_text(respuesta).await;
+        assert!(
+            !texto.contains("secreto-de-la-prueba"),
+            "el pánico publicó su motivo por el socket: {texto}"
+        );
     }
 
     #[tokio::test]

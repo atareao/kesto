@@ -17,13 +17,36 @@
 //! tiene que seguir vivo mientras se drena su salida**. Está medido y contado en
 //! [`Cliente::ejecutar`], y hay una prueba marcada `#[ignore]` que lo fija.
 
+#[cfg(any(feature = "motor", test))]
 mod cliente;
+#[cfg(any(feature = "motor", test))]
+pub use cliente::Cliente;
+// Estos dos ayudantes solo los llama el servidor IPC del motor; las pruebas del
+// cliente los importan directamente del módulo, así que no hace falta reexportarlos.
+#[cfg(feature = "motor")]
+pub(crate) use cliente::{codigo_de_salida, exigir_la_etiqueta_de_fuente};
+
+// El arnés de pruebas (`src/test_support.rs`, los tests de `engine`) usa el
+// cliente real contra el socket de Podman: con `cfg(test)` tiene que compilarse
+// el mismo transporte bollard que usa el motor, o las pruebas `#[ignore]`
+// intentarían hablar con Docker por el canal IPC y se colgarían. La API de
+// producción —sin `motor` y sin `test`— sigue usando solo el cliente IPC.
+#[cfg(not(any(feature = "motor", test)))]
+mod ipc_cliente;
+#[cfg(not(any(feature = "motor", test)))]
+pub use ipc_cliente::Cliente;
+
+/// Causa del fallo, según el proceso: el error de la biblioteca en el motor y
+/// en el arnés de pruebas, el del canal IPC en la API de producción.
+#[cfg(any(feature = "motor", test))]
+type CausaDelMotor = bollard::errors::Error;
+/// Causa del fallo en la API, que no enlaza la biblioteca del daemon.
+#[cfg(not(any(feature = "motor", test)))]
+type CausaDelMotor = crate::ipc::Error;
 
 use std::time::Duration;
 
 use thiserror::Error;
-
-pub use cliente::Cliente;
 
 /// La etiqueta con la que un contenedor se declara **fuente de copia**.
 ///
@@ -166,13 +189,18 @@ pub enum Error {
     },
 
     /// No se pudo hablar con el motor por el socket indicado.
-    #[error("no se pudo hablar con el motor de contenedores por {socket}: {causa}")]
+    ///
+    /// El `Display` publica la causa para que el operador sepa qué falló, pero nunca
+    /// nombra el socket: este error cruza la frontera IPC y acaba en `error_message`,
+    /// que muestra el panel. La ruta se conserva en el campo para los registros y
+    /// diagnósticos internos; en cambio, no se interpola en ese mensaje.
+    #[error("no se pudo hablar con el motor de contenedores: {causa}")]
     MotorNoDisponible {
         /// Socket con el que se intentó.
         socket: String,
         /// Causa, tal y como la informa la biblioteca.
         #[source]
-        causa: bollard::errors::Error,
+        causa: CausaDelMotor,
     },
 
     /// El motor contestó con un error de su propia API al operar con un contenedor.
@@ -203,7 +231,7 @@ pub enum Error {
         contenedor: String,
         /// Causa, tal y como la informa la biblioteca.
         #[source]
-        causa: bollard::errors::Error,
+        causa: CausaDelMotor,
     },
 
     /// El `exec` no dejó ningún flujo del que leer.
@@ -314,6 +342,7 @@ pub enum Error {
     },
 }
 
+#[cfg(any(feature = "motor", test))]
 impl Error {
     /// Traduce un fallo del motor que se refiere a un contenedor concreto.
     ///
@@ -322,7 +351,7 @@ impl Error {
     /// de [`Error::MotorNoContesta`]. Se distinguen porque no se arreglan igual: lo
     /// primero es el motor diciendo que no a algo concreto, lo segundo es no haber podido
     /// preguntarle.
-    fn del_contenedor(contenedor: &str, causa: bollard::errors::Error) -> Self {
+    pub(crate) fn del_contenedor(contenedor: &str, causa: bollard::errors::Error) -> Self {
         match causa {
             bollard::errors::Error::DockerResponseServerError {
                 status_code,
@@ -341,7 +370,7 @@ impl Error {
 
     /// Traduce un fallo del motor que **no** se refiere a ningún contenedor: la conexión
     /// inicial y la comprobación de que el motor contesta.
-    fn del_socket(socket: &str, causa: bollard::errors::Error) -> Self {
+    pub(crate) fn del_socket(socket: &str, causa: bollard::errors::Error) -> Self {
         match causa {
             // La biblioteca comprueba que la ruta existe **antes** de abrir nada, así que
             // este fallo es «no hay socket ahí» y no un problema de transporte: se
@@ -357,21 +386,24 @@ impl Error {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "motor")))]
 mod tests {
     use std::time::Duration;
 
+    #[cfg(feature = "motor")]
     use bollard::errors::Error as ErrorDelMotor;
 
     use super::{Canal, Error, Orden};
 
     /// El mensaje que el motor da cuando el contenedor no existe, **medido** contra el
     /// Podman de esta máquina: el nombre del contenedor viaja dentro, entrecomillado.
+    #[cfg(feature = "motor")]
     const MENSAJE_DEL_404: &str =
         "no container with name or ID \"mi-contenedor\" found: no such container";
 
     /// El mensaje que el motor da cuando el `exec` se pide sin ningún `attach`, también
     /// medido: es un `500` del motor, no un fallo del comando.
+    #[cfg(feature = "motor")]
     const MENSAJE_DEL_500: &str = "must provide at least one stream to attach to: invalid argument";
 
     /// Un 404 del motor se traduce a nuestro error y **el motivo nombra el contenedor**.
@@ -379,6 +411,7 @@ mod tests {
     /// Es el requisito que impide que un contenedor mal escrito se lea como un fallo de
     /// volcado: el motivo tiene que llevar el nombre, y no se delega en el texto del motor
     /// —que hoy lo lleva— porque ese texto es suyo.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_404_del_motor_nombra_el_contenedor() {
         let medida = ErrorDelMotor::DockerResponseServerError {
@@ -420,6 +453,7 @@ mod tests {
     /// Es la mitad que de verdad se prueba: con el mensaje medido, un código que se limitara
     /// a copiarlo pasaría la prueba de arriba sin poner nada de su parte. Aquí el mensaje no
     /// lleva el nombre y el motivo lo tiene que llevar igual.
+    #[cfg(feature = "motor")]
     #[test]
     fn el_motivo_nombra_el_contenedor_aunque_el_motor_no_lo_haga() {
         let medida = ErrorDelMotor::DockerResponseServerError {
@@ -439,6 +473,7 @@ mod tests {
     ///
     /// Se distingue del 404 porque no significan lo mismo: el 404 dice que el contenedor no
     /// está, y el 500 —el que midió el `attach` ausente— dice que la petición no se entendió.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_500_del_motor_conserva_su_codigo_y_su_mensaje() {
         let medida = ErrorDelMotor::DockerResponseServerError {
@@ -472,6 +507,7 @@ mod tests {
     /// Es la diferencia entre «el motor dijo que no» y «no se pudo preguntar». Inventar un
     /// `status_code` para lo segundo mandaría a buscar un contenedor inexistente cuando el
     /// problema es el transporte.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_fallo_que_no_es_del_servidor_se_conserva_como_causa() {
         let error = Error::del_contenedor("mi-contenedor", ErrorDelMotor::RequestTimeoutError);
@@ -487,6 +523,7 @@ mod tests {
     }
 
     /// Un socket que no existe se reconoce como tal, y el motivo nombra la ruta pedida.
+    #[cfg(feature = "motor")]
     #[test]
     fn un_socket_inexistente_se_reconoce_por_su_ruta() {
         let error = Error::del_socket(
@@ -575,6 +612,32 @@ mod tests {
             motivo,
             copia.to_string(),
             "el plazo de la restauración y el de la copia se leen igual: {motivo}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pruebas_de_redaccion {
+    use super::Error;
+
+    /// El `Display` de este error llega al panel: ni la ruta del socket ni una credencial
+    /// incrustada en ella pueden cruzar esa frontera.
+    #[test]
+    fn motor_no_disponible_no_publica_la_ruta_del_socket_en_el_display() {
+        let socket = String::from("/run/secreto/motor.sock?token=CLAVE");
+        let error = Error::MotorNoDisponible {
+            socket: socket.clone(),
+            causa: bollard::errors::Error::RequestTimeoutError,
+        };
+
+        let motivo = error.to_string();
+        assert!(
+            !motivo.contains("/run/secreto") && !motivo.contains("CLAVE"),
+            "el Display publicó la ruta o la credencial: {motivo}"
+        );
+        assert!(
+            matches!(&error, Error::MotorNoDisponible { socket: guardado, .. } if guardado == &socket),
+            "el campo socket se perdió: {error:?}"
         );
     }
 }

@@ -315,7 +315,7 @@ fn raiz_canonica(raiz: &Path) -> PathBuf {
     std::fs::canonicalize(raiz).unwrap_or_else(|_| raiz.to_path_buf())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "motor")))]
 mod tests {
     use std::os::unix::fs::symlink;
     use std::path::Path;
