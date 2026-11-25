@@ -9,6 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bollard::container::LogOutput;
@@ -21,6 +22,7 @@ use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::time::Instant;
 
 use crate::ipc::{
     CanalIpc, ClaseFallo, Error as ErrorIpc, RespuestaMotor, SolicitudMotor, escribir,
@@ -55,12 +57,13 @@ pub enum Error {
     CanalCerrado,
 }
 
-/// Aborta la tarea de lectura cuando la conexión termina, también por `?`.
-struct AbortarLector(tokio::task::JoinHandle<()>);
+/// Aborta al lector y al vigilante cuando la conexión termina, también por `?`.
+struct AbortarTareas(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>);
 
-impl Drop for AbortarLector {
+impl Drop for AbortarTareas {
     fn drop(&mut self) {
         self.0.abort();
+        self.1.abort();
     }
 }
 
@@ -154,56 +157,128 @@ fn preparar_ruta(ruta: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Atiende una conexión completa.
-///
-/// La lectura corre en una tarea propia y nunca se cancela: `read_exact` no es
-/// cancel-safe, y un `select!` que interrumpiera un mensaje a medias dejaría el
-/// canal desincronizado para siempre. Lo que se selecciona aquí son dos
-/// *receptores* —solicitudes ya completas y eventos del `exec`—, no lecturas.
+/// Vigila la conexión sin cancelar la lectura: `en_curso` y el contador de solicitudes
+/// se reinician con cada mensaje completo, y el plazo corre solo en huecos verdaderos.
+/// `en_curso` también permanece activo mientras un `exec` produce trozos, aunque la
+/// salida calle: un `exec` silencioso no es inactividad del par IPC.
+async fn vigilar_inactividad(
+    en_curso: Arc<AtomicBool>,
+    recibidas: Arc<AtomicU64>,
+    emisor: mpsc::Sender<Result<SolicitudMotor, Error>>,
+    inactividad: Duration,
+) {
+    let paso = inactividad
+        .min(Duration::from_millis(100))
+        .max(Duration::from_millis(1));
+    let mut vistas = recibidas.load(Ordering::Acquire);
+    let mut ultimo_avance = Instant::now();
+    loop {
+        tokio::time::sleep(paso).await;
+        let actuales = recibidas.load(Ordering::Acquire);
+        if actuales != vistas || en_curso.load(Ordering::Acquire) {
+            vistas = actuales;
+            ultimo_avance = Instant::now();
+            continue;
+        }
+        if ultimo_avance.elapsed() < inactividad {
+            continue;
+        }
+        // El lector marca `en_curso` con `Release` antes de incrementar `recibidas` y
+        // antes de encolar. Releer ambos justo antes de enviar evita declarar inactiva
+        // una conexión que acaba de encolar una solicitud mientras decidíamos el plazo.
+        let actuales = recibidas.load(Ordering::Acquire);
+        if actuales != vistas || en_curso.load(Ordering::Acquire) {
+            vistas = actuales;
+            ultimo_avance = Instant::now();
+            continue;
+        }
+        // El error entra en el mismo canal que las solicitudes: el bucle principal
+        // sale por `??` y el guard aborta al lector, sin cancelar un `read_exact`.
+        let _ = emisor.send(Err(Error::TiempoDeLectura)).await;
+        return;
+    }
+}
+
+/// Atiende una conexión completa con el plazo de inactividad del contrato.
 async fn atender(
     stream: UnixStream,
     docker: Arc<bollard::Docker>,
     raiz: &Path,
 ) -> Result<(), Error> {
+    atender_con_plazo(stream, docker, raiz, TIEMPO_DE_LECTURA).await
+}
+
+/// Atiende una conexión completa, cerrándola solo tras `inactividad` sin tráfico.
+///
+/// La lectura corre en una tarea propia y nunca se cancela por un `timeout`: `read_exact` no es
+/// cancel-safe y un mensaje a medias desincronizaría el canal. El vigilante comprueba periódicamente
+/// si hay una solicitud o un `exec` en curso y cuántas se han recibido; solo cuando no hay operación
+/// pendiente y no llega nada nuevo entrega `TiempoDeLectura` por el canal de solicitudes. El bucle
+/// principal sale por `??` y el guard aborta al lector: no hace falta señal, porque abortar una
+/// conexión que ya se cierra no desincroniza nada. Lo que se selecciona en el bucle principal son
+/// dos *receptores* —solicitudes ya completas y eventos del `exec`—, no lecturas.
+async fn atender_con_plazo(
+    stream: UnixStream,
+    docker: Arc<bollard::Docker>,
+    raiz: &Path,
+    inactividad: Duration,
+) -> Result<(), Error> {
     let (lectura, mut escritura) = tokio::io::split(stream);
     let (emisor_solicitudes, mut solicitudes) = mpsc::channel::<Result<SolicitudMotor, Error>>(16);
-    let lector =
-        tokio::spawn(async move {
+    let en_curso = Arc::new(AtomicBool::new(false));
+    let recibidas = Arc::new(AtomicU64::new(0));
+
+    let emisor_del_lector = emisor_solicitudes.clone();
+    let lector = tokio::spawn({
+        let en_curso = Arc::clone(&en_curso);
+        let recibidas = Arc::clone(&recibidas);
+        async move {
             let mut lectura = lectura;
             loop {
-                let solicitud =
-                    match tokio::time::timeout(TIEMPO_DE_LECTURA, recibir_solicitud(&mut lectura))
-                        .await
-                    {
-                        Ok(Ok(solicitud)) => Ok(solicitud),
-                        Ok(Err(error)) => Err(Error::Ipc(error)),
-                        Err(_) => Err(Error::TiempoDeLectura),
-                    };
+                let solicitud = match recibir_solicitud(&mut lectura).await {
+                    Ok(solicitud) => Ok(solicitud),
+                    Err(error) => Err(Error::Ipc(error)),
+                };
+                if solicitud.is_ok() {
+                    // Se marca aquí, antes de encolar, para que el vigilante no vea un hueco
+                    // entre la lectura completa y el inicio del manejo de la solicitud. El
+                    // orden importa: `Release` en `en_curso` precede al contador y al `send`.
+                    en_curso.store(true, Ordering::Release);
+                    recibidas.fetch_add(1, Ordering::AcqRel);
+                }
                 let termino = solicitud.is_err();
-                if emisor_solicitudes.send(solicitud).await.is_err() || termino {
+                if emisor_del_lector.send(solicitud).await.is_err() || termino {
                     break;
                 }
             }
-        });
-    let _lector = AbortarLector(lector);
+        }
+    });
+
+    let vigilante = tokio::spawn(vigilar_inactividad(
+        Arc::clone(&en_curso),
+        Arc::clone(&recibidas),
+        emisor_solicitudes.clone(),
+        inactividad,
+    ));
+    let _tareas = AbortarTareas(lector, vigilante);
 
     let (emisor, mut eventos) = mpsc::channel::<RespuestaMotor>(64);
     let mut actual: Option<ExecEnCurso> = None;
-    let desenlace = loop {
+    loop {
         tokio::select! {
             solicitud = solicitudes.recv() => {
                 let solicitud = solicitud.ok_or(Error::CanalCerrado)??;
-                match solicitud {
+                let (resultado, termino) = match solicitud {
                     SolicitudMotor::Comprobar => {
-                        responder(&mut escritura, &RespuestaMotor::Aceptado).await?;
+                        (responder(&mut escritura, &RespuestaMotor::Aceptado).await, true)
                     }
                     SolicitudMotor::CrearContenedor { nombre, imagen, etiquetas } => {
                         let resultado = crear_contenedor(&docker, &nombre, &imagen, &etiquetas).await;
-                        responder(&mut escritura, &resultado).await?;
+                        (responder(&mut escritura, &resultado).await, true)
                     }
                     SolicitudMotor::IniciarContenedor { nombre } => {
                         let resultado = iniciar_contenedor(&docker, &nombre).await;
-                        responder(&mut escritura, &resultado).await?;
+                        (responder(&mut escritura, &resultado).await, true)
                     }
                     SolicitudMotor::CrearExec { contenedor, orden, con_entrada } => {
                         let resultado = crear_exec(&docker, &contenedor, &orden, con_entrada, raiz).await;
@@ -215,11 +290,11 @@ async fn atender(
                                 entrada: None,
                             });
                         }
-                        responder(&mut escritura, &resultado).await?;
+                        (responder(&mut escritura, &resultado).await, true)
                     }
                     SolicitudMotor::InspeccionarExec { id } => {
                         let resultado = inspeccionar_exec(&docker, &id).await;
-                        responder(&mut escritura, &resultado).await?;
+                        (responder(&mut escritura, &resultado).await, true)
                     }
                     SolicitudMotor::IniciarExec { id: _, entrada } => {
                         let respuesta = match actual.as_mut() {
@@ -232,27 +307,44 @@ async fn atender(
                                 None,
                             )),
                         };
-                        if let Some(respuesta) = respuesta {
-                            responder(&mut escritura, &respuesta).await?;
+                        match respuesta {
+                            Some(respuesta) => {
+                                (responder(&mut escritura, &respuesta).await, true)
+                            }
+                            // El `exec` sigue vivo y `drenar` emitirá trozos después:
+                            // este hueco no es inactividad aunque no haya salida.
+                            None => (Ok(()), false),
                         }
                     }
+                };
+                if termino {
+                    en_curso.store(false, Ordering::Release);
                 }
+                resultado?;
             }
             evento = eventos.recv() => {
                 match evento {
                     Some(respuesta) => {
-                        let finalizo = matches!(respuesta, RespuestaMotor::Terminado { .. });
+                        let finalizo = matches!(
+                            respuesta,
+                            RespuestaMotor::Terminado { .. } | RespuestaMotor::Fallo { .. }
+                        );
+                        if finalizo {
+                            en_curso.store(false, Ordering::Release);
+                        }
                         responder(&mut escritura, &respuesta).await?;
                         if finalizo {
                             break Ok(());
                         }
                     }
-                    None => break Ok(()),
+                    None => {
+                        en_curso.store(false, Ordering::Release);
+                        break Ok(());
+                    }
                 }
             }
         }
-    };
-    desenlace
+    }
 }
 
 /// Escribe una respuesta con el framing del contrato.
@@ -571,7 +663,7 @@ fn fallo_de_docker(error: crate::docker::Error) -> RespuestaMotor {
 mod pruebas {
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use crate::ipc::{conectar, escribir, recibir};
 
@@ -603,6 +695,48 @@ mod pruebas {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
             let _ = std::fs::remove_file(&self.1);
+        }
+    }
+
+    /// Daemon falso: acepta conexiones y nunca escribe respuesta, para que una
+    /// operación contra él quede pendiente más tiempo que el plazo de inactividad.
+    struct DockerFalso {
+        ruta: PathBuf,
+        aceptador: tokio::task::JoinHandle<()>,
+    }
+
+    impl DockerFalso {
+        async fn nuevo() -> Self {
+            let nombre = format!(
+                "kesto-motor-falso-{}-{}",
+                std::process::id(),
+                CONTADOR.fetch_add(1, Ordering::Relaxed)
+            );
+            let ruta = std::env::temp_dir().join(format!("{nombre}.sock"));
+            let _ = std::fs::remove_file(&ruta);
+            let escucha = UnixListener::bind(&ruta).expect("enlaza el daemon falso");
+            let aceptador = tokio::spawn(async move {
+                let mut abiertas = Vec::new();
+                while let Ok((stream, _)) = escucha.accept().await {
+                    // Mantener la conexión abierta sin contestar: es exactamente
+                    // el hueco silencioso que no debe cerrar el vigilante.
+                    abiertas.push(stream);
+                }
+            });
+            Self { ruta, aceptador }
+        }
+
+        fn cliente(&self) -> bollard::Docker {
+            let socket = format!("unix://{}", self.ruta.display());
+            bollard::Docker::connect_with_socket(&socket, 1, bollard::API_DEFAULT_VERSION)
+                .expect("conecta con el daemon falso")
+        }
+    }
+
+    impl Drop for DockerFalso {
+        fn drop(&mut self) {
+            self.aceptador.abort();
+            let _ = std::fs::remove_file(&self.ruta);
         }
     }
 
@@ -697,6 +831,129 @@ mod pruebas {
             "una operación fuera de la lista blanca obtuvo una respuesta"
         );
         servidor.abort();
+    }
+
+    #[tokio::test]
+    async fn una_operacion_larga_no_cierra_la_conexion_aunque_calle_mas_que_el_plazo() {
+        let plazo = Duration::from_millis(80);
+        let docker = DockerFalso::nuevo().await;
+        let ipc = SocketDePrueba::nuevo();
+        let escucha = UnixListener::bind(&ipc.0).expect("enlaza el socket IPC de prueba");
+        let servidor = tokio::spawn({
+            let docker = Arc::new(docker.cliente());
+            let raiz = PathBuf::from("/tmp/kesto-raiz-de-prueba");
+            async move {
+                let (stream, _) = escucha.accept().await.expect("acepta la conexión IPC");
+                atender_con_plazo(stream, docker, &raiz, plazo).await
+            }
+        });
+
+        let mut canal = conectar(&ipc.0.to_string_lossy())
+            .await
+            .expect("conecta al IPC del motor");
+        let cuerpo = serde_json::to_vec(&SolicitudMotor::CrearContenedor {
+            nombre: "lento".to_owned(),
+            imagen: "imagen".to_owned(),
+            etiquetas: Vec::new(),
+        })
+        .expect("serializa la solicitud");
+        escribir(&mut canal, &cuerpo)
+            .await
+            .expect("envía la solicitud que deja al daemon callado");
+
+        tokio::time::sleep(plazo * 3).await;
+        assert!(
+            !servidor.is_finished(),
+            "el vigilante cerró la conexión con una operación en curso"
+        );
+        assert!(
+            tokio::time::timeout(plazo, recibir(&mut canal))
+                .await
+                .is_err(),
+            "llegó una respuesta mientras el daemon falso seguía sin contestar"
+        );
+        servidor.abort();
+    }
+
+    #[tokio::test]
+    async fn una_conexion_realmente_inactiva_devuelve_tiempo_de_lectura() {
+        let plazo = Duration::from_millis(80);
+        let docker = DockerFalso::nuevo().await;
+        let ipc = SocketDePrueba::nuevo();
+        let escucha = UnixListener::bind(&ipc.0).expect("enlaza el socket IPC de prueba");
+        let servidor = tokio::spawn({
+            let docker = Arc::new(docker.cliente());
+            let raiz = PathBuf::from("/tmp/kesto-raiz-de-prueba");
+            async move {
+                let (stream, _) = escucha.accept().await.expect("acepta la conexión IPC");
+                atender_con_plazo(stream, docker, &raiz, plazo).await
+            }
+        });
+
+        let mut canal = conectar(&ipc.0.to_string_lossy())
+            .await
+            .expect("conecta al IPC del motor");
+        let cuerpo = serde_json::to_vec(&SolicitudMotor::Comprobar).expect("serializa el latido");
+        escribir(&mut canal, &cuerpo)
+            .await
+            .expect("envía el latido");
+        assert!(matches!(
+            tokio::time::timeout(plazo * 3, recibir(&mut canal))
+                .await
+                .expect("el motor contesta al latido"),
+            Ok(RespuestaMotor::Aceptado)
+        ));
+
+        // Después del latido llega el silencio real: ya no hay solicitud ni exec en curso.
+        let desenlace = tokio::time::timeout(plazo * 6, servidor)
+            .await
+            .expect("el vigilante debía declarar la inactividad");
+        assert!(
+            matches!(desenlace, Ok(Err(Error::TiempoDeLectura))),
+            "la conexión inactiva no terminó con TiempoDeLectura: {desenlace:?}"
+        );
+        let desenlace = recibir(&mut canal).await;
+        assert!(
+            matches!(
+                desenlace,
+                Err(ErrorIpc::NoDisponible { .. }) | Err(ErrorIpc::CanalCerrado)
+            ),
+            "la conexión inactiva no se cerró para el cliente: {desenlace:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_solicitud_nueva_reinicia_el_plazo_de_inactividad() {
+        let plazo = Duration::from_millis(80);
+        let en_curso = Arc::new(AtomicBool::new(false));
+        let recibidas = Arc::new(AtomicU64::new(0));
+        let (emisor, mut solicitudes) = mpsc::channel::<Result<SolicitudMotor, Error>>(4);
+        let vigilante = tokio::spawn(vigilar_inactividad(
+            Arc::clone(&en_curso),
+            Arc::clone(&recibidas),
+            emisor,
+            plazo,
+        ));
+
+        for numero in 1..=3u64 {
+            tokio::time::sleep(plazo / 2).await;
+            en_curso.store(true, Ordering::Release);
+            recibidas.store(numero, Ordering::Release);
+        }
+        en_curso.store(false, Ordering::Release);
+        assert!(
+            solicitudes.try_recv().is_err(),
+            "el vigilante cerró la conexión aunque seguían llegando solicitudes"
+        );
+
+        let desenlace = tokio::time::timeout(plazo * 6, solicitudes.recv())
+            .await
+            .expect("el vigilante debía declarar la inactividad al callar la API");
+        assert!(
+            matches!(desenlace, Some(Err(Error::TiempoDeLectura))),
+            "la conexión inactiva no se cerró con TiempoDeLectura: {desenlace:?}"
+        );
+        vigilante.abort();
     }
 
     #[test]

@@ -52,6 +52,11 @@ Reconstruir la imagen: el Dockerfile genera `kesto` y `kesto-motor` en árboles 
 - El motor revalida etiqueta y rutas: la API se trata como no confiable.
 - El tope de 1 MiB se aplica antes de asignar memoria; las lecturas no son cancelables por eventos.
 
+## Ajuste posterior (2026-11-24)
+
+- `src/motor/servidor.rs`: `atender_con_plazo` sustituye al `timeout` que envolvía `recibir_solicitud`. Un vigilante con `en_curso` y un contador de solicitudes entregadas solo declara `TiempoDeLectura` cuando no hay operación pendiente y no llega nada en 30 s; una `IniciarExec` esperando un `stdin` que no drena mantiene viva la conexión. El lector se levanta de su `select!` por señal, sin cancelar una lectura a medias.
+- `src/docker/mod.rs` y `src/ipc/mensaje.rs`: el `Display` de `MotorNoDisponible` / `NoDisponible` ya no publica la ruta del socket, que sigue en el campo `socket` para diagnósticos. `SocketInexistente` conserva su redacción porque es un error de configuración deliberado.
+
 ## Verificación
 
 `just check` (RC=0), `just check-all` (RC=0), `cargo test --features motor --bin kesto-motor` (6/6), `podman compose config` (RC=0), `cargo tree --bin kesto -e normal` sin `bollard`, y `nm -C` confirmando que `kesto` no tiene símbolos `bollard::` y `kesto-motor` sí.

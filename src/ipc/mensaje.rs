@@ -167,7 +167,11 @@ pub enum Error {
         socket: String,
     },
     /// No se pudo hablar con el motor.
-    #[error("no se pudo hablar con el motor por {socket}: {causa}")]
+    ///
+    /// El `Display` redacta la ruta: este error puede acabar en `error_message`, y la ruta
+    /// del socket IPC es información del despliegue, no del volcado. El campo se conserva
+    /// para diagnósticos internos.
+    #[error("no se pudo hablar con el motor: {causa}")]
     NoDisponible {
         /// Socket al que se intentó conectar.
         socket: String,
@@ -340,4 +344,27 @@ pub async fn conectar(ruta: &str) -> Result<tokio::net::UnixStream, Error> {
             socket: ruta.to_owned(),
             causa,
         })
+}
+
+#[cfg(test)]
+mod pruebas {
+    use super::Error;
+
+    #[test]
+    fn no_disponible_no_publica_la_ruta_en_el_display() {
+        let error = Error::NoDisponible {
+            socket: String::from("/run/secreto/motor.sock?token=CLAVE"),
+            causa: std::io::Error::other("conexión rechazada"),
+        };
+
+        let motivo = error.to_string();
+        assert!(
+            !motivo.contains("/run/secreto") && !motivo.contains("CLAVE"),
+            "el Display publicó la ruta o la credencial: {motivo}"
+        );
+        assert!(
+            motivo.contains("conexión rechazada"),
+            "se perdió la causa: {motivo}"
+        );
+    }
 }

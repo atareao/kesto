@@ -1668,8 +1668,8 @@ mod tests {
             "el fallo del `ping` no se reconoció como motor no disponible: {error:?}"
         );
         assert!(
-            motivo.contains(&ruta),
-            "el motivo no nombra el socket: {motivo}"
+            !motivo.contains(&ruta),
+            "el motivo publicó la ruta del socket al panel: {motivo}"
         );
     }
 

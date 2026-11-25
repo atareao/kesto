@@ -189,7 +189,12 @@ pub enum Error {
     },
 
     /// No se pudo hablar con el motor por el socket indicado.
-    #[error("no se pudo hablar con el motor de contenedores por {socket}: {causa}")]
+    ///
+    /// El `Display` publica la causa para que el operador sepa qué falló, pero nunca
+    /// nombra el socket: este error cruza la frontera IPC y acaba en `error_message`,
+    /// que muestra el panel. La ruta se conserva en el campo para los registros y
+    /// diagnósticos internos; en cambio, no se interpola en ese mensaje.
+    #[error("no se pudo hablar con el motor de contenedores: {causa}")]
     MotorNoDisponible {
         /// Socket con el que se intentó.
         socket: String,
@@ -607,6 +612,32 @@ mod tests {
             motivo,
             copia.to_string(),
             "el plazo de la restauración y el de la copia se leen igual: {motivo}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pruebas_de_redaccion {
+    use super::Error;
+
+    /// El `Display` de este error llega al panel: ni la ruta del socket ni una credencial
+    /// incrustada en ella pueden cruzar esa frontera.
+    #[test]
+    fn motor_no_disponible_no_publica_la_ruta_del_socket_en_el_display() {
+        let socket = String::from("/run/secreto/motor.sock?token=CLAVE");
+        let error = Error::MotorNoDisponible {
+            socket: socket.clone(),
+            causa: bollard::errors::Error::RequestTimeoutError,
+        };
+
+        let motivo = error.to_string();
+        assert!(
+            !motivo.contains("/run/secreto") && !motivo.contains("CLAVE"),
+            "el Display publicó la ruta o la credencial: {motivo}"
+        );
+        assert!(
+            matches!(&error, Error::MotorNoDisponible { socket: guardado, .. } if guardado == &socket),
+            "el campo socket se perdió: {error:?}"
         );
     }
 }
