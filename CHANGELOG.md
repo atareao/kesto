@@ -1,4 +1,94 @@
 # Changelog
+## [0.18.0] - 2026-11-26
+
+### Bug Fixes
+
+- *(ci)* La puerta de dependencias no veía kesto-mcp sin --workspace
+- *(db)* Propaga el fallo del hash HMAC en vez de degradar a vacío
+- *(test)* Restaurar el cliente Docker real en el arnés E2E
+- *(api)* Resolver conflictos de stash en tests de repositorios
+- *(motor)* Mantener el IPC vivo durante execs largos y redactar la ruta
+
+### Dependencies
+
+- *(seguridad)* Zstd 0.13.4, rmcp 3.11 y async-executor 1.14.1
+- *(db)* Sqlx 0.9.1 con SQLite empaquetado 3.54.1 y libsqlite3-sys saneado
+- Sube url a 2.5.9 (RUSTSEC-2026-0592)
+- Actualiza cookie 0.18.2 → 0.18.3 por RUSTSEC-2026-0594
+
+### Documentation
+
+- *(openspec)* Propuesta del endurecimiento del arranque y la autenticación
+- Documenta el endurecimiento del arranque y de la autenticación
+- *(openspec)* Marca el PR #170 y el issue de seguimiento #169
+- Documentar el confinamiento de la frontera operador→motor
+- *(spec)* Change proposal de endurecimiento de la restauración (#164)
+- Documento de la feature 041 (endurecimiento de la restauración)
+- Documento de la feature 042 (arreglo del flake de la sonda)
+- *(openspec)* Archiva el arreglo del flake de la sonda de arranque (#171)
+- Documenta el endurecimiento de la superficie de API (#163, #165, #166)
+- *(feature)* FEATURE-044 y la documentación del gate de dependencias
+- *(feature)* El follow-up de chrono ya tiene dueño (#185)
+- *(openspec)* Archiva el change saneamiento-de-dependencias y cierra PLAN-044
+- Documenta el endurecimiento de cabeceras y del panel (FEATURE-045)
+- *(test)* Completa el comentario del generador de claves del proveedor falso
+- Documenta el endurecimiento OIDC y de tokens de API (SEC-22)
+- Documentar la frontera motor/API y las variables IPC
+- *(scheduler)* Document chrono→time migration (#185)
+- *(plan)* Archive PLAN-053 (chrono migration)
+
+### Features
+
+- *(arranque)* Permiso explícito, loopback y credencial fuerte
+- *(engine)* Confinar host_path, db_path y el contenedor del exec
+- *(engine)* Restauración de PostgreSQL por base y endurecida (#164)
+- Endurecimiento de la superficie de API (#163, #165, #166)
+- *(panel)* La HSTS cubre el origen entero y la CSP es una política completa (SEC-12, SEC-18)
+- Endurece la validación de entrada del borde (#168)
+- *(auth)* Revocar la sesión al cerrarla y documentar la frontera mono-operador
+- *(auth)* Endurece el flujo OIDC con PKCE S256
+- *(db)* Firma los tokens de API con HMAC y zeroiza las claves
+- *(motor)* Separar el daemon en un binario privilegiado
+- *(api)* SEC-15 sanitize error_message + SEC-22 endpoint validation (grupo 5)
+- Implementar SEC-19/SEC-20/SEC-21 — paginación, CI pinned SHA, /health sin metadatos
+- *(scheduler)* Migrate chrono/chrono-tz to native time scheduler
+
+### Miscellaneous Tasks
+
+- *(deploy)* Plantilla y smoke test en forma de producción
+- *(openspec)* Archiva el endurecimiento del arranque y cierra PLAN-039
+- *(openspec)* Change confinamiento-frontera-motor y PLAN-040
+- *(openspec)* Marcar el cierre del PLAN-040 hasta el PR
+- *(openspec)* Archiva el confinamiento de la frontera operador→motor
+- *(openspec)* Change endurecimiento-superficie-api y PLAN-043
+- *(openspec)* Archiva el endurecimiento de la restauración y cierra PLAN-041
+- *(openspec)* Marcar el cierre del PLAN-042 hasta el PR
+- *(openspec)* Cerrar la fila del cabo abierto con la reproducción hecha
+- *(openspec)* Change saneamiento-de-dependencias y PLAN-044
+- *(ci)* Puerta de cadena de suministro con cargo deny y cobertura del workspace
+- *(openspec)* Archiva el endurecimiento de la superficie de API (#163, #165, #166)
+- *(ci)* Observaciones del review sobre la puerta y su relato
+- *(openspec)* Archiva el change endurecimiento-cabeceras-y-panel y cierra PLAN-045
+- *(openspec)* Archiva endurecimiento-validacion-de-entrada y cierra PLAN-046
+- Archivar endurecimiento-sesion-y-frontera
+- Archivar endurecimiento-oidc
+- Retrigger CI tras corregir el arnés E2E
+- Retrigger CI tras correction E2E arnés
+- *(openspec)* Archive chrono migration change (#185)
+
+### Refactor
+
+- *(test)* La seguridad de los AssertSqlSafe pasa de la prosa al compilador
+- *(auth)* Registrar_login recibe el code_verifier por &str
+
+### Testing
+
+- *(e2e)* Sonda de arranque con confirmación del definitivo (#171)
+- *(ci)* Prueba estructural del cableado de dependencias y del checksum de migraciones
+- *(auth)* El proveedor falso captura el cuerpo del canje
+- *(auth)* Prueba la recarga del JWKS con rotación de clave
+- *(e2e)* Levantar el motor privilegiado en la batería
+- *(openspec)* Complete chrono migration checklist
 ## [0.17.0] - 2026-11-20
 
 ### Bug Fixes
@@ -9,6 +99,10 @@
 
 - *(mcp)* Expone `limit` y `offset` en `list_snapshots`
 - *(ui)* Conserva la página anterior al paginar en los tres listados
+
+### Miscellaneous Tasks
+
+- Release v0.17.0
 
 ### Refactor
 
