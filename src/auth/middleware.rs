@@ -33,15 +33,19 @@ use crate::state::AppState;
 /// manejador no tiene por qué saber que la identidad viaja dentro de un JWT, ni
 /// tiene por qué verificarlo otra vez.
 ///
-/// Lleva **sólo** `sub` y `email`, no los `iat`/`exp` de
+/// Lleva **sólo** `sub`, `email` y el `jti` de la sesión, no los `iat`/`exp` de
 /// [`crate::auth::session::Claims`]: la vigencia ya la comprobó el *gate*, y
-/// exponerla invitaría a reimplementar esa comprobación en cada manejador.
+/// exponerla invitaría a reimplementar esa comprobación en cada manejador. El
+/// `jti` sí viaja porque es lo que el `logout` necesita para revocar **esta**
+/// sesión concreta, y no se expone en ninguna respuesta.
 #[derive(Debug, Clone)]
 pub struct SessionIdentity {
     /// Identificador del usuario en el proveedor de identidad.
     pub sub: String,
     /// Correo del usuario.
     pub email: String,
+    /// Identificador único de la sesión: la clave con la que se revoca.
+    pub jti: String,
 }
 
 /// Identidad de un token de API ya verificado, tal y como la ve un manejador.
@@ -103,7 +107,7 @@ pub async fn gate(
         return con_token(&estado, &en_claro, request, next).await;
     }
 
-    let identidad = match con_cookie(&estado, &jar) {
+    let identidad = match con_cookie(&estado, &jar).await {
         Ok(identidad) => identidad,
         Err(rechazo) => return rechazo.into_response(),
     };
@@ -123,13 +127,13 @@ async fn con_token(
     next: Next,
 ) -> Response {
     // Se busca por el hash: la base no guarda el valor en claro, así que lo único que se puede
-    // preguntar es por el hash del token entrante.
-    let token = match estado
-        .db
-        .tokens
-        .buscar_por_hash(&hash_de_token(en_claro))
-        .await
-    {
+    // preguntar es por el hash del token entrante. Hashear es un HMAC que no puede fallar con
+    // nuestra clave de 32 bytes, pero el fallo se propaga —y no se degrada a un hash vacío—.
+    let hash = match hash_de_token(en_claro, estado.db.clave.api_token_key()) {
+        Ok(hash) => hash,
+        Err(error) => return AppError::Database(error).into_response(),
+    };
+    let token = match estado.db.tokens.buscar_por_hash(&hash).await {
         Ok(Some(token)) => token,
         Ok(None) => return AppError::Unauthorized(TOKEN_QUE_NO_VALE.to_owned()).into_response(),
         Err(error) => return AppError::Database(error).into_response(),
@@ -176,7 +180,13 @@ async fn con_token(
 }
 
 /// Resuelve la identidad por el camino de la cookie de sesión.
-fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<SessionIdentity, AppError> {
+///
+/// Verifica la firma y la vigencia, y **además** consulta si la sesión está revocada
+/// —el cierre de sesión deja su `jti` en `sesiones_revocadas`—, porque la firma sola no
+/// permite cerrar un JWT antes de su `exp`. Es una lectura más de la base, de la misma
+/// clase que ya hace el camino del token, y va en **cada** petición: sin caché ni ventana
+/// de gracia, para que la revocación surta efecto en la petición siguiente.
+async fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<SessionIdentity, AppError> {
     // Por construcción el *gate* sólo se monta donde hay proveedor, así que un `None` aquí es un
     // fallo de invariante: se rechaza la petición en vez de abrirla.
     let auth = estado
@@ -188,16 +198,31 @@ fn con_cookie(estado: &AppState, jar: &CookieJar) -> Result<SessionIdentity, App
         .get(SESSION_COOKIE_NAME)
         .ok_or_else(|| AppError::Unauthorized(SIN_SESION.to_owned()))?;
 
-    match session::verify(&auth.secret, cookie.value()) {
+    let claims = match session::verify(&auth.secret, cookie.value()) {
         // El rechazo no distingue «no hay cookie» de «la cookie no vale»: decir cuál de las dos
         // es contaría a quien no ha entrado si su token caducó o si la firma no cuadra. El motivo
         // concreto se queda en el registro, dentro de `session::verify`.
-        Ok(claims) => Ok(SessionIdentity {
-            sub: claims.sub,
-            email: claims.email,
-        }),
-        Err(error) => Err(error),
+        Ok(claims) => claims,
+        Err(error) => return Err(error),
+    };
+
+    // La revocación y el rechazo comparten el mismo `401` y el mismo motivo que la cookie
+    // ausente o inválida: quien no ha entrado no aprende si su sesión se cerró.
+    if estado
+        .db
+        .sesiones
+        .esta_revocada(&claims.jti)
+        .await
+        .map_err(AppError::Database)?
+    {
+        return Err(AppError::Unauthorized(SIN_SESION.to_owned()));
     }
+
+    Ok(SessionIdentity {
+        sub: claims.sub,
+        email: claims.email,
+        jti: claims.jti,
+    })
 }
 
 /// El token en claro que trae la petición, si trae uno.
@@ -377,6 +402,20 @@ mod tests {
         estado_oidc().await
     }
 
+    /// Emite una sesión de prueba con la clave del estado y devuelve el token en claro.
+    ///
+    /// Se emite por la **capa de sesión** con el secreto del propio estado: así el token
+    /// verifica contra el mismo `KESTO_SECRET` con el que el *gate* comprueba.
+    fn token_de_sesion(estado: &AppState) -> String {
+        let auth = estado
+            .auth
+            .as_ref()
+            .expect("en modo Oidc hay estado de autenticación");
+
+        session::issue(&auth.secret, SUB.to_owned(), EMAIL.to_owned())
+            .expect("la emisión de la sesión de prueba no puede fallar")
+    }
+
     /// Emite un token de prueba con los scopes dados y devuelve su valor en claro.
     ///
     /// Se emite por la **capa de acceso** y no por la API: lo que estas pruebas miden es el
@@ -389,7 +428,7 @@ mod tests {
             .tokens
             .alta(AltaDeToken {
                 name: "token-de-prueba".to_owned(),
-                token_hash: hash_de_token(&en_claro),
+                en_claro: en_claro.clone(),
                 scopes: scopes.to_vec(),
                 expires_at: None,
             })
@@ -449,6 +488,68 @@ mod tests {
         assert!(
             cuerpo.to_string().contains(SUB),
             "la respuesta no trae la identidad: {cuerpo}"
+        );
+    }
+
+    /// 3.1 — Una cookie bien firmada y en vigor cuyo `jti` está revocado contesta `401`.
+    ///
+    /// La firma sola no basta: el cierre de sesión revoca el `jti` en la base, y el *gate*
+    /// tiene que consultarlo para que esa cookie deje de servir hasta su caducidad.
+    #[tokio::test]
+    async fn una_cookie_con_el_jti_revocado_no_se_acepta() {
+        let estado = estado().await;
+        let token = token_de_sesion(&estado);
+        let claims = {
+            let auth = estado
+                .auth
+                .as_ref()
+                .expect("en modo Oidc hay estado de autenticación");
+            session::verify(&auth.secret, &token).expect("el token emitido debe verificar")
+        };
+
+        // Se revoca por la **misma** capa que usará el logout: así lo que se mide es el
+        // *gate*, no el camino de la revocación.
+        estado
+            .db
+            .sesiones
+            .revocar(&claims.jti, claims.exp)
+            .await
+            .expect("la revocación de prueba no puede fallar");
+
+        let respuesta =
+            get_with_cookie(router(&estado).await, RUTA, &session_cookie_header(&token)).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::UNAUTHORIZED,
+            "una cookie con el `jti` revocado no puede pasar el *gate*"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 401);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 401 debe traer un mensaje: {cuerpo}"
+        );
+    }
+
+    /// 3.2 — La misma cookie **sin** revocar deja pasar: el contrapeso del escenario anterior,
+    /// para que el rechazo sea por la revocación y no por cualquier otra cosa.
+    #[tokio::test]
+    async fn la_misma_cookie_sin_revocar_deja_pasar() {
+        let estado = estado().await;
+        let token = token_de_sesion(&estado);
+
+        let respuesta =
+            get_with_cookie(router(&estado).await, RUTA, &session_cookie_header(&token)).await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::OK,
+            "una cookie en vigor y no revocada tiene que pasar"
         );
     }
 
@@ -520,7 +621,10 @@ mod tests {
         let fila = estado
             .db
             .tokens
-            .buscar_por_hash(&hash_de_token(&revocado))
+            .buscar_por_hash(
+                &hash_de_token(&revocado, estado.db.clave.api_token_key())
+                    .expect("el hash de prueba no puede fallar"),
+            )
             .await
             .expect("la búsqueda no puede fallar")
             .expect("el token debe estar");
@@ -537,7 +641,7 @@ mod tests {
             .tokens
             .alta(AltaDeToken {
                 name: "caducado".to_owned(),
-                token_hash: hash_de_token(&caducado),
+                en_claro: caducado.clone(),
                 scopes: vec![Scope::Read],
                 expires_at: Some(datetime!(2020-01-01 00:00:00 UTC)),
             })

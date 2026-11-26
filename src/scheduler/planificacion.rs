@@ -1,17 +1,16 @@
 //! El reloj y su sincronización con `backup_jobs`.
 //!
-//! Este fichero tiene las tres cosas que el módulo **decide** y la biblioteca no puede decidir por
-//! él: qué está planificado, cada cuánto se relee la base, y cuándo se deja de aceptar trabajo. Lo
-//! que no tiene es el disparo, que vive en [`super::disparo`] porque es una llamada al motor y no
-//! una decisión del reloj.
+//! Este fichero tiene las tres cosas que el módulo **decide**: qué está planificado, cada cuánto se
+//! relee la base, y cuándo se deja de aceptar trabajo. Lo que no tiene es el disparo, que vive en
+//! [`super::disparo`] porque es una llamada al motor y no una decisión del reloj.
 //!
 //! # La verdad es SQLite, y el reloj es efímero
 //!
-//! La biblioteca trae su propia persistencia —`JobBuilder`, el trait `JobCode`, sus dos almacenes—
-//! y **no se usa ninguna**: `backup_jobs` ya es el almacén, y duplicarlo abriría dos verdades que
-//! se desincronizan sin dar error. Lo que se usa es la mitad que no guarda nada, un reloj con sus
-//! tareas en memoria. La consecuencia se declara: al reiniciar no hay nada planificado hasta que
-//! termina la planificación inicial, y esa ventana se cierra **antes** de empezar a escuchar.
+//! El reloj es **nativo**: un bucle de Tokio con un mapa de tareas en memoria y un despertador
+//! calculado sobre `time::OffsetDateTime`. `backup_jobs` ya es el almacén, y duplicarlo abriría dos
+//! verdades que se desincronizan sin dar error. La consecuencia se declara: al reiniciar no hay nada
+//! planificado hasta que termina la planificación inicial, y esa ventana se cierra **antes** de
+//! empezar a escuchar.
 //!
 //! # La sincronización es periódica: [`PERIODO_DE_RECONCILIACION`]
 //!
@@ -27,16 +26,15 @@
 //! `add()` devuelve un `Uuid` que es el mango de la tarea y `remove(&Uuid)` es lo único que la
 //! retira; `remove` de un mango que no existe devuelve `Ok(())` y no hay forma de enumerar lo
 //! planificado. Así que la tabla de este módulo es la única autoridad sobre qué está planificado, y
-//! **hay que olvidar el mango viejo al reemplazar**: una tarea cuyo cron cambia se retira por su
-//! mango de entonces y se vuelve a añadir. Si el mango viejo se pierde sin retirarse, la
+//! **hay que olvidar el mango viejo al reemplazar**: una tarea cuyo calendario cambia se retira por
+//! su mango de entonces y se vuelve a añadir. Si el mango viejo se pierde sin retirarse, la
 //! planificación duplicada **no da ningún error** —simplemente dispara dos veces—, y por eso la
 //! tabla guarda el mango y no solo un booleano.
 //!
 //! # La puerta de parada: una bandera de un solo sentido, cerrada sin esperar candados
 //!
-//! Está medido que `shutdown()` vuelve en microsegundos —no espera al disparo en vuelo— y que un
-//! tick puede disparar **después** de que la parada empiece. Por eso la garantía de que no se
-//! encola tras la parada **no se delega en la biblioteca**: [`Interior::abierta`] es una bandera
+//! Está medido que apagar el bucle puede dejar un tick disparando después, así que la garantía de
+//! que no se encola tras la parada **no se delega en el bucle**: [`Interior::abierta`] es una bandera
 //! atómica que [`Planificador::parar`] pone a `false` **antes de cualquier `await`**. El cierre no
 //! puede depender de adquirir un candado dentro del plazo: si el candado [`Interior::estado`] está
 //! tomado más que el plazo —un disparo que lo retiene durante `encolar` mientras una escritura
@@ -45,33 +43,31 @@
 //!
 //! [`super::disparo`] consulta la bandera **dentro de la misma sección crítica que el encolado**
 //! —el candado [`Interior::estado`]—, así que un encolado o termina antes del cierre o no empieza,
-//! y eso cubre también el tick que la biblioteca dispare de más. Y como la bandera solo pasa de
+//! y eso cubre también el tick que el bucle pueda disparar de más. Y como la bandera solo pasa de
 //! abierta a cerrada, un disparo que ya pasó el chequeo termina su encolado y ninguno nuevo
 //! empieza. El plazo de [`Planificador::parar`] acota **el drenaje del módulo** —la espera al
-//! disparo en vuelo—, no el cierre, que ya está hecho; ni la llamada a `shutdown()`, que volvería
-//! igualmente en microsegundos.
+//! disparo en vuelo y el apagado del bucle—, no el cierre de la puerta, que ya está hecho.
 //!
 //! # Por qué el reloj va detrás de un `Mutex` cuando nadie lo comparte
 //!
-//! Porque tres de sus métodos piden `&mut self` —`shutdown`, `next_tick_for_job` y
-//! `time_till_next_job`— y la superficie de este módulo solo presta `&self`. El módulo se queda el
-//! `JobScheduler` y le pasa **clones** a los cierres de disparo, que es lo que la biblioteca
-//! espera.
+//! Porque el bucle del reloj necesita `&mut self` para apagarse y la superficie de este módulo solo
+//! presta `&self`. El módulo se queda el reloj nativo y le pasa **clones** a los cierres de disparo,
+//! que es lo que hace que un disparo vea la planificación viva y que la parada alcance a todos.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use sqlx::SqlitePool;
 use thiserror::Error;
-use tokio::sync::Mutex;
-use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError, JobToRunAsync};
+use time::{Duration, OffsetDateTime};
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::validacion::validar;
+use super::validacion::{Agenda, validar};
 use crate::db::DbError;
 use crate::db::entities::Tareas;
 use crate::engine::Motor;
@@ -86,13 +82,13 @@ use crate::engine::Motor;
 ///
 /// Treinta segundos: bastante para no leer la tabla cada segundo por nada, y lo bastante corto para
 /// que una tarea recién dada de alta no se quede esperando un ciclo largo.
-pub const PERIODO_DE_RECONCILIACION: Duration = Duration::from_secs(30);
+pub const PERIODO_DE_RECONCILIACION: Duration = Duration::seconds(30);
 
 /// El plazo que acota el drenaje del planificador al pararlo.
 ///
 /// Es el número con el que [`Planificador::parar`] acota **su** drenaje —la reconciliación o el
-/// disparo que estuviera en vuelo, bajo el candado que comparte con el encolado—, no la llamada a
-/// `shutdown()` de la biblioteca, que vuelve en microsegundos aunque haya un job durmiendo. Se
+/// disparo que estuviera en vuelo, bajo el candado que comparte con el encolado, y el apagado del
+/// bucle—, no el cierre de la puerta, que ya está hecho. Se
 /// declara **aquí y en un solo sitio**: el proceso lo lee de esta constante al montar el apagado
 /// ordenado, y no de una variable de entorno, porque la parada del planificador no añade
 /// configuración.
@@ -103,7 +99,7 @@ pub const PERIODO_DE_RECONCILIACION: Duration = Duration::from_secs(30);
 /// detrás de otra —el reloj dentro del futuro de apagado y el motor después de `serve`—, dentro del
 /// período de gracia de un `docker stop` (diez segundos). Igualar el plazo del motor dejaría el peor
 /// caso pegado a ese límite, y acotar existe justo para no acabar en un `SIGKILL`.
-pub const PLAZO_DE_PARADA: Duration = Duration::from_secs(2);
+pub const PLAZO_DE_PARADA: Duration = Duration::seconds(2);
 
 /// Cómo se arranca el planificador y cada cuánto sincroniza.
 ///
@@ -144,14 +140,13 @@ impl Ajustes {
 /// decisión de que la errata de una tarea no pueda convertirse en la ausencia de todas las copias.
 #[derive(Debug, Error)]
 pub enum ErrorDelPlanificador {
-    /// El reloj de la biblioteca no ha podido montarse, aceptar una tarea o arrancar.
+    /// El reloj nativo no ha podido arrancar, aceptar una tarea o pararse.
     ///
-    /// El motivo es texto y **no** el [`JobSchedulerError`] de la biblioteca a propósito: su
-    /// `Display` es su `Debug` —`ParseSchedule` y nada más—, y un tipo suyo en esta superficie
-    /// pública ataría el borde al reloj.
+    /// El motivo es texto y **no** un tipo ajeno a este módulo a propósito: un tipo de la
+    /// implementación del reloj en esta superficie pública ataría el borde a la implementación.
     #[error("el reloj del planificador no ha respondido: {motivo}")]
     Reloj {
-        /// Qué dijo la biblioteca, ya pasado a texto.
+        /// Qué dijo el reloj, ya pasado a texto.
         motivo: String,
     },
 
@@ -167,12 +162,221 @@ pub enum ErrorDelPlanificador {
     },
 }
 
+/// Por qué una operación interna del reloj nativo no se ha podido confirmar.
+///
+/// No sale de este módulo: es el tipo que [`Estado::aplicar_retirada`] usa para decidir si una
+/// entrada se queda en la tabla esperando un reintento.
+#[derive(Debug, Error)]
+pub(super) enum ErrorDelReloj {
+    /// La operación no se pudo completar; el motivo se guarda como texto.
+    ///
+    /// La variante existe también en producción: el apagado del bucle puede fallar y el llamante
+    /// tiene que poder distinguir un reloj que no confirmó su retirada de uno que sí lo hizo.
+    #[error("el reloj nativo no ha podido completar la operación: {motivo}")]
+    Operacion {
+        /// La razón, ya convertida en texto.
+        motivo: String,
+    },
+}
+
+/// El cuerpo del disparo que el reloj llama en cada vencimiento.
+///
+/// Recibe el identificador de la tarea de Kesto y devuelve un futuro que se ejecuta en su propia
+/// tarea de Tokio, para que un encolado lento no retrase el cálculo del siguiente vencimiento.
+type Disparo = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Lo que el reloj sabe de un job planificado.
+///
+/// El `mango` es la clave del mapa y el identificador que la tabla [`Estado::planificadas`] guarda;
+/// el `job_id` es el de la tarea de `backup_jobs` y es lo que se entrega al disparo.
+struct JobInfo {
+    /// La tarea de Kesto a la que pertenece este job.
+    job_id: Uuid,
+    /// La agenda validada, con la que se calcula cada vencimiento.
+    agenda: Agenda,
+    /// El cuerpo que se ejecuta al vencer.
+    disparo: Disparo,
+    /// El siguiente vencimiento ya calculado; `None` si la agenda no tiene ocurrencia siguiente.
+    proxima_ejecucion: Option<OffsetDateTime>,
+}
+
+/// El reloj nativo: un mapa de jobs, un despertador y un bucle que los evalúa.
+///
+/// No guarda nada en disco: `backup_jobs` es la única verdad. El mapa vive tras un `Arc<Mutex<_>>`
+/// para que el bucle y las operaciones de alta/baja compartan exactamente el mismo estado sin
+/// copias.
+pub(super) struct NativeScheduler {
+    /// Los jobs vivos, por mango.
+    jobs: Arc<Mutex<HashMap<Uuid, JobInfo>>>,
+    /// Despierta al bucle cuando cambia el mapa o se ordena la parada.
+    notify: Arc<Notify>,
+    /// La bandera de parada propia del bucle.
+    apagado: Arc<AtomicBool>,
+    /// La tarea del bucle, para poder esperarla al apagar.
+    tarea: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl NativeScheduler {
+    /// Construye un reloj vacío, aún sin bucle en marcha.
+    fn nuevo() -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            notify: Arc::new(Notify::new()),
+            apagado: Arc::new(AtomicBool::new(false)),
+            tarea: Mutex::new(None),
+        }
+    }
+
+    /// Lanza el bucle que calcula vencimientos y dispara.
+    async fn arrancar(&self) {
+        let jobs = Arc::clone(&self.jobs);
+        let notify = Arc::clone(&self.notify);
+        let apagado = Arc::clone(&self.apagado);
+        let tarea = tokio::spawn(async move {
+            bucle_del_reloj(jobs, notify, apagado).await;
+        });
+
+        let mut guardia = self.tarea.lock().await;
+        *guardia = Some(tarea);
+    }
+
+    /// Añade un job y devuelve su mango.
+    async fn añadir(&self, job_id: Uuid, agenda: Agenda, disparo: Disparo) -> Uuid {
+        let mango = Uuid::new_v4();
+        // La próxima marca se calcula **al alta**, no en el primer tick del bucle: la tabla tiene
+        // que poder responder por la próxima ejecución desde el mismo instante en que se crea.
+        let proxima_ejecucion = agenda.proxima_tras(OffsetDateTime::now_utc());
+        // El mango se inserta antes de despertar: el bucle no puede ver un aviso sin job.
+        let mut jobs = self.jobs.lock().await;
+        jobs.insert(
+            mango,
+            JobInfo {
+                job_id,
+                agenda,
+                disparo,
+                proxima_ejecucion,
+            },
+        );
+        drop(jobs);
+        // `notify_one` guarda un permiso: si el bucle todavía no ha registrado su `notified()`,
+        // el aviso se consume en cuanto lo registre. `notify_waiters` solo avisa a los waiters
+        // ya registrados y perdería este aviso.
+        self.notify.notify_one();
+        mango
+    }
+
+    /// Retira un job por su mango, sin fallar si ya no estaba.
+    pub(super) async fn remove(&self, mango: &Uuid) -> Result<(), ErrorDelReloj> {
+        let mut jobs = self.jobs.lock().await;
+        if jobs.remove(mango).is_none() {
+            tracing::debug!(
+                %mango,
+                "el mango que se retira ya no estaba en el reloj"
+            );
+        }
+        drop(jobs);
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// El siguiente vencimiento que el reloj tiene calculado para un mango.
+    #[cfg(test)]
+    async fn proxima_de(&self, mango: Uuid) -> Result<Option<OffsetDateTime>, ErrorDelReloj> {
+        let jobs = self.jobs.lock().await;
+        Ok(jobs.get(&mango).and_then(|info| info.proxima_ejecucion))
+    }
+
+    /// Apaga el bucle y espera a que termine.
+    async fn apagar(&self) -> Result<(), ErrorDelReloj> {
+        self.apagado.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+
+        let tarea = self.tarea.lock().await.take();
+        if let Some(tarea) = tarea
+            && let Err(error) = tarea.await
+        {
+            return Err(ErrorDelReloj::Operacion {
+                motivo: error.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// El bucle del reloj nativo.
+///
+/// En cada vuelta calcula el vencimiento más próximo entre todos los jobs, ejecuta los que ya
+/// vencieron en tareas propias y duerme hasta el siguiente —o hasta que un alta, una baja o la
+/// parada lo despierte—. La bandera de parada se comprueba arriba y el despertar de la parada llega
+/// por el mismo `Notify`, así que no hay ventana en la que el bucle siga durmiendo tras el cierre.
+async fn bucle_del_reloj(
+    jobs: Arc<Mutex<HashMap<Uuid, JobInfo>>>,
+    notify: Arc<Notify>,
+    apagado: Arc<AtomicBool>,
+) {
+    loop {
+        if apagado.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let ahora = OffsetDateTime::now_utc();
+        let (proximo, vencidas) = {
+            let mut mapa = jobs.lock().await;
+            let mut proximo: Option<OffsetDateTime> = None;
+            let mut vencidas = Vec::new();
+
+            for info in mapa.values_mut() {
+                if info.proxima_ejecucion.is_none() {
+                    info.proxima_ejecucion = info.agenda.proxima_tras(ahora);
+                }
+
+                if let Some(cuando) = info.proxima_ejecucion {
+                    if cuando <= ahora {
+                        vencidas.push((info.job_id, Arc::clone(&info.disparo)));
+                        info.proxima_ejecucion = info.agenda.proxima_tras(cuando);
+                    } else if proximo.is_none() || cuando < proximo.expect("hay próximo") {
+                        proximo = Some(cuando);
+                    }
+                }
+            }
+
+            (proximo, vencidas)
+        };
+
+        for (job_id, disparo) in vencidas {
+            tokio::spawn(disparo(job_id));
+        }
+
+        match proximo {
+            Some(cuando) if cuando > ahora => {
+                let resto = cuando - ahora;
+                let plazo = std::time::Duration::from_nanos(resto.whole_nanoseconds() as u64);
+                tokio::select! {
+                    _ = tokio::time::sleep(plazo) => {}
+                    _ = notify.notified() => {}
+                }
+            }
+            Some(_) => {
+                // Ya venció: otra vuelta lo ejecuta sin dormir.
+            }
+            None => {
+                notify.notified().await;
+            }
+        }
+    }
+}
+
+/// Convierte un plazo de `time` al tipo que espera `tokio::time`.
+fn a_std(plazo: Duration) -> std::time::Duration {
+    std::time::Duration::from_nanos(plazo.whole_nanoseconds() as u64)
+}
+
 /// El reloj del planificador: las tareas activas y su disparo.
 ///
 /// Es **clonable y barato** —como [`Motor`]—, porque por dentro hay un [`Arc`]: clonarlo no vuelve
-/// a leer la base ni a montar un reloj. El clon que viaja a cada cierre de disparo de la biblioteca
-/// comparte estado con el original, que es lo que hace que un disparo vea la planificación viva y
-/// que la parada alcance a todos.
+/// a leer la base ni a montar un reloj. El clon que viaja a cada cierre de disparo comparte estado
+/// con el original, que es lo que hace que un disparo vea la planificación viva y que la parada
+/// alcance a todos.
 ///
 /// No entra en el `AppState`: ninguna ruta lo necesita, y meterlo obligaría a que cada prueba de
 /// las rutas levantara un reloj. Su mango viaja por `main` hasta la parada ordenada, al lado del
@@ -183,8 +387,8 @@ pub struct Planificador(pub(super) Arc<Interior>);
 /// Lo que comparten el planificador y sus clones.
 ///
 /// Es `pub(super)` y no público porque [`super::disparo`] —un módulo hermano— tiene que alcanzar el
-/// motor y el estado del disparo, y que el cierre de la biblioteca llame al cuerpo del disparo sin
-/// que este módulo publique su interior hacia fuera.
+/// motor y el estado del disparo, y que el cierre del reloj llame al cuerpo del disparo sin que este
+/// módulo publique su interior hacia fuera.
 pub(super) struct Interior {
     /// El motor: la única puerta por la que nace una ejecución, la misma del disparo manual.
     pub(super) motor: Motor,
@@ -192,12 +396,12 @@ pub(super) struct Interior {
     pub(super) tareas: Tareas,
     /// Cómo se arranca y cada cuánto reconcilia.
     pub(super) ajustes: Ajustes,
-    /// El reloj de la biblioteca.
+    /// El reloj nativo.
     ///
-    /// Tras un candado porque `shutdown` pide `&mut self` y la superficie de aquí solo presta
-    /// `&self`. Orden de cerrojo: siempre [`Interior::estado`] antes que este, para que un disparo
-    /// que retira una tarea no se cruce con una reconciliación.
-    pub(super) reloj: Mutex<JobScheduler>,
+    /// Tras un candado porque el bucle del reloj necesita `&mut self` para apagarse y la superficie
+    /// de aquí solo presta `&self`. Orden de cerrojo: siempre [`Interior::estado`] antes que este,
+    /// para que un disparo que retira una tarea no se cruce con una reconciliación.
+    pub(super) reloj: Mutex<NativeScheduler>,
     /// La puerta de parada: si el planificador sigue aceptando disparos.
     ///
     /// Es una bandera atómica y **no** un campo de [`Estado`], porque su cierre no puede depender de
@@ -210,7 +414,7 @@ pub(super) struct Interior {
     /// —[`Planificador::parar`]— y cuando el motor deja de aceptar trabajo —[`super::disparo`], al
     /// ver `MotorParado`—.
     pub(super) abierta: AtomicBool,
-    /// La tabla `job_id → mango` de la biblioteca, bajo su candado.
+    /// La tabla `job_id → mango`, bajo su candado.
     pub(super) estado: Mutex<Estado>,
 }
 
@@ -233,16 +437,16 @@ impl Interior {
 /// donde [`super::disparo`] consulta la puerta **en la misma sección crítica que el encolado** —así
 /// un encolado o termina antes del cierre o no empieza— y donde la reconciliación ajusta la tabla.
 pub(super) struct Estado {
-    /// La tabla `job_id → mango` de la biblioteca.
+    /// La tabla `job_id → mango` del reloj nativo.
     ///
-    /// Es la **única autoridad** sobre lo planificado: la biblioteca no ofrece ninguna señal de
-    /// estado utilizable —`remove` de un mango inexistente devuelve `Ok(())`—, así que el origen de
+    /// Es la **única autoridad** sobre lo planificado: el reloj no ofrece ninguna señal de estado
+    /// utilizable —`remove` de un mango inexistente devuelve `Ok(())`—, así que el origen de
     /// verdad es esta tabla y el reloj solo la obedece.
     pub(super) planificadas: HashMap<Uuid, Uuid>,
     /// La expresión **normalizada** con la que se planificó cada tarea, por su identificador.
     ///
     /// No es una segunda autoridad sobre lo planificado —esa es [`Estado::planificadas`]—, es la
-    /// memoria de **con qué** se planificó: la biblioteca no deja leer el calendario de una tarea
+    /// memoria de **con qué** se planificó: el reloj no deja leer el calendario de una tarea
     /// planificada, así que sin esto no habría forma de distinguir «sigue igual» de «cambió la
     /// expresión» y la reconciliación reemplazaría a ciegas —o no reemplazaría nunca—. Guarda la
     /// forma normalizada, que es la que se le dio al reloj, no la que tecleó el usuario.
@@ -250,7 +454,7 @@ pub(super) struct Estado {
 }
 
 impl Estado {
-    /// Aplica a la tabla el desenlace de `reloj.remove`, y devuelve el error si no se confirmó.
+    /// Aplica a la tabla el desenlace de `quitar`, y devuelve el error si no se confirmó.
     ///
     /// # El invariante: nada sale de la tabla hasta que el reloj confirma
     ///
@@ -267,8 +471,8 @@ impl Estado {
     pub(super) fn aplicar_retirada(
         &mut self,
         job_id: Uuid,
-        desenlace: Result<(), JobSchedulerError>,
-    ) -> Result<(), JobSchedulerError> {
+        desenlace: Result<(), ErrorDelReloj>,
+    ) -> Result<(), ErrorDelReloj> {
         match desenlace {
             Ok(()) => {
                 self.planificadas.remove(&job_id);
@@ -282,7 +486,7 @@ impl Estado {
 }
 
 impl Planificador {
-    /// Planifica las tareas activas y arranca el reloj de la biblioteca.
+    /// Planifica las tareas activas y arranca el reloj nativo.
     ///
     /// Lee `backup_jobs`, planifica cada tarea con `enabled = 1` y su expresión, y **no** planifica
     /// ninguna con `enabled = 0`. Una tarea cuya expresión no parsea se registra como un error que
@@ -296,20 +500,15 @@ impl Planificador {
     /// # Errors
     ///
     /// [`ErrorDelPlanificador::Base`] si la base no se puede leer, y
-    /// [`ErrorDelPlanificador::Reloj`] si el reloj de la biblioteca no se puede montar o añadir una
-    /// tarea.
+    /// [`ErrorDelPlanificador::Reloj`] si el reloj no se puede arrancar o añadir una tarea.
     pub async fn arrancar(
         motor: Motor,
         base: SqlitePool,
         ajustes: Ajustes,
     ) -> Result<Self, ErrorDelPlanificador> {
-        // El reloj de la biblioteca, sin su persistencia: sus tareas viven en memoria y el almacén
-        // es `backup_jobs`.
-        let reloj = JobScheduler::new()
-            .await
-            .map_err(|error| ErrorDelPlanificador::Reloj {
-                motivo: error.to_string(),
-            })?;
+        // El reloj nativo, sin persistencia: sus tareas viven en memoria y el almacén es
+        // `backup_jobs`.
+        let reloj = NativeScheduler::nuevo();
 
         let planificador = Self(Arc::new(Interior {
             motor,
@@ -330,16 +529,7 @@ impl Planificador {
 
         // Y el reloj, a andar. Se arranca después de planificar: un reloj arrancado antes tendría
         // una ventana en la que dispara contra un motor que todavía no acepta trabajo.
-        planificador
-            .0
-            .reloj
-            .lock()
-            .await
-            .start()
-            .await
-            .map_err(|error| ErrorDelPlanificador::Reloj {
-                motivo: error.to_string(),
-            })?;
+        planificador.0.reloj.lock().await.arrancar().await;
 
         // Y constancia de que el reloj está en marcha: es la marca con la que se afirma, en el
         // registro del proceso, que el planificador quedó vivo **antes** de empezar a escuchar.
@@ -378,7 +568,7 @@ impl Planificador {
         // entiende. Una expresión que no parsea se registra nombrando tarea y expresión —es lo
         // único que la distingue en un registro con veinte tareas— y se salta: la errata de una
         // tarea no puede convertirse en la ausencia de todas las copias.
-        let mut deseadas: HashMap<Uuid, String> = HashMap::new();
+        let mut deseadas: HashMap<Uuid, Agenda> = HashMap::new();
 
         for tarea in &tareas {
             if !tarea.enabled {
@@ -387,7 +577,7 @@ impl Planificador {
 
             match validar(&tarea.cron_expression) {
                 Ok(agenda) => {
-                    deseadas.insert(tarea.id, agenda.normalizada().to_owned());
+                    deseadas.insert(tarea.id, agenda);
                 }
                 Err(error) => {
                     tracing::error!(
@@ -424,11 +614,11 @@ impl Planificador {
                     }
                 }
                 // Sigue deseada: solo se reemplaza si la expresión cambió.
-                Some(expresion) => {
+                Some(agenda) => {
                     let igual = estado
                         .expresiones
                         .get(&job_id)
-                        .is_some_and(|con_la_que_esta| con_la_que_esta == expresion);
+                        .is_some_and(|con_la_que_esta| con_la_que_esta == agenda.normalizada());
 
                     if !igual {
                         // **El mango viejo se retira antes de volver a añadir**: si se perdiera sin
@@ -454,14 +644,19 @@ impl Planificador {
         }
 
         // 2. Añadir lo que falta —lo nuevo y lo que se acaba de retirar para reemplazar—.
-        for (job_id, expresion) in &deseadas {
-            if estado.planificadas.contains_key(job_id) {
+        let pendientes: Vec<Uuid> = deseadas.keys().copied().collect();
+        for job_id in pendientes {
+            if estado.planificadas.contains_key(&job_id) {
                 continue;
             }
 
-            let mango = self.planificar_una(&mut reloj, *job_id, expresion).await?;
-            estado.planificadas.insert(*job_id, mango);
-            estado.expresiones.insert(*job_id, expresion.clone());
+            let agenda = deseadas
+                .remove(&job_id)
+                .expect("el job_id salió de las claves de `deseadas`");
+            let normalizada = agenda.normalizada().to_owned();
+            let mango = self.planificar_una(&mut reloj, job_id, agenda).await?;
+            estado.planificadas.insert(job_id, mango);
+            estado.expresiones.insert(job_id, normalizada);
         }
 
         Ok(())
@@ -470,48 +665,36 @@ impl Planificador {
     /// Monta el job de una tarea y lo añade al reloj, devolviendo su mango.
     ///
     /// El cuerpo del disparo es **una sola línea** —[`Planificador::disparar`]—; se prueba el
-    /// cuerpo y no el cierre, porque un tick de calendario real no se puede esperar en una prueba.
+    /// cuerpo y no el cierre, porque un vencimiento real del calendario no se puede esperar en una
+    /// prueba.
     ///
     /// # El identificador con el que dispara el cierre es el de Kesto, capturado
     ///
-    /// El `Uuid` que la biblioteca entrega al cierre es **su** mango interno —el mismo que devuelve
-    /// `add`—, **no** el `job_id` de la tarea de Kesto, y el cierre no puede deducir este último por
-    /// su cuenta: `add` no recibe el `job_id`. Tratar el mango como `job_id` fue el fallo real que
-    /// llevaba cada tick hasta `TareaQueNoEsta` sin crear nunca una ejecución. Por eso el
-    /// identificador de verdad viaja **capturado aquí** —que es donde se conoce— y el de la
-    /// biblioteca se ignora (`_mango`).
+    /// El `Uuid` que el reloj entrega al cierre es ahora el `job_id` de la tarea de Kesto, que es
+    /// lo único que el disparo necesita. Tratar el mango del reloj como `job_id` fue el fallo real
+    /// que llevaba cada tick hasta `TareaQueNoEsta` sin crear nunca una ejecución. Por eso el
+    /// identificador de verdad viaja **guardado en el job** y se entrega al disparo al vencer.
     async fn planificar_una(
         &self,
-        reloj: &mut JobScheduler,
+        reloj: &mut NativeScheduler,
         job_id: Uuid,
-        expresion: &str,
+        agenda: Agenda,
     ) -> Result<Uuid, ErrorDelPlanificador> {
         // El clon que viaja al cierre comparte el estado: un disparo ve la planificación viva y la
         // parada lo alcanza.
         let planificador = self.clone();
 
-        let disparo: Box<JobToRunAsync> = Box::new(
-            move |_mango: Uuid, _reloj: JobScheduler| -> Pin<Box<dyn Future<Output = ()> + Send>> {
-                let planificador = planificador.clone();
-                Box::pin(async move {
-                    planificador.disparar(job_id).await;
-                })
-            },
-        );
+        let disparo: Disparo = Arc::new(move |id| {
+            let planificador = planificador.clone();
+            Box::pin(async move {
+                planificador.disparar(id).await;
+            })
+        });
 
         // La expresión que se le da al reloj es la **normalizada**: la misma que la validación dio
-        // por buena, para que lo validado y lo evaluado sean la misma cadena.
-        let job =
-            Job::new_async(expresion, disparo).map_err(|error| ErrorDelPlanificador::Reloj {
-                motivo: error.to_string(),
-            })?;
-
-        reloj
-            .add(job)
-            .await
-            .map_err(|error| ErrorDelPlanificador::Reloj {
-                motivo: error.to_string(),
-            })
+        // por buena, para que lo validado y lo evaluado sean la misma cadena. Ya viene dentro de
+        // `agenda`, construida por `validar`.
+        Ok(reloj.añadir(job_id, agenda, disparo).await)
     }
 
     /// **Una sola pasada** de reconciliación: lo que la vigilancia periódica llama.
@@ -554,7 +737,7 @@ impl Planificador {
     /// vigilancia es solo el envoltorio que la repite cada [`Ajustes::periodo`].
     pub fn vigilar(&self) {
         let planificador = self.clone();
-        let periodo = self.0.ajustes.periodo;
+        let periodo = a_std(self.0.ajustes.periodo);
 
         tokio::spawn(async move {
             let mut intervalo = tokio::time::interval(periodo);
@@ -596,19 +779,20 @@ impl Planificador {
     /// porque un `docker stop` no puede convertirse en una espera indefinida que el orquestador
     /// resuelva con un `SIGKILL`.
     ///
-    /// El plazo acota **el drenaje del módulo**, no el cierre —ya garantizado— ni la llamada a
-    /// `shutdown()` de la biblioteca, que vuelve en microsegundos aunque haya un disparo en vuelo.
+    /// El plazo acota **el drenaje del módulo**, no el cierre —ya garantizado—: el apagado del bucle
+    /// también se ejecuta dentro de él, para que la parada esté acotada de principio a fin.
     pub async fn parar(&self, plazo: Duration) {
         // **Lo primero: cerrar la puerta, antes de cualquier `await`.** Un solo sentido: de abierta a
-        // cerrada y nunca al revés, porque la biblioteca no se reanuda. A partir de aquí, cualquier
-        // disparo que llegue —incluido el tick que la biblioteca pueda disparar tras `shutdown()`—
+        // cerrada y nunca al revés, porque el bucle no se reanuda. A partir de aquí, cualquier
+        // disparo que llegue —incluido el vencimiento que el bucle pueda disparar tras el apagado—
         // encuentra la puerta cerrada y no encola.
         self.0.cerrar_la_puerta();
+        let plazo_std = a_std(plazo);
 
         // Y ahora, el drenaje acotado: adquirir el candado espera al disparo que estuviera en vuelo,
         // de modo que `parar` no vuelve con un encolado a medias. Si vence, se registra y se
         // continúa: la puerta ya está cerrada, que es la garantía que importa.
-        match tokio::time::timeout(plazo, self.0.estado.lock()).await {
+        match tokio::time::timeout(plazo_std, self.0.estado.lock()).await {
             Ok(_guardia) => {}
             Err(_) => {
                 tracing::warn!(
@@ -619,21 +803,24 @@ impl Planificador {
             }
         }
 
-        // Y el reloj de la biblioteca, con **el mismo plazo**: su `shutdown` vuelve en microsegundos
-        // aunque haya un disparo en vuelo —por eso no lo acota la lentitud—, pero no se deja el
-        // apagado esperando sin cota; si el candado no llega dentro del plazo, se registra y se
-        // continúa.
-        match tokio::time::timeout(plazo, self.0.reloj.lock()).await {
-            Ok(mut reloj) => {
-                if let Err(error) = reloj.shutdown().await {
-                    tracing::warn!(%error, "el reloj de la biblioteca no se ha apagado limpiamente");
-                }
+        // Y el reloj nativo, con **el mismo plazo**: se apaga dentro del plazo, de modo que ni el
+        // candado ni la espera al bucle puedan alargar la parada; si vence, se registra y se
+        // continúa, porque la puerta ya está cerrada.
+        match tokio::time::timeout(plazo_std, async {
+            let reloj = self.0.reloj.lock().await;
+            reloj.apagar().await
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "el reloj nativo no se ha apagado limpiamente");
             }
             Err(_) => {
                 tracing::warn!(
                     plazo = ?plazo,
-                    "el candado del reloj no se ha podido tomar dentro del plazo para apagarlo: se \
-                     continúa con el apagado"
+                    "el apagado del reloj no ha terminado dentro del plazo: se continúa con el \
+                     apagado (la puerta ya está cerrada)"
                 );
             }
         }
@@ -645,7 +832,7 @@ impl Planificador {
 
     /// Las tareas que el planificador tiene planificadas, por su identificador.
     ///
-    /// Es lo que este módulo puede observar de lo planificado, porque la biblioteca **no** ofrece
+    /// Es lo que este módulo puede observar de lo planificado, porque el reloj **no** ofrece
     /// ninguna forma de enumerar sus tareas: el único mango es el `Uuid` que devolvió `add`, y vive
     /// en la tabla [`Estado::planificadas`].
     pub fn planificadas(&self) -> Vec<Uuid> {
@@ -683,7 +870,7 @@ impl Planificador {
     /// Los mangos vivos en el reloj, uno por tarea planificada.
     ///
     /// Es un gancho **interno** —`pub(super)`, no superficie pública— para que la prueba del
-    /// reemplazo pueda comprobar que un cambio de expresión no acumula mangos. La biblioteca no deja
+    /// reemplazo pueda comprobar que un cambio de expresión no acumula mangos. El reloj no deja
     /// enumerar sus tareas, así que lo único que se puede afirmar es lo que la tabla autoriza. Solo
     /// lo usa la prueba —el proceso no tiene por qué enumerar mangos—, así que se compila con las
     /// pruebas.
@@ -702,8 +889,9 @@ impl Planificador {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
+    use time::Duration;
     use uuid::Uuid;
 
     use super::Planificador;
@@ -715,18 +903,17 @@ mod tests {
     /// Es acotado y con nombre, como todos los plazos del repositorio: la parada acota **su**
     /// drenaje, así que con nada en vuelo vuelve muy por debajo de este número. Existe para que una
     /// avería del drenaje no convierta la prueba en un cuelgue.
-    const PLAZO_DE_PARADA: Duration = Duration::from_secs(1);
+    const PLAZO_DE_PARADA: Duration = Duration::seconds(1);
 
-    /// El plazo con el que una prueba espera un tick **real** del reloj.
+    /// El plazo con el que una prueba espera un vencimiento **real** del reloj.
     ///
-    /// Un calendario de cada segundo dispara en cuanto el bucle del reloj da su vuelta —medio
-    /// segundo de `sleep` por vuelta, más el desfase hasta la marca del segundo—, así que dispara
-    /// muy por debajo de este número. Existe para acotar un cuelgue, no para dar margen a una
-    /// ejecución lenta.
-    const PLAZO_DEL_TICK: Duration = Duration::from_secs(5);
+    /// Un calendario de cada segundo dispara en cuanto el bucle del reloj da su vuelta, así que
+    /// dispara muy por debajo de este número. Existe para acotar un cuelgue, no para dar margen a
+    /// una ejecución lenta.
+    const PLAZO_DEL_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Cada cuánto se mira si el tick ya creó la ejecución.
-    const INTERVALO_DE_MIRADA: Duration = Duration::from_millis(50);
+    const INTERVALO_DE_MIRADA: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// Y el plazo con el que la prueba espera a que esa ejecución llegue a su estado terminal.
     ///
@@ -734,20 +921,19 @@ mod tests {
     /// escribe en la base a través del runtime, y soltar el runtime con una ejecución a medias hace
     /// saltar al hilo que escribe. El abridor de este aparato tarda un segundo en decir que no
     /// abre, así que vuelve muy por debajo de este número.
-    const PLAZO_DEL_FINAL: Duration = Duration::from_secs(30);
+    const PLAZO_DEL_FINAL: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// La próxima ejecución que el reloj tiene calculada para un mango, en texto; `None` si el reloj
     /// no tiene ninguna tarea con ese mango.
     ///
     /// Es una observación del **reloj privado** —el mismo que el módulo guarda tras su candado—, y
-    /// el instante se queda en texto a propósito: nombrar su tipo sería importar `chrono`, que no es
-    /// una dependencia directa del crate, y lo que estas pruebas necesitan es distinguir una próxima
-    /// ejecución de otra —o de ninguna—, no leer el instante.
+    /// el instante se queda en texto a propósito: lo que estas pruebas necesitan es distinguir una
+    /// próxima ejecución de otra —o de ninguna—, no leer el instante.
     async fn proxima_del_reloj(planificador: &Planificador, mango: Uuid) -> Option<String> {
-        let mut reloj = planificador.0.reloj.lock().await;
+        let reloj = planificador.0.reloj.lock().await;
 
         reloj
-            .next_tick_for_job(mango)
+            .proxima_de(mango)
             .await
             .expect("el reloj tiene que poder decir cuándo dispara su tarea")
             .map(|cuando| format!("{cuando:?}"))
@@ -757,7 +943,7 @@ mod tests {
     ///
     /// Las dos mitades se afirman por separado porque son dos hechos distintos: que la tarea esté en
     /// la tabla de lo planificado, y que el reloj le haya calculado el tick. Un `add` que se hubiera
-    /// quedado en `ParseSchedule` no dejaría mango, y uno que hubiera entrado sin próxima ejecución
+    /// quedado sin mango no dejaría mango, y uno que hubiera entrado sin próxima ejecución
     /// sería una tarea que nunca dispara.
     #[tokio::test]
     async fn una_tarea_activa_queda_planificada_al_arrancar() {
@@ -1041,8 +1227,8 @@ mod tests {
     /// 6 — Escenario 2: la parada del planificador no crea ninguna ejecución nueva.
     ///
     /// «Cuando transcurre el tiempo que habría hecho disparar» no se puede esperar en una prueba, así
-    /// que se provoca el tick de la única forma que el contrato admite: llamando a `disparar`, que es
-    /// exactamente lo que haría el cierre de la biblioteca —y que la medición de la fase 0 mostró que
+    /// que se provoca el vencimiento de la única forma que el contrato admite: llamando a `disparar`,
+    /// que es exactamente lo que hará el cierre del reloj —y que la medición de la fase 0 mostró que
     /// puede llegar **después** de la parada—. Lo que se mide es el recuento de filas: con la puerta
     /// cerrada no hay ninguna.
     #[tokio::test]
@@ -1060,7 +1246,7 @@ mod tests {
             "tras parar, el planificador sigue aceptando trabajo"
         );
 
-        // El tick que la biblioteca puede disparar después de la parada: la puerta cerrada lo deja
+        // El vencimiento que el bucle puede disparar después de la parada: la puerta cerrada lo deja
         // sin efecto.
         planificador.disparar(tarea).await;
 
@@ -1071,23 +1257,22 @@ mod tests {
         );
     }
 
-    /// 2 y 5 — Un tick **real** del reloj crea la ejecución de la tarea que le toca.
+    /// 2 y 5 — Un vencimiento **real** del reloj crea la ejecución de la tarea que le toca.
     ///
     /// Todas las demás pruebas del módulo llaman a [`Planificador::disparar`] directamente —que es
-    /// el cuerpo del cierre de la biblioteca— y por eso ninguna ve cómo el cierre **elige el
+    /// el cuerpo del cierre del reloj— y por eso ninguna ve cómo el cierre **elige el
     /// identificador** con el que dispara. Ese hueco dejó pasar un fallo real: el cierre recibía el
-    /// `Uuid` que la biblioteca entrega —su mango interno, el que devuelve `add`— y lo trataba como
-    /// el `job_id` de Kesto, así que cada tick acababa en `TareaQueNoEsta` y **nunca** nacía una
-    /// ejecución.
+    /// `Uuid` que el reloj entregaba y lo trataba como `job_id` de Kesto, así que cada tick acababa
+    /// en `TareaQueNoEsta` y **nunca** nacía una ejecución.
     ///
-    /// Esta es la que atraviesa el tick de verdad: planifica una tarea de cada segundo, deja correr
-    /// el reloj y espera a que aparezca la fila de **esa** tarea. Es lenta por construcción —el
+    /// Esta es la que atraviesa el vencimiento de verdad: planifica una tarea de cada segundo, deja
+    /// correr el reloj y espera a que aparezca la fila de **esa** tarea. Es lenta por construcción —el
     /// bucle del reloj mide el tiempo con el reloj de pared, así que no se puede pausar—, y por eso
     /// espera con un plazo acotado en vez de con un `sleep` fijo.
     #[tokio::test]
     async fn un_tick_real_del_reloj_crea_la_ejecucion_de_su_tarea() {
         let aparato = Aparato::nuevo().await;
-        // `* * * * * *` es «cada segundo»: el tick llega sin esperar una hora del calendario.
+        // `* * * * * *` es «cada segundo»: el vencimiento llega sin esperar una hora del calendario.
         let tarea = aparato.tarea("* * * * * *", true).await;
 
         let planificador = aparato.planificador().await;
@@ -1096,8 +1281,8 @@ mod tests {
         while aparato.ejecuciones_de(&tarea).await == 0 {
             assert!(
                 Instant::now() < limite,
-                "el tick del reloj no creó la ejecución de su tarea en {PLAZO_DEL_TICK:?}: el \
-                 disparo de la biblioteca no llega a la tarea de Kesto"
+                "el vencimiento del reloj no creó la ejecución de su tarea en {PLAZO_DEL_TICK:?}: \
+                 el disparo del reloj no llega a la tarea de Kesto"
             );
             tokio::time::sleep(INTERVALO_DE_MIRADA).await;
         }
@@ -1114,8 +1299,8 @@ mod tests {
 
             assert!(
                 Instant::now() < limite,
-                "la ejecución que creó el tick no llegó a un estado terminal en {PLAZO_DEL_FINAL:?}: \
-                 {estado}"
+                "la ejecución que creó el vencimiento no llegó a un estado terminal en \
+                 {PLAZO_DEL_FINAL:?}: {estado}"
             );
             tokio::time::sleep(INTERVALO_DE_MIRADA).await;
         }
@@ -1126,14 +1311,14 @@ mod tests {
     /// El plazo, deliberadamente diminuto, con el que se fuerza que el drenaje de una parada venza:
     /// se toma el candado `estado` —como lo tendría un disparo en vuelo durante un `encolar` lento—
     /// y se para con este plazo, que no llega a adquirirlo.
-    const PLAZO_QUE_VENCE: Duration = Duration::from_millis(10);
+    const PLAZO_QUE_VENCE: Duration = Duration::milliseconds(10);
 
     /// 6 — La puerta queda cerrada aunque el drenaje venza el plazo.
     ///
     /// Es el caso que el diseño anterior no cubría: si el candado `estado` está tomado más que el
     /// plazo —un `disparar` que lo retiene durante `motor.encolar(..).await`, con una escritura que
     /// puede esperar el `BUSY_TIMEOUT` de la base—, una puerta que solo se cerrara al adquirirlo se
-    /// quedaría abierta **para siempre**: los ticks posteriores encolarían tras la parada y
+    /// quedaría abierta **para siempre**: los vencimientos posteriores encolarían tras la parada y
     /// [`Planificador::esta_parado`] seguiría diciendo que no. Aquí se comprueba que el cierre **no
     /// depende** de adquirir el candado dentro del plazo.
     #[tokio::test]
@@ -1157,7 +1342,7 @@ mod tests {
 
     /// 6 — Un disparo posterior a una parada que venció el plazo tampoco encola.
     ///
-    /// Es la mitad que importa del requisito 6: el tick que la biblioteca dispare **después** de
+    /// Es la mitad que importa del requisito 6: el vencimiento que el reloj dispare **después** de
     /// `shutdown()` no puede crear ninguna ejecución. Con la puerta que solo se cerraba al adquirir
     /// el candado, este disparo encontraba el planificador abierto y encolaba.
     #[tokio::test]
@@ -1179,11 +1364,49 @@ mod tests {
         );
     }
 
+    /// Los avisos del reloj no se pierden aunque lleguen antes de que el bucle esté esperando.
+    ///
+    /// `añadir`, `remove` y `apagar` notifican **después** de soltar el candado de `jobs`, así que
+    /// es posible que el bucle todavía no haya registrado su `notified()`. Con `notify_waiters()`
+    /// el aviso se perdería y el bucle podría dormirse para siempre con un job nuevo o con la
+    /// parada ya ordenada; `notify_one()` guarda un permiso que se consume al registrarse.
+    #[tokio::test]
+    async fn un_aviso_antes_de_registrar_el_waiter_no_se_pierde() {
+        use std::sync::Arc;
+
+        use super::{Disparo, NativeScheduler};
+
+        let reloj = NativeScheduler::nuevo();
+        let disparo: Disparo = Arc::new(|_job_id| Box::pin(async {}));
+        let agenda = super::validar("* * * * * *").expect("una agenda de cada segundo es válida");
+
+        // El reloj no tiene bucle en marcha: los tres avisos ocurren antes de registrar un waiter.
+        let mango = reloj.añadir(Uuid::new_v4(), agenda, disparo).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), reloj.notify.notified())
+            .await
+            .expect("el aviso del alta se perdió sin waiter registrado");
+
+        reloj
+            .remove(&mango)
+            .await
+            .expect("retirar el mango del reloj no puede fallar");
+        tokio::time::timeout(std::time::Duration::from_secs(1), reloj.notify.notified())
+            .await
+            .expect("el aviso de la retirada se perdió sin waiter registrado");
+
+        reloj
+            .apagar()
+            .await
+            .expect("apagar un reloj sin bucle en marcha no puede fallar");
+        tokio::time::timeout(std::time::Duration::from_secs(1), reloj.notify.notified())
+            .await
+            .expect("el aviso de la parada se perdió sin waiter registrado");
+    }
+
     /// El invariante contra el **mango huérfano**: la tabla no se toca hasta que el reloj confirma.
     ///
-    /// Con el `remove` de la biblioteca que trae su almacén en memoria esto no es alcanzable
-    /// —`SimpleMetadataStore::delete` devuelve `Ok(())` siempre—, así que el fallo se dobla aquí: se
-    /// llama a [`Estado::aplicar_retirada`] —la única puerta por la que las tres retiradas tocan la
+    /// Con el `remove` nativo, que no trae almacén en memoria, el fallo se dobla aquí: se llama a
+    /// [`Estado::aplicar_retirada`] —la única puerta por la que las tres retiradas tocan la
     /// tabla— con un `Err` construido a mano. Lo que se fija es el invariante, no el camino: si la
     /// retirada no se confirma, la entrada **y su mango** se quedan, para que la siguiente pasada
     /// pueda reintentarla; quitarla antes la dejaría planificada y sin nadie capaz de retirarla.
@@ -1191,9 +1414,7 @@ mod tests {
     fn una_retirada_que_el_reloj_no_confirma_deja_el_mango_en_la_tabla() {
         use std::collections::HashMap;
 
-        use tokio_cron_scheduler::JobSchedulerError;
-
-        use super::Estado;
+        use super::{ErrorDelReloj, Estado};
 
         let job_id = Uuid::new_v4();
         let mango = Uuid::new_v4();
@@ -1203,7 +1424,12 @@ mod tests {
             expresiones: HashMap::from([(job_id, CRON_DE_CINCO.to_owned())]),
         };
 
-        let fallo = estado.aplicar_retirada(job_id, Err(JobSchedulerError::RemoveShutdownNotifier));
+        let fallo = estado.aplicar_retirada(
+            job_id,
+            Err(ErrorDelReloj::Operacion {
+                motivo: "fallo simulado".to_owned(),
+            }),
+        );
 
         assert!(
             fallo.is_err(),

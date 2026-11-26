@@ -27,6 +27,7 @@
 //! ([`CopiaHecha`]) y la señal de la entrega del volcado
 //! ([`EntregaDelVolcado::completa`]), y quien los compone en un veredicto es el motor.
 
+pub mod endpoint;
 mod error;
 mod origen;
 mod progreso;

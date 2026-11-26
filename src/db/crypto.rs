@@ -70,6 +70,12 @@ pub const PREFIJO: &str = "v1";
 /// **literalmente** —no basta con que «acabe en `v1`»—.
 pub const ETIQUETA: &[u8] = b"kesto/secrets/v1";
 
+// Nueva etiqueta para el hash de tokens API: **distinta** a la de secretos.
+/// Se usa para derivar la clave HMAC-SHA256 con la que se hashean los tokens.
+/// No reutilicemos `kesto/secrets/v1`: un cambio de etiqueta ahí dejaría ilegibles
+/// los secretos guardados y el de los tokens tendría que ser una rotación nueva.
+pub const API_TOKEN_ETIQUETA: &[u8] = b"kesto/api-tokens/v1";
+
 /// Error del cifrado en reposo.
 ///
 /// Ninguna variante publica el valor cifrado, el nonce ni el valor en claro: una
@@ -157,15 +163,33 @@ pub enum ErrorDeCifrado {
 /// en una variable global— y se deriva una vez por proceso. El material vive en un
 /// [`Zeroizing`], así que se borra al caer, como el de [`SecretString`]: es la
 /// misma política del crate para todo lo que es secreto.
-pub struct Clave(Zeroizing<[u8; 32]>);
+pub struct Clave {
+    /// Clave de cifrado AES-256-GCM para los secretos en reposo.
+    cifrado: Zeroizing<[u8; 32]>,
+    /// Clave HMAC-SHA256 para hashear tokens API, derivada con [`API_TOKEN_ETIQUETA`].
+    ///
+    /// Va en un [`Zeroizing`] como [`Self::cifrado`]: es material secreto y la
+    /// política del crate es que se borre al caer. Dejarla en un `[u8; 32]` pelado
+    /// la mantendría en la pila hasta que el proceso muriera.
+    api_token: Zeroizing<[u8; 32]>,
+}
 
 impl Clave {
-    /// Deriva la clave de la maestra con [`ETIQUETA`].
+    /// Deriva las claves de la maestra con [`ETIQUETA`] y [`API_TOKEN_ETIQUETA`].
     ///
     /// No devuelve `Result` a propósito: HKDF-SHA256 con cualquier entrada
     /// funciona, así que no hay ningún fallo que informar.
     pub fn desde_maestra(maestra: &SecretString) -> Self {
-        Clave(Zeroizing::new(derivar(maestra, ETIQUETA)))
+        Clave {
+            cifrado: Zeroizing::new(derivar(maestra, ETIQUETA)),
+            api_token: Zeroizing::new(derivar(maestra, API_TOKEN_ETIQUETA)),
+        }
+    }
+
+    /// La clave HMAC-SHA256 para tokens API, derivada de `KESTO_MASTER_KEY` con
+    /// [`API_TOKEN_ETIQUETA`].
+    pub fn api_token_key(&self) -> &[u8; 32] {
+        &self.api_token
     }
 
     /// Cifra un secreto en el sobre `v1:<nonce>:<cifrado>`.
@@ -251,7 +275,7 @@ impl Clave {
     /// fija la longitud que el algoritmo exige, así que la construcción es
     /// infalible y no hay ningún `Result` que contestar.
     fn cifrador(&self) -> Aes256Gcm {
-        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0[..]))
+        Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.cifrado[..]))
     }
 }
 
@@ -286,7 +310,7 @@ fn derivar(maestra: &SecretString, etiqueta: &[u8]) -> [u8; 32] {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{Clave, ETIQUETA, ErrorDeCifrado, PREFIJO};
+    use super::{API_TOKEN_ETIQUETA, Clave, ETIQUETA, ErrorDeCifrado, PREFIJO};
     use crate::secret::SecretString;
     use crate::test_support::capturar_log;
 
@@ -609,11 +633,26 @@ mod tests {
             "dos derivaciones con la misma maestra y la misma etiqueta difieren"
         );
 
-        let con_otra_etiqueta = super::derivar(&maestra, b"kesto/secrets/otra");
+        let con_otra_etiqueta = super::derivar(&maestra, API_TOKEN_ETIQUETA);
 
         assert_ne!(
             primera, con_otra_etiqueta,
             "cambiar la etiqueta no cambió la clave derivada"
+        );
+
+        // Las dos etiquetas del crate son **distintas**: usar la de los secretos para
+        // los tokens de API ataría la rotación de una a la de la otra y un cambio en
+        // cualquiera dejaría de ser un cambio de etiqueta para ser una pérdida.
+        assert_ne!(
+            API_TOKEN_ETIQUETA, ETIQUETA,
+            "la etiqueta de los tokens de API no puede ser la de los secretos en reposo"
+        );
+
+        // La etiqueta de los tokens es **literal**, igual que la de los secretos: los
+        // hashes ya guardados dejarían de validar si cambiara.
+        assert_eq!(
+            API_TOKEN_ETIQUETA, b"kesto/api-tokens/v1",
+            "la etiqueta de los tokens de API cambió: los hashes guardados dejarían de validar"
         );
 
         // La etiqueta es **literal**: no basta con que «acabe en `v1`». Cambiarla

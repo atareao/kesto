@@ -1,5 +1,4 @@
 //! Prueba de integración del **arranque real** del binario de Kesto.
-//!
 //! El `SHALL` «la aplicación SHALL intentar el descubrimiento del proveedor al
 //! arrancar … SHALL arrancar igualmente con un aviso» vive en `src/main.rs`, que
 //! ningún test unitario toca: el escenario 1.5 prueba `descubrimiento_al_arrancar`
@@ -139,6 +138,10 @@ fn el_arranque_avisa_si_el_proveedor_no_contesta_y_arranca_igualmente() {
         .env("OIDC_ISSUER_URL", &emisor)
         .env("OIDC_CLIENT_ID", "kesto-panel")
         .env("OIDC_CLIENT_SECRET", "secreto-de-cliente-distinguible")
+        .env(
+            "OIDC_REDIRECT_URL",
+            "https://panel.example.test/api/v1/auth/callback",
+        )
         .env("DATABASE_URL", &dsn)
         // Un puerto efímero: lo elige el sistema y ningún test choca con el 8080
         // del Kesto en desarrollo.
@@ -487,7 +490,9 @@ fn socket_muerto() -> String {
 /// la base, la dirección de escucha y el socket del motor—, así que la salida depende de lo escrito
 /// aquí y no del entorno de quien corre la suite. Las tres `OIDC_*` se dejan **fuera** a propósito:
 /// lo que estas pruebas miden no es la autenticación, y sin ellas el modo es `Disabled` y la salud
-/// —que es pública en los dos modos— contesta sin sesión, que es lo que hace falta.
+/// —que es pública en los dos modos— contesta sin sesión, que es lo que hace falta. Y precisamente
+/// porque el modo es `Disabled`, el permiso explícito —`KESTO_ALLOW_INSECURE=1`— es obligatorio:
+/// sin él el proceso ni siquiera arranca.
 fn lanzar(puerto: u16, socket_del_motor: &str) -> EnMarcha {
     let base = std::env::temp_dir().join(format!("kesto-arranque-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&base).expect("el directorio temporal de la prueba debe crearse");
@@ -498,6 +503,7 @@ fn lanzar(puerto: u16, socket_del_motor: &str) -> EnMarcha {
     let child = Command::new(env!("CARGO_BIN_EXE_kesto"))
         .env_clear()
         .env("KESTO_MASTER_KEY", MASTER_KEY)
+        .env("KESTO_ALLOW_INSECURE", "1")
         .env("DATABASE_URL", &dsn)
         .env("BIND_ADDRESS", format!("127.0.0.1:{puerto}"))
         .env("DOCKER_HOST", socket_del_motor)
@@ -717,10 +723,13 @@ fn un_socket_de_docker_inalcanzable_no_impide_arrancar_y_el_motor_va_antes_del_l
         )
     });
 
-    assert_eq!(
-        cuerpo["data"]["auth_mode"], "disabled",
-        "la salud contestó `200` pero no declaró el modo de autenticación de esta prueba: se esperaba \
-         el modo `Disabled`, que es el de un arranque sin las tres `OIDC_*`. Cuerpo:\n{}",
+    assert!(
+        !cuerpo["data"]
+            .as_object()
+            .expect("data debe ser objeto")
+            .contains_key("auth_mode"),
+        "la salud contestó `200` pero declaró `auth_mode` en `data`: en este arranque sin socket el \
+         modo de autenticación no debe figurar. Cuerpo:\n{}",
         salud.cuerpo
     );
 
@@ -1071,4 +1080,76 @@ fn un_sigterm_acaba_con_el_proceso_aunque_haya_un_cliente_en_el_stream() {
     // El cliente se suelta aquí, con el proceso ya muerto y sus aserciones ya hechas: el socket
     // tiene que haber estado abierto todo el tiempo para que la prueba midiera lo que mide.
     drop(cliente);
+}
+
+/// El retorno de OIDC por `http` **no** deja arrancar el binario.
+///
+/// Es el otro extremo del `Secure` incondicional de la cookie: si el atributo ya
+/// no depende del retorno, quien decide si el despliegue es admisible es el
+/// arranque. Se lanza el binario de verdad —con las tres `OIDC_*` y el retorno
+/// por `http`— y se exige que **termine en fallo** nombrando la variable, que es
+/// lo que el operador lee en su registro.
+#[test]
+fn el_arranque_no_sale_adelante_si_el_retorno_de_oidc_no_es_https() {
+    let base = std::env::temp_dir().join(format!("kesto-arranque-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("el directorio temporal de la prueba debe crearse");
+
+    let directorio = DirectorioTemporal(base);
+    let dsn = format!("sqlite://{}/kesto.db", directorio.0.display());
+
+    let mut hijo = Hijo(
+        Command::new(env!("CARGO_BIN_EXE_kesto"))
+            .env_clear()
+            .env("KESTO_MASTER_KEY", MASTER_KEY)
+            .env("KESTO_SECRET", SESSION_SECRET)
+            .env("OIDC_ISSUER_URL", emisor_caido())
+            .env("OIDC_CLIENT_ID", "kesto-panel")
+            .env("OIDC_CLIENT_SECRET", "secreto-de-cliente-distinguible")
+            .env(
+                "OIDC_REDIRECT_URL",
+                "http://localhost:8080/api/v1/auth/callback",
+            )
+            .env("DATABASE_URL", &dsn)
+            .env("BIND_ADDRESS", "127.0.0.1:0")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("el binario de Kesto debe poder lanzarse"),
+    );
+
+    let inicio = Instant::now();
+    let estado = loop {
+        if let Some(estado) = hijo
+            .0
+            .try_wait()
+            .expect("el proceso debe poder consultarse")
+        {
+            break estado;
+        }
+
+        if inicio.elapsed() >= ESPERA {
+            panic!("con el retorno por http el proceso tenía que morir, y sigue vivo");
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(
+        !estado.success(),
+        "el arranque tenía que fallar y salió con {estado}"
+    );
+
+    let mut error = String::new();
+    hijo.0
+        .stderr
+        .take()
+        .expect("stderr capturado")
+        .read_to_string(&mut error)
+        .expect("el stderr del proceso debe poder leerse");
+
+    assert!(
+        error.contains("OIDC_REDIRECT_URL"),
+        "el motivo tiene que nombrar la variable: {error}"
+    );
 }

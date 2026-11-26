@@ -42,23 +42,6 @@ El volcado SHALL seguir describiendo el resto de la configuración: es lo que lo
 - **WHEN** la aplicación arranca y carga su configuración
 - **THEN** ninguna línea del log SHALL contener el valor de ninguna de las tres credenciales
 
-### Requirement: Una credencial débil se denuncia sin impedir el arranque
-
-Si `KESTO_SECRET` o `KESTO_MASTER_KEY` están presentes y miden menos de 32 caracteres, la aplicación SHALL emitir un aviso que nombre la variable y el mínimo, y SHALL arrancar igualmente. Kesto es el orquestador de las copias de seguridad: negarse a arrancar por una variable floja convertiría un error de configuración en ausencia de copias.
-
-Una credencial **ausente** NO SHALL confundirse con una débil: la ausencia la decide `config`, y en el modo de desarrollo es legítima.
-
-#### Scenario: Una clave corta avisa y arranca
-- **GIVEN** `KESTO_MASTER_KEY` de 12 caracteres
-- **WHEN** la aplicación arranca
-- **THEN** SHALL emitir un aviso que nombre la variable y el mínimo de 32 caracteres
-- **AND** el servicio SHALL arrancar y contestar la salud
-
-#### Scenario: Una clave larga no avisa
-- **GIVEN** `KESTO_MASTER_KEY` y `KESTO_SECRET` de 64 caracteres cada una
-- **WHEN** la aplicación arranca
-- **THEN** NO SHALL emitir ningún aviso sobre credenciales
-
 ### Requirement: Un secreto se guarda cifrado y no se puede leer del fichero
 
 Los secretos que viven en la base de datos —`repositories.secret_access_key`, `repositories.passphrase` y `backup_targets.db_password`— SHALL escribirse **cifrados**, con un AEAD AES-256-GCM, y el valor almacenado SHALL llevar un **prefijo de versión** con esta forma:
@@ -246,3 +229,44 @@ El texto del intérprete cuando un cuerpo se rechaza NO SHALL registrarse tampoc
 - **THEN** SHALL quedar la traza del campo que no cumplía
 - **AND** la salida NO SHALL contener la credencial
 - **AND** NO SHALL contener el cuerpo de la petición
+
+### Requirement: Una credencial presente y débil impide el arranque
+
+`KESTO_MASTER_KEY` —obligatoria siempre— SHALL medir al menos **32 caracteres**, y una que esté presente y mida menos SHALL ser un error de arranque que nombre la variable y el mínimo. La credencial **vacía** cuenta como débil: una variable definida pero vacía NO SHALL tratarse como ausente ni aceptarse por el solo hecho de estar.
+
+`KESTO_SECRET` SHALL medir esos mismos 32 caracteres **cuando el modo sea `Oidc`**, que es cuando se usa y cuando es obligatoria. Sin proveedor de identidad la variable NO SHALL leerse ni validarse: no hay sesión que firmar, así que no SHALL poder impedir el arranque del modo de desarrollo.
+
+El error NO SHALL incluir el valor de la credencial.
+
+La credencial **ausente** NO SHALL confundirse con una débil: la ausencia la decide `config`, y en modo `Disabled` `KESTO_SECRET` no hace falta.
+
+#### Scenario: Una clave maestra corta no arranca
+- **GIVEN** un entorno con `KESTO_MASTER_KEY` de 12 caracteres
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_MASTER_KEY` y el mínimo de 32 caracteres
+- **AND** el mensaje NO SHALL incluir el valor de la clave
+
+#### Scenario: Una clave maestra vacía no arranca
+- **GIVEN** un entorno con `KESTO_MASTER_KEY=` presente pero vacía
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_MASTER_KEY`
+
+#### Scenario: En modo OIDC una clave de firma corta no arranca
+- **GIVEN** un entorno con las tres variables `OIDC_*` y `KESTO_SECRET` de 12 caracteres
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_SECRET` y el mínimo de 32 caracteres
+
+#### Scenario: Dos credenciales largas arrancan sin aviso
+- **GIVEN** `KESTO_MASTER_KEY` y `KESTO_SECRET` de 64 caracteres cada una
+- **WHEN** la configuración se carga
+- **THEN** SHALL ser válida
+- **AND** NO SHALL emitir ningún aviso sobre credenciales
+
+#### Scenario: La ausencia no es debilidad
+- **GIVEN** un entorno en modo `Disabled` con `KESTO_MASTER_KEY` de 64 caracteres y sin `KESTO_SECRET`
+- **WHEN** la configuración se carga
+- **THEN** SHALL ser válida
+- **AND** NO SHALL fallar por `KESTO_SECRET`

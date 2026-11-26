@@ -24,6 +24,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use crate::api::contenido;
+use crate::api::error_sanitizer::sanitize_error_message;
 use crate::api::extract::Query;
 use crate::api::response::ApiResponse;
 use crate::api::targets::texto_del_tipo;
@@ -191,7 +192,7 @@ impl RestauracionDelCable {
             target_name: fila.target_name.clone(),
             target_type: fila.target_type.map(|tipo| texto_del_tipo(tipo).to_owned()),
             status: fila.restauracion.status.texto().to_owned(),
-            error_message: fila.restauracion.error_message.clone(),
+            error_message: sanitize_error_message(fila.restauracion.error_message.as_deref())?,
             started_at: formatear(fila.restauracion.started_at)?,
             finished_at: fila.restauracion.finished_at.map(formatear).transpose()?,
         })
@@ -731,5 +732,209 @@ mod tests {
         );
 
         assert_eq!(cuerpo["status"], 401, "la envoltura del 401: {cuerpo}");
+    }
+
+    /// SEC-15: error_message es null cuando la restauración no tiene error.
+    ///
+    /// Cubre el spec delta `executions-error_message`: cuando la restauración fue exitosa,
+    /// el campo `error_message` tiene que ser `null` en la respuesta JSON.
+    #[tokio::test]
+    async fn error_message_es_null_cuando_no_hay_error() {
+        let (estado, _directorio) = estado_con_base().await;
+        let target = sembrar_target(&estado, "target-del-historico").await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+        let _restauracion = sembrar_restauracion(
+            &estado.db.restauraciones,
+            Some(target.id),
+            Estado::Success,
+            "instantanea-exitosa-000000000000000000000000",
+            base,
+        )
+        .await;
+
+        let respuesta = get(api_router(estado), "/api/v1/restorations").await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado contesta {status} para restauración exitosa"
+        );
+
+        let filas = cuerpo["data"]["restorations"]
+            .as_array()
+            .expect("el listado tiene que traer `restorations` como array");
+
+        assert_eq!(filas.len(), 1, "solo una restauración");
+        assert_eq!(
+            filas[0]["error_message"],
+            serde_json::Value::Null,
+            "error_message ha de ser null cuando no hay error: {cuerpo}"
+        );
+    }
+
+    /// SEC-15: error_message con credenciales debe contestar 400.
+    ///
+    /// Cubre el spec delta `executions-error_message`: si el motor devuelve un error_message
+    /// que contiene `Password` o `secret=`, la API debe contestar `400` con un mensaje
+    /// de validación.
+    #[tokio::test]
+    async fn error_message_con_credenciales_contesta_400() {
+        let (estado, _directorio) = estado_con_base().await;
+        let target = sembrar_target(&estado, "target-con-error").await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        // Siembra una restauración y luego actualiza su error_message.
+        let mut fila = estado
+            .db
+            .restauraciones
+            .alta(crate::db::entities::AltaDeRestauracion {
+                snapshot_id: "instantanea-con-error-000000000000000000000001".to_owned(),
+                target_id: Some(target.id),
+                started_at: base,
+            })
+            .await
+            .expect("la restauración se da de alta");
+
+        fila.status = Estado::Failed;
+        fila.finished_at = Some(base + Duration::seconds(30));
+        fila.error_message = Some("Password 'admin' failed for db user".to_owned());
+
+        estado
+            .db
+            .restauraciones
+            .actualizar(&fila)
+            .await
+            .expect("la actualización no puede fallar");
+
+        let respuesta = get(api_router(estado), "/api/v1/restorations").await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        // La validación aún no está implementada: el error_message se devuelve tal cual.
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "error_message con datos sensibles tiene que contestar 400: {cuerpo}"
+        );
+
+        let mensaje = cuerpo["message"]
+            .as_str()
+            .expect("el 400 tiene que traer mensaje")
+            .to_owned();
+
+        assert!(
+            mensaje.contains("error_message"),
+            "el mensaje ha de nombrar el campo error_message: {mensaje}"
+        );
+        assert!(
+            !mensaje.contains("Password") && !mensaje.contains("admin"),
+            "el mensaje no ha de contener credenciales: {mensaje}"
+        );
+    }
+
+    /// SEC-15: error_message vacío se trata como sin error.
+    ///
+    /// Cubre el spec delta `executions-error_message`: si el motor devuelve
+    /// `error_message: ""`, la API debe tratarlo como `null` y contestar `200`.
+    #[tokio::test]
+    async fn error_message_vacio_es_sin_error() {
+        let (estado, _directorio) = estado_con_base().await;
+        let target = sembrar_target(&estado, "target-vacio").await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        // Siembra una restauración y luego actualiza su error_message a vacío.
+        let mut fila = estado
+            .db
+            .restauraciones
+            .alta(crate::db::entities::AltaDeRestauracion {
+                snapshot_id: "instantanea-vacia-000000000000000000000002".to_owned(),
+                target_id: Some(target.id),
+                started_at: base,
+            })
+            .await
+            .expect("la restauración se da de alta");
+
+        fila.status = Estado::Failed;
+        fila.finished_at = Some(base + Duration::seconds(30));
+        fila.error_message = Some("".to_owned());
+
+        estado
+            .db
+            .restauraciones
+            .actualizar(&fila)
+            .await
+            .expect("la actualización no puede fallar");
+
+        let respuesta = get(api_router(estado), "/api/v1/restorations").await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "error_message vacío ha de contestar 200: {cuerpo}"
+        );
+
+        let filas = cuerpo["data"]["restorations"]
+            .as_array()
+            .expect("el listado tiene que traer `restorations` como array");
+
+        assert_eq!(filas.len(), 1, "solo una restauración");
+        assert_eq!(
+            filas[0]["error_message"],
+            serde_json::Value::Null,
+            "error_message vacío ha de ser null: {cuerpo}"
+        );
+    }
+
+    /// SEC-15: error_message no contiene patrones de stack trace.
+    ///
+    /// Cubre el spec delta `executions-error_message`: si el motor devuelve un error_message
+    /// que parece un stack trace, la API debe contestar `400`.
+    #[tokio::test]
+    async fn error_message_sin_stack_trace() {
+        let (estado, _directorio) = estado_con_base().await;
+        let target = sembrar_target(&estado, "target-stacktrace").await;
+
+        let base = datetime!(2026-10-25 03:00:00 UTC);
+
+        // Siembra una restauración y luego actualiza su error_message a uno con stack trace.
+        let mut fila = estado
+            .db
+            .restauraciones
+            .alta(crate::db::entities::AltaDeRestauracion {
+                snapshot_id: "instantanea-stacktrace-000000000000000000000003".to_owned(),
+                target_id: Some(target.id),
+                started_at: base,
+            })
+            .await
+            .expect("la restauración se da de alta");
+
+        fila.status = Estado::Failed;
+        fila.finished_at = Some(base + Duration::seconds(30));
+        fila.error_message = Some("Stack trace at module.rs:42 in main".to_owned());
+
+        estado
+            .db
+            .restauraciones
+            .actualizar(&fila)
+            .await
+            .expect("la actualización no puede fallar");
+
+        let respuesta = get(api_router(estado), "/api/v1/restorations").await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+
+        // La validación aún no está implementada.
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "error_message con stack trace tiene que contestar 400: {cuerpo}"
+        );
     }
 }

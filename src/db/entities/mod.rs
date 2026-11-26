@@ -30,6 +30,7 @@ pub mod execution;
 pub mod job;
 pub mod repository;
 pub mod restauracion;
+pub mod sesion_revocada;
 pub mod target;
 
 pub use api_token::{AltaDeToken, Scope, TokenDeApi, Tokens, hash_de_token};
@@ -43,4 +44,5 @@ pub use restauracion::{
     AltaDeRestauracion, FiltroDeRestauraciones, PaginaDeRestauraciones, Restauracion,
     RestauracionListada, Restauraciones,
 };
+pub use sesion_revocada::SesionesRevocadas;
 pub use target::{AltaDeTarget, Target, Targets, TipoDeTarget};

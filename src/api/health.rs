@@ -6,18 +6,16 @@ use axum::http::StatusCode;
 use crate::api::response::{ApiResponse, Data};
 use crate::state::AppState;
 
-/// `GET /api/v1/health`, sin sesión: contesta la versión y el modo de autenticación.
+/// `GET /api/v1/health`, sin sesión: contesta solo el estado.
 ///
-/// No declara la dirección de escucha, ni la cadena de base de datos, ni el
-/// emisor OIDC: es un endpoint sin autenticar.
-pub async fn health(State(state): State<AppState>) -> ApiResponse {
+/// No declara la versión, ni el modo de autenticación, ni la dirección de
+/// escucha, ni la cadena de base de datos, ni el emisor OIDC: es un endpoint
+/// sin autenticar que no filtra metadatos.
+pub async fn health(State(_state): State<AppState>) -> ApiResponse {
     ApiResponse::new(
         StatusCode::OK,
         "servicio en marcha",
-        Data::Some(serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "auth_mode": state.config.auth.as_str(),
-        })),
+        Data::Some(serde_json::json!({})),
     )
 }
 
@@ -32,12 +30,9 @@ mod tests {
     // una segunda fuente de verdad del mismo literal, y cambiar una y no la otra
     // dejaría los dos tests mintiendo en silencio.
     use crate::test_support::{
-        OIDC_ISSUER_URL, base_con_clave, body_json, body_text, estado_con_base, estado_de_prueba,
+        OIDC_ISSUER_URL, OIDC_REDIRECT_URL, base_con_clave, body_json, body_text, estado_de_prueba,
         get, lookup_from,
     };
-
-    /// Versión que tiene que declarar la salud: la del binario.
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
 
     /// Clave maestra larga, para que ningún aviso se cuele en la respuesta.
     const MASTER_KEY: &str = "clave-maestra-distinguible-000000000000000000000000000000000000";
@@ -73,8 +68,18 @@ mod tests {
     }
 
     /// Configuración de desarrollo: sin OIDC.
+    ///
+    /// Declara el permiso explícito del modo sin autenticación: sin las `OIDC_*` la
+    /// aplicación solo arranca con `KESTO_ALLOW_INSECURE=1` y un bind de loopback. Va
+    /// en este ayudante —y no en `state()`, que comparten los de OIDC— porque es el
+    /// único que construye una configuración `Disabled`; en modo `Oidc` el permiso ni
+    /// se consulta, así que declararlo allí no describiría nada.
     async fn desarrollo() -> AppState {
-        state(&[("KESTO_MASTER_KEY", MASTER_KEY)]).await
+        state(&[
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ])
+        .await
     }
 
     /// Configuración con la autenticación encendida.
@@ -85,6 +90,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
         ])
         .await
     }
@@ -98,6 +104,7 @@ mod tests {
             ("OIDC_ISSUER_URL", OIDC_ISSUER_URL),
             ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
             ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
             ("BIND_ADDRESS", BIND_ADDRESS),
             ("DATABASE_URL", DATABASE_URL),
         ])
@@ -115,7 +122,6 @@ mod tests {
         let cuerpo = body_json(respuesta).await;
 
         assert_eq!(cuerpo["status"], 200);
-        assert_eq!(cuerpo["data"]["version"], VERSION);
         assert!(
             cuerpo["message"]
                 .as_str()
@@ -125,12 +131,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn la_salud_no_debe_incluir_version_auth_mode() {
+        let respuesta = get(api_router(desarrollo().await), "/api/v1/health").await;
+        let cuerpo = body_json(respuesta).await;
+
+        let datos = cuerpo["data"]
+            .as_object()
+            .expect("data debe ser un objeto JSON");
+
+        assert!(
+            !datos.contains_key("version"),
+            "data no debe contener la clave version: {cuerpo}"
+        );
+        assert!(
+            !datos.contains_key("auth_mode"),
+            "data no debe contener la clave auth_mode: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
     async fn la_salud_declara_el_modo_de_autenticacion() {
+        // auth_mode no debe estar en data tras el cambio de SEC-21.
         let cuerpo = body_json(get(api_router(desarrollo().await), "/api/v1/health").await).await;
-        assert_eq!(cuerpo["data"]["auth_mode"], "disabled");
+        assert!(
+            !cuerpo["data"]
+                .as_object()
+                .expect("data debe ser un objeto JSON")
+                .contains_key("auth_mode"),
+            "data no debe contener la clave auth_mode: {cuerpo}"
+        );
 
         let cuerpo = body_json(get(api_router(con_oidc().await), "/api/v1/health").await).await;
-        assert_eq!(cuerpo["data"]["auth_mode"], "oidc");
+        assert!(
+            !cuerpo["data"]
+                .as_object()
+                .expect("data debe ser un objeto JSON")
+                .contains_key("auth_mode"),
+            "data no debe contener la clave auth_mode: {cuerpo}"
+        );
     }
 
     #[tokio::test]
@@ -168,40 +206,38 @@ mod tests {
             .collect();
         claves.sort();
 
+        // Tras SEC-21, `data` no lleva `version` ni `auth_mode`, así que el conjunto de claves
+        // es vacío.
         assert_eq!(
             claves,
-            ["auth_mode", "version"],
-            "la salud debe limitar su cuerpo a la versión y el modo de autenticación: {cuerpo}"
+            Vec::<String>::new(),
+            "la salud debe limitar su cuerpo a un objeto vacío: {cuerpo}"
         );
     }
 
     #[tokio::test]
-    async fn con_una_clave_debil_la_salud_contesta_igual() {
-        // El escenario del aviso por credencial débil tiene dos mitades: el
-        // aviso y que el servicio arranque y conteste la salud.
+    async fn con_una_clave_debil_no_hay_salud_que_contestar() {
+        // Este test fijaba que una clave débil solo avisaba y el servicio
+        // arrancaba y contestaba la salud. Ahora una clave débil es puerta de
+        // arranque: no hay salud que contestar porque el proceso no llega a
+        // levantarse. La aserción se invierte a conciencia —la clave deja de
+        // asumir que arranca—; no la «restaures» pensando que era intencional.
         let clave_debil = "c".repeat(12);
-        let lookup = lookup_from(&[("KESTO_MASTER_KEY", &clave_debil)]);
-        let config = Config::from_lookup(&lookup).expect("una clave débil no impide arrancar");
+        let lookup = lookup_from(&[
+            ("KESTO_MASTER_KEY", &clave_debil),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ]);
 
-        let avisos = config.warnings();
+        let error = Config::from_lookup(&lookup)
+            .expect_err("una clave débil no puede arrancar, así que no contesta la salud");
 
         assert!(
-            avisos
-                .iter()
-                .any(|aviso| aviso.contains("KESTO_MASTER_KEY")),
-            "una clave maestra débil debe avisar: {avisos:?}"
+            error.to_string().contains("KESTO_MASTER_KEY"),
+            "el rechazo debe nombrar la variable débil: {error}"
         );
-
-        let estado = estado_con_base(config).await;
-
-        let respuesta = get(api_router(estado), "/api/v1/health").await;
-
-        assert_eq!(respuesta.status(), StatusCode::OK);
-
-        let cuerpo = body_json(respuesta).await;
-
-        assert_eq!(cuerpo["status"], 200);
-        assert_eq!(cuerpo["data"]["version"], VERSION);
-        assert_eq!(cuerpo["data"]["auth_mode"], "disabled");
+        assert!(
+            !error.to_string().contains(clave_debil.as_str()),
+            "el rechazo no puede publicar el valor de la clave: {error}"
+        );
     }
 }

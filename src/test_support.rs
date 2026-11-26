@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +30,7 @@ use rustic_core::{
     RepositoryOptions, SnapshotOptions, WriteBackend,
     jiff::{Timestamp, Zoned, tz::TimeZone},
 };
+use sqlx::SqlStr;
 use sqlx::SqlitePool;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use tower::ServiceExt;
@@ -36,7 +38,7 @@ use uuid::Uuid;
 
 use crate::config::{Config, Lookup};
 use crate::db::crypto::Clave;
-use crate::docker::Cliente;
+use crate::docker::{Cliente, ETIQUETA_DE_FUENTE_DE_COPIA, VALOR_DE_FUENTE_DE_COPIA};
 use crate::engine::{Ajustes, ComprobadorDeSalud, Dependencias, Motor};
 use crate::rustic::BarrasDelMotor;
 use crate::secret::SecretString;
@@ -59,8 +61,9 @@ pub(crate) const OIDC_ISSUER_URL: &str = "https://idp.example.test/realms/kesto"
 pub(crate) const OIDC_CLIENT_ID: &str = "kesto-panel";
 /// Secreto del cliente OIDC: solo tiene que estar presente.
 pub(crate) const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
-/// URL de retorno por defecto: la del SRS, la que se usa si no se declara otra.
-pub(crate) const OIDC_REDIRECT_URL: &str = "http://localhost:8080/api/v1/auth/callback";
+/// URL de retorno de las pruebas: en modo OIDC tiene que ser `https`, o el
+/// arranque no sale adelante.
+pub(crate) const OIDC_REDIRECT_URL: &str = "https://panel.example.test/api/v1/auth/callback";
 /// Usuario distinguible de la sesión de pruebas.
 pub(crate) const SUB: &str = "usuario-distinguible-1";
 /// Correo distinguible de la sesión de pruebas.
@@ -468,6 +471,25 @@ pub(crate) fn barras_mudas() -> BarrasDelMotor {
     BarrasDelMotor::mudas()
 }
 
+/// La ruta del sistema de ficheros que esconde el `endpoint` de una fila de prueba.
+///
+/// Desde el endurecimiento del borde, el `endpoint` de una fila tiene que ser una URL, así que
+/// el `endpoint` de las pruebas es una URL cuyo **camino** es la ruta de verdad —lo que deja
+/// [`destino_local_de_prueba`]—. Este ayudante deshace el disfraz: es lo que usan
+/// [`abridor_local`] y [`comprobador_local`] para saber dónde abrir el repositorio, y lo que
+/// pide una prueba que necesite la ruta —para escribir un fichero donde el motor espera un
+/// directorio— en vez de recomponerla por su cuenta.
+///
+/// Un valor que **no** sea una URL con anfitrión se devuelve tal cual: es lo que deja
+/// [`acceso_local`], que no pasa por el borde y sigue hablando de rutas peladas, y es lo que
+/// mantiene funcionando a las pruebas del motor y de la biblioteca sin tocarlas.
+pub(crate) fn ruta_del_endpoint(endpoint: &str) -> PathBuf {
+    match url::Url::parse(endpoint) {
+        Ok(url) if url.has_host() => PathBuf::from(url.path()),
+        _ => PathBuf::from(endpoint),
+    }
+}
+
 /// El abridor de repositorios del motor, para las pruebas: abre un repositorio **local**.
 ///
 /// El motor abre su repositorio con un puntero a función que entra por los ajustes, y sin este
@@ -475,18 +497,18 @@ pub(crate) fn barras_mudas() -> BarrasDelMotor {
 /// —cola, hilo, archivado, fila— se recorre contra un directorio del sistema de ficheros, sin red,
 /// sin credenciales y sin motor de contenedores, que es lo que permite que corra en el CI.
 ///
-/// La ruta del repositorio sale del `endpoint` del [`Acceso`](crate::rustic::Acceso): es lo que
-/// [`acceso_local`] deja ahí, y por eso un aparato de prueba solo tiene que escribir esa ruta en la
-/// fila del §3 para que el motor abra **ese** repositorio. Y es un `fn` y no un cierre porque el
-/// tipo que el motor acepta es un puntero a función: lo que se inyecta no puede llevar dentro ni
-/// una credencial ni una ruta escondida.
+/// La ruta del repositorio sale del **camino** del `endpoint` del [`Acceso`](crate::rustic::Acceso),
+/// que es lo que traduce [`ruta_del_endpoint`]: es lo que [`acceso_local`] deja ahí, y por eso un
+/// aparato de prueba solo tiene que escribir esa ruta en la fila del §3 para que el motor abra
+/// **ese** repositorio. Y es un `fn` y no un cierre porque el tipo que el motor acepta es un puntero
+/// a función: lo que se inyecta no puede llevar dentro ni una credencial ni una ruta escondida.
 pub(crate) fn abridor_local(
     acceso: &crate::rustic::Acceso,
     barras: BarrasDelMotor,
 ) -> Result<(crate::rustic::Repositorio, crate::rustic::PuestaEnMarcha), crate::rustic::Error> {
     crate::rustic::poner_en_marcha_con(
         acceso,
-        backends_locales(Path::new(&acceso.endpoint)),
+        backends_locales(&ruta_del_endpoint(&acceso.endpoint)),
         barras,
     )
 }
@@ -496,8 +518,9 @@ pub(crate) fn abridor_local(
 /// Es el gemelo de [`abridor_local`] en el otro punto de inyección de los ajustes: sin él, las
 /// pruebas de las dos rutas de comprobación del §5 tendrían que hablar con un S3 de verdad —que no
 /// hay—, y lo que hay que medir es el camino de la capa HTTP —leer la fila, comprobar, anotar y
-/// devolver—, no el backend. La ruta del repositorio sale del `endpoint` del `Acceso`, igual que en
-/// el abridor, así que un aparato de prueba solo tiene que escribir esa ruta en la fila.
+/// devolver—, no el backend. La ruta del repositorio sale del **camino** del `endpoint` del
+/// `Acceso` —lo que traduce [`ruta_del_endpoint`]—, igual que en el abridor, así que un aparato de
+/// prueba solo tiene que escribir esa ruta en la fila.
 ///
 /// Llama a [`salud_del_repositorio_con`](crate::rustic::salud_del_repositorio_con) —el gancho de
 /// solo lectura del módulo de la biblioteca, sin tope porque un destino local contesta en el acto—
@@ -508,7 +531,7 @@ pub(crate) fn comprobador_local(
 ) -> Result<crate::rustic::LoQueContestaElDestino, crate::rustic::Error> {
     crate::rustic::salud_del_repositorio_con(
         acceso,
-        backends_locales(Path::new(&acceso.endpoint)),
+        backends_locales(&ruta_del_endpoint(&acceso.endpoint)),
         barras,
     )
 }
@@ -614,9 +637,13 @@ pub(crate) fn destino_de_s3_que_se_traga_la_peticion() -> String {
 ///
 /// El alta de un repositorio dejó de ser un apunte: desde el change `backup-engine` **habla con el
 /// destino** —lo inicializa o conecta con él—, así que el `endpoint` de una fila de prueba tiene que
-/// ser una ruta de verdad donde [`abridor_local`] pueda abrir un repositorio. Un `endpoint` de
-/// mentira (`https://s3.example.test/…`) haría fallar el alta por destino inalcanzable, que es
+/// llevar el camino de una ruta de verdad donde [`abridor_local`] pueda abrir un repositorio. Un
+/// `endpoint` cuyo camino no exista haría fallar el alta por destino inalcanzable, que es
 /// justamente lo que ese camino tiene que hacer.
+///
+/// Lo que devuelve es una URL `https` **con el camino real dentro**: el borde solo admite URLs, así
+/// que la ruta va disfrazada de camino y quien necesite la ruta pelada la pide a
+/// [`ruta_del_endpoint`], que es lo que deshace el disfraz.
 ///
 /// La guarda del directorio se **retiene** hasta que el proceso de pruebas termina, y ése es el
 /// motivo de que este ayudante exista en vez de que cada prueba se monte el suyo: el alta ocurre
@@ -629,7 +656,21 @@ pub(crate) fn destino_local_de_prueba(nombre: &str) -> String {
 
     retener(directorio);
 
-    ruta.to_string_lossy().into_owned()
+    // El `endpoint` va disfrazado de URL porque el borde lo exige: desde el endurecimiento de
+    // la superficie, una fila no admite un `endpoint` que no sea una URL. El anfitrión es de
+    // mentira y **nadie lo resuelve**: el motor de las pruebas es el abridor local, que saca del
+    // camino la ruta de verdad —es lo que hace [`ruta_del_endpoint`]—.
+    format!("https://destino.local{}", ruta.to_string_lossy())
+}
+
+/// El `endpoint` de prueba para una ruta que **ya existe** en el sistema de ficheros.
+///
+/// Es la forma de [`destino_local_de_prueba`] para quien ya tiene el directorio —lo creó
+/// [`directorio_de_prueba`], o lo trae un ayudante— y no quiere que se le cree otro. Desde el
+/// endurecimiento del borde el `endpoint` de una fila tiene que ser una URL, así que la ruta viaja
+/// dentro del camino del mismo anfitrión fingido, y [`ruta_del_endpoint`] la saca de ahí.
+pub(crate) fn endpoint_de_prueba(ruta: &Path) -> String {
+    format!("https://destino.local{}", ruta.to_string_lossy())
 }
 
 /// Abre el repositorio local del directorio dado, con la biblioteca y sin pasar por el
@@ -919,13 +960,72 @@ pub(crate) fn sembrar_snapshot_ajeno(ruta: &Path, passphrase: &str) -> (String, 
 }
 
 /// Configuración válida que apunta a una base de datos dada.
+///
+/// Declara el permiso explícito del modo sin autenticación: sin las `OIDC_*` el
+/// modo es `Disabled`, y desde el endurecimiento del arranque ese modo exige
+/// `KESTO_ALLOW_INSECURE=1` **y** un bind de loopback —[`BIND_ADDRESS`] lo es—.
+/// El permiso va aquí, y no en cada prueba, porque este ayudante es el punto por
+/// el que pasan todas las que abren una base: declararlo una vez evita que
+/// cualquiera tenga que acordarse, y una prueba nueva arranca sin sorpresas.
+///
+/// Declara además la raíz de copias de [`raiz_de_copias_del_arnes`], por el mismo motivo: es el
+/// camino por el que pasan las pruebas que siembran un target de directorio sobre un temporal, y
+/// sin ella el borde HTTP rechazaría el alta por alcance. Una prueba que necesite medir el alcance
+/// contra otra raíz usa [`config_con_dsn_y_raiz_de_copias`].
 pub(crate) fn config_con_dsn(dsn: &str) -> Config {
+    config_con_dsn_y_raiz_de_copias(dsn, texto_de_raiz(raiz_de_copias_del_arnes()))
+}
+
+/// La raíz de copias que declaran los estados de prueba que copian temporales del arnés.
+///
+/// Es la raíz de los temporales de esta ejecución —[`raiz_de_la_ejecucion`]—, la que contiene todo
+/// lo que crea [`directorio_de_prueba`]: así un target de directorio sembrado sobre un temporal de
+/// la prueba pasa la comprobación de alcance sin que cada prueba tenga que declarar una raíz
+/// propia. Es la contrapartida de prueba del defecto de producción: el defecto es
+/// `/backup_sources`, que es donde monta el `compose` del §8, y el arnés declara la suya.
+pub(crate) fn raiz_de_copias_del_arnes() -> &'static Path {
+    raiz_de_la_ejecucion()
+}
+
+/// El texto de una ruta del arnés, que siempre se construye en UTF-8.
+fn texto_de_raiz(ruta: &Path) -> &str {
+    ruta.to_str().expect("las rutas del arnés son UTF-8")
+}
+
+/// Configuración de prueba que apunta a una base y declara una raíz de copias **dada**.
+///
+/// Existe para las pruebas del borde HTTP que necesitan medir el alcance contra una raíz concreta
+/// —las que fijan `/backup_sources`, la del §8— en vez de contra la de los temporales del arnés.
+pub(crate) fn config_con_dsn_y_raiz_de_copias(dsn: &str, raiz: &str) -> Config {
     Config::from_lookup(&lookup_from(&[
         ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_ALLOW_INSECURE", "1"),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn),
+        ("KESTO_BACKUP_ROOT", raiz),
     ]))
     .expect("la configuración de prueba con base de datos es válida")
+}
+
+/// Configuración de prueba que **rebaja** el borde del `endpoint`.
+///
+/// Es [`config_con_dsn`] con `KESTO_ALLOW_INSECURE_ENDPOINT=1`: la única diferencia es que el
+/// borde admite un `endpoint` por `http` y contra el loopback, que es el caso del laboratorio
+/// local y el de la batería e2e. Vive aquí y no en la prueba porque el permiso es una variable de
+/// entorno y es el arnés quien sabe cómo se declaran.
+pub(crate) fn config_con_dsn_y_endpoint_inseguro(dsn: &str) -> Config {
+    Config::from_lookup(&lookup_from(&[
+        ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_ALLOW_INSECURE", "1"),
+        ("KESTO_ALLOW_INSECURE_ENDPOINT", "1"),
+        ("BIND_ADDRESS", BIND_ADDRESS),
+        ("DATABASE_URL", dsn),
+        (
+            "KESTO_BACKUP_ROOT",
+            texto_de_raiz(raiz_de_copias_del_arnes()),
+        ),
+    ]))
+    .expect("la configuración de prueba con el permiso del endpoint es válida")
 }
 
 /// Directorio temporal, pool con el esquema del §3 ya aplicado y la clave de cifrado.
@@ -1103,19 +1203,21 @@ pub(crate) fn estado_de_prueba_con_comprobador(
 /// tocar las migraciones de verdad del repositorio: el migrador embebido está en
 /// verde por construcción, así que ese camino solo se puede recorrer inyectando
 /// uno que falle.
+///
+/// Se arma con [`Migrator::with_migrations`], el camino que el propio `sqlx`
+/// ofrece para un migrador en tiempo de ejecución: en `0.9` el literal del struct
+/// ya no compila —ganó `table_name` y `create_schemas`— y el constructor deja los
+/// demás campos en su defecto. `locking` pasa de `false` a su defecto `true`, y en
+/// SQLite da igual: allí `lock`/`unlock` son no-ops (`sqlx-sqlite`), así que el
+/// camino que la prueba mide —la migración que falla— es el mismo.
 pub(crate) fn migrador_roto() -> Migrator {
-    Migrator {
-        migrations: Cow::Owned(vec![Migration::new(
-            1,
-            Cow::Borrowed("rota"),
-            MigrationType::Simple,
-            Cow::Borrowed("ESTO NO ES SQL"),
-            false,
-        )]),
-        ignore_missing: false,
-        locking: false,
-        no_tx: false,
-    }
+    Migrator::with_migrations(vec![Migration::new(
+        1,
+        Cow::Borrowed("rota"),
+        MigrationType::Simple,
+        SqlStr::from_static("ESTO NO ES SQL"),
+        false,
+    )])
 }
 
 /// Estado con la autenticación apagada: el modo de desarrollo.
@@ -1124,13 +1226,26 @@ pub(crate) fn migrador_roto() -> Migrator {
 /// arnés no mienta sobre dónde está la base. Las bases de los ayudantes se abren en un
 /// directorio temporal y su guarda se **retiene** (ver [`retener`]): la base sobrevive
 /// al ayudante, así que la guarda también tiene que sobrevivir.
+///
+/// Declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— porque este es el modo sin
+/// proveedor de identidad: sin él la aplicación se niega a arrancar, y el arnés no
+/// tendría estado de desarrollo que entregar.
+///
+/// Declara también la raíz de copias de [`raiz_de_copias_del_arnes`]: este estado es el que usan
+/// las pruebas que siembran un target de directorio sobre un temporal, y sin esa raíz el borde
+/// HTTP rechazaría el alta por alcance.
 pub(crate) async fn estado_desarrollo() -> AppState {
     let (dsn, pool, clave) = base_del_arnes().await;
 
     let config = Config::from_lookup(&lookup_from(&[
         ("KESTO_MASTER_KEY", MASTER_KEY),
+        ("KESTO_ALLOW_INSECURE", "1"),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn.as_str()),
+        (
+            "KESTO_BACKUP_ROOT",
+            texto_de_raiz(raiz_de_copias_del_arnes()),
+        ),
     ]))
     .expect("la configuración de desarrollo es válida");
 
@@ -1163,6 +1278,7 @@ pub(crate) fn lookup_oidc_con_emisor(emisor: &str, dsn: &str) -> impl Lookup + u
         ("OIDC_ISSUER_URL", emisor),
         ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
         ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+        ("OIDC_REDIRECT_URL", OIDC_REDIRECT_URL),
         ("BIND_ADDRESS", BIND_ADDRESS),
         ("DATABASE_URL", dsn),
     ]
@@ -1361,6 +1477,53 @@ async fn request(router: Router, metodo: Method, uri: &str) -> Response {
 /// Lanza un `GET` contra `router` sin abrir un socket.
 pub(crate) async fn get(router: Router, uri: &str) -> Response {
     request(router, Method::GET, uri).await
+}
+
+/// Lanza un `GET` con una cabecera añadida, sin abrir un socket.
+///
+/// Existe para las pruebas del límite de tasa: necesitan mandar una cabecera que el
+/// cliente controla —`X-Forwarded-For`— y comprobar que **no** se tiene en cuenta
+/// ni acaba en el cuerpo de la respuesta.
+pub(crate) async fn get_con_cabecera(
+    router: Router,
+    uri: &str,
+    nombre: header::HeaderName,
+    valor: &str,
+) -> Response {
+    let peticion = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(nombre, valor)
+        .body(Body::empty())
+        .expect("petición de prueba válida");
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
+}
+
+/// Lanza un `GET` fingiendo una conexión desde `origen`, sin abrir un socket.
+///
+/// En producción la IP del cliente la pone `into_make_service_with_connect_info`, que inserta un
+/// `ConnectInfo<SocketAddr>` en las extensiones de la petición. Aquí se inserta a mano para poder
+/// ejercitar el límite de tasa **por IP real** sin abrir un puerto: es la única forma de simular
+/// dos sockets distintos en una prueba.
+pub(crate) async fn get_con_conexion(router: Router, uri: &str, origen: SocketAddr) -> Response {
+    let mut peticion = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("petición de prueba válida");
+
+    peticion
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(origen));
+
+    router
+        .oneshot(peticion)
+        .await
+        .expect("el router no debe fallar")
 }
 
 /// Lanza un `POST` sin cuerpo contra `router` sin abrir un socket.
@@ -1896,8 +2059,8 @@ pub(crate) fn lector_del_volcado(
 // ── Motor de contenedores ────────────────────────────────────────────────────
 //
 // Las pruebas que necesitan un motor de contenedores van marcadas `#[ignore]`, y hoy son
-// **veintisiete**: trece en `src/docker` (todas en `cliente.rs`) y catorce en `src/engine`
-// (siete en `extraccion.rs`, cuatro en `mod.rs` y tres en `restauracion.rs`). El motivo de
+// **treinta y seis**: dieciséis en `src/docker` (todas en `cliente.rs`) y veinte en `src/engine`
+// (diez en `extraccion.rs`, cuatro en `mod.rs` y seis en `restauracion.rs`). El motivo de
 // que estén marcadas es el job `backend` de `.github/workflows/ci.yml`: no declara
 // servicios, así que `cargo test` tiene que quedar verde sin motor. Quien las lance con
 // `cargo test -- --ignored` necesita un motor de verdad en la máquina —y el runner del job
@@ -1991,13 +2154,43 @@ pub(crate) struct ContenedorDePrueba {
 }
 
 impl ContenedorDePrueba {
-    /// Crea y arranca un contenedor de la imagen de prueba, con `sleep 600`.
+    /// Crea y arranca un contenedor de prueba **declarado fuente de copia**.
+    ///
+    /// Lleva la etiqueta [`ETIQUETA_DE_FUENTE_DE_COPIA`] con el valor
+    /// [`VALOR_DE_FUENTE_DE_COPIA`] porque el motor solo crea `exec` en contenedores que la
+    /// declaran: es el caso normal, el de una prueba que quiere que sus órdenes se ejecuten.
+    /// Para el caso contrario —la prueba negativa del confinamiento— está
+    /// [`ContenedorDePrueba::sin_etiqueta_de_fuente`].
     ///
     /// El guardián (`Self`) se construye **entre** el alta y el arranque: en cuanto el
     /// contenedor existe en el motor hay algo que borrar, y construirlo al final dejaba el
     /// arranque —y cualquier pánico intermedio— sin nadie que lo limpiara. Ver el comentario
     /// de dentro.
     pub(crate) async fn nuevo(prueba: &str) -> Self {
+        Self::con_etiquetas(prueba, true).await
+    }
+
+    /// Crea y arranca un contenedor de prueba **sin** la etiqueta de fuente de copia.
+    ///
+    /// Es lo que hace falta para medir el confinamiento de punta a punta: el motor inspecciona
+    /// el contenedor, no ve la etiqueta y **no le crea ningún `exec`**.
+    #[cfg_attr(
+        feature = "motor",
+        expect(
+            dead_code,
+            reason = "solo lo usan las pruebas del transporte con bollard, que no se compilan en la API"
+        )
+    )]
+    pub(crate) async fn sin_etiqueta_de_fuente(prueba: &str) -> Self {
+        Self::con_etiquetas(prueba, false).await
+    }
+
+    /// Crea y arranca un contenedor de la imagen de prueba, con `sleep 600`.
+    ///
+    /// `fuente_de_copia` decide si el contenedor nace con la etiqueta que el motor exige para
+    /// crear un `exec` en él: ver [`ContenedorDePrueba::nuevo`] y
+    /// [`ContenedorDePrueba::sin_etiqueta_de_fuente`].
+    async fn con_etiquetas(prueba: &str, fuente_de_copia: bool) -> Self {
         let socket = socket_del_motor()
             .expect("las pruebas del motor necesitan un socket de Docker o Podman");
         let motor = bollard::Docker::connect_with_socket(
@@ -2008,6 +2201,15 @@ impl ContenedorDePrueba {
         .expect("el socket existe, así que el cliente del arnés se construye");
 
         let nombre = format!("kesto-prueba-{prueba}");
+
+        // La etiqueta de fuente de copia **viaja con el contenedor**: quien lo crea dice si lo
+        // es, y el motor solo crea `exec` en los que la llevan. El caso negativo no la pone.
+        let etiquetas = fuente_de_copia.then(|| {
+            HashMap::from([(
+                ETIQUETA_DE_FUENTE_DE_COPIA.to_owned(),
+                VALOR_DE_FUENTE_DE_COPIA.to_owned(),
+            )])
+        });
 
         // Una corrida anterior que muriera sin limpiar deja el nombre ocupado, y el alta
         // fallaría con un `409` que no hablaría de nada de esto. Se retira lo que hubiera con
@@ -2031,6 +2233,7 @@ impl ContenedorDePrueba {
                             .map(|arg| (*arg).to_owned())
                             .collect(),
                     ),
+                    labels: etiquetas,
                     ..Default::default()
                 },
             )

@@ -17,8 +17,8 @@
 
 | Receta | Qué hace |
 |---|---|
-| `just check` | Los tres checks del CI, en su orden: `cargo fmt --all -- --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test --locked`. Ejecútalo antes de cada commit. |
-| `just check-all` | `just check` + los cuatro pasos del panel (`just ui-check`). |
+| `just check` | Los tres checks del CI, en su orden y sobre el **workspace** entero: `cargo fmt --all -- --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo test --locked --workspace`. Ejecútalo antes de cada commit. |
+| `just check-all` | `just check` + la puerta de dependencias (`just deny` = `cargo deny --workspace check`) + las pruebas de `scripts/` + los cuatro pasos del panel (`just ui-check`). Es el análogo local del CI entero. |
 | `just check-spec` | Puerta del protocolo SDD: falla si no hay change proposal activo en `openspec/changes/`. |
 
 ## Reglas de git flow (obligatorio)
@@ -29,7 +29,7 @@
 - Formateo **antes** de cada commit: `cargo fmt --all` → `cargo clippy -- -D warnings` → `cargo test`; en `ui/`: `pnpm run lint` → `npx tsc --noEmit` → `pnpm test`. Si el formateo toca ficheros, commit aparte (`🎨 style: apply formatting`).
 - Nunca hagas `git commit` directo en `main`: ahí solo entran PRs de release desde `development`.
 
-**Pipeline:** **Un merge a `main` ES una release.** No se etiqueta a mano: `release-prepare` decide el bump desde los conventional commits (`feat` → minor, `!:` / `BREAKING CHANGE` → major, resto → patch) y empuja el tag, que es lo que dispara `release.yml`. El CI corre lo mismo que `just check`: repítelo antes de cada push. Workflows, secretos y ramas, en `GIT_FLOW.md`.
+**Pipeline:** **Un merge a `main` ES una release.** No se etiqueta a mano: `release-prepare` decide el bump desde los conventional commits (`feat` → minor, `!:` / `BREAKING CHANGE` → major, resto → patch) y empuja el tag, que es lo que dispara `release.yml`. El CI corre lo mismo que `just check` **sobre el workspace entero** (`--workspace`), más la puerta de dependencias `cargo deny --workspace check` (en local, `just deny`): repítelo antes de cada push. Workflows, secretos y ramas, en `GIT_FLOW.md`.
 
 ## Planes y documentación — regla fija
 
@@ -72,10 +72,12 @@ Tabla completa (nombres, defectos, obligatoriedad) en `docs/ENTORNO.md`. Lo que 
 - Las tres variables `OIDC_*` que gobiernan el modo (`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`) son **un todo o nada**: unas sí y otras no es **error de arranque**, no un modo degradado.
 - `KESTO_MASTER_KEY` es obligatoria **siempre**.
 - `KESTO_SECRET` es obligatoria **en modo OIDC** —es la clave con la que se firma la sesión— y no hace falta en modo `Disabled`. **Rotarla invalida todas las sesiones vivas**.
-- Una credencial de menos de 32 caracteres **avisa y arranca igualmente**.
-- `BIND_ADDRESS` sin puerto es error de arranque, y **el valor vacío no cae al defecto**: `BIND_ADDRESS=` mata el arranque. Si usas `compose` con interpolación de una variable que no definiste, acuérdate de esto.
+- Una credencial —`KESTO_MASTER_KEY` siempre, `KESTO_SECRET` en modo OIDC— de menos de **32 caracteres**, **vacía incluida**, **impide el arranque** nombrando la variable y el mínimo. Ya **no** basta con avisar: la clave vacía hace determinista y pública la derivación del cifrado en reposo.
+- El modo sin autenticación **no es lo que pasa por omisión**: sin las tres `OIDC_*` hace falta el permiso explícito `KESTO_ALLOW_INSECURE=1` (`0` o ausente lo niega; cualquier otro valor es error de arranque) **y** una dirección de escucha de loopback, así que ese modo no se puede publicar. En modo OIDC el permiso ni se consulta. La gestión de tokens (`/api/v1/tokens*`) **no se monta** en ese modo.
+- `BIND_ADDRESS` sin puerto es error de arranque, y **el valor vacío no cae al defecto**: `BIND_ADDRESS=` mata el arranque. Su defecto es `127.0.0.1:8080`, **no** el `0.0.0.0:8080` del §8: escuchar en todas las interfaces es una decisión explícita del operador. Si usas `compose` con interpolación de una variable que no definiste, acuérdate de esto.
 - Lo mismo vale para `RUST_LOG`: presente pero vacía es **error de arranque**, no «sin registro».
-- Un `OIDC_REDIRECT_URL` configurado **solo**, sin las otras tres, se ignora en silencio.
+- `OIDC_REDIRECT_URL` es **obligatoria** en modo OIDC y tiene que ser `https`: con las tres `OIDC_*` puestas, ausente o sin `https` es **error de arranque** que nombra la variable. Configurada **sola**, sin las otras tres, se ignora en silencio.
+- `KESTO_ALLOW_INSECURE_ENDPOINT` — `1` admite el `endpoint` `http` y el loopback; `0` o ausente lo niega; cualquier otro valor es error de arranque. Se lee **siempre**, también con OIDC, porque el `endpoint` de un repositorio se valida en los dos modos.
 
 ## Cifrado en reposo
 
@@ -83,7 +85,7 @@ Los tres secretos del §3 —`repositories.secret_access_key`, `repositories.pas
 
 ## Modo de desarrollo (sin OIDC)
 
-Basta `KESTO_MASTER_KEY` para arrancar sin proveedor de identidad: sin ninguna de las tres `OIDC_*` el modo es `Disabled`. `GET /api/v1/health` contesta `auth_mode: "disabled"`. Ese modo **no pone ninguna capa**: la mitad protegida no se monta, todo `/api/v1/*` queda abierto y `/api/v1/auth/*` ni siquiera existe —contesta `404` con la envoltura, **no** `401`—. Es para desarrollo, no para un despliegue expuesto.
+Sin ninguna de las tres `OIDC_*` el modo es `Disabled`, y **no basta con `KESTO_MASTER_KEY`**: hace falta el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**, así que ese modo no se publica. `GET /api/v1/health` contesta `auth_mode: "disabled"`. Ese modo **no pone ninguna capa**: la mitad protegida no se monta, todo `/api/v1/*` queda abierto y `/api/v1/auth/*` ni siquiera existe —contesta `404` con la envoltura, **no** `401`—; la única excepción es la gestión de tokens (`/api/v1/tokens*`), que tampoco se monta. Es para desarrollo, no para un despliegue expuesto.
 
 ## Entorno de desarrollo
 
@@ -102,6 +104,12 @@ Versiones y runtime en `docs/ENTORNO.md`. Las que no se negocian:
 - **Nunca enlaces un `Uuid` de `sqlx` contra una columna `TEXT`**: usa la forma canónica con guiones (`uuid::fmt::Hyphenated`).
 - **`foreign_keys` va en las opciones de conexión del pool**, nunca en un `PRAGMA` suelto (el `ON DELETE CASCADE` **no ocurre sin que nada lo delate**).
 - **El arnés de captura de registro (`src/test_support.rs`) instala un suscriptor global y elige el buffer por hilo**: nunca `set_default` ni `with_default`.
+- **La cookie de sesión va `Secure` incondicional**: `session_cookie` (`src/auth/session.rs`) no lo condiciona a la configuración ni al esquema de la petición, porque una cookie de sesión sin `Secure` viaja en claro.
+- **El `endpoint` de un repositorio se valida en el borde HTTP, no en el motor**: `POST`/`PUT /api/v1/repositories` lo juzgan **antes** de escribir la fila y antes de hablar con el destino (`src/rustic/endpoint.rs`; único consumidor, `endpoint_admisible` en `src/api/repositories.rs`), con un `400` que nombra el campo y no repite la URL. `https` siempre, `http` solo con `KESTO_ALLOW_INSECURE_ENDPOINT=1`; enlace local, metadatos, no especificada y credenciales embebidas se rechazan siempre, también con el permiso. La edición **no** conecta con el destino, así que una comprobación en el motor no la alcanzaría; el alta **conserva** su `502` para «el destino no responde».
+- **La ruta de entrada tiene dos protecciones en memoria**: tope duro del mapa de `state`s pendientes (`MAX_LOGINS`, `src/state.rs`: purga por caducidad y desalojo de la más antigua, **nunca** rechazo) y límite de tasa por IP en `GET /api/v1/auth/login` (`src/auth/limite.rs`: `VENTANA_DE_LOGIN`, `MAX_PETICIONES_DE_LOGIN`, `429`). La IP sale del **socket** (`ConnectInfo<SocketAddr>`, con `into_make_service_with_connect_info` en `src/main.rs`), **nunca** de una cabecera: `X-Forwarded-For` la falsifica el cliente.
+- **El volcado que se restaura es contenido no confiable, y cada cliente se invoca en el modo que ignora sus metacomandos**: `sqlite3 -safe` (SQLite ≥ 3.27), `mariadb --binary-mode` y `psql -X` con el volcado troceado por base y los metacomandos de primer nivel descartados. El volcado sale de un repositorio que **configura el operador**, así que sus metacomandos —`.shell` de `sqlite3`, `\!` de `mariadb` y `psql`— no pueden llegar a ejecutarse como `root` en el contenedor destino. Detalle en `docs/ARQUITECTURA.md`.
+- **El volcado de PostgreSQL se trocea por los `\connect` de primer nivel y se restaura base por base**: `\restrict` —el único modo de `psql` que rechaza metacomandos— **bloquea `\connect`**, así que un `psql` único con el volcado global desvía los datos a la base equivocada. El troceador (`src/engine/troceador.rs`) reconoce el estado léxico —comillas, dólares, comentarios anidables y bloques `COPY`— y el metacomando se reconoce por el **primer byte no blanco**, no por la columna cero: `psql` lo ejecuta precedido de **cualquier** blanco de su juego (`[ \t\n\r\f\v]`, `\f` y `\v` incluidos). El descarte de metacomandos es un **puerto fiel** de la detección de `COPY … FROM stdin` de `psql` —letra inicial de los identificadores de primer nivel, tope ocho, sin los de paréntesis, y decisión al `;` a profundidad cero—, **no** una búsqueda de subcadena. Y **`\restrict` es una precondición comprobada en tiempo de ejecución, no una capa opcional**: antes de restaurar se ejecuta `psql --version` con el mismo binario y, si el cliente no lo honra —17.6, o el mínimo de su rama: 16.10, 15.14, 14.19, 13.22—, la restauración **falla** y no restaura nada. Además, el **nombre de base del `\connect` no puede tener forma de cadena de conexión** —un `=`, o un esquema `postgres://`/`postgresql://`, hacen que `psql -d` lea el valor como *conninfo* y desvíe la conexión con la credencial del entorno puesta—: se **rechaza** y la restauración **falla** sin ejecutar esa sección ni las siguientes. Y los errores de SQL **dentro** de una sección aún **no** se detectan (`psql` sin `ON_ERROR_STOP` sale con `0`): **#175**. Detalle en `docs/ARQUITECTURA.md`.
+- **Las cabeceras de seguridad del origen se declaran en una sola capa, la que envuelve el router compuesto (API + panel), y nunca en la mitad de la API.** `con_cabeceras_de_seguridad` (`src/panel.rs`) es la única: una capa colgada de un router no cubre un *fallback* añadido después, así que la HSTS declarada en `api_router` dejaba al panel sin ella. Son cinco: `nosniff`, `X-Frame-Options`, `Referrer-Policy`, la CSP completa (`default-src 'self'`, con `script-src 'self'` sin ninguna excepción) y la HSTS opcional (`KESTO_HSTS_MAX_AGE`). `style-src 'unsafe-inline'` es la única excepción y está justificada —antd v5 inyecta estilos en tiempo de ejecución—; el documento del panel no lleva JavaScript en línea: el arranque de tema vive en `ui/public/tema-inicial.js`.
 
 ## Dónde está el resto
 

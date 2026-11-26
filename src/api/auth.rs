@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::api::response::{ApiResponse, Data};
 use crate::auth::middleware::SessionIdentity;
-use crate::auth::session::SESSION_COOKIE_NAME;
+use crate::auth::session::{SESSION_COOKIE_NAME, SESSION_LIFETIME};
 use crate::auth::{oidc, session};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -33,6 +33,14 @@ const INTENTO_INVALIDO: &str = "el intento de entrada no es válido";
 /// Mensaje con el que se rechaza un callback al que le faltan los parámetros del
 /// flujo.
 const CALLBACK_INCOMPLETO: &str = "el callback no trae los parámetros del flujo";
+
+/// Mensaje con el que se rechaza un login pendiente sin `code_verifier` PKCE.
+///
+/// Un login emitido antes de que existiera PKCE —o uno cuyo registro se haya
+/// corrompido— no puede canjearse: canjearlo sin verifier entregaría una sesión
+/// sin la prueba de posesión que PKCE exige, así que se falla en alto en vez de
+/// degradar el flujo.
+const LOGIN_SIN_VERIFIER: &str = "el login pendiente no trae el code_verifier de PKCE";
 
 /// Destino de la vuelta tras el callback: la raíz del panel.
 ///
@@ -65,10 +73,11 @@ pub async fn login(State(state): State<AppState>) -> Response {
 
     let solicitud = oidc::build_authorization_url(auth.settings.as_ref(), &discovery);
 
-    // El `state` se guarda con su marca de tiempo y junto al `nonce` emitido: el
-    // callback comparará ese `nonce` con el del ID token al verificar. La
-    // respuesta no emite cookie: la sesión llega con el callback.
-    auth.registrar_login(&solicitud.state, &solicitud.nonce)
+    // El `state` se guarda con su marca de tiempo, el `nonce` emitido y el
+    // `code_verifier` PKCE: el callback los usa para verificar el ID token y
+    // para enviar al `token_endpoint`. La respuesta no emite cookie: la sesión
+    // llega con el callback.
+    auth.registrar_login(&solicitud.state, &solicitud.nonce, &solicitud.code_verifier)
         .await;
 
     redireccion_302(&solicitud.url)
@@ -161,12 +170,27 @@ pub async fn callback(
         Err(error) => return error.into_response(),
     };
 
-    let id_token = match oidc::canjear_codigo(auth.settings.as_ref(), &discovery, code).await {
+    // Sin `code_verifier` no se canjea: un login que no lo trae —uno emitido
+    // antes de PKCE, o un registro corrupto— se rechaza aquí, antes de tocar el
+    // `token_endpoint`, en vez de degradar el flujo a uno sin prueba de posesión.
+    if pendiente.code_verifier.is_empty() {
+        return AppError::Unauthorized(LOGIN_SIN_VERIFIER.to_owned()).into_response();
+    }
+
+    let id_token = match oidc::canjear_codigo(
+        auth.settings.as_ref(),
+        &discovery,
+        code,
+        &pendiente.code_verifier,
+    )
+    .await
+    {
         Ok(id_token) => id_token,
         Err(error) => return error.into_response(),
     };
 
     let identidad = match oidc::verificar_id_token(
+        auth,
         auth.settings.as_ref(),
         &discovery,
         &id_token,
@@ -183,7 +207,7 @@ pub async fn callback(
         Err(error) => return error.into_response(),
     };
 
-    let cookie = match session::session_cookie(token, &auth.settings.redirect_url) {
+    let cookie = match session::session_cookie(token) {
         Ok(cookie) => cookie,
         Err(error) => return error.into_response(),
     };
@@ -228,11 +252,30 @@ pub struct CallbackParams {
 
 /// `POST /api/v1/auth/logout` — protegida.
 ///
-/// Borra la cookie de sesión —la **misma** cookie, con el mismo `Path` y con
-/// `Max-Age=0`— y contesta la envoltura. Se declara como `POST` y no como `GET`
-/// porque cambia estado: un `GET` lo dispararían un enlace, un prefetch o una
-/// imagen.
-pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse) {
+/// Revoca la sesión **ante el servidor** y borra la cookie de sesión —la **misma**
+/// cookie, con el mismo `Path` y con `Max-Age=0`—, y contesta la envoltura. Se
+/// declara como `POST` y no como `GET` porque cambia estado: un `GET` lo
+/// dispararían un enlace, un prefetch o una imagen.
+///
+/// La revocación es lo que hace efectivo el cierre: sin ella, la firma del JWT
+/// seguiría valiendo hasta su `exp` y una cookie copiada seguiría sirviendo. Se
+/// revoca el `jti` de la sesión que el *gate* **ya verificó** —la ruta está tras el
+/// *gate*, sin sesión no se llega al manejador—, así que no se vuelve a leer ni a
+/// verificar la cookie.
+pub async fn logout(
+    State(estado): State<AppState>,
+    Extension(identidad): Extension<SessionIdentity>,
+    jar: CookieJar,
+) -> Response {
+    if let Err(error) = estado
+        .db
+        .sesiones
+        .revocar(&identidad.jti, exp_de_la_revocacion())
+        .await
+    {
+        return AppError::Database(error).into_response();
+    }
+
     // La `Set-Cookie` de borrado viaja por el propio frasco de la petición: es
     // lo que hace que la respuesta lleve la cabecera y la envoltura a la vez.
     let jar = jar.add(cookie_de_borrado());
@@ -241,6 +284,19 @@ pub async fn logout(jar: CookieJar) -> (CookieJar, ApiResponse) {
         jar,
         ApiResponse::new(StatusCode::OK, "sesión cerrada", Data::None),
     )
+        .into_response()
+}
+
+/// El `exp` con el que el cierre guarda una revocación.
+///
+/// La identidad verificada no lleva el `exp` del token —el *gate* no expone la vigencia, para
+/// no invitar a recomprobarla en cada manejador—, así que el cierre no puede copiar el del JWT.
+/// Usa el fin de la vida máxima de una sesión **desde ahora**, que nunca es anterior al `exp`
+/// real —la sesión no llevaba viva más que su vida entera—, así que la revocación jamás se purga
+/// mientras la cookie podría seguir presentándose. El lado seguro es retenerla de más, no de
+/// menos: una revocación purgada demasiado pronto dejaría servir una cookie cerrada.
+fn exp_de_la_revocacion() -> u64 {
+    jsonwebtoken::get_current_timestamp() + SESSION_LIFETIME.as_secs()
 }
 
 /// `GET /api/v1/auth/session` — protegida.
@@ -275,20 +331,23 @@ fn cookie_de_borrado() -> Cookie<'static> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::time::Instant;
 
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
     use crate::api::api_router;
+    use crate::auth::limite::MAX_PETICIONES_DE_LOGIN;
     use crate::auth::session::SESSION_COOKIE_NAME;
     use crate::error::AppError;
     use crate::test_support::{
         EMAIL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, SUB, body_json, body_text, callback_url,
-        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc_con_emisor, get, get_with_cookie,
-        header_text, login_state_y_nonce, parametros_de_consulta, post, post_with_cookie,
-        proveedor_falso::ACCESS_TOKEN, proveedor_falso::IdToken, proveedor_falso::ProveedorFalso,
-        router_oidc, router_oidc_con_emisor, session_cookie_header, token_de_set_cookie,
+        capturar_log, cookie_de_sesion, emisor_caido, estado_oidc, estado_oidc_con_emisor, get,
+        get_con_cabecera, get_con_conexion, get_with_cookie, header_text, login_state_y_nonce,
+        parametros_de_consulta, post, post_with_cookie, proveedor_falso::ACCESS_TOKEN,
+        proveedor_falso::IdToken, proveedor_falso::ProveedorFalso, router_oidc,
+        router_oidc_con_emisor, session_cookie_header, token_de_set_cookie,
     };
 
     #[tokio::test]
@@ -349,6 +408,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn el_login_por_encima_del_cupo_contesta_429() {
+        let proveedor = ProveedorFalso::servir().await;
+        let estado = estado_oidc_con_emisor(&proveedor.issuer).await;
+        // El limitador vive en el estado, que se clona en cada petición: esta copia
+        // comparte el mismo mapa que usa el router.
+        let auth = estado
+            .auth
+            .clone()
+            .expect("en modo Oidc hay estado de autenticación");
+        let router = api_router(estado);
+
+        for intento in 0..MAX_PETICIONES_DE_LOGIN {
+            let respuesta = get(router.clone(), "/api/v1/auth/login").await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::FOUND,
+                "la petición {intento} está dentro del cupo y tiene que redirigir"
+            );
+        }
+
+        let respuesta = get(router.clone(), "/api/v1/auth/login").await;
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "por encima del cupo el login tiene que contestar 429"
+        );
+
+        let cuerpo = body_json(respuesta).await;
+
+        assert_eq!(cuerpo["status"], 429, "el 429 lleva la envoltura: {cuerpo}");
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 429 tiene que traer un mensaje: {cuerpo}"
+        );
+
+        let logins = auth.logins.lock().await;
+
+        assert_eq!(
+            logins.len(),
+            MAX_PETICIONES_DE_LOGIN as usize,
+            "una petición rechazada por el límite no puede guardar su state en el mapa"
+        );
+    }
+
+    #[tokio::test]
+    async fn el_login_dentro_del_cupo_sigue_redirigiendo() {
+        // Contrapeso: el límite no puede romper el camino bueno.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        let respuesta = get(router, "/api/v1/auth/login").await;
+
+        assert_eq!(respuesta.status(), StatusCode::FOUND);
+
+        let location = header_text(&respuesta, header::LOCATION).expect("el 302 trae Location");
+
+        assert!(
+            location.contains("state="),
+            "la redirección tiene que traer el state del flujo: {location}"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_respuesta_429_no_publica_la_cabecera_de_la_peticion() {
+        // El límite cuenta por la IP del **socket**, no por una cabecera que el
+        // cliente puede falsificar, y el 429 no puede devolver al cuerpo nada de lo
+        // que mandó la petición.
+        const RASTRO: &str = "rastro-de-la-peticion-que-no-puede-salir";
+
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        let mut ultima = None;
+
+        for indice in 0..=MAX_PETICIONES_DE_LOGIN {
+            // Cada petición declara una IP de origen **distinta** en la cabecera: si
+            // el límite se creyera esa cabecera, ninguna agotaría el cupo.
+            let respuesta = get_con_cabecera(
+                router.clone(),
+                "/api/v1/auth/login",
+                header::HeaderName::from_static("x-forwarded-for"),
+                &format!("203.0.113.{indice}, {RASTRO}"),
+            )
+            .await;
+
+            ultima = Some(respuesta);
+        }
+
+        let respuesta = ultima.expect("el bucle lanza peticiones");
+
+        assert_eq!(
+            respuesta.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "la cabecera no puede estrenar una IP en cada petición: el cupo se agota igual"
+        );
+
+        let cuerpo = body_text(respuesta).await;
+
+        assert!(
+            !cuerpo.contains(RASTRO),
+            "el 429 no puede publicar nada de lo que mandó la petición: {cuerpo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dos_sockets_distintos_son_dos_ips_aunque_la_cabecera_sea_la_misma() {
+        // Escenario del delta: la IP sale del **socket**, no de `X-Forwarded-For`. Dos conexiones
+        // distintas con la misma cabecera tienen que contar como dos IPs, de modo que el cupo de la
+        // primera no agote el de la segunda. La mitad «la cabecera se ignora» la cubre
+        // `la_respuesta_429_no_publica_la_cabecera_de_la_peticion`, que manda una cabecera distinta
+        // en cada petición y aun así agota el cupo: aquí la cabecera es la misma para las dos y lo
+        // que cambia es el socket.
+        let proveedor = ProveedorFalso::servir().await;
+        let router = router_oidc_con_emisor(&proveedor.issuer).await;
+
+        let origen_a: SocketAddr = "10.0.0.1:1111".parse().expect("dirección válida");
+        let origen_b: SocketAddr = "10.0.0.2:2222".parse().expect("dirección válida");
+
+        for intento in 0..MAX_PETICIONES_DE_LOGIN {
+            let respuesta = get_con_conexion(router.clone(), "/api/v1/auth/login", origen_a).await;
+
+            assert_eq!(
+                respuesta.status(),
+                StatusCode::FOUND,
+                "la petición {intento} del socket A está dentro del cupo"
+            );
+        }
+
+        let agotada = get_con_conexion(router.clone(), "/api/v1/auth/login", origen_a).await;
+        assert_eq!(
+            agotada.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "el socket A tiene que haber agotado su cupo"
+        );
+
+        // La misma cabecera, un socket distinto: tiene su propio cupo.
+        let otra = get_con_conexion(router.clone(), "/api/v1/auth/login", origen_b).await;
+        assert_eq!(
+            otra.status(),
+            StatusCode::FOUND,
+            "un socket distinto es una IP distinta: la cabecera compartida no puede unirlos"
+        );
+    }
+
+    #[tokio::test]
     async fn el_cierre_borra_la_cookie() {
         // Escenario 1.33.
         let respuesta = post_with_cookie(
@@ -384,6 +592,55 @@ mod tests {
                 .as_str()
                 .is_some_and(|mensaje| !mensaje.is_empty()),
             "el logout debe contestar la envoltura con message: {cuerpo}"
+        );
+    }
+
+    /// 4.1/4.2 — El cierre **revoca** la sesión además de borrar la cookie: la misma cookie,
+    /// reutilizada después, contesta `401`; y el cierre sigue contestando `200` con la
+    /// `Set-Cookie` de borrado.
+    #[tokio::test]
+    async fn la_cookie_cerrada_deja_de_servir() {
+        let router = router_oidc().await;
+        let cookie = cookie_de_sesion();
+
+        let cierre = post_with_cookie(router.clone(), "/api/v1/auth/logout", &cookie).await;
+
+        assert_eq!(
+            cierre.status(),
+            StatusCode::OK,
+            "el cierre tiene que atenderse"
+        );
+
+        // El cierre sigue devolviendo la cookie de borrado (contrapeso 4.2).
+        let cabecera = header_text(&cierre, header::SET_COOKIE)
+            .expect("el cierre tiene que traer una Set-Cookie de borrado");
+
+        assert!(
+            cabecera.starts_with(&format!("{SESSION_COOKIE_NAME}=;")),
+            "la cookie de borrado debe dejar el valor vacío: {cabecera}"
+        );
+        assert!(
+            cabecera.contains("Max-Age=0"),
+            "la cookie de borrado debe llevar Max-Age=0: {cabecera}"
+        );
+
+        // Y la misma cookie, reutilizada, ya no sirve: el servidor la revocó.
+        let reutilizada = get_with_cookie(router, "/api/v1/auth/session", &cookie).await;
+
+        assert_eq!(
+            reutilizada.status(),
+            StatusCode::UNAUTHORIZED,
+            "una cookie cerrada no puede seguir sirviendo en una ruta protegida"
+        );
+
+        let cuerpo = body_json(reutilizada).await;
+
+        assert_eq!(cuerpo["status"], 401);
+        assert!(
+            cuerpo["message"]
+                .as_str()
+                .is_some_and(|mensaje| !mensaje.is_empty()),
+            "el 401 debe traer un mensaje: {cuerpo}"
         );
     }
 
@@ -477,6 +734,42 @@ mod tests {
         assert!(
             !cuerpo.to_string().contains("eyJ"),
             "la sesión no debe devolver el JWT: {cuerpo}"
+        );
+    }
+
+    /// El `jti` de la sesión **no** sale en `GET /api/v1/auth/session`: la respuesta sigue
+    /// siendo `sub` y `email`. El `jti` es la clave de revocación y no tiene por qué viajar
+    /// al cliente, que ya lo lleva dentro de su propia cookie firmada.
+    #[tokio::test]
+    async fn la_respuesta_de_la_sesion_no_publica_el_jti() {
+        let estado = estado_oidc().await;
+        let auth = estado
+            .auth
+            .as_ref()
+            .expect("en modo Oidc hay estado de autenticación");
+        let token = crate::auth::session::issue(&auth.secret, SUB.to_owned(), EMAIL.to_owned())
+            .expect("la emisión de la sesión de prueba no puede fallar");
+        let claims = crate::auth::session::verify(&auth.secret, &token)
+            .expect("el token emitido debe verificar");
+
+        let respuesta = get_with_cookie(
+            api_router(estado),
+            "/api/v1/auth/session",
+            &session_cookie_header(&token),
+        )
+        .await;
+
+        assert_eq!(respuesta.status(), StatusCode::OK);
+
+        let texto = body_text(respuesta).await;
+
+        assert!(
+            !texto.contains(&claims.jti),
+            "la respuesta de la sesión publicó el `jti`: {texto}"
+        );
+        assert!(
+            texto.contains(SUB) && texto.contains(EMAIL),
+            "la respuesta de la sesión tiene que llevar sub y email: {texto}"
         );
     }
 

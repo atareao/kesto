@@ -1,6 +1,7 @@
 //! API HTTP de Kesto: el router de `/api/v1` y la partición de su superficie.
 
 pub mod auth;
+pub mod error_sanitizer;
 pub mod events;
 pub mod executions;
 pub mod extract;
@@ -11,6 +12,7 @@ pub mod response;
 pub mod restorations;
 pub mod snapshots;
 pub mod targets;
+pub mod texto;
 pub mod tokens;
 
 #[cfg(test)]
@@ -20,12 +22,16 @@ mod secretos;
 mod particion;
 
 use axum::Router;
-use axum::http::{HeaderValue, header};
+use axum::extract::{ConnectInfo, State};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde::Serialize;
-use tower_http::set_header::SetResponseHeaderLayer;
+use std::net::SocketAddr;
+use std::time::Instant;
+use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::api::response::Data;
+use crate::auth::limite::IP_CENTINELA;
 use crate::auth::middleware;
 use crate::engine::ErrorDelMotor;
 use crate::error::AppError;
@@ -69,6 +75,47 @@ async fn trazar(
     respuesta
 }
 
+/// Mensaje con el que se rechaza un login que ha pasado su cupo.
+///
+/// Dice qué hacer —esperar— y **nada** de la petición: ni la IP de origen ni el valor de
+/// ninguna cabecera. El límite es por IP, y publicar la IP en el cuerpo le contaría al que
+/// abusa lo que ya sabe y a quien no abusa lo que no necesita.
+const DEMASIADAS_PETICIONES: &str =
+    "demasiados intentos de entrada seguidos: espera un momento y vuelve a intentarlo";
+
+/// Corta el login de una IP que ya ha pasado su cupo.
+///
+/// La IP sale del **socket** de la conexión (`ConnectInfo<SocketAddr>`) y **nunca** de una
+/// cabecera: `X-Forwarded-For` la falsifica el cliente, así que honrarla sería regalar el
+/// límite —bastaría variar la cabecera para estrenar una IP en cada petición—. Kesto no se
+/// despliega detrás de un proxy de confianza, así que no hay ninguna cabecera que honrar.
+///
+/// Donde no hay información de conexión —las pruebas despachan el router con `oneshot`, sin
+/// socket— se usa la centinela: todas esas peticiones comparten un mismo cubo, y el límite
+/// sigue siendo ejercitable sin abrir un puerto.
+async fn limitar_el_login(
+    State(state): State<AppState>,
+    peticion: axum::extract::Request,
+    siguiente: axum::middleware::Next,
+) -> axum::response::Response {
+    let ip = peticion
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|conexion| conexion.0.ip())
+        .unwrap_or(IP_CENTINELA);
+
+    let permitido = {
+        let mut limitador = state.limite.lock().await;
+        limitador.permitir(ip, Instant::now())
+    };
+
+    if !permitido {
+        return AppError::TooManyRequests(DEMASIADAS_PETICIONES.to_owned()).into_response();
+    }
+
+    siguiente.run(peticion).await
+}
+
 /// Router de `/api/v1`.
 ///
 /// La superficie se parte en dos mitades por **lista blanca**: una pública —la
@@ -88,8 +135,18 @@ pub fn api_router(state: AppState) -> Router {
     let router = match &state.auth {
         // Con proveedor, el flujo de entrada es público y el resto, protegido.
         Some(_) => {
-            public = public
+            // El límite de tasa se cuelga **solo** de la ruta de entrada, y con `route_layer`
+            // sobre su propio sub-router: el callback no es una ruta que estrene nada —su
+            // `state` ya tiene que existir— y no necesita cupo propio.
+            let entrada = Router::new()
                 .route("/api/v1/auth/login", get(auth::login))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    limitar_el_login,
+                ));
+
+            public = public
+                .merge(entrada)
                 .route("/api/v1/auth/callback", get(auth::callback));
 
             // La superficie de negocio: las rutas del flujo de entrada y las de los
@@ -133,15 +190,21 @@ pub fn api_router(state: AppState) -> Router {
         // ninguna capa, así que las rutas de negocio quedan públicas, que es lo que el
         // modo de desarrollo significa. Sin esto, `just dev` contestaría `404` en cada
         // recurso y no habría forma de dar de alta nada sin un proveedor de identidad.
+        // La única ruta de negocio que **no** entra es la gestión de tokens, por el
+        // motivo que se explica en su sitio.
         None => public
             .merge(repositories::router())
             .merge(targets::router())
             .merge(jobs::router())
             .merge(executions::router())
-            // La gestión de tokens, como los recursos: sin capa que montar queda abierta, que es
-            // lo que el modo de desarrollo significa —y es útil para emitir un token con el que
-            // probar el camino `Bearer` sin levantar un proveedor de identidad—.
-            .merge(tokens::router())
+            // La gestión de tokens **no** se monta aquí, y es la única excepción a que la
+            // superficie de negocio quede abierta en este modo. Sin proveedor de identidad no
+            // hay sesión que exigir, así que la ruta de gestión solo puede quedarse abierta
+            // —y emitir credenciales sin credencial alguna— o no existir. Y no es un apunte
+            // pasajero: un token emitido así sobrevive al cambio de modo, porque su hash queda
+            // en la base y no depende de quién lo pidió, de modo que seguiría sirviendo cuando
+            // la autenticación se encienda. Se retira, y contesta el `404` de la envoltura
+            // —como `/api/v1/auth/*`— en vez de un `401` sin capa.
             // Y el explorador, igual: en este modo no hay ninguna capa que montar, así que queda
             // abierto como el resto —es lo que el modo de desarrollo significa— y el panel puede
             // explorar un repositorio sin un proveedor de identidad.
@@ -156,15 +219,6 @@ pub fn api_router(state: AppState) -> Router {
             .merge(events::router()),
     };
 
-    // Cabecera HSTS opcional: si el operador configuró `KESTO_HSTS_MAX_AGE`, toda
-    // respuesta —incluidos los *fallbacks* de 404 y 405, que la capa envuelve por
-    // estar en el router raíz— la lleva. Sin configurar, el valor es `None` y la
-    // capa no inserta nada.
-    let hsts_value: Option<HeaderValue> = state
-        .config
-        .hsts_max_age
-        .and_then(|edad| HeaderValue::from_str(&format!("max-age={edad}")).ok());
-
     router
         // Dos fallbacks, no uno: el de rutas cubre lo que no está declarado, y
         // el de métodos cubre lo que sí lo está con otro verbo. Sin el segundo,
@@ -177,11 +231,8 @@ pub fn api_router(state: AppState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(metodo_no_permitido)
         .layer(axum::middleware::from_fn(trazar))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::STRICT_TRANSPORT_SECURITY,
-            move |_respuesta: &axum::response::Response| hsts_value.clone(),
-        ))
         .with_state(state)
+        .layer(CatchPanicLayer::custom(respuesta_tras_panico))
 }
 
 /// La mitad protegida: las rutas de negocio, con el *gate* de sesión colgado.
@@ -259,6 +310,14 @@ pub(crate) async fn not_found() -> AppError {
 /// a los métodos que no son de lectura.
 pub(crate) async fn metodo_no_permitido() -> AppError {
     AppError::MethodNotAllowed("el método no está permitido en esta ruta".to_owned())
+}
+
+/// Convierte un pánico de un handler en el `500` de siempre.
+///
+/// El valor del pánico se descarta: puede contener credenciales o rutas del
+/// despliegue, y la respuesta de un `5xx` nunca las publica.
+fn respuesta_tras_panico(_: Box<dyn std::any::Any + Send>) -> axum::response::Response {
+    AppError::Other(String::from("pánico al atender la petición")).into_response()
 }
 
 /// El `404` de una tarea que no está, con un solo texto para las cuatro rutas que la buscan.
@@ -462,12 +521,9 @@ mod tests {
     use super::{api_router, protected_router};
     use crate::api::response::{ApiResponse, Data};
     use crate::test_support::{
-        body_json, body_text, cookie_de_sesion, estado_con_base, estado_desarrollo, estado_oidc,
-        get, get_with_cookie, header_text, lookup_from, post, post_with_cookie, router_desarrollo,
-        router_oidc,
+        body_json, body_text, cookie_de_sesion, estado_desarrollo, estado_oidc, get,
+        get_with_cookie, header_text, post, post_with_cookie, router_desarrollo, router_oidc,
     };
-
-    use crate::config::Config;
 
     /// Ruta de negocio ficticia: hoy ningún change declara rutas de negocio, así
     /// que la partición se prueba con esta, colgada de la mitad protegida por el
@@ -494,40 +550,6 @@ mod tests {
                 0,
                 "el estado de {modo} escucha en {} y no en un puerto efímero",
                 estado.config.bind_address
-            );
-        }
-    }
-
-    /// Clave maestra para los estados que esta prueba construye a mano.
-    const MASTER_KEY_HSTS: &str = "clave-maestra-para-hsts-00000000000000000000000000000000000000";
-
-    #[tokio::test]
-    async fn sin_hsts_ninguna_respuesta_lleva_la_cabecera() {
-        let respuesta = get(router_desarrollo().await, "/api/v1/health").await;
-
-        assert_eq!(
-            header_text(&respuesta, header::STRICT_TRANSPORT_SECURITY),
-            None,
-            "sin configurar la HSTS no debe haber cabecera"
-        );
-    }
-
-    #[tokio::test]
-    async fn con_hsts_toda_respuesta_lleva_la_cabecera() {
-        let config = Config::from_lookup(&lookup_from(&[
-            ("KESTO_MASTER_KEY", MASTER_KEY_HSTS),
-            ("KESTO_HSTS_MAX_AGE", "31536000"),
-        ]))
-        .expect("la configuración con HSTS es válida");
-        let router = api_router(estado_con_base(config).await);
-
-        for uri in ["/api/v1/health", "/api/v1/no-existe"] {
-            let respuesta = get(router.clone(), uri).await;
-
-            assert_eq!(
-                header_text(&respuesta, header::STRICT_TRANSPORT_SECURITY).as_deref(),
-                Some("max-age=31536000"),
-                "la respuesta de {uri} debe llevar la HSTS"
             );
         }
     }
@@ -586,7 +608,12 @@ mod tests {
 
         let cuerpo = body_json(respuesta).await;
 
-        assert_eq!(cuerpo["data"]["auth_mode"], "oidc");
+        // SEC-21: data ya no incluye auth_mode
+        let data_objeto = cuerpo["data"].as_object().expect("data debe ser un objeto");
+        assert!(
+            !data_objeto.contains_key("auth_mode"),
+            "data no debe tener auth_mode tras SEC-21"
+        );
     }
 
     #[tokio::test]
@@ -773,6 +800,28 @@ mod tests {
             serde_json::from_str(&texto).expect("el 401 debe traer JSON en el cuerpo");
 
         assert_eq!(cuerpo["status"], 401);
+    }
+
+    async fn panico() -> &'static str {
+        panic!("secreto-de-la-prueba")
+    }
+
+    #[tokio::test]
+    async fn un_panico_de_un_handler_no_llega_al_socket() {
+        let router = Router::new()
+            .route("/api/v1/panico", axum::routing::get(panico))
+            .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+                super::respuesta_tras_panico,
+            ));
+
+        let respuesta = get(router, "/api/v1/panico").await;
+
+        assert_eq!(respuesta.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let texto = body_text(respuesta).await;
+        assert!(
+            !texto.contains("secreto-de-la-prueba"),
+            "el pánico publicó su motivo por el socket: {texto}"
+        );
     }
 
     #[tokio::test]

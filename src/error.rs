@@ -84,6 +84,17 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
 
+    /// El cliente ha pedido demasiado en poco tiempo: es un `429`.
+    ///
+    /// Nace con el límite de tasa de la ruta de entrada: `GET /api/v1/auth/login` es pública y
+    /// cada petición escribe en memoria del proceso, así que un caudal alto y no autenticado se
+    /// corta antes de atenderlo. El motivo se explica —como en el `400`— porque el `429` es un
+    /// rechazo de la petición y lo único que le permite a quien llama saber qué hacer —esperar—
+    /// es que se lo digan; y el motivo **no** lleva ni la IP de origen ni nada de lo que mandó la
+    /// petición.
+    #[error("{0}")]
+    TooManyRequests(String),
+
     /// El servicio no puede atender la petición ahora mismo: es un `503`.
     ///
     /// El motivo **no** se publica —es un `5xx`— y el mensaje es [`UNAVAILABLE_MESSAGE`]: el motor
@@ -148,6 +159,14 @@ impl IntoResponse for AppError {
             Self::Conflict(motivo) => {
                 tracing::debug!(motivo = %motivo, "petición rechazada");
                 (StatusCode::CONFLICT, motivo)
+            }
+            // El `429` es también un rechazo de la petición y su motivo —«espera un momento»— es
+            // lo único que le permite saber qué hacer a quien llama. Se traza a `debug` igual que
+            // el `400`. El motivo no nombra la IP ni ninguna cabecera: quien abusa ya sabe desde
+            // dónde abusa, y quien no, no necesita saberlo.
+            Self::TooManyRequests(motivo) => {
+                tracing::debug!(motivo = %motivo, "petición rechazada por el límite de tasa");
+                (StatusCode::TOO_MANY_REQUESTS, motivo)
             }
             // El `428` es también un rechazo de la petición, y su motivo —«confirma la
             // sobrescritura»— es lo único que permite al panel saber qué condición pedir. Se traza a

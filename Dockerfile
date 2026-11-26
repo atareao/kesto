@@ -79,7 +79,18 @@ RUN --mount=type=secret,id=actions_cache_url \
     find src -type f -exec touch {} +; \
     mkdir -p kesto-mcp/src; \
     echo '' > kesto-mcp/src/lib.rs; \
-    cargo build --release --locked
+    CARGO_TARGET_DIR=/app/target-api \
+    cargo build --release --locked --bin kesto
+# Árboles de destino separados: compilar el motor en el mismo `target/release`
+# sobrescribía `kesto` con un binario que enlazaba `bollard`.
+RUN --mount=type=secret,id=actions_cache_url \
+    --mount=type=secret,id=actions_runtime_token \
+    set -eux; \
+    export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url 2>/dev/null || true)"; \
+    export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token 2>/dev/null || true)"; \
+    export SCCACHE_GHA_ENABLED="$([ -n "${ACTIONS_CACHE_URL}" ] && echo true || echo false)"; \
+    CARGO_TARGET_DIR=/app/target-motor \
+    cargo build --release --locked --features motor --bin kesto-motor
 
 # ── Etapa 3: runtime mínimo ────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -93,7 +104,8 @@ RUN apt-get update \
 # el proceso arranca en /app y el panel queda en /app/ui/dist.
 WORKDIR /app
 
-COPY --from=rust-builder /app/target/release/kesto /app/kesto
+COPY --from=rust-builder /app/target-api/release/kesto /app/kesto
+COPY --from=rust-builder /app/target-motor/release/kesto-motor /app/kesto-motor
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
 
 # Directorio de datos (SQLite) propiedad del usuario sin privilegios.

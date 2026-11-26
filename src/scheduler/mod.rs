@@ -7,37 +7,34 @@
 //! - [`validacion`], que convierte una `cron_expression` en una [`Agenda`] o en un rechazo. Es la
 //!   única pieza de la **gramática** que se publica hacia fuera, porque el alta y la edición de una
 //!   tarea la necesitan **antes** de escribir;
-//! - [`planificacion`], que tiene el reloj de la biblioteca, la tabla `job_id → mango` —la única
-//!   autoridad sobre lo planificado, porque la biblioteca no ofrece ninguna señal de estado— y la
-//!   **puerta de parada**. La puerta vive aquí y no en la biblioteca por una medición: su
-//!   `shutdown()` vuelve en microsegundos y deja un tick disparando después, así que la garantía de
-//!   «no se encola tras la parada» es del módulo, cerrada **en la misma sección crítica que el
-//!   encolado**;
-//! - y [`disparo`], que es el cuerpo que el cierre de la biblioteca llama en una sola línea, y su
+//! - [`planificacion`], que lleva el reloj nativo —un bucle de Tokio con un mapa de tareas y un
+//!   despertador calculado sobre `time::OffsetDateTime`—, la tabla `job_id → mango`, la única
+//!   autoridad sobre lo planificado, y la **puerta de parada**. La puerta vive aquí porque el
+//!   cierre de la bandera no puede esperar candados: se cierra **en el mismo instante** en que
+//!   empieza la parada, antes de cualquier `await`, y se consulta **en la misma sección crítica
+//!   que el encolado**;
+//! - y [`disparo`], que es el cuerpo que el cierre del reloj llama en una sola línea, y su
 //!   tabla de desenlaces: seis variantes de [`crate::engine::ErrorDelMotor`] con la reacción que le
 //!   toca a cada una.
 //!
 //! Lo que sale de este módulo es [`Planificador`], sus [`Ajustes`] y su [`ErrorDelPlanificador`],
-//! además de la validación. Ninguno de los tres nombres es de `tokio_cron_scheduler`: el reloj de la
-//! biblioteca se queda dentro, como la tabla de mangos.
+//! además de la validación. El reloj y su tabla de mangos se quedan dentro.
 //!
-//! # El borde: la validación se alcanza sin nombrar la biblioteca del reloj
+//! # El borde: la validación se alcanza sin arrancar el reloj
 //!
-//! `src/api` tiene que poder validar una expresión **sin importar `tokio_cron_scheduler`**. Un borde
-//! HTTP que nombrara la biblioteca daría a la gramática dos dueños —el que valida y el que
-//! evalúa—, y el día que uno de los dos cambiara, la validación aceptaría lo que el reloj no sabe
-//! leer. Por eso **ningún tipo de `tokio_cron_scheduler` aparece en la superficie pública** de este
-//! módulo: lo que se publica es [`Agenda`], [`ErrorDeExpresion`], [`normalizar`] y [`validar`], y
-//! con eso la capa de recursos valida sin saber que existe un reloj.
+//! `src/api` tiene que poder validar una expresión **sin depender del bucle de disparos**. Un borde
+//! HTTP que arrancara el reloj daría a la gramática dos dueños —el que valida y el que evalúa—, y
+//! el día que uno de los dos cambiara, la validación aceptaría lo que el reloj no sabe leer. Por
+//! eso **ningún tipo del reloj aparece en la superficie pública** de este módulo: lo que se publica
+//! es [`Agenda`], [`ErrorDeExpresion`], [`normalizar`] y [`validar`], y con eso la capa de recursos
+//! valida sin saber que existe un bucle.
 //!
 //! # La familia de fechas de la superficie
 //!
-//! `croner` y la biblioteca del reloj miden el calendario con `chrono`; el §3 y el resto de Kesto lo
-//! miden con `time`. La frontera de esta pieza habla **la familia del repositorio** —`time`, que es
-//! una dependencia directa y la que el resto del programa ya usa—, así que quien valida desde la API
-//! no tiene que aprender una segunda familia para llamar a [`validar`]: [`Agenda::proxima_tras`]
-//! recibe y devuelve `time::OffsetDateTime`, y ninguna firma pública de este módulo nombra una fecha
-//! de `chrono`.
+//! El reloj nativo mide el calendario con `time`, que es la familia que ya usa el §3 y el resto de
+//! Kesto. La frontera de esta pieza habla **la familia del repositorio**, así que quien valida
+//! desde la API no tiene que aprender otra: [`Agenda::proxima_tras`] recibe y devuelve
+//! `time::OffsetDateTime`.
 
 mod disparo;
 mod planificacion;

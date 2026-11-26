@@ -32,7 +32,7 @@ jobs:
       has_ui: ${{ steps.detect.outputs.has_ui }}
       ui_pm: ${{ steps.detect.outputs.ui_pm }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Detect ui/ and its package manager
         id: detect
@@ -55,27 +55,55 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust (rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # `--workspace` no es cosmético: sin él Cargo se queda en el paquete raíz y
+      # el crate `kesto-mcp` —donde vive el SDK del MCP— no se mira nunca. Es la
+      # paridad con `just clippy` y `just test` (.justfile).
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Scripts tests
         run: for f in scripts/*.test.sh; do echo "── $f"; bash "$f"; done
+
+  # La puerta de la cadena de suministro. Sin `needs: preflight` a propósito: no
+  # depende de la detección del panel, así que corre en paralelo con el resto.
+  dependencies:
+    name: Dependencies (cargo deny)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-deny
+
+      # `--workspace` is not cosmetic here: the root manifest is a package, not a
+      # virtual one, so without the flag the crate graph starts at that single root
+      # and `kesto-mcp` (and with it `rmcp`) never enters it.
+      - name: Dependencies (advisories, licenses, bans, sources)
+        run: cargo deny --workspace --locked check
 
   frontend:
     name: Frontend
@@ -87,14 +115,14 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # `pnpm/action-setup` aborta si se le pasa `version:` y `ui/package.json`
       # declara `packageManager`. Si algún día pasa eso, borra el `version:` de
       # este paso y deja que lo decida package.json.
       - name: Setup pnpm
         if: needs.preflight.outputs.ui_pm == 'pnpm'
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 12
 
@@ -102,7 +130,7 @@ jobs:
       # (de ahí el orden), y la ruta del lockfile se elige en la expresión para no
       # apuntar nunca a un lockfile que no existe.
       - name: Setup Node 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           cache: ${{ needs.preflight.outputs.ui_pm }}
@@ -146,13 +174,13 @@ jobs:
       # Clave de relleno solo para los tests: nunca un secret real.
       KESTO_MASTER_KEY: kesto-e2e-test-master-key-000000000000
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Verify Docker daemon
         run: docker info
@@ -163,6 +191,10 @@ jobs:
           docker pull "$POSTGRES_IMAGE"
           docker pull "$ALPINE_IMAGE"
           docker pull "$S3_IMAGE"
+
+      - name: Build kesto-motor
+        # La batería e2e lanza los dos binarios: `cargo test --features e2e` solo construye la API.
+        run: cargo build --locked --features motor --bin kesto-motor
 
       # Los dos pasos que ejecutan la batería van por un tubo —para que el registro quede en el
       # artefacto—, y el desenlace de un tubo es el del **último** comando: sin `pipefail`, un
@@ -182,7 +214,7 @@ jobs:
 
       - name: Upload test logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: e2e-logs
           path: |

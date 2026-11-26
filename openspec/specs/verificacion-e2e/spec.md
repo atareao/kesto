@@ -102,7 +102,9 @@ La batería NO SHALL omitir escenarios en silencio. Si falta el motor de contene
 
 ### Requirement: Restauración hacia contenedor de punta a punta
 
-La restauración hacia un contenedor SHALL estar cubierta por la batería de punta a punta, desde el snapshot en S3 hasta el `stdin` del proceso de restauración, sin fichero temporal intermedio.
+La restauración hacia un contenedor SHALL estar cubierta por la batería de punta a punta, desde el snapshot en S3 hasta el `stdin` del proceso de restauración, sin fichero temporal intermedio. La batería SHALL cubrir además dos consecuencias del trato del volcado como contenido **no confiable**: la restauración global de PostgreSQL SHALL repartir cada base en su base, y los **datos** de un volcado que *parezcan* un metacomando SHALL sobrevivir al ciclo íntegros —lo que fija que el descarte de metacomandos no se come contenido—.
+
+Que un metacomando del volcado **no se ejecute** se comprueba en las pruebas de sonda de la capability `restauracion`, no aquí: la batería no puede inyectar un volcado hostil en el repositorio, porque el volcado lo produce la extracción a partir de una base real. Aquí se comprueba lo que sí viaja de punta a punta.
 
 #### Scenario: El snapshot viaja de S3 al stdin del contenedor
 - **GIVEN** un snapshot en S3 con un volcado conocido
@@ -113,6 +115,24 @@ La restauración hacia un contenedor SHALL estar cubierta por la batería de pun
 - **GIVEN** un contenedor cuyo proceso de restauración no lee su `stdin`
 - **WHEN** transcurre el plazo de inactividad
 - **THEN** la restauración termina en error acotado y no queda bloqueada
+
+#### Scenario: Los datos que parecen un metacomando sobreviven al ciclo
+- **GIVEN** un origen con una tabla cuyos valores son texto que parece un metacomando de cliente (`\! …`, `\.shell`, `\connect …`)
+- **WHEN** se copia y se restaura hacia el contenedor
+- **THEN** esos valores SHALL estar en el destino **íntegros**, sin una línea de menos
+- **AND** NO SHALL ejecutarse ninguna orden de shell
+
+#### Scenario: La restauración global de PostgreSQL reparte cada base en su base
+- **GIVEN** un snapshot de PostgreSQL con dos bases y sus datos
+- **WHEN** se restaura el volcado global hacia el contenedor
+- **THEN** cada base SHALL contener los datos que le corresponden
+- **AND** ninguna base SHALL recibir los datos de otra
+
+#### Scenario: Un contenedor con un `psql` sin `\restrict` falla la restauración de punta a punta
+- **GIVEN** un contenedor de PostgreSQL cuyo `psql` es anterior al mínimo de su rama
+- **WHEN** se restaura un snapshot global
+- **THEN** la restauración SHALL acabar en `failed` nombrando el mínimo
+- **AND** NO SHALL reponerse ninguna base del snapshot
 
 ### Requirement: Sobrescritura de un destino con contenido
 
@@ -148,3 +168,48 @@ La retención SHALL estar cubierta contra S3 real: las reglas retiran los snapsh
 - **GIVEN** un fallo del servidor S3 durante la purga
 - **WHEN** se aplica la retención
 - **THEN** la ejecución falla con el motivo del almacén y el estado del repositorio queda legible
+
+### Requirement: La frontera del operador al motor se verifica de punta a punta
+
+La batería SHALL probar que el confinamiento rechaza, contra un motor de contenedores real, y no solo en la unidad: un contenedor de origen **sin** la etiqueta `io.kesto.backup-source=true` no recibe `exec`, y un `host_path` fuera de la raíz no se copia. Los contenedores de origen que la batería sí copia SHALL llevar la etiqueta, y la raíz de copias SHALL apuntar a la raíz temporal de la batería, de modo que los escenarios que hoy copian directorios sigan corriendo.
+
+#### Scenario: Un contenedor de origen sin etiqueta no se copia
+
+- **GIVEN** un contenedor de origen en marcha al que no se le ha puesto la etiqueta de fuente de copia
+- **WHEN** se lanza una copia contra un target que lo nombra
+- **THEN** la ejecución SHALL acabar en `failed`
+- **AND** el motivo SHALL nombrar el contenedor
+
+#### Scenario: Los contenedores de origen de la batería llevan la etiqueta
+
+- **GIVEN** los contenedores que la batería crea para copiar
+- **WHEN** se ejecuta el ciclo completo de copia y restauración
+- **THEN** SHALL completarse para cada tipo de origen
+- **AND** cada contenedor de origen SHALL haber llevado la etiqueta de fuente de copia
+
+El caso **literalmente** fuera de la raíz no llega a la batería: el borde HTTP lo rechaza con `400` al dar de alta el target. El caso que solo el motor puede cerrar —y el que aquí se prueba de punta a punta— es el de una ruta textualmente bajo la raíz que un enlace simbólico lleva fuera.
+
+#### Scenario: Un directorio fuera de la raíz no se copia
+
+- **GIVEN** un target `directory` cuyo `host_path` resuelve —una vez canonicalizado— fuera de la raíz de copias de la batería
+- **WHEN** se lanza la copia
+- **THEN** la ejecución SHALL acabar en `failed`
+- **AND** NO SHALL crearse instantánea en el repositorio
+
+### Requirement: La batería declara el permiso de endpoints inseguros
+
+El arnés de la batería SHALL declarar `KESTO_ALLOW_INSECURE_ENDPOINT=1` en el entorno del binario que arranca, porque su almacén real —SeaweedFS— escucha en `http://127.0.0.1:<puerto>`: sin el permiso, la validación del `endpoint` rechazaría todos los altas de repositorio de la batería y los escenarios que dependen de un almacén real dejarían de poder correr.
+
+La batería SHALL seguir verificando el almacén real —crear el repositorio contra él, aislarlo entre ejecuciones y copiar y restaurar a través suyo—, de modo que el permiso sea lo único que cambia y NO SHALL perderse cobertura.
+
+#### Scenario: El almacén real se sigue verificando con el permiso declarado
+- **GIVEN** la batería arrancada con `KESTO_ALLOW_INSECURE_ENDPOINT=1`
+- **WHEN** se ejecuta el escenario que crea un repositorio contra el almacén real
+- **THEN** SHALL contestar `201`
+- **AND** el escenario NO SHALL fallar por la validación del `endpoint`
+
+#### Scenario: El aislamiento entre ejecuciones no depende del permiso
+- **GIVEN** dos ejecuciones seguidas de la batería sobre el mismo almacén
+- **WHEN** la segunda crea su repositorio
+- **THEN** NO SHALL encontrar los datos de la primera
+- **AND** el permiso declarado NO SHALL cambiar el aislamiento

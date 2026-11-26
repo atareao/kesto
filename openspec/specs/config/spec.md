@@ -12,21 +12,23 @@ El contrato de configuración de Kesto: qué variables de entorno se leen y con 
 Las variables que el SRS no declara SHALL llevar prefijo `KESTO_` —o conservar el nombre que ya usa shuul, en el caso de `OIDC_*`— para no colisionar con las de otro servicio del mismo host.
 
 #### Scenario: El compose del SRS se lee sin traducción
-- **GIVEN** un entorno con `BIND_ADDRESS=0.0.0.0:9090` y `DATABASE_URL=sqlite:///tmp/x.db`
+- **GIVEN** un entorno con `BIND_ADDRESS=0.0.0.0:9090`, `DATABASE_URL=sqlite:///tmp/x.db`, las tres variables `OIDC_*` y `KESTO_SECRET` —la forma del §8, que declara las tres y sirve en todas las interfaces—
 - **WHEN** se carga la configuración
 - **THEN** la dirección de escucha efectiva SHALL ser `0.0.0.0:9090`
 - **AND** la cadena de base de datos SHALL ser `sqlite:///tmp/x.db`
 
 ### Requirement: Las variables que pueden tener valor por defecto lo tienen, y es el del SRS
 
-`RUST_LOG`, `BIND_ADDRESS` y `DATABASE_URL` SHALL tener valor por defecto, y SHALL coincidir con el que el §8 declara, para que un `compose` que las omita se comporte como el que las declara.
+`RUST_LOG` y `DATABASE_URL` SHALL tener valor por defecto, y SHALL coincidir con el que el §8 declara, para que un `compose` que las omita se comporte como el que las declara.
+
+`BIND_ADDRESS` SHALL tener valor por defecto, y el suyo SHALL ser `127.0.0.1:8080` y **no** el `0.0.0.0:8080` del §8: escuchar en todas las interfaces SHALL ser una decisión explícita del operador —el §8 la toma en su `compose`, que la declara tal cual, y con proveedor de identidad— y NO SHALL ser nunca el resultado de no haber dicho nada.
 
 Una variable **presente pero vacía** NO SHALL confundirse con una ausente: el valor por defecto es para la variable que no está, no para la que está sin valor.
 
 #### Scenario: Sin esas variables, ganan los valores del SRS
-- **GIVEN** un entorno con `KESTO_MASTER_KEY` y sin `BIND_ADDRESS` ni `DATABASE_URL`
+- **GIVEN** un entorno con `KESTO_MASTER_KEY`, `KESTO_ALLOW_INSECURE=1` y sin `BIND_ADDRESS` ni `DATABASE_URL`
 - **WHEN** se carga la configuración
-- **THEN** la dirección de escucha SHALL ser `0.0.0.0:8080`
+- **THEN** la dirección de escucha SHALL ser `127.0.0.1:8080`
 - **AND** la cadena de base de datos SHALL apuntar a `sqlite:///app/data/kesto.db`
 
 ### Requirement: Una variable obligatoria ausente falla en alto y nombra solo la variable
@@ -56,36 +58,6 @@ Un valor presente SHALL usarse recortado de los espacios sobrantes. No es cosmé
 - **WHEN** se carga la configuración
 - **THEN** SHALL fallar en alto
 - **AND** el mensaje SHALL nombrar `RUST_LOG`
-
-### Requirement: El modo de autenticación se deduce de la presencia de las variables OIDC
-
-La configuración de OIDC SHALL ser opcional en su conjunto, para permitir el desarrollo sin proveedor, y SHALL tener exactamente tres desenlaces: `Oidc` cuando las tres variables están presentes, `Disabled` cuando no está ninguna, y un error de arranque cuando están unas sí y otras no.
-
-`Disabled` es el modo de desarrollo y SHALL anunciarse con un aviso en voz alta al arrancar. Una configuración a medias NO SHALL degradarse a `Disabled`: NO SHALL arrancar.
-
-#### Scenario: Las tres variables presentes encienden la autenticación
-- **GIVEN** `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET` presentes
-- **WHEN** se carga la configuración
-- **THEN** el modo SHALL ser `Oidc`
-- **AND** el emisor SHALL ser el de `OIDC_ISSUER_URL`
-
-#### Scenario: Ninguna variable deja la autenticación apagada y lo anuncia
-- **GIVEN** un entorno sin ninguna variable `OIDC_*`
-- **WHEN** se carga la configuración
-- **THEN** el modo SHALL ser `Disabled`
-- **AND** el arranque SHALL emitir un aviso que declare el modo de desarrollo
-
-#### Scenario: Una configuración a medias es un error, no un modo desarrollo
-- **GIVEN** `OIDC_ISSUER_URL` y `OIDC_CLIENT_ID` presentes pero sin `OIDC_CLIENT_SECRET`
-- **WHEN** se carga la configuración
-- **THEN** SHALL fallar en alto
-- **AND** el mensaje SHALL nombrar `OIDC_CLIENT_SECRET`
-- **AND** NO SHALL arrancar con la autenticación apagada
-
-#### Scenario: La URL de retorno tiene un valor por defecto de desarrollo
-- **GIVEN** las tres variables de OIDC presentes y sin `OIDC_REDIRECT_URL`
-- **WHEN** se carga la configuración
-- **THEN** la URL de retorno SHALL apuntar al callback local
 
 ### Requirement: `KESTO_SECRET` solo es obligatoria con la autenticación encendida
 
@@ -119,29 +91,49 @@ Sin autenticación no hay sesión que firmar, así que `KESTO_SECRET` SHALL ser 
 
 ### Requirement: El socket de Docker se configura por `DOCKER_HOST` y tiene un valor por defecto
 
-La aplicación SHALL respetar `DOCKER_HOST` como la variable que decide a qué socket se conecta el motor para hablar con Docker, SHALL usar la ruta por defecto de la plataforma cuando la variable no está informada, y NO SHALL exigirla para arrancar.
+El binario `kesto-motor` SHALL respetar `DOCKER_HOST` como la variable que decide a qué socket se conecta para hablar con Docker, SHALL usar `unix:///var/run/docker.sock` cuando la variable no está informada, SHALL recortar los espacios de su valor y NO SHALL exigirla para arrancar. El binario de la API NO SHALL leer `DOCKER_HOST` ni usarlo para construir el cliente: solo conoce `KESTO_MOTOR_SOCKET`.
 
 El nombre no es una elección de este proyecto: es la variable que la biblioteca de Docker lee por convención, y respetarla permite que un `compose` que ya la define para Kesto funcione sin traducir el nombre. Hace falta además por una razón de este entorno: la máquina de desarrollo no tiene Docker, tiene Podman con una API compatible en otro socket, así que una ruta fija en el binario haría imposible ejercitar el motor sin un Docker de verdad. En producción la variable no se informa y se usa la ruta del §8.
 
-Una variable con valor por defecto no SHALL considerarse obligatoria: informada pero vacía SHALL caer al valor por defecto, como se hizo con las otras rutas del contrato, porque una ruta vacía es una interpolación de `compose` sin variable y no una intención.
+Una variable con valor por defecto NO SHALL considerarse obligatoria: informada pero vacía SHALL caer al valor por defecto, como se hizo con las otras rutas del contrato, porque una ruta vacía es una interpolación de `compose` sin variable y no una intención. Con espacios SHALL caer al mismo valor recortado, por la misma razón.
+
+Un socket configurado que no responde SHALL producir un error en el motor que lo nombra, y NO SHALL impedir el arranque de la API: el fallo SHALL aparecer al ejecutar una copia, en el lado motor, no al arrancar el proceso que sirve HTTP.
 
 #### Scenario: Sin DOCKER_HOST se usa la ruta por defecto
 - **GIVEN** un entorno sin `DOCKER_HOST`
-- **WHEN** se carga la configuración
-- **THEN** el socket SHALL ser la ruta por defecto de la plataforma
+- **WHEN** se carga la configuración del motor
+- **THEN** el socket SHALL ser `unix:///var/run/docker.sock`
 - **AND** NO SHALL fallar el arranque por su ausencia
 
 #### Scenario: DOCKER_HOST se respeta
 - **GIVEN** un entorno con `DOCKER_HOST=unix:///run/user/1000/podman/podman.sock`
-- **WHEN** se carga la configuración
+- **WHEN** se carga la configuración del motor
 - **THEN** el socket SHALL ser el de esa ruta
-- **AND** SHALL usarse para hablar con el motor de contenedores
+- **AND** SHALL usarse para hablar con el motor de contenedores desde el proceso motor
 
 #### Scenario: DOCKER_HOST vacío cae al valor por defecto
 - **GIVEN** un entorno con `DOCKER_HOST=` (vacía)
-- **WHEN** se carga la configuración
-- **THEN** SHALL valer la ruta por defecto
+- **WHEN** se carga la configuración del motor
+- **THEN** SHALL valer `unix:///var/run/docker.sock`
 - **AND** NO SHALL fallar el arranque
+
+#### Scenario: DOCKER_HOST con espacios se recorta
+- **GIVEN** un entorno con `DOCKER_HOST=  unix:///run/user/1000/podman/podman.sock  `
+- **WHEN** se carga la configuración del motor
+- **THEN** SHALL usarse la ruta sin los espacios
+- **AND** NO SHALL fallar el arranque
+
+#### Scenario: La API no lee DOCKER_HOST
+- **GIVEN** un entorno con `DOCKER_HOST` apuntando a un socket cualquiera
+- **WHEN** arranca el binario de la API
+- **THEN** la configuración de la API SHALL NOT contener esa ruta
+- **AND** el binario API SHALL NOT enlazar el cliente Docker
+
+#### Scenario: Un socket inexistente no impide arrancar la API
+- **GIVEN** un `DOCKER_HOST` configurado en el motor que apunta a una ruta muerta
+- **WHEN** arranca la API y se ejecuta una copia
+- **THEN** el motor SHALL fallar con un error que nombra el socket
+- **AND** la API SHALL haber arrancado y escuchado
 
 ### Requirement: La lectura del socket se inyecta como la del resto de la configuración
 
@@ -160,3 +152,200 @@ Es la regla que ya rige para las demás variables y la razón por la que existe:
 - **WHEN** las dos se usan a la vez
 - **THEN** cada una SHALL hablar con el suyo
 - **AND** ninguna SHALL ver el del otro
+
+### Requirement: El modo sin autenticación exige un permiso explícito
+
+La aplicación SHALL negarse a arrancar en modo `Disabled` sin el permiso explícito de `KESTO_ALLOW_INSECURE`, que SHALL valer `1` para permitirlo y `0` para negarlo. Ausente SHALL equivaler a negado, y cualquier otro valor —vacío incluido— SHALL ser un error de formato que nombre la variable.
+
+Sin las tres `OIDC_*` no hay credencial que verificar, así que la ausencia de proveedor NO SHALL ser por sí sola un modo de funcionamiento: un despliegue que pierde las `OIDC_*` —un `.env` que no se carga, un `compose` que interpola a vacío— SHALL negarse a arrancar en vez de quedar abierto en todas las interfaces, con el motor incluido. El permiso es lo que convierte el modo de desarrollo en una decisión y no en un accidente.
+
+Con el modo `Oidc` la variable NO SHALL tener efecto alguno: la capa de sesión se monta igual y el permiso no la relaja.
+
+#### Scenario: Sin proveedor y sin permiso no se arranca
+- **GIVEN** un entorno con `KESTO_MASTER_KEY` y sin ninguna variable `OIDC_*` ni `KESTO_ALLOW_INSECURE`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_ALLOW_INSECURE`
+
+#### Scenario: Con el permiso explícito el modo de desarrollo arranca
+- **GIVEN** un entorno con `KESTO_MASTER_KEY`, `KESTO_ALLOW_INSECURE=1` y `BIND_ADDRESS=127.0.0.1:8080`, sin ninguna variable `OIDC_*`
+- **WHEN** se carga la configuración
+- **THEN** el modo SHALL ser `Disabled`
+- **AND** la configuración SHALL ser válida
+
+#### Scenario: Un permiso que no es `1` ni `0` es un error de formato
+- **GIVEN** un entorno con `KESTO_MASTER_KEY` y `KESTO_ALLOW_INSECURE=true`, sin ninguna variable `OIDC_*`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_ALLOW_INSECURE`
+
+#### Scenario: Con proveedor de identidad el permiso no cambia nada
+- **GIVEN** un entorno con las tres variables `OIDC_*`, `KESTO_SECRET` y sin `KESTO_ALLOW_INSECURE`
+- **WHEN** se carga la configuración
+- **THEN** el modo SHALL ser `Oidc`
+- **AND** NO SHALL fallar por falta de permiso
+
+### Requirement: El modo sin autenticación solo escucha en loopback
+
+En modo `Disabled`, la dirección de escucha efectiva SHALL ser de loopback —`127.0.0.0/8` o `::1`— y escuchar en cualquier otra SHALL ser un error de arranque que nombre `BIND_ADDRESS`, aunque el permiso explícito esté dado: sin capa de autenticación, la superficie completa —incluido el motor, que dirige el socket del daemon— NO SHALL quedar alcanzable desde otra interfaz.
+
+En modo `Oidc` NO SHALL haber tal restricción: el §8 declara `0.0.0.0:8080` y es legítimo.
+
+#### Scenario: Sin autenticación y en todas las interfaces no se arranca
+- **GIVEN** un entorno con `KESTO_MASTER_KEY`, `KESTO_ALLOW_INSECURE=1` y `BIND_ADDRESS=0.0.0.0:8080`, sin ninguna variable `OIDC_*`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `BIND_ADDRESS`
+
+#### Scenario: Con autenticación, escuchar en todas las interfaces es legítimo
+- **GIVEN** un entorno con las tres variables `OIDC_*`, `KESTO_SECRET` y `BIND_ADDRESS=0.0.0.0:8080`
+- **WHEN** se carga la configuración
+- **THEN** la configuración SHALL ser válida
+- **AND** la dirección de escucha efectiva SHALL ser `0.0.0.0:8080`
+
+### Requirement: La raíz de las copias de directorio se configura con `KESTO_BACKUP_ROOT`
+
+`KESTO_BACKUP_ROOT` SHALL ser la raíz bajo la que el motor acepta el `host_path` de un target `directory`, y SHALL tener el valor por defecto `/backup_sources`, que es donde el `compose` del §8 monta los directorios a respaldar, para que el despliegue de referencia no tenga que declararla.
+
+Su valor SHALL ser una ruta **absoluta**. Presente pero relativa o vacía SHALL ser un error de arranque que nombra la variable, en la línea de `RUST_LOG` y `BIND_ADDRESS`: un valor presente pero inutilizable no se degrada en silencio. Ausente SHALL tomar el valor por defecto.
+
+La variable lleva el prefijo `KESTO_` que este repositorio reserva para todo lo que no son las tres del §8, `DOCKER_HOST` y las `OIDC_*`.
+
+El porqué: la raíz no se cablea en código porque el e2e y el modo local copian directorios temporales que no viven bajo `/backup_sources`, y porque el operador debe poder moverla sin tocar el binario. Y no se deriva de los montajes del propio contenedor porque en el modo local no hay contenedor de Kesto que inspeccionar.
+
+#### Scenario: Sin la variable gana el defecto
+
+- **GIVEN** un entorno sin `KESTO_BACKUP_ROOT`
+- **WHEN** se carga la configuración
+- **THEN** la raíz de copias SHALL ser `/backup_sources`
+- **AND** la configuración SHALL ser válida
+
+#### Scenario: Una raíz relativa no se acepta
+
+- **GIVEN** un entorno con `KESTO_BACKUP_ROOT=backup_sources`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_BACKUP_ROOT`
+
+#### Scenario: Una raíz vacía no cae al defecto
+
+- **GIVEN** un entorno con `KESTO_BACKUP_ROOT` presente pero vacía
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_BACKUP_ROOT`
+
+### Requirement: El modo de autenticación se deduce de la presencia de las variables OIDC, y con ellas el retorno es obligatorio y `https`
+
+La configuración de OIDC SHALL ser opcional en su conjunto, para permitir el desarrollo sin proveedor, y SHALL tener exactamente tres desenlaces: `Oidc` cuando las tres variables están presentes, `Disabled` cuando no está ninguna, y un error de arranque cuando están unas sí y otras no.
+
+`Disabled` es el modo de desarrollo y SHALL anunciarse con un aviso en voz alta al arrancar. Una configuración a medias NO SHALL degradarse a `Disabled`: NO SHALL arrancar.
+
+`OIDC_REDIRECT_URL` NO SHALL tener valor por defecto y NO SHALL decidir el modo. Con las tres variables presentes SHALL ser obligatoria y su esquema SHALL ser `https`: ausente, o presente con cualquier otro esquema, SHALL ser un error de arranque que nombra la variable, y la aplicación NO SHALL arrancar. Sin ninguna de las tres SHALL ignorarse en silencio, como hasta ahora: no hay modo OIDC al que aplicarle la regla.
+
+El motivo: la URL de retorno es la dirección a la que el proveedor devuelve la sesión, y por ella viaja el código de autorización; un retorno por `http` expone ese código y no tiene uso legítimo en un despliegue. Y el retorno **solo** se usa en modo OIDC, así que un valor por defecto no puede ser válido nunca: es mejor no tenerlo y decir qué falta que tenerlo y decir que no sirve.
+
+#### Scenario: Las tres variables presentes encienden la autenticación
+- **GIVEN** `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` y `OIDC_REDIRECT_URL` por `https`
+- **WHEN** se carga la configuración
+- **THEN** el modo SHALL ser `Oidc`
+- **AND** el emisor SHALL ser el de `OIDC_ISSUER_URL`
+
+#### Scenario: Ninguna variable deja la autenticación apagada y lo anuncia
+- **GIVEN** un entorno sin ninguna variable `OIDC_*`
+- **WHEN** se carga la configuración
+- **THEN** el modo SHALL ser `Disabled`
+- **AND** el arranque SHALL emitir un aviso que declare el modo de desarrollo
+
+#### Scenario: Una configuración a medias es un error, no un modo desarrollo
+- **GIVEN** `OIDC_ISSUER_URL` y `OIDC_CLIENT_ID` presentes pero sin `OIDC_CLIENT_SECRET`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `OIDC_CLIENT_SECRET`
+- **AND** NO SHALL arrancar con la autenticación apagada
+
+#### Scenario: La URL de retorno no tiene valor por defecto
+- **GIVEN** las tres variables de OIDC presentes y sin `OIDC_REDIRECT_URL`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `OIDC_REDIRECT_URL`
+- **AND** NO SHALL aplicarse ningún valor por defecto
+
+#### Scenario: Un retorno por `http` no arranca
+- **GIVEN** las tres variables `OIDC_*` presentes y `OIDC_REDIRECT_URL=http://localhost:8080/api/v1/auth/callback`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `OIDC_REDIRECT_URL`
+
+#### Scenario: Un retorno por `https` arranca
+- **GIVEN** las tres variables `OIDC_*` presentes y `OIDC_REDIRECT_URL=https://panel.example.test/api/v1/auth/callback`
+- **WHEN** se carga la configuración
+- **THEN** el modo SHALL ser `Oidc`
+- **AND** la URL de retorno SHALL ser la declarada
+
+#### Scenario: Sin modo OIDC la variable se ignora
+- **GIVEN** un entorno con `OIDC_REDIRECT_URL` por `http` y sin ninguna de las tres `OIDC_*`
+- **WHEN** se carga la configuración
+- **THEN** el modo SHALL ser `Disabled`
+- **AND** NO SHALL fallar por la URL de retorno
+
+### Requirement: El `endpoint` de un repositorio se valida salvo permiso explícito
+
+`KESTO_ALLOW_INSECURE_ENDPOINT` SHALL gobernar si un `endpoint` de repositorio puede ser inseguro: `1` SHALL conceder el permiso, `0` o ausente SHALL negarlo, y cualquier otro valor —vacío incluido— SHALL ser un error de arranque que nombra la variable. El defecto SHALL ser el permiso negado. La variable lleva el prefijo `KESTO_` que este repositorio reserva para todo lo que no son las tres del §8, `DOCKER_HOST` y las `OIDC_*`.
+
+Con el permiso concedido, el borde HTTP SHALL aceptar un `endpoint` por `http` y uno que apunte al loopback —o a un nombre `localhost`—; NO SHALL aceptar, ni con el permiso, un `endpoint` que apunte a una dirección de enlace local, a la de metadatos, a la no especificada o que lleve credenciales embebidas. Las reglas completas del `endpoint` están en la capability `api-resources`.
+
+El motivo de una sola variable para las dos rebajas: `http` y loopback son el mismo caso —«el destino está en mi propia máquina y en claro»—, que es lo que hacen el desarrollo local y la batería. Lo que la variable NO SHALL rebajar nunca es el enlace local, la dirección de metadatos ni la no especificada: no hay laboratorio que necesite alcanzar el servicio de metadatos.
+
+#### Scenario: El permiso se concede con `1`
+- **GIVEN** un entorno con `KESTO_ALLOW_INSECURE_ENDPOINT=1`
+- **WHEN** se carga la configuración
+- **THEN** la configuración SHALL ser válida
+- **AND** el permiso SHALL estar concedido
+
+#### Scenario: Sin la variable el permiso está negado
+- **GIVEN** un entorno sin `KESTO_ALLOW_INSECURE_ENDPOINT`
+- **WHEN** se carga la configuración
+- **THEN** el permiso SHALL estar negado
+- **AND** la configuración SHALL ser válida
+
+#### Scenario: Un valor que no es `1` ni `0` no arranca
+- **GIVEN** un entorno con `KESTO_ALLOW_INSECURE_ENDPOINT=si`
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_ALLOW_INSECURE_ENDPOINT`
+
+#### Scenario: Una variable vacía no vale como permiso
+- **GIVEN** un entorno con `KESTO_ALLOW_INSECURE_ENDPOINT` presente pero vacía
+- **WHEN** se carga la configuración
+- **THEN** SHALL fallar en alto
+- **AND** el mensaje SHALL nombrar `KESTO_ALLOW_INSECURE_ENDPOINT`
+
+### Requirement: El socket IPC y el UID de la API se configuran por variables separadas
+
+`KESTO_MOTOR_SOCKET` SHALL fijar la ruta del Unix domain socket por el que la API pide operaciones al motor, con valor por defecto `/run/kesto/motor.sock`. La API SHALL usarla para construir su cliente; el motor SHALL usarla para enlazar el socket. Es una ruta IPC local, NO SHALL ser una dirección de red ni el socket del daemon.
+
+`KESTO_API_UID` SHALL ser obligatoria en el binario `kesto-motor`: el motor SHALL compararla con el UID del par vía `SO_PEERCRED` antes de procesar ninguna solicitud y SHALL negarse a arrancar si falta, nombrando la variable en el error. La API SHALL NOT necesitar declararla. Ambas variables SHALL documentarse en `docs/ENTORNO.md` y en la plantilla de entorno.
+
+#### Scenario: El socket IPC usa su defecto
+- **GIVEN** un entorno sin `KESTO_MOTOR_SOCKET`
+- **WHEN** arrancan la API y el motor
+- **THEN** el socket IPC SHALL ser `/run/kesto/motor.sock`
+- **AND** ambos procesos SHALL usar esa misma ruta
+
+#### Scenario: El socket IPC se respeta
+- **GIVEN** un entorno con `KESTO_MOTOR_SOCKET=/run/kesto/prueba.sock`
+- **WHEN** arrancan la API y el motor
+- **THEN** el motor SHALL enlazar esa ruta
+- **AND** la API SHALL conectarse a esa ruta
+
+#### Scenario: El motor exige el UID de la API
+- **GIVEN** un entorno sin `KESTO_API_UID`
+- **WHEN** se intenta arrancar `kesto-motor`
+- **THEN** SHALL fallar en alto
+- **AND** el error SHALL nombrar `KESTO_API_UID`
+
+#### Scenario: La API no necesita el UID de la API
+- **GIVEN** un entorno con `KESTO_MOTOR_SOCKET` y sin `KESTO_API_UID`
+- **WHEN** arranca solo el binario de la API
+- **THEN** SHALL arrancar
+- **AND** SHALL conectarse al motor por `KESTO_MOTOR_SOCKET`

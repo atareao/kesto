@@ -158,6 +158,8 @@ sqlite3 -readonly <db_path> .dump
 
 El volcado de SQLite es un **volcado SQL** —las sentencias que reconstruyen el esquema y los datos—, no una copia del fichero. `sqlite3 -readonly <db_path> .dump` se ejecuta **dentro del contenedor del target** y lee la base de forma **consistente en caliente**, de modo que la copia es válida con el **modo WAL** activo y con la base **en uso**, sin detener el servicio. El `-readonly` es obligatorio: sin él `sqlite3` **crea** el fichero si la ruta no existe y `.dump` sobre una base vacía no emite nada y sale con código 0, así que una ruta mal escrita daría una ejecución en `success` con un volcado vacío. No se copia el `.db` con un `cp` —ni su `-wal`—: con WAL activo el `.db` puede ir por detrás de su `.wal` y la copia resultante puede restaurarse con corrupción o con datos perdidos sin que nada lo delate. El contenedor del target debe disponer del binario `sqlite3`.
 
+> **Nota (confinamiento del `db_path`).** El `db_path` queda **confinado al contenedor del target** y ha de ser su **forma canónica** dentro de él: antes de ejecutar ninguna orden el motor resuelve `readlink -f <db_path>` y exige coincidencia **exacta** con la ruta declarada; si difiere —hay un `..` o un enlace simbólico, también en un directorio padre— la ejecución acaba en `failed` sin volcar y sin retirar nada. El contenedor ha de traer **`readlink`** además de `sqlite3`. El `host_path` de un target `directory` queda, a su vez, bajo `KESTO_BACKUP_ROOT` (ver §8).
+
 
 ```
 [Target DB Container] 
@@ -291,16 +293,82 @@ services:
       - RUST_LOG=info,kesto=debug
       - DATABASE_URL=sqlite:///app/data/kesto.db
       - BIND_ADDRESS=0.0.0.0:8080
+      # Obligatorias: la plantilla de producción no arranca sin proveedor de
+      # identidad. Sin las OIDC_* el modo sería el de desarrollo, que exige
+      # KESTO_ALLOW_INSECURE=1 y un bind de loopback, y no puede publicar el puerto.
+      - KESTO_MASTER_KEY=${KESTO_MASTER_KEY:?}
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:?}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:?}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:?}
+      # Retorno del callback. OBLIGATORIA en modo OIDC y tiene que ser `https`: la
+      # cookie de sesión se emite SIEMPRE con el atributo `Secure`, y un retorno por
+      # `http` haría que el navegador no la devolviera nunca. Ausente, o con un valor
+      # que no sea `https`, el arranque falla nombrando la variable.
+      - OIDC_REDIRECT_URL=${OIDC_REDIRECT_URL:?}
+      - KESTO_SECRET=${KESTO_SECRET:?}
+      # Raíz bajo la que ha de quedar el `host_path` de un target `directory`.
+      # Ruta absoluta; por defecto /backup_sources, que es donde se montan abajo
+      # los directorios a respaldar. Presente pero relativa o vacía = error de arranque.
+      - KESTO_BACKUP_ROOT=/backup_sources
+      # Canal IPC con el motor de copias. La API NO ve el socket del daemon.
+      - KESTO_MOTOR_SOCKET=/run/kesto/motor.sock
+      # Opcional: rebaja el borde del `endpoint` para un almacén S3 en claro y en la
+      # propia máquina (laboratorio). `1` concede; `0` o ausente lo niega. Nunca rebaja
+      # el enlace local, la dirección de metadatos ni las credenciales embebidas.
+      # - KESTO_ALLOW_INSECURE_ENDPOINT=1
     volumes:
-      # Acceso al socket de Docker del host
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Directorios del host a respaldar (modo lectura)
+      # Canal IPC compartido con el proceso privilegiado; NO el socket de Docker.
+      - kesto_ipc:/run/kesto
+      # Directorios del host a respaldar (modo lectura), bajo KESTO_BACKUP_ROOT.
       - /var/www:/backup_sources/var_www:ro
       - /etc/nginx:/backup_sources/nginx_config:ro
       # Persistencia interna de la app (DB SQLite)
       - kesto_data:/app/data
 
+  # Proceso privilegiado: el único que monta el socket del daemon y puede crear
+  # `exec` en los contenedores fuente. Su UID de par tiene que ser el de `kesto`.
+  kesto-motor:
+    image: kesto:latest
+    container_name: kesto-motor
+    restart: always
+    entrypoint: ["/app/kesto-motor"]
+    user: "10001:10001"
+    environment:
+      - RUST_LOG=info
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - KESTO_MOTOR_SOCKET=/run/kesto/motor.sock
+      - KESTO_API_UID=10001
+      - KESTO_BACKUP_ROOT=/backup_sources
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - kesto_ipc:/run/kesto
+      - /var/www:/backup_sources/var_www:ro
+      - /etc/nginx:/backup_sources/nginx_config:ro
+    # El gid del dueño del socket del daemon depende del host (`getent group docker`).
+
 volumes:
   kesto_data:
+  kesto_ipc:
 
 ```
+
+`compose.yaml` reproduce este despliegue y **exige proveedor de identidad**: declara `KESTO_MASTER_KEY`, las cuatro `OIDC_*` y `KESTO_SECRET` con la forma `${VAR:?}`, de modo que `podman compose config` —y `podman compose up`— se niegan a levantar el servicio, sin crear el contenedor, cuando falte cualquiera de ellas. El motivo es que sin las `OIDC_*` el modo sería el de **desarrollo**, que exige el permiso explícito `KESTO_ALLOW_INSECURE=1` y una dirección de escucha de **loopback**: con el proceso atado a loopback el reenvío del puerto no alcanza al servicio, así que `BIND_ADDRESS=0.0.0.0:8080` solo es legítimo con proveedor y el modo de desarrollo no se publica. Los secretos entran siempre por el entorno del host (`.env` o gestor de secretos), nunca escritos en este fichero.
+
+La cuarta `OIDC_*`, `OIDC_REDIRECT_URL`, deja de ser opcional: sin valor por defecto —el que había, `http://localhost:8080/api/v1/auth/callback`, desapareció justo por ser `http`—, en modo OIDC es **obligatoria** y **tiene que ser `https`**. El motivo es que la cookie de sesión se emite **siempre** con el atributo `Secure` —es una cookie de sesión, y una cookie de sesión sin `Secure` viaja en claro—, de modo que un retorno por `http` haría que el navegador no la devolviera nunca: fallar en el arranque es mejor que un panel que no deja entrar. Ausente con las otras tres puestas, o presente con un valor que no sea `https`, el arranque falla nombrando la variable. Configurada **sola**, sin las otras tres, se sigue ignorando en silencio: los tres desenlaces del modo se deciden sobre la presencia de `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID` y `OIDC_CLIENT_SECRET`.
+
+**`KESTO_BACKUP_ROOT`** es la raíz bajo la que ha de quedar el `host_path` de un target `directory`. Su valor por defecto es `/backup_sources` —exactamente donde este `compose` monta los directorios a respaldar en **los dos servicios**—, así que la plantilla de referencia no necesita declararla. Es una ruta **absoluta**: presente pero relativa o vacía es **error de arranque** que nombra la variable, en la línea de `RUST_LOG=""` y `BIND_ADDRESS=""`; ausente toma el defecto. La API valida el `host_path` contra esta raíz y el motor repite el confinamiento antes del `exec`: si cambias la raíz hay que declararla en `kesto` y en `kesto-motor` y montar las mismas fuentes bajo ella en ambos, o el motor rechazará rutas que la API aceptó.
+
+**`KESTO_MOTOR_SOCKET`** y **`KESTO_API_UID`** definen el canal entre los dos procesos. La primera la leen la API y el motor, y apunta al mismo fichero del volumen `kesto_ipc` (`/run/kesto/motor.sock` por defecto): la API solo entrega órdenes por ahí y **nunca** lee `DOCKER_HOST`; el motor enlaza el socket y atiende exclusivamente al UID de la API. `KESTO_API_UID` la lee **solo el motor**, es obligatoria y ha de ser un UID numérico: ausente o no numérico impide el arranque, sin modo degradado que acepte a otro par. En el `compose` se fija a `10001`, el mismo UID con el que corre `kesto`. El socket del daemon se monta únicamente en `kesto-motor`, en solo lectura.
+
+**`KESTO_ALLOW_INSECURE_ENDPOINT`** gobierna si el borde HTTP admite un `endpoint` de repositorio inseguro. Es **opcional** y su defecto es el permiso **negado**: `1` concede; `0` o **ausente** lo niega; cualquier otro valor —**vacío incluido**— es **error de arranque** que nombra la variable. Se lee **siempre**, también en modo OIDC, porque el `endpoint` de un repositorio se valida en los dos modos. Con el permiso, el borde admite un `endpoint` por `http` **y** uno que apunte al loopback —o a un nombre `localhost`/`*.localhost`—: son el mismo caso, «el destino está en mi propia máquina y en claro», que es el laboratorio local y la batería e2e. **No** rebaja nunca la dirección de enlace local (`169.254.0.0/16`, `fe80::/10`), la dirección de metadatos (`169.254.169.254`, `fd00:ec2::254`), la dirección no especificada (`0.0.0.0`, `::`) ni las credenciales embebidas en la URL: esas se rechazan también con el permiso. Sin el permiso, el `endpoint` tiene que ser una URL absoluta con esquema `https` y host. En el `compose` es **opcional** y viaja por el `env_file` (`.env`), no por `environment:` con `:?`.
+
+Los **contenedores de los que se copia** (los targets de base de datos) han de declararse **fuentes de copia** con la etiqueta `io.kesto.backup-source=true` al crearlos: el motor inspecciona el contenedor **antes** de crear ningún `exec` y lo exige, de modo que sin la etiqueta la ejecución acaba en `failed` sin ejecutar nada. La etiqueta viaja con el contenedor y no hay lista de configuración que poblar; el propio `kesto-app` queda denegado por sí solo, porque nadie lo etiqueta. Un origen de ejemplo:
+
+```yaml
+  mariadb:
+    image: mariadb:11
+    labels:
+      # Se declara fuente de copia: sin esta etiqueta el motor no le crea `exec`.
+      - io.kesto.backup-source=true
+```
+

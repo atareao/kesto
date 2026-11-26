@@ -33,7 +33,7 @@ El volumen nombrado **`kesto_data`** se monta en `/app/data` (la SQLite vive ah�
 - **`KESTO_MASTER_KEY`** — obligatoria **siempre**; es la clave de la que se deriva la del cifrado en reposo. Llega por el `.env` del despliegue o un gestor de secretos, **nunca en claro** en la imagen ni en el `compose.yaml` versionado.
 - **`KESTO_SECRET`** + las tres **`OIDC_*`** (`OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`) — «todo o nada»: con las tres presentes el modo es **OIDC** (y entonces `KESTO_SECRET` es obligatoria, la clave de firma de sesión); con ninguna, el modo es **`disabled`** (desarrollo); con unas sí y otras no, el arranque falla.
 - **`RUST_LOG`**, **`BIND_ADDRESS`**, **`DATABASE_URL`** — se leen **sin prefijo `KESTO_`**, tal cual. Una variable **presente pero vacía** (`BIND_ADDRESS=`, `RUST_LOG=`) es **error de arranque**, no un retorno al defecto.
-- El `compose.yaml` usa **`${KESTO_MASTER_KEY:?...}`**: sin la clave maestra, `podman compose up` (o `compose config`) **falla antes de crear el contenedor**. Dentro del proceso, en cambio, una credencial de **menos de 32 caracteres avisa y arranca igualmente** (higiene, no puerta).
+- El `compose.yaml` usa **`${KESTO_MASTER_KEY:?...}`**: sin la clave maestra, `podman compose up` (o `compose config`) **falla antes de crear el contenedor**. Dentro del proceso, en cambio, una credencial de **menos de 32 caracteres, vacía incluida, impide el arranque**. (Al entregarse esta feature solo avisaba; se endureció en `endurecimiento-arranque-auth`: ver `docs/ENTORNO.md`.)
 
 ## Cómo construir y desplegar
 
@@ -66,7 +66,7 @@ just ui-dev
 - `HEALTHCHECK` presente y el contenedor alcanza `(healthy)`.
 - `GET /api/v1/health` → **`200`** con `auth_mode:"disabled"` (version `0.2.0`); `GET /` → **`200`** `text/html`.
 - El volumen `kesto_data` **persiste** entre contenedores.
-- `podman compose config` válido con la master key. Rechazos: sin master key falla `compose config` (exit 1); OIDC parcial → `la configuración de OIDC está incompleta: falta OIDC_CLIENT_SECRET`; `BIND_ADDRESS=` → `tiene un valor con formato inválido`; credencial corta → `WARN KESTO_MASTER_KEY mide menos de 32 caracteres` y arranca.
+- `podman compose config` válido con la master key. Rechazos: sin master key falla `compose config` (exit 1); OIDC parcial → `la configuración de OIDC está incompleta: falta OIDC_CLIENT_SECRET`; `BIND_ADDRESS=` → `tiene un valor con formato inválido`; credencial corta → **error de arranque** `la variable de entorno KESTO_MASTER_KEY debe medir al menos 32 caracteres` (cambió en `endurecimiento-arranque-auth`: antes solo avisaba).
 
 ## Follow-ups
 

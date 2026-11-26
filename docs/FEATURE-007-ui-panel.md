@@ -62,14 +62,17 @@ El fallback resuelve cualquier ruta del cliente con `index.html` (SPA): `GET /ta
 
 ### Las cabeceras de seguridad
 
-`con_cabeceras_de_seguridad` envuelve el **router completo** —las dos mitades, API y panel— con cuatro capas `SetResponseHeaderLayer::overriding`:
+`con_cabeceras_de_seguridad` envuelve el **router completo** —las dos mitades, API y panel— con cinco capas `SetResponseHeaderLayer::overriding`:
 
 - `X-Content-Type-Options: nosniff`
-- `Content-Security-Policy: frame-ancestors 'none'`
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'`
 - `X-Frame-Options: DENY`
 - `Referrer-Policy: no-referrer`
+- `Strict-Transport-Security: max-age=<n>` — **solo** si `KESTO_HSTS_MAX_AGE` está configurado.
 
-Van **alrededor** del router compuesto y no colgadas del fallback porque son la política de respuesta de este origen, y este origen sirve dos mitades: una capa solo del fallback dejaría a `/api/v1/health` sin `nosniff` ni prohibición de enmarcado, y las cabeceras de una misma superficie dependerían de qué mitad atendió la petición. Se usan `overriding` (y no `if_not_present`) porque son decisiones de este módulo, no un relleno de último recurso. La capa fija **su** cabecera y ninguna otra: no pisa el `Content-Type` ni el `Cache-Control` de `ServeFile`.
+Van **alrededor** del router compuesto y no colgadas del fallback porque son la política de respuesta de este origen, y este origen sirve dos mitades: una capa solo del fallback dejaría a `/api/v1/health` sin `nosniff` ni prohibición de enmarcado. La HSTS se declaraba antes dentro de `api_router` —una sola mitad—, así que las respuestas del panel salían sin ella; ahora es una capa de este mismo origen. Se usan `overriding` (y no `if_not_present`) porque son decisiones de este módulo, no un relleno de último recurso. Cada capa fija **su** cabecera y ninguna otra: no pisa el `Content-Type` ni el `Cache-Control` de `ServeFile`.
+
+`script-src 'self'` no lleva excepción porque el documento del panel no lleva JavaScript en línea: el arranque de tema vive en `ui/public/tema-inicial.js`, cargado de forma síncrona en el `<head>` antes del primer pintado. `style-src 'unsafe-inline'` es la única excepción, y es deliberada: antd v5 inyecta estilos en tiempo de ejecución y los componentes usan atributos `style`. Detalle en `docs/FEATURE-045-endurecimiento-cabeceras-y-panel.md`.
 
 ### La sesión y las rutas (cliente)
 
@@ -89,7 +92,7 @@ Un **único stream SSE global**, `GET /api/v1/events`, con `event: <nombre>` (`e
 
 **Ninguna variable de entorno nueva.** El panel no lee configuración por entorno: la ruta del panel compilado es la constante `PANEL_POR_DEFECTO = "ui/dist"`, **relativa al directorio de trabajo del proceso** — el despliegue deja `ui/dist` al lado del binario y arranca desde ahí. La ruta entra por parámetro en `panel::app` para que las pruebas usen un directorio temporal sin abrir un puerto ni tocar el entorno.
 
-Para levantar todo en dev siguen bastando las de siempre: `KESTO_MASTER_KEY` (obligatoria siempre), `DATABASE_URL`, `BIND_ADDRESS` y `DOCKER_HOST`. Sin ninguna `OIDC_*` el modo es `Disabled` y `/api/v1/health` contesta `auth_mode: "disabled"`, con lo que el panel entra directo. En modo `oidc` hacen falta las tres `OIDC_*` y `KESTO_SECRET`.
+Para levantar todo en dev siguen bastando las de siempre: `KESTO_MASTER_KEY` (obligatoria siempre), `DATABASE_URL`, `BIND_ADDRESS` y `DOCKER_HOST`. Sin ninguna `OIDC_*` el modo es `Disabled` y `/api/v1/health` contesta `auth_mode: "disabled"`, con lo que el panel entra directo. En modo `oidc` hacen falta las `OIDC_*` y `KESTO_SECRET`.
 
 Versiones relevantes del frontal (las fija `ui/package.json`): React **19**, Ant Design **5**, TanStack Query **5**, React Router **7**, Vite **7**, Vitest **5**, TypeScript **5.9**, ESLint **9**.
 

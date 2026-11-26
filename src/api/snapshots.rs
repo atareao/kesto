@@ -989,8 +989,8 @@ mod tests {
     use crate::test_support::{
         DirectorioDePrueba, ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA, SEMILLA,
         SEMILLA_CONTENIDO, base_con_clave, body_json, config_con_dsn, directorio_de_prueba,
-        estado_de_prueba, get, nombre_de_tarea_de_prueba, post_json, router_desarrollo,
-        sembrar_snapshot_ajeno, sembrar_snapshots,
+        endpoint_de_prueba, estado_de_prueba, get, nombre_de_tarea_de_prueba, post_json,
+        router_desarrollo, sembrar_snapshot_ajeno, sembrar_snapshots,
     };
 
     /// Un identificador bien formado cualquiera, que no corresponde a ninguna fila.
@@ -1016,7 +1016,7 @@ mod tests {
     fn cuerpo_de_alta(nombre: &str, ruta: &str) -> serde_json::Value {
         serde_json::json!({
             "name": nombre,
-            "endpoint": ruta,
+            "endpoint": endpoint_de_prueba(Path::new(ruta)),
             "bucket": format!("cubo-{nombre}"),
             "region": "eu-west-1",
             "access_key_id": "AKIAIOSFODNN7EXAMPLE",

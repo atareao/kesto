@@ -89,6 +89,20 @@ pub const REGION: &str = "us-east-1";
 /// mundo, así que el nombre no dice nada de la ejecución. Ver [`Motor::recoger_los_restos`].
 pub const ETIQUETA_DEL_CREADOR: &str = "kesto-e2e-pid";
 
+/// Etiqueta con la que un contenedor de la batería se declara **fuente de copia**.
+///
+/// Es el **mismo** valor que `crate::docker::ETIQUETA_DE_FUENTE_DE_COPIA`: el motor solo crea
+/// `exec` en contenedores que la llevan con el valor [`VALOR_DE_FUENTE_DE_COPIA`], así que los
+/// contenedores de los que Kesto copia o en los que restaura tienen que declararla. Se repite
+/// aquí porque la batería es un crate aparte y no puede importar el binario; al cambiar el valor
+/// en producción hay que cambiarlo también aquí.
+pub const ETIQUETA_DE_FUENTE_DE_COPIA: &str = "io.kesto.backup-source";
+
+/// Valor de la etiqueta que declara un contenedor fuente de copia.
+///
+/// El **mismo** que `crate::docker::VALOR_DE_FUENTE_DE_COPIA`: la comparación del motor es exacta.
+pub const VALOR_DE_FUENTE_DE_COPIA: &str = "true";
+
 /// Imagen por defecto del servidor S3 de la batería.
 ///
 /// Fijada por **versión** —nunca `latest`—, como el resto de las piezas, para que la batería no
@@ -165,8 +179,10 @@ pub const PLAZO_DE_INACTIVIDAD: Duration = Duration::from_secs(300);
 
 /// La sonda que da por arrancada una base: la orden y el entorno que la acompañan.
 ///
-/// Es una función pura con forma de par de listas, para que los escenarios «la espera de una
-/// base no se conforma con que escuche» puedan afirmarla sin levantar nada.
+/// Es una función pura con forma de par de listas, para que las pruebas de las sondas puedan
+/// afirmarla sin levantar nada. Ojo: el «la sonda nombra la base» que introdujo el #170 **no**
+/// está en ningún spec —vive en las pruebas de `escenarios.rs` y en el `CHANGELOG`—, así que
+/// estas pruebas no citan ningún escenario de spec que las respalde.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sonda {
     /// El comando y sus argumentos.
@@ -289,6 +305,13 @@ pub struct Receta<'a> {
     pub puerto: Option<(u16, u16)>,
     /// Fichero del host montado dentro: `(ruta del host, ruta del contenedor)`.
     pub montaje: Option<(&'a str, &'a str)>,
+    /// Si el contenedor se declara **fuente de copia** para el motor.
+    ///
+    /// El motor solo crea `exec` en contenedores que llevan la etiqueta
+    /// `io.kesto.backup-source=true`, así que los contenedores de los que Kesto copia o en los
+    /// que restaura tienen que declararlo. Los que solo existen para la prueba —el servidor S3,
+    /// por ejemplo— no: nacen sin la etiqueta y el motor no les crearía ningún `exec`.
+    pub fuente_de_copia: bool,
 }
 
 /// Lo que un proceso dejó al terminar dentro de un contenedor.
@@ -497,6 +520,25 @@ impl Motor {
             .montaje
             .map(|(del_host, del_contenedor)| vec![format!("{del_host}:{del_contenedor}:ro,z")]);
 
+        // La etiqueta que deja dicho **qué proceso** creó el contenedor, que es lo único que
+        // permite después distinguir los restos de una ejecución muerta de los contenedores de
+        // otra que esté viva: ver [`Motor::recoger_los_restos`].
+        let mut etiquetas = HashMap::from([(
+            ETIQUETA_DEL_CREADOR.to_owned(),
+            std::process::id().to_string(),
+        )]);
+
+        // Y, si la receta lo pide, la etiqueta que declara el contenedor **fuente de copia**: es
+        // la que el motor exige para crear un `exec` en él, así que sin ella Kesto no podría
+        // copiar ni restaurar. Se añade **sin pisar** la del creador: son dos etiquetas distintas
+        // y las dos hacen falta.
+        if receta.fuente_de_copia {
+            etiquetas.insert(
+                ETIQUETA_DE_FUENTE_DE_COPIA.to_owned(),
+                VALOR_DE_FUENTE_DE_COPIA.to_owned(),
+            );
+        }
+
         let configuracion = Config {
             image: Some(receta.imagen.to_owned()),
             // Un `cmd` vacío se deja **sin declarar**, y no como lista vacía: declararlo vacío
@@ -505,13 +547,7 @@ impl Motor {
             cmd: (!receta.cmd.is_empty())
                 .then(|| receta.cmd.iter().map(|parte| (*parte).to_owned()).collect()),
             env: Some(receta.env.iter().map(|par| (*par).to_owned()).collect()),
-            // La etiqueta que deja dicho **qué proceso** creó el contenedor, que es lo único que
-            // permite después distinguir los restos de una ejecución muerta de los contenedores de
-            // otra que esté viva: ver [`Motor::recoger_los_restos`].
-            labels: Some(HashMap::from([(
-                ETIQUETA_DEL_CREADOR.to_owned(),
-                std::process::id().to_string(),
-            )])),
+            labels: Some(etiquetas),
             host_config: Some(HostConfig {
                 port_bindings: puertos,
                 binds: montajes,
@@ -839,6 +875,124 @@ fn proceso_vivo(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+// ── La espera de arranque de un motor ──────────────────────────────────────
+
+/// La espera entre los dos sondeos que confirman un arranque: **2 s**.
+///
+/// # De dónde sale el número
+///
+/// Es la **ventana del servidor temporal** medida sobre las imágenes de la batería —lo que tarda
+/// el entrypoint desde que le crea la base al temporal hasta que lo apaga—, 5 corridas por motor
+/// en máquina ociosa:
+///
+/// | Motor | Ventanas medidas (ms) | Máximo |
+/// |---|---|---|
+/// | MariaDB (`mariadb:11`) | 31 · 26 · 25 · 28 · 25 | **31** |
+/// | PostgreSQL (`postgres:18-alpine`) | 134 · 137 · 133 · 148 · 131 | **148** |
+///
+/// Los dos segundos son **~13× el máximo medido**: no es el valor de la ventana, es una holgura
+/// deliberada. La suite levanta contenedores en paralelo y la máquina puede estar cargada, y lo
+/// que se gana con el margen —no confundir el temporal con el definitivo— vale más que la espera.
+///
+/// El coste se paga **una vez por arranque de contenedor**: la espera va entre los dos sondeos de
+/// la confirmación, no antes de cada sondeo, así que no escala con el número de intentos.
+pub const ESPERA_ENTRE_SONDEOS: Duration = Duration::from_secs(2);
+
+/// Espera a que un motor esté arrancado **de verdad**: la sonda tiene que acertar **dos veces**,
+/// separadas por `espera`, y solo entonces se da el arranque por bueno.
+///
+/// # Por qué un acierto no basta
+///
+/// Las imágenes oficiales de MariaDB y de PostgreSQL levantan un **servidor temporal** para
+/// inicializarse —que **ya tiene la base creada**, porque la crea él— y lo apagan antes de
+/// arrancar el definitivo: MariaDB lo arranca con `--skip-networking` y PostgreSQL con
+/// `listen_addresses=''`, y en los dos casos el temporal crea la base del `MARIADB_DATABASE` /
+/// `POSTGRES_DB` antes de apagarse. La sonda **nombra la base** ([`sonda_de_mariadb`],
+/// [`sonda_de_postgres`]), y eso la protege del temporal *antes* de que la base exista, pero no
+/// de su tramo final: un acierto único puede ser contra un servidor que se apaga un instante
+/// después, y quien siembra entonces se encuentra el socket ausente (`ERROR 2002`, `ENOENT`).
+/// Exigir que el acierto se **repita** tras una espera distingue al definitivo —que sigue en
+/// pie— del temporal, que ya no está.
+///
+/// Es la espera que usan los dos motores con servidor temporal, y **no** la de un arranque que
+/// no lo tenga: [`Motor::esperar_orden`] se queda como está para lo demás —el `alpine` con el
+/// cliente SQLite, sin servidor—, y esta espera no le añade a ese caso una latencia ni un modo
+/// de fallo que no le corresponden.
+///
+/// # Por qué el sondeo y la espera se inyectan
+///
+/// El **sondeo** llega como clausura y la **espera** como parámetro —no como constantes leídas
+/// dentro—, igual que el `reintentar` del #141 recibe el «intento»: así una prueba simula la
+/// secuencia entera —acierto durante el temporal, fallo después, acierto estable al final— sin
+/// contenedores y sin esperar la espera de producción, marcando la que quiere medir y contando
+/// cuántas veces se sondeó. El `tokio::time` vive **solo aquí**, en el borde que duerme de
+/// verdad; el resto es el bucle y su contrato.
+///
+/// # El plazo acota el primer acierto, no la confirmación
+///
+/// `plazo` es el presupuesto visible para que la sonda acierte **por primera vez**; la
+/// confirmación —la espera y el segundo sondeo— dispone de su propia holgura, acotada por
+/// `espera`. Por eso el límite interno del bucle es `plazo + espera` y no `plazo`: si el
+/// definitivo aparece al final del plazo, su acierto **se confirma** en vez de fallar por unos
+/// milisegundos. La espera entre sondeos no consume el plazo.
+///
+/// # Errors
+///
+/// Con el **último motivo** que dio el sondeo cuando vence el límite, nombrando el contenedor,
+/// la orden y `plazo` (el presupuesto visible) —el mismo contrato que [`Motor::esperar_orden`]—
+/// en vez de dar el arranque por bueno.
+pub async fn esperar_arranque<F, Fut>(
+    contenedor: &str,
+    cmd: &[&str],
+    plazo: Duration,
+    espera: Duration,
+    mut sonda: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let inicio = Instant::now();
+    // El presupuesto visible es `plazo`, pero la confirmación de un acierto que llegue justo al
+    // final necesita su propia holgura: por eso el bucle se corta en `plazo + espera`.
+    let limite = plazo + espera;
+    let mut ultimo = String::new();
+
+    loop {
+        let confirmado = match sonda().await {
+            // El servidor contestó: para darlo por definitivo tiene que seguir en pie después de
+            // la espera. El temporal del arranque se apaga justo aquí, así que no confirma.
+            Ok(()) => {
+                tokio::time::sleep(espera).await;
+
+                match sonda().await {
+                    Ok(()) => true,
+                    Err(motivo) => {
+                        ultimo = motivo;
+                        false
+                    }
+                }
+            }
+            Err(motivo) => {
+                ultimo = motivo;
+                false
+            }
+        };
+
+        if confirmado {
+            return Ok(());
+        }
+
+        if inicio.elapsed() >= limite {
+            return Err(format!(
+                "`{contenedor}` no respondió a `{cmd:?}` en {plazo:?}: {ultimo}"
+            ));
+        }
+
+        tokio::time::sleep(espera).await;
+    }
+}
+
 // ── El servidor S3 ─────────────────────────────────────────────────────────
 
 /// La identidad con la que el servidor S3 de la batería admite peticiones.
@@ -905,7 +1059,10 @@ pub async fn esperar_el_s3(endpoint: &str, plazo: Duration) -> Result<(), String
 
 /// El binario de Kesto arrancado para una prueba, con su base de datos y su puerto.
 pub struct Kesto {
+    /// API: es la que la prueba interroga por HTTP.
     hijo: Child,
+    /// Proceso privilegiado que enlaza el socket IPC y habla con el daemon de contenedores.
+    motor: Child,
     raiz: PathBuf,
     /// Puerto donde escucha.
     pub puerto: u16,
@@ -914,11 +1071,35 @@ pub struct Kesto {
 
 impl Drop for Kesto {
     fn drop(&mut self) {
-        // El proceso muere pase lo que pase, incluso si la prueba entró en pánico.
+        // El proceso muere pase lo que pase, incluso si la prueba entró en pánico. La API
+        // primero: si el motor desapareciera antes, una petición en curso vería el IPC roto.
         let _ = self.hijo.kill();
         let _ = self.hijo.wait();
+        let _ = self.motor.kill();
+        let _ = self.motor.wait();
         let _ = std::fs::remove_dir_all(&self.raiz);
     }
+}
+
+/// Plazo para que `kesto-motor` enlace el socket IPC antes de arrancar la API.
+const PLAZO_DE_SOCKET_MOTOR: Duration = Duration::from_secs(10);
+
+/// UID numérico del proceso de prueba.
+///
+/// El motor comprueba `SO_PEERCRED` contra este valor: si la API hija corriera con otro UID,
+/// cada orden por el IPC sería rechazada. La prueba y la API son el mismo usuario, así que
+/// basta con leer el primer campo de la línea `Uid:` de `/proc/self/status`.
+fn uid_del_proceso() -> Result<u32, String> {
+    let estado = std::fs::read_to_string("/proc/self/status")
+        .map_err(|causa| format!("no se pudo leer `/proc/self/status`: {causa}"))?;
+    let uid = estado
+        .lines()
+        .find_map(|linea| linea.strip_prefix("Uid:"))
+        .and_then(|resto| resto.split_whitespace().next())
+        .ok_or_else(|| "`/proc/self/status` no tiene la línea `Uid:`".to_owned())?;
+
+    uid.parse::<u32>()
+        .map_err(|causa| format!("el UID `{uid}` de `/proc/self/status` no es válido: {causa}"))
 }
 
 impl Kesto {
@@ -926,40 +1107,127 @@ impl Kesto {
     ///
     /// El modo es `Disabled` a propósito —no se declara ninguna `OIDC_*`—: sin proveedor de
     /// identidad la mitad protegida no se monta y todo `/api/v1/*` queda abierto, que es justo
-    /// lo que la batería necesita para hablar con la API sin fabricar sesiones.
+    /// lo que la batería necesita para hablar con la API sin fabricar sesiones. Y como el modo
+    /// es `Disabled`, el proceso declara el permiso explícito —`KESTO_ALLOW_INSECURE=1`— con un
+    /// bind de loopback: sin ellos la aplicación se niega a arrancar.
+    ///
+    /// El almacén de la batería es un servidor S3 en `http://127.0.0.1:<puerto>` —esquema en claro
+    /// y anfitrión de loopback—, así que el borde rechazaría su `endpoint` con un `400` sin el
+    /// permiso del `endpoint`. Se declara con la misma forma que `KESTO_ALLOW_INSECURE` y por el
+    /// mismo motivo —`KESTO_ALLOW_INSECURE_ENDPOINT=1`—, porque la batería es un laboratorio local
+    /// y no un despliegue.
+    ///
+    /// `raiz_de_copias` es la raíz bajo la que el motor acepta el `host_path` de un target
+    /// `directory` —se declara como `KESTO_BACKUP_ROOT`—: es la raíz temporal de la batería, y
+    /// los directorios que los escenarios copian cuelgan de ella.
     ///
     /// # Errors
     ///
-    /// Si el proceso no arranca o no llega a contestar la salud.
-    pub async fn arrancar(socket: &str) -> Result<Self, String> {
+    /// Si el motor no enlaza su socket IPC, o si el proceso no arranca o no llega a contestar
+    /// la salud.
+    pub async fn arrancar(socket: &str, raiz_de_copias: &Path) -> Result<Self, String> {
         let puerto = puerto_libre();
         let raiz = std::env::temp_dir().join(format!("kesto-e2e-binario-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&raiz)
             .map_err(|causa| format!("no se pudo crear `{}`: {causa}", raiz.display()))?;
 
-        let registro = File::create(raiz.join("kesto.log"))
+        // Socket IPC privado de este escenario: el motor lo enlaza y la API lo abre.
+        let socket_motor = raiz.join("motor.sock");
+        let uid_api = uid_del_proceso()?;
+
+        let registro_ruta = raiz.join("kesto.log");
+        let registro = File::create(&registro_ruta)
             .map_err(|causa| format!("no se pudo abrir el registro de la prueba: {causa}"))?;
+
+        let raiz_de_copias = raiz_de_copias
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "la raíz de copias `{}` no es UTF-8",
+                    raiz_de_copias.display()
+                )
+            })?
+            .to_owned();
+
+        // Se clona antes de lanzar nada: así un fallo de clonado no deja un proceso huérfano.
+        let registro_motor_salida = registro
+            .try_clone()
+            .map_err(|causa| format!("no se pudo duplicar el registro del motor: {causa}"))?;
+        let registro_motor_error = registro
+            .try_clone()
+            .map_err(|causa| format!("no se pudo duplicar el registro del motor: {causa}"))?;
+        let registro_api_salida = registro
+            .try_clone()
+            .map_err(|causa| format!("no se pudo duplicar el registro: {causa}"))?;
+
+        // `cargo test --features e2e` no construye el motor: tiene `required-features = ["motor"]`.
+        let motor_bin =
+            std::env::var("KESTO_MOTOR_BIN").unwrap_or_else(|_| "target/debug/kesto-motor".into());
+        let mut motor = Command::new(&motor_bin)
+            .env_clear()
+            .env(ENV_DOCKER_HOST, socket)
+            .env("KESTO_MOTOR_SOCKET", socket_motor.as_os_str())
+            // `SO_PEERCRED` del API hijo tiene que coincidir con este UID.
+            .env("KESTO_API_UID", uid_api.to_string())
+            .env("KESTO_BACKUP_ROOT", &raiz_de_copias)
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(registro_motor_salida)
+            .stderr(registro_motor_error)
+            .spawn()
+            .map_err(|causa| {
+                format!(
+                    "no se pudo lanzar `{motor_bin}` (define `KESTO_MOTOR_BIN` si no está en \
+                     `target/debug/`): {causa}"
+                )
+            })?;
+
+        // La API solo conoce el IPC: arrancarla antes de que exista el socket la dejaría
+        // incapaz de copiar, aunque `/api/v1/health` contestara.
+        let inicio = Instant::now();
+        while !socket_motor.exists() {
+            if let Some(estado) = motor.try_wait().map_err(|causa| {
+                format!("no se pudo comprobar el estado de `{motor_bin}`: {causa}")
+            })? {
+                return Err(format!(
+                    "`{motor_bin}` terminó con {estado} antes de crear `{}`: mira `{}`",
+                    socket_motor.display(),
+                    registro_ruta.display()
+                ));
+            }
+            if inicio.elapsed() >= PLAZO_DE_SOCKET_MOTOR {
+                let _ = motor.kill();
+                let _ = motor.wait();
+                return Err(format!(
+                    "el socket IPC `{}` no apareció en {PLAZO_DE_SOCKET_MOTOR:?}: mira `{}`",
+                    socket_motor.display(),
+                    registro_ruta.display()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let hijo = Command::new(env!("CARGO_BIN_EXE_kesto"))
             // `env_clear` deja la prueba hermética: lo que el binario ve es solo lo de aquí.
             .env_clear()
             .env("KESTO_MASTER_KEY", CLAVE_MAESTRA)
+            .env("KESTO_ALLOW_INSECURE", "1")
+            .env("KESTO_ALLOW_INSECURE_ENDPOINT", "1")
             .env("BIND_ADDRESS", format!("127.0.0.1:{puerto}"))
             .env(
                 "DATABASE_URL",
                 format!("sqlite://{}/kesto.db", raiz.display()),
             )
+            .env("KESTO_BACKUP_ROOT", raiz_de_copias)
             .env("RUST_LOG", "info")
-            .env(ENV_DOCKER_HOST, socket)
+            .env("KESTO_MOTOR_SOCKET", socket_motor.as_os_str())
             .stdin(Stdio::null())
-            .stdout(
-                registro
-                    .try_clone()
-                    .map_err(|causa| format!("no se pudo duplicar el registro: {causa}"))?,
-            )
+            .stdout(registro_api_salida)
             .stderr(registro)
             .spawn()
             .map_err(|causa| {
+                let _ = motor.kill();
+                let _ = motor.wait();
                 format!(
                     "no se pudo lanzar el binario de Kesto (`{}`): {causa}",
                     env!("CARGO_BIN_EXE_kesto")
@@ -973,6 +1241,7 @@ impl Kesto {
 
         let kesto = Self {
             hijo,
+            motor,
             raiz,
             puerto,
             cliente,
@@ -1490,6 +1759,9 @@ impl Mundo {
                         .expect("la ruta de la configuración del S3 es UTF-8"),
                     "/etc/seaweedfs/s3.json",
                 )),
+                // El servidor S3 **no** es fuente de copia: no se copia ni se restaura en él, así
+                // que no lleva la etiqueta y el motor no le crearía ningún `exec`.
+                fuente_de_copia: false,
             })
             .await
             .unwrap_or_else(|motivo| panic!("{motivo}"));
@@ -1523,7 +1795,7 @@ impl Mundo {
         // El binario, contra el mismo socket del motor. Y sin proveedor de identidad: modo de
         // desarrollo, donde toda la API está abierta.
         let socket = motor.socket().to_owned();
-        let kesto = Kesto::arrancar(&socket)
+        let kesto = Kesto::arrancar(&socket, &raiz)
             .await
             .unwrap_or_else(|motivo| panic!("{motivo}"));
 
@@ -1740,6 +2012,10 @@ mod tests {
     /// que la batería pierda segundos esperándolo.
     const ESPERA_DE_PRUEBA: Duration = Duration::from_millis(20);
 
+    /// El plazo de arranque de las pruebas: corto, para que un sondeo que nunca sobrevive
+    /// agote el plazo en milisegundos en vez de en los 180 s de [`PLAZO_DE_ARRANQUE`].
+    const PLAZO_DE_PRUEBA: Duration = Duration::from_millis(200);
+
     /// Un contador de llamadas compartido con la clausura del intento.
     fn contador_de_llamadas() -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
         let llamadas = Rc::new(Cell::new(0));
@@ -1874,6 +2150,190 @@ mod tests {
             transcurrido >= minimo,
             "con 3 intentos y una espera de {ESPERA_DE_PRUEBA:?} el backoff acumula al menos \
              {minimo:?} entre reintentos y pasaron {transcurrido:?}"
+        );
+    }
+
+    // ══ Requisito: la espera de arranque no se conforma con el servidor temporal ══
+
+    /// Escenario: el servidor temporal no da la base por arrancada.
+    ///
+    /// El temporal del entrypoint oficial contesta con la base ya creada y se apaga un instante
+    /// después: un único acierto no puede dar el arranque por bueno, porque el que contestó ya
+    /// no está cuando llega la siembra. Aquí el sondeo acierta la primera vez y falla después
+    /// —el temporal que se apaga—, así que el ayudante tiene que seguir sondeando y, agotado el
+    /// plazo, fallar con el último motivo en vez de devolver un `Ok` que no le corresponde.
+    #[tokio::test]
+    async fn el_servidor_temporal_no_da_el_arranque_por_bueno() {
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO_DE_PRUEBA,
+            ESPERA_DE_PRUEBA,
+            move || {
+                let sondeo = para_la_sonda.get();
+                para_la_sonda.set(sondeo + 1);
+
+                async move {
+                    if sondeo == 0 {
+                        // El temporal contesta una vez, con la base ya creada…
+                        Ok(())
+                    } else {
+                        // …y se apaga: el socket desaparece.
+                        Err("ERROR 2002: el socket no existe".to_owned())
+                    }
+                }
+            },
+        )
+        .await;
+
+        let motivo =
+            desenlace.expect_err("un acierto que no sobrevive no da el arranque por bueno");
+
+        assert!(
+            motivo.contains("ERROR 2002"),
+            "el motivo tiene que ser el último del sondeo, no un ok: {motivo}"
+        );
+        assert!(
+            sondeos.get() >= 2,
+            "el ayudante tiene que exigir un segundo sondeo y solo hizo {}",
+            sondeos.get()
+        );
+    }
+
+    /// Escenario: el servidor definitivo da la base por arrancada.
+    ///
+    /// El definitivo sigue en pie, así que su acierto se repite: el ayudante sondea **dos veces**
+    /// separadas por la espera y da el arranque por bueno. El número de sondeos es exactamente el
+    /// mínimo —no se sondea de más una vez confirmado—.
+    #[tokio::test]
+    async fn el_servidor_definitivo_da_el_arranque_por_bueno_tras_dos_sondeos() {
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO_DE_PRUEBA,
+            ESPERA_DE_PRUEBA,
+            move || {
+                para_la_sonda.set(para_la_sonda.get() + 1);
+
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert!(
+            desenlace.is_ok(),
+            "el definitivo, que sigue en pie, da el arranque por bueno: {desenlace:?}"
+        );
+        assert_eq!(
+            sondeos.get(),
+            2,
+            "dos aciertos separados por la espera son el mínimo: no se sondea de más"
+        );
+    }
+
+    /// Escenario: la espera entre sondeos es la inyectada, no una constante interna.
+    ///
+    /// La espera llega **inyectada** como parámetro, no como una constante leída dentro: con una
+    /// espera marcada **muy por debajo** de la de producción ([`ESPERA_ENTRE_SONDEOS`], 2 s) y un
+    /// sondeo que falla la primera vez, el ayudante la consume antes del segundo sondeo. Se
+    /// afirman **las dos cotas**: transcurrió al menos la inyectada y bastante menos que la de
+    /// producción. Si el ayudante ignorase el parámetro y leyera la constante interna, la cota
+    /// superior fallaría —con 2 s por espera, dos esperas son ~4 s—, así que la prueba sí
+    /// discrimina. La cota inferior no introduce flakiness, como en el backoff del #141: la carga
+    /// de la máquina solo puede aumentar el tiempo transcurrido, nunca reducirlo.
+    #[tokio::test]
+    async fn la_espera_entre_sondeos_es_la_inyectada() {
+        const ESPERA_INYECTADA: Duration = Duration::from_millis(20);
+        // Muy por debajo de la de producción: así una implementación que leyera la constante
+        // interna (2 s) se delata en la cota superior.
+        const COTA_SUPERIOR: Duration = Duration::from_millis(500);
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let inicio = Instant::now();
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO_DE_PRUEBA,
+            ESPERA_INYECTADA,
+            move || {
+                let sondeo = para_la_sonda.get();
+                para_la_sonda.set(sondeo + 1);
+
+                async move {
+                    if sondeo == 0 {
+                        Err("todavía no".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        let transcurrido = inicio.elapsed();
+
+        assert!(
+            desenlace.is_ok(),
+            "el segundo acierto da el arranque: {desenlace:?}"
+        );
+        assert!(
+            transcurrido >= ESPERA_INYECTADA,
+            "la espera entre sondeos es la inyectada ({ESPERA_INYECTADA:?}) y pasaron \
+             {transcurrido:?}"
+        );
+        assert!(
+            transcurrido < COTA_SUPERIOR,
+            "la espera inyectada ({ESPERA_INYECTADA:?}) tiene que mandar sobre la de producción \
+             ({ESPERA_ENTRE_SONDEOS:?}), y pasaron {transcurrido:?}"
+        );
+        assert!(sondeos.get() >= 2, "hubo al menos un segundo sondeo");
+    }
+
+    /// Escenario: agotado el plazo, se falla en voz alta.
+    ///
+    /// Con un sondeo que nunca sobrevive, el ayudante no devuelve un ok silencioso: vencido el
+    /// plazo falla nombrando el contenedor, la orden y el plazo —el mismo contrato que
+    /// [`Motor::esperar_orden`]— con el **último** motivo que dio el sondeo.
+    #[tokio::test]
+    async fn agotado_el_plazo_falla_con_el_ultimo_motivo() {
+        const PLAZO: Duration = Duration::from_millis(150);
+        let (para_la_sonda, sondeos) = contador_de_llamadas();
+
+        let desenlace = esperar_arranque(
+            "maria",
+            &["mariadb", "-e", "SELECT 1"],
+            PLAZO,
+            ESPERA_DE_PRUEBA,
+            move || {
+                let sondeo = para_la_sonda.get();
+                para_la_sonda.set(sondeo + 1);
+
+                async move { Err(format!("intento {sondeo}")) }
+            },
+        )
+        .await;
+
+        let motivo = desenlace.expect_err("agotado el plazo no se da el arranque por bueno");
+        let ultimo = format!("intento {}", sondeos.get().saturating_sub(1));
+
+        assert!(
+            motivo.contains("maria"),
+            "el motivo nombra el contenedor: {motivo}"
+        );
+        assert!(
+            motivo.contains("mariadb"),
+            "el motivo nombra la orden: {motivo}"
+        );
+        assert!(
+            motivo.contains("150ms"),
+            "el motivo nombra el plazo: {motivo}"
+        );
+        assert!(
+            motivo.contains(&ultimo),
+            "el motivo es el último del sondeo (`{ultimo}`), no uno anterior: {motivo}"
         );
     }
 }

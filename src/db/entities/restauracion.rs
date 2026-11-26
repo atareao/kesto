@@ -542,16 +542,24 @@ mod tests {
     }
 
     /// Las columnas del índice dado, en su orden.
-    async fn columnas_del_indice(pool: &SqlitePool, indice: &str) -> Vec<String> {
-        sqlx::query(&format!("PRAGMA index_info('{indice}')"))
-            .fetch_all(pool)
-            .await
-            .expect("el `PRAGMA index_info` debe poder leerse")
-            .iter()
-            .map(|fila| {
-                sqlx::Row::try_get(fila, "name").expect("la columna del índice tiene nombre")
-            })
-            .collect()
+    ///
+    /// El parámetro es `&'static str`, y eso es lo que hace segura la interpolación: el
+    /// nombre del índice solo puede ser una **constante de compilación**, así que el
+    /// compilador **impide** que entre una cadena construida en ejecución. `AssertSqlSafe`
+    /// sigue haciendo falta porque `sqlx 0.9` solo implementa `SqlSafeStr` para `&'static str`
+    /// y aquí el texto se compone con `format!` —un `PRAGMA` no admite valor enlazado—. La
+    /// consulta que llega a SQLite es la misma que antes del salto
+    /// (`saneamiento-de-dependencias`).
+    async fn columnas_del_indice(pool: &SqlitePool, indice: &'static str) -> Vec<String> {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA index_info('{indice}')"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("el `PRAGMA index_info` debe poder leerse")
+        .iter()
+        .map(|fila| sqlx::Row::try_get(fila, "name").expect("la columna del índice tiene nombre"))
+        .collect()
     }
 
     /// 0.2 — La migración crea la tabla, sus columnas, su `CHECK`, su clave foránea y su índice.

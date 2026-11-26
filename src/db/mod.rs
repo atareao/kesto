@@ -221,6 +221,20 @@ pub enum DbError {
     /// El mensaje del error de cifrado no publica el valor, así que éste tampoco.
     #[error(transparent)]
     Cifrado(#[from] crate::db::crypto::ErrorDeCifrado),
+
+    /// La clave HMAC con la que se hashea un token de API no es utilizable.
+    ///
+    /// `HMAC-SHA256` acepta claves de **cualquier** longitud, así que con las claves
+    /// de 32 bytes derivadas de `KESTO_MASTER_KEY` este error es inalcanzable:
+    /// existe para no degradar en silencio a un hash vacío —que casaría con un token
+    /// vacío— si algún día se pasara una clave que `hmac` rechace. El mensaje **no
+    /// publica** la clave, solo la causa que informa `hmac`.
+    #[error("la clave HMAC de los tokens de API no es utilizable: {causa}")]
+    ClaveDeTokenInservible {
+        /// Motivo, tal y como lo informa `hmac`.
+        #[source]
+        causa: hmac::digest::InvalidLength,
+    },
 }
 
 /// Ruta del fichero de la base a partir del DSN.
@@ -446,11 +460,13 @@ mod tests {
     #[test]
     fn el_dsn_de_tres_barras_da_la_ruta_absoluta_sin_barra_de_mas() {
         // El DSN por defecto del SRS, tal y como lo resuelve la configuración
-        // cuando `DATABASE_URL` no está en el entorno.
-        let config = crate::config::Config::from_lookup(&crate::test_support::lookup_from(&[(
-            "KESTO_MASTER_KEY",
-            crate::test_support::MASTER_KEY,
-        )]))
+        // cuando `DATABASE_URL` no está en el entorno. El permiso explícito va con
+        // la clave maestra: sin `OIDC_*` el modo es `Disabled`, y ese modo no
+        // arranca sin él.
+        let config = crate::config::Config::from_lookup(&crate::test_support::lookup_from(&[
+            ("KESTO_MASTER_KEY", crate::test_support::MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ]))
         .expect("la configuración por defecto es válida");
 
         assert_eq!(

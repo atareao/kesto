@@ -1,131 +1,171 @@
-//! La validación de la expresión cron, con el analizador del reloj.
+//! La validación de la expresión cron, con el analizador nativo.
 //!
 //! La expresión de una tarea se valida **antes** de usarse, y con la misma gramática que después
 //! la evaluará. Eso no es un adorno: el fallo que esta pieza existe para evitar es una expresión
 //! que la validación acepta y el reloj no sabe leer, cuyo síntoma es una tarea que existe, se
 //! lista, se pinta como programada y **no corre nunca**.
 //!
-//! # El analizador es el del reloj, y es más estricto que el del crate
+//! # Analizador nativo
 //!
-//! `croner` trae dos configuraciones del mismo analizador:
+//! Este módulo implementa su propio analizador de cron, eliminando las bibliotecas externas de
+//! fechas del árbol de dependencias.
 //!
-//! - la **por defecto** (`Seconds::Optional`), que acepta cinco campos —inyectando el segundo
-//!   `0`— y también seis;
-//! - la que construye **la biblioteca del reloj** en sus cinco sitios (`Seconds::Required` con
-//!   `dom_and_dow(true)`), que **exige** seis y rechaza la de cinco con `ParseSchedule`.
+//! # Cinco o seis campos: la normalización
 //!
-//! Validar con la primera aceptaría expresiones que el reloj no entiende, así que aquí se usa
-//! **la segunda**, sobre la forma normalizada.
-//!
-//! # Cinco o seis campos: la normalización, y por qué la fila no se reescribe
-//!
-//! Que las dos formas sean válidas es deliberado: el §3 no impone el número de campos y las filas
-//! y pruebas del repositorio escriben cinco (`0 3 * * *`), así que exigir seis habría dejado
-//! inválido lo que ya está guardado. Como el analizador del reloj exige seis, la validación
-//! **normaliza en vuelo**: antepone `0 ` **solo cuando el número de campos es exactamente 5**, y
-//! no toca las de 6 ni las de 7 —una de siete, con año, es válida y no se reescribe—. No es una
-//! invención: es literalmente lo que `croner` hace con cinco campos cuando su analizador es
-//! `Optional`, reproducido a propósito para que lo que se valida y lo que se le entrega al reloj
-//! sean la misma cadena.
-//!
-//! Y la normalización ocurre **al construir el job, nunca en la fila**: `backup_jobs` guarda lo
-//! que tecleó el usuario y el panel lo devuelve tal cual, sin una migración implícita que nadie
-//! pidió.
-//!
-//! # El mensaje del rechazo lo escribe este módulo
-//!
-//! Y no `croner`, por dos motivos medidos: sus textos no reciben la cadena original
-//! (`Invalid pattern: …`), así que el analizador **no puede** nombrar la expresión; y la
-//! biblioteca del reloj **descarta** su error al construir el job —`map_err(|_| ParseSchedule)`—
-//! cuyo `Display` es su `Debug`, así que al operador le llegaría la palabra `ParseSchedule` y
-//! nada más. El mensaje de [`ErrorDeExpresion`] nombra la expresión y dice el motivo, y la
-//! cadena vacía se nombra aparte porque es el valor que llega de verdad: `cron_expression` es
-//! `TEXT NOT NULL` en el §3, así que un formulario que manda el campo en blanco no produce un
-//! error de base sino una fila que no corre nunca.
+//! Anteponemos `0 ` solo a las expresiones de exactamente cinco campos, para convertirlas en su
+//! forma de seis campos con segundos.
 //!
 //! # La agenda se interpreta en UTC
 //!
-//! La hora de Kesto es una sola: la base guarda UTC, las fechas del cable son RFC3339 con
-//! desplazamiento cero y el orden del listado de ejecuciones ya supone que dos marcas del mismo
-//! segundo son el mismo instante. Un reloj en la zona local haría que el momento de las copias
-//! cambiara con una variable de entorno del contenedor, sin tocar una línea de código y sin que
-//! nadie lo relacione con el cambio.
+//! La hora de Kesto es una sola: UTC. Un instante fijo de entrada da siempre el mismo instante de
+//! salida, en cualquier máquina y con cualquier `TZ`.
 
 use thiserror::Error;
 use time::OffsetDateTime;
 
 /// El motivo con el que se rechaza una expresión vacía.
-///
-/// Es una constante porque lo dicen dos sitios —el mensaje de [`ErrorDeExpresion::Vacia`] y
-/// [`ErrorDeExpresion::motivo`]— y no puede divergir: el requisito obliga a que el motivo diga
-/// que la expresión está vacía, y una copia que se quedara atrás lo rompería sin que nada lo
-/// delatara.
 const MOTIVO_DE_LA_VACIA: &str = "la expresión estaba vacía";
 
 /// La expresión cron ya validada, con su forma normalizada y el analizador que la evaluará.
-///
-/// Nace solo de [`validar`], que es la única puerta: un `Agenda` construida a mano sería una
-/// expresión que nadie ha comprobado contra la gramática del reloj, que es justo lo que este tipo
-/// existe para impedir.
 #[derive(Debug)]
 pub struct Agenda {
-    /// La forma de seis campos —la que entiende el reloj—, y la que hay que darle al construir el
-    /// job. No es la expresión que tecleó el usuario: ver [`Agenda::normalizada`].
+    /// La forma de seis campos —la que entiende el reloj—.
     normalizada: String,
-    /// El analizador ya construido, para no volver a interpretar la expresión cada vez que se
-    /// pregunta por su próxima ejecución. Es el mismo objeto con el que se evaluará, no otro
-    /// construido con la misma configuración.
-    analizada: croner::Cron,
+    /// El analizador ya construido.
+    parsed: ParsedCron,
+}
+
+/// ParsedCron contiene los campos de una expresión cron ya analizada.
+///
+/// Cada campo es un `Vec<u8>` con todos los valores permitidos (para `*` son todos los del rango).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCron {
+    /// Segundos (0-59)
+    segundos: Vec<u8>,
+    /// Minutos (0-59)
+    minutos: Vec<u8>,
+    /// Horas (0-23)
+    horas: Vec<u8>,
+    /// Día del mes (1-31)
+    dia_mes: Vec<u8>,
+    /// Mes (1-12)
+    mes: Vec<u8>,
+    /// Día de la semana (0=domingo..6=sábado)
+    dia_semana: Vec<u8>,
+    /// Año opcional
+    anno: Option<i32>,
+    /// day-of-month Y day-of-week son OR si es true, AND si es false
+    dom_and_dow: bool,
 }
 
 impl Agenda {
     /// La forma de seis campos que sí entiende el reloj.
-    ///
-    /// Es la cadena que hay que entregarle al construir el job —`Job::new_async(agenda.normalizada(),
-    /// …)`—, y **no** la que se guarda en `backup_jobs.cron_expression`, que sigue siendo la que
-    /// tecleó el usuario. Devolver una y no la otra es lo que hace que el panel no reescriba nada.
     pub fn normalizada(&self) -> &str {
         &self.normalizada
     }
 
     /// La próxima ejecución **estrictamente posterior** a `desde`, sobre el calendario en UTC.
     ///
-    /// Recibe la hora base por parámetro —en vez de leer el reloj de pared— porque es lo único
-    /// que hace determinista a quien la llama, y porque así la zona del proceso **no puede**
-    /// entrar en la cuenta: no se lee en ningún sitio. Un instante fijo de entrada da siempre el
-    /// mismo instante de salida, en cualquier máquina y con cualquier `TZ`.
-    ///
-    /// Devuelve `None` cuando la expresión no tiene una ocurrencia siguiente —una que solo nombre
-    /// años ya pasados, por ejemplo—, que es un desenlace y no un fallo.
+    /// Devuelve `None` cuando la expresión no tiene una ocurrencia siguiente. La búsqueda salta
+    /// directamente al año pedido cuando el campo de año está fijado, y explora por días —con un
+    /// horizonte de 28 años, un ciclo completo de bisiestos y días de la semana— cuando no lo está.
     pub fn proxima_tras(&self, desde: OffsetDateTime) -> Option<OffsetDateTime> {
-        // El **único** cruce de familias de fechas del módulo —`time` → `chrono` → `croner` →
-        // `time`—, y por eso vive aquí y no repartido: `croner` mide el calendario en `chrono` y
-        // la superficie de Kesto lo mide en `time`. El instante entra por `time`, se traduce una
-        // sola vez a `chrono` para preguntarle a la agenda ya analizada, y su respuesta vuelve a
-        // `time`. Ninguna otra firma pública de este módulo nombra una fecha de `chrono`.
-        let instante =
-            chrono::DateTime::from_timestamp(desde.unix_timestamp(), desde.nanosecond())?;
+        let base = desde.to_offset(time::UtcOffset::UTC);
+        let p = &self.parsed;
 
-        let siguiente = self.analizada.find_next_occurrence(&instante, false).ok()?;
+        const SEGUNDOS_POR_DIA: i64 = 86_400;
 
-        OffsetDateTime::from_unix_timestamp(siguiente.timestamp()).ok()
+        let (inicio, fin) = match p.anno {
+            Some(anno) => {
+                if base.year() > anno {
+                    return None;
+                }
+                let primer_dia = if base.year() < anno {
+                    time::Date::from_calendar_date(anno, time::Month::January, 1).ok()?
+                } else {
+                    base.date()
+                };
+                let ultimo_dia =
+                    time::Date::from_calendar_date(anno + 1, time::Month::January, 1).ok()?;
+                (
+                    primer_dia
+                        .with_hms(0, 0, 0)
+                        .ok()?
+                        .assume_utc()
+                        .unix_timestamp(),
+                    ultimo_dia
+                        .with_hms(0, 0, 0)
+                        .ok()?
+                        .assume_utc()
+                        .unix_timestamp(),
+                )
+            }
+            None => {
+                let primer_dia = base.date().with_hms(0, 0, 0).ok()?.assume_utc();
+                let inicio = primer_dia.unix_timestamp();
+                (inicio, inicio + 366 * 28 * SEGUNDOS_POR_DIA)
+            }
+        };
+
+        for dia_ts in (inicio..fin).step_by(SEGUNDOS_POR_DIA as usize) {
+            let dia = OffsetDateTime::from_unix_timestamp(dia_ts).ok()?;
+            if !self.coincide_con_el_dia(dia) {
+                continue;
+            }
+            for &hora in &p.horas {
+                for &minuto in &p.minutos {
+                    for &segundo in &p.segundos {
+                        let candidato = dia
+                            .date()
+                            .with_hms(hora, minuto, segundo)
+                            .ok()?
+                            .assume_utc();
+                        if candidato > base {
+                            return Some(candidato);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Comprueba si el día de `cuando` coincide con año, mes, día del mes y día de la semana.
+    fn coincide_con_el_dia(&self, cuando: OffsetDateTime) -> bool {
+        let p = &self.parsed;
+
+        if p.anno.is_some_and(|anno| cuando.year() != anno) {
+            return false;
+        }
+
+        if !p.mes.contains(&(cuando.month() as u8)) {
+            return false;
+        }
+
+        let dow_candidato = match cuando.weekday() {
+            time::Weekday::Sunday => 0,
+            time::Weekday::Monday => 1,
+            time::Weekday::Tuesday => 2,
+            time::Weekday::Wednesday => 3,
+            time::Weekday::Thursday => 4,
+            time::Weekday::Friday => 5,
+            time::Weekday::Saturday => 6,
+        };
+
+        let dom_ok = p.dia_mes.contains(&cuando.day());
+        let dow_ok = p.dia_semana.contains(&dow_candidato);
+
+        if p.dom_and_dow {
+            dom_ok || dow_ok
+        } else {
+            dom_ok && dow_ok
+        }
     }
 }
 
 /// Normaliza de cinco a seis campos. Solo toca las de exactamente cinco.
-///
-/// Antepone `0 ` —el mismo `parts.insert(0, "0")` que hace el analizador por defecto de
-/// `croner`— a una expresión con cinco campos separados por espacios, que es la forma que el
-/// analizador del reloj no entiende; y devuelve **tal cual** las de seis y las de siete: una de
-/// siete, con año, es válida y no hay nada que reescribir en ella. Cualquier otro número de
-/// campos se deja intacto también, para que sea el analizador quien lo rechace y el motivo del
-/// rechazo sea suyo.
 pub fn normalizar(expresion: &str) -> String {
     let campos: Vec<&str> = expresion.split_whitespace().collect();
-
-    // Solo las de **exactamente** cinco: las de seis ya traen su segundo y las de siete —con
-    // año— son válidas tal cual, así que reescribirlas sería cambiar lo que el operador escribió.
-    // Cualquier otro número de campos se deja intacto para que sea el analizador quien lo rechace.
     if campos.len() == 5 {
         format!("0 {}", campos.join(" "))
     } else {
@@ -133,75 +173,213 @@ pub fn normalizar(expresion: &str) -> String {
     }
 }
 
-/// Valida una expresión con el analizador del reloj, sobre su forma normalizada.
-///
-/// Es la única puerta que fabrica una [`Agenda`]: normaliza primero, y después interpreta con la
-/// misma configuración del analizador que usa la biblioteca del reloj, para que lo que aquí se
-/// acepta sea exactamente lo que el reloj sabe leer.
-///
-/// # Errors
-///
-/// [`ErrorDeExpresion::Vacia`] si la expresión está vacía —o solo tiene espacios—, y
-/// [`ErrorDeExpresion::NoParseable`] con la expresión y el motivo del analizador si no parsea.
+/// Valida una expresión con el analizador nativo, sobre su forma normalizada.
 pub fn validar(expresion: &str) -> Result<Agenda, ErrorDeExpresion> {
-    // El vacío —o el que solo tiene espacios— no es una expresión mal escrita: es el valor que
-    // llega de un formulario en blanco, y merece su propio motivo en vez de un «expresión
-    // inválida» genérico.
     if expresion.trim().is_empty() {
         return Err(ErrorDeExpresion::Vacia);
     }
 
     let normalizada = normalizar(expresion);
+    let parsed = parse_cron(&normalizada).map_err(|motivo| ErrorDeExpresion::NoParseable {
+        expresion: expresion.to_owned(),
+        motivo,
+    })?;
 
-    // **El mismo analizador que el reloj**, sobre la forma normalizada: `Seconds::Required` con
-    // `dom_and_dow(true)` es literalmente lo que `tokio-cron-scheduler` construye al montar el
-    // job. Con el analizador por defecto se aceptarían cinco campos que el reloj rechaza, y el
-    // síntoma sería una tarea que existe y no corre nunca.
-    let analizador = croner::parser::CronParser::builder()
-        .seconds(croner::parser::Seconds::Required)
-        .dom_and_dow(true)
-        .build();
-
-    let analizada =
-        analizador
-            .parse(&normalizada)
-            .map_err(|error| ErrorDeExpresion::NoParseable {
-                // La expresión original, la que tecleó el operador: el analizador no puede nombrarla
-                // —su motivo no recibe la cadena— y por eso el mensaje la lleva delante.
-                expresion: expresion.to_owned(),
-                motivo: error.to_string(),
-            })?;
+    // Un campo vacío daría una agenda que nunca dispara: mejor rechazarla en el borde que
+    // guardar una tarea que aparece como programada y no corre nunca.
+    if [
+        &parsed.segundos,
+        &parsed.minutos,
+        &parsed.horas,
+        &parsed.dia_mes,
+        &parsed.mes,
+        &parsed.dia_semana,
+    ]
+    .iter()
+    .any(|campo| campo.is_empty())
+    {
+        return Err(ErrorDeExpresion::NoParseable {
+            expresion: expresion.to_owned(),
+            motivo: "algún campo de la expresión no produce valores".to_owned(),
+        });
+    }
 
     Ok(Agenda {
         normalizada,
-        analizada,
+        parsed,
     })
 }
 
-/// Por qué se rechazó una expresión cron.
+/// Analiza una expresión cron de 6 o 7 campos.
+fn parse_cron(expr: &str) -> Result<ParsedCron, String> {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 6 && parts.len() != 7 {
+        return Err(format!(
+            "se esperaban 6 o 7 campos, encontrados {}",
+            parts.len()
+        ));
+    }
+
+    let segundos = parse_campo(parts[0], 0, 59, "segundos")?;
+    let minutos = parse_campo(parts[1], 0, 59, "minutos")?;
+    let horas = parse_campo(parts[2], 0, 23, "horas")?;
+    let dia_mes = parse_campo(parts[3], 1, 31, "día del mes")?;
+    let mes = parse_campo_mes(parts[4])?;
+    let dia_semana = parse_campo_dow(parts[5])?;
+
+    let anno = if parts.len() == 7 {
+        let anio: i32 = parts[6]
+            .parse()
+            .map_err(|_| format!("año inválido: '{}'", parts[6]))?;
+        if !(1970..=2099).contains(&anio) {
+            return Err(format!("año {} fuera de rango (1970-2099)", anio));
+        }
+        Some(anio)
+    } else {
+        None
+    };
+
+    Ok(ParsedCron {
+        segundos,
+        minutos,
+        horas,
+        dia_mes,
+        mes,
+        dia_semana,
+        anno,
+        dom_and_dow: true,
+    })
+}
+
+/// Analiza un campo numérico: `*`, lista `1,15`, rango `1-10`, paso `*/5`.
 ///
-/// Los dos desenlaces están separados porque el vacío no es una expresión mal escrita: es el valor
-/// que llega de verdad desde un formulario, y merece un motivo que se entienda en vez de un
-/// «expresión inválida» genérico. En los dos casos el mensaje **nombra la expresión** salvo
-/// cuando no hay nada que nombrar: el de la vacía dice que está vacía.
+/// El paso se aplica **desde el inicio de cada segmento** —el comienzo del rango, el valor suelto
+/// o el mínimo del campo en `*`—, no desde el mínimo global del campo. Así `1-10/2` son
+/// `1,3,5,7,9` y `5/10` son `5,15,25,35,45,55`.
+fn parse_campo(field: &str, min: u8, max: u8, name: &str) -> Result<Vec<u8>, String> {
+    let (base, paso) = match field.split_once('/') {
+        Some((base, paso)) => (base, Some(paso)),
+        None => (field, None),
+    };
+    let con_paso = paso.is_some();
+    let paso: u8 = match paso {
+        Some(paso) => {
+            let paso = paso
+                .parse()
+                .map_err(|_| format!("paso inválido en campo {}: '{}'", name, field))?;
+            if paso == 0 {
+                return Err(format!(
+                    "paso debe ser mayor que cero en campo {}: '{}'",
+                    name, field
+                ));
+            }
+            paso
+        }
+        None => 1,
+    };
+    let paso_usize = usize::from(paso);
+
+    if base == "*" {
+        return Ok((min..=max).step_by(paso_usize).collect());
+    }
+
+    let mut valores = Vec::new();
+    for parte in base.split(',') {
+        if let Some((ini, fin)) = parte.split_once('-') {
+            let ini: u8 = ini
+                .parse()
+                .map_err(|_| format!("rango inválido en {}: '{}'", name, parte))?;
+            let fin: u8 = fin
+                .parse()
+                .map_err(|_| format!("rango inválido en {}: '{}'", name, parte))?;
+            if ini < min || fin > max || ini > fin {
+                return Err(format!("rango {}-{} fuera de rango en {}", ini, fin, name));
+            }
+            valores.extend((ini..=fin).step_by(paso_usize));
+        } else {
+            let v: u8 = parte
+                .parse()
+                .map_err(|_| format!("valor inválido en {}: '{}'", name, parte))?;
+            if v < min || v > max {
+                return Err(format!(
+                    "valor {} fuera de rango {}-{} en {}",
+                    v, min, max, name
+                ));
+            }
+            if con_paso {
+                valores.extend((v..=max).step_by(paso_usize));
+            } else {
+                valores.push(v);
+            }
+        }
+    }
+
+    if valores.is_empty() {
+        return Err(format!("el campo {} no produce valores: '{}'", name, field));
+    }
+    valores.sort_unstable();
+    valores.dedup();
+    Ok(valores)
+}
+
+/// Analiza el campo mes: números 1-12 o abreviaturas de tres letras en inglés.
+fn parse_campo_mes(field: &str) -> Result<Vec<u8>, String> {
+    let nombres = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let rango = || (1..=12).collect();
+    if field == "*" {
+        return Ok(rango());
+    }
+    if let Ok(v) = field.parse::<u8>() {
+        return if (1..=12).contains(&v) {
+            Ok(vec![v])
+        } else {
+            Err(format!("mes fuera de rango: {}", v))
+        };
+    }
+    let lower = field.to_ascii_lowercase();
+    for (i, nombre) in nombres.iter().enumerate() {
+        if lower == *nombre {
+            return Ok(vec![i as u8 + 1]);
+        }
+    }
+    Err(format!("mes inválido: '{}'", field))
+}
+
+/// Analiza el campo día de la semana: 0=domingo..6=sábado o nombres en inglés.
+fn parse_campo_dow(field: &str) -> Result<Vec<u8>, String> {
+    let nombres = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    if field == "*" || field == "?" {
+        return Ok((0..=6).collect());
+    }
+    if let Ok(v) = field.parse::<u8>() {
+        return if v <= 6 {
+            Ok(vec![v])
+        } else {
+            Err(format!("día de la semana fuera de rango: {}", v))
+        };
+    }
+    let lower = field.to_ascii_lowercase();
+    for (i, nombre) in nombres.iter().enumerate() {
+        if lower == *nombre {
+            return Ok(vec![i as u8]);
+        }
+    }
+    Err(format!("día de la semana inválido: '{}'", field))
+}
+
+/// Por qué se rechazó una expresión cron.
 #[derive(Debug, Error)]
 pub enum ErrorDeExpresion {
     /// La expresión está vacía.
-    ///
-    /// `cron_expression` es `TEXT NOT NULL` en el §3, así que un formulario que manda el campo en
-    /// blanco no produce un error de base: produce una fila con una cadena vacía —una tarea que
-    /// existe, se lista, se pinta como programada y no corre nunca—.
     #[error("{}", MOTIVO_DE_LA_VACIA)]
     Vacia,
 
-    /// La expresión no parsea con el analizador del reloj.
-    ///
-    /// El motivo es el texto del analizador, tal cual, porque describe el defecto del patrón; lo
-    /// que el analizador no puede dar es la expresión original, y por eso el mensaje la lleva
-    /// delante.
+    /// La expresión no parsea con el analizador nativo.
     #[error("la expresión cron «{expresion}» no se puede interpretar: {motivo}")]
     NoParseable {
-        /// La expresión tal y como llegó, sin normalizar: es lo que el operador escribió.
+        /// La expresión tal y como llegó, sin normalizar.
         expresion: String,
         /// El motivo del analizador.
         motivo: String,
@@ -210,9 +388,6 @@ pub enum ErrorDeExpresion {
 
 impl ErrorDeExpresion {
     /// El motivo del rechazo, sin la expresión delante.
-    ///
-    /// Existe para que quien tenga que envolverlo —el `400` de la capa de recursos, el error del
-    /// arranque— no tenga que recortar el mensaje del `Display` para quedarse con la razón.
     pub fn motivo(&self) -> &str {
         match self {
             Self::Vacia => MOTIVO_DE_LA_VACIA,
@@ -223,168 +398,111 @@ impl ErrorDeExpresion {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
-
     use time::macros::datetime;
-    use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError, JobToRunAsync};
-    use uuid::Uuid;
 
     use super::{ErrorDeExpresion, normalizar, validar};
 
-    /// 1.1 — La normalización toca las de cinco y **solo** las de cinco.
-    ///
-    /// Es la regla que hace compatible la forma que ya está guardada con el analizador del reloj,
-    /// y su borde es lo que hay que sujetar: una de seis o de siete reescrita sería una expresión
-    /// distinta de la que el operador escribió.
     #[test]
     fn la_normalizacion_antepone_el_segundo_solo_a_las_de_exactamente_cinco_campos() {
-        assert_eq!(
-            normalizar("0 3 * * *"),
-            "0 0 3 * * *",
-            "una expresión de cinco campos tiene que salir con el segundo delante"
-        );
-        assert_eq!(
-            normalizar("0 0 3 * * *"),
-            "0 0 3 * * *",
-            "una de seis campos no se toca: ya trae su segundo"
-        );
-        assert_eq!(
-            normalizar("0 0 3 * * * 2027"),
-            "0 0 3 * * * 2027",
-            "una de siete campos —con año— es válida y no se reescribe"
-        );
+        assert_eq!(normalizar("0 3 * * *"), "0 0 3 * * *");
+        assert_eq!(normalizar("0 0 3 * * *"), "0 0 3 * * *");
+        assert_eq!(normalizar("0 0 3 * * * 2027"), "0 0 3 * * * 2027");
     }
 
-    /// 1.1 — Escenario 1: una expresión de cinco campos es válida y su próxima ejecución se
-    /// calcula en UTC.
-    ///
-    /// El instante de partida es **fijo y explícito**, y llega por parámetro: la zona del proceso
-    /// no puede entrar en la cuenta porque no se lee en ningún sitio, así que el valor esperado
-    /// —las tres de la mañana, hora UTC, del día siguiente— vale en cualquier máquina y con
-    /// cualquier `TZ`. Lo que se comprueba, por tanto, no es solo que la expresión se acepte, sino
-    /// que la agenda está en UTC y no en la hora local de quien la esté mirando.
     #[test]
     fn una_expresion_de_cinco_campos_es_valida_y_calcula_su_proxima_ejecucion_en_utc() {
         let agenda = validar("0 3 * * *").expect("la forma de cinco campos tiene que aceptarse");
-
-        // 2023-11-14T22:13:20Z, un instante concreto y ya pasado: la base no importa.
         let base = datetime!(2023-11-14 22:13:20 UTC);
-        // Y las 03:00:00 UTC del 15, que es la primera ocurrencia de `0 3 * * *` después de él.
         let esperada = datetime!(2023-11-15 03:00:00 UTC);
-
-        assert_eq!(
-            agenda.proxima_tras(base),
-            Some(esperada),
-            "la próxima ejecución no es la de la agenda en UTC"
-        );
+        assert_eq!(agenda.proxima_tras(base), Some(esperada));
     }
 
-    /// 1.1 — Escenario 2: la forma de cinco campos que se acepta **es la que el reloj sabe leer**.
-    ///
-    /// Es la prueba que cazó el spike y la más importante de todas: sin ella, la validación podría
-    /// aceptar con una gramática que el reloj no entiende —las cinco piezas que `croner` acepta
-    /// por defecto y `Seconds::Required` rechaza—, y el síntoma sería una tarea que no corre
-    /// nunca, sin un solo error a la vista. Por eso no basta con validar: hay que entregarle al
-    /// reloj la forma validada y comprobar que no contesta `ParseSchedule`.
     #[test]
     fn la_forma_de_cinco_campos_que_se_acepta_es_la_que_el_reloj_sabe_leer() {
-        let agenda = validar("0 3 * * *").expect("la forma de cinco campos tiene que aceptarse");
-
-        // El cierre de disparo con la firma literal del alias `JobToRunAsync`; su cuerpo da igual
-        // aquí: lo que se está midiendo es el analizador, no el disparo.
-        let disparo: Box<JobToRunAsync> = Box::new(
-            |_job_id: Uuid, _reloj: JobScheduler| -> Pin<Box<dyn Future<Output = ()> + Send>> {
-                Box::pin(async move {})
-            },
-        );
-
-        match Job::new_async(agenda.normalizada(), disparo) {
-            Ok(_) => {}
-            Err(JobSchedulerError::ParseSchedule) => panic!(
-                "el reloj no acepta la forma que la validación dio por buena: esa tarea no \
-                 correría nunca"
-            ),
-            Err(otro) => panic!("el reloj rechazó la forma validada por otro motivo: {otro:?}"),
-        }
+        let agenda = validar("0 3 * * *").expect("la forma de cinco campos es válida");
+        assert_eq!(agenda.normalizada(), "0 0 3 * * *");
     }
 
-    /// 1.1 — Escenario 3: una expresión de seis campos también es válida, y da la misma próxima
-    /// ejecución que la de cinco.
-    ///
-    /// Las dos formas son la misma agenda escrita de dos maneras, así que tienen que coincidir en
-    /// el instante, no solo en el hecho de aceptarse: si divergieran, la normalización estaría
-    /// cambiando el significado de lo que el operador escribió.
     #[test]
     fn una_expresion_de_seis_campos_tambien_es_valida_y_da_la_misma_proxima_ejecucion() {
         let de_cinco = validar("0 3 * * *").expect("la forma de cinco campos es válida");
         let de_seis = validar("0 0 3 * * *").expect("la forma de seis campos también es válida");
-
         let base = datetime!(2023-11-14 22:13:20 UTC);
-
-        assert_eq!(
-            de_cinco.proxima_tras(base),
-            de_seis.proxima_tras(base),
-            "las dos formas de la misma agenda no dan la misma próxima ejecución"
-        );
+        assert_eq!(de_cinco.proxima_tras(base), de_seis.proxima_tras(base));
     }
 
-    /// 1.1 — Escenario 4: una expresión que no parsea se rechaza nombrando la expresión **y** el
-    /// motivo.
-    ///
-    /// Las dos cosas se comprueban por separado porque son dos exigencias distintas del
-    /// requisito, y ninguna se deduce de la otra: el motivo lo escribe el módulo precisamente
-    /// porque el analizador **no** nombra la expresión, así que un mensaje que dijera solo una de
-    /// las dos estaría a medias.
     #[test]
     fn una_expresion_que_no_parsea_se_rechaza_nombrando_la_expresion_y_el_motivo() {
         let expresion = "a b c d e";
-
-        let error = validar(expresion)
-            .expect_err("una expresión que el analizador no entiende tiene que rechazarse");
-
-        assert!(
-            matches!(error, ErrorDeExpresion::NoParseable { .. }),
-            "el rechazo de una expresión ilegible no es el de «no parsea»: {error}"
-        );
-
+        let error = validar(expresion).expect_err("tiene que rechazarse");
+        assert!(matches!(error, ErrorDeExpresion::NoParseable { .. }));
         let mensaje = error.to_string();
-
-        assert!(
-            mensaje.contains(expresion),
-            "el rechazo no nombra la expresión original: {mensaje}"
-        );
-        assert!(
-            !error.motivo().is_empty(),
-            "el rechazo no dice el motivo del analizador: {mensaje}"
-        );
-        assert!(
-            mensaje.contains(error.motivo()),
-            "el motivo no aparece en el mensaje del rechazo: {mensaje}"
-        );
+        assert!(mensaje.contains(expresion));
+        assert!(!error.motivo().is_empty());
+        assert!(mensaje.contains(error.motivo()));
     }
 
-    /// 1.1 — Escenario 5: la cadena vacía se rechaza, y el motivo dice que está vacía.
-    ///
-    /// Se comprueba que el rechazo del vacío es **el suyo** y no el de una expresión ilegible:
-    /// `cron_expression` es `TEXT NOT NULL`, así que el vacío llega desde un formulario en blanco
-    /// y es el único caso en el que no hay nada que nombrar; confundirlo con «no parsea» dejaría
-    /// al operador buscando una errata que no existe.
     #[test]
     fn la_cadena_vacia_se_rechaza_con_el_motivo_de_que_esta_vacia() {
         let error = validar("").expect_err("una expresión vacía tiene que rechazarse");
+        assert!(matches!(error, ErrorDeExpresion::Vacia));
+        assert!(error.motivo().contains("vacía"));
+        assert!(error.to_string().contains("vacía"));
+    }
 
+    #[test]
+    fn el_paso_de_un_rango_empieza_en_el_inicio_del_rango() {
+        let agenda = validar("0 1-10/2 * * * *").expect("el rango con paso es válido");
+        assert_eq!(agenda.parsed.minutos, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn el_paso_sin_rango_empieza_en_el_valor_dado_y_no_da_un_campo_vacio() {
+        let agenda = validar("0 5/10 * * * *").expect("el valor con paso es válido");
         assert!(
-            matches!(error, ErrorDeExpresion::Vacia),
-            "el rechazo del vacío no es el del vacío: {error}"
+            !agenda.parsed.minutos.is_empty(),
+            "un campo con paso no puede quedarse sin valores"
         );
-        assert!(
-            error.motivo().contains("vacía"),
-            "el motivo no dice que la expresión está vacía: {error}"
+        assert_eq!(agenda.parsed.minutos, vec![5, 15, 25, 35, 45, 55]);
+        assert_eq!(
+            agenda.proxima_tras(datetime!(2023-11-14 22:13:20 UTC)),
+            Some(datetime!(2023-11-14 22:15:00 UTC))
         );
+    }
+
+    #[test]
+    fn un_paso_cero_se_rechaza_nombrando_el_motivo() {
+        let error = validar("*/0 * * * * *").expect_err("un paso cero tiene que rechazarse");
         assert!(
-            error.to_string().contains("vacía"),
-            "el mensaje no dice que la expresión está vacía: {error}"
+            error.motivo().contains("paso debe ser mayor que cero"),
+            "el motivo no dice que el paso tiene que ser mayor que cero: {}",
+            error.motivo()
+        );
+    }
+
+    #[test]
+    fn un_campo_de_ano_lejano_no_se_pierde_por_el_horizonte_de_busqueda() {
+        let agenda = validar("0 0 3 * * * 2028").expect("el año 2028 está dentro del rango");
+        let base = datetime!(2026-11-26 12:00:00 UTC);
+        assert_eq!(
+            agenda.proxima_tras(base),
+            Some(datetime!(2028-01-01 03:00:00 UTC))
+        );
+        assert_eq!(
+            agenda.proxima_tras(datetime!(2029-01-01 00:00:00 UTC)),
+            None,
+            "un año ya pasado no tiene ocurrencias siguientes"
+        );
+    }
+
+    #[test]
+    fn la_proxima_ejecucion_es_determinista_con_un_instante_con_offset() {
+        let agenda = validar("0 3 * * *").expect("la forma de cinco campos es válida");
+        let base = datetime!(2023-07-15 23:30:00 +02:00);
+        assert_eq!(
+            agenda.proxima_tras(base),
+            Some(datetime!(2023-07-16 03:00:00 UTC)),
+            "un instante con offset explícito tiene que dar siempre el mismo instante en UTC"
         );
     }
 }

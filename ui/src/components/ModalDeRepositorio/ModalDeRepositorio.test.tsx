@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
@@ -100,5 +100,32 @@ describe('ModalDeRepositorio', () => {
     // Los secretos tecleados para la fila 1 no viajan a la fila 2.
     expect(screen.getByLabelText(/clave secreta/i)).toHaveValue('')
     expect(screen.getByLabelText(/passphrase/i)).toHaveValue('')
+  })
+
+  it('los campos de texto no dejan escribir más de lo que el borde acepta', async () => {
+    const usuario = userEvent.setup()
+    instalarFetchFalso(() => {
+      throw new Error('no debería llamarse a fetch')
+    })
+
+    montarArnes([FILA1])
+
+    await usuario.click(screen.getByRole('button', { name: 'Editar r1' }))
+    const dialogo = await screen.findByRole('dialog')
+
+    expect(within(dialogo).getByRole('textbox', { name: 'Nombre' })).toHaveAttribute(
+      'maxlength',
+      '120',
+    )
+    expect(within(dialogo).getByLabelText('Bucket')).toHaveAttribute('maxlength', '63')
+    expect(within(dialogo).getByLabelText('Endpoint')).toHaveAttribute('maxlength', '2048')
+    expect(within(dialogo).getByLabelText('Región')).toHaveAttribute('maxlength', '64')
+    expect(within(dialogo).getByLabelText('ID de la clave de acceso')).toHaveAttribute(
+      'maxlength',
+      '128',
+    )
+    // El borde no acota los secretos: esos campos no llevan tope.
+    expect(within(dialogo).getByLabelText(/clave secreta/i)).not.toHaveAttribute('maxlength')
+    expect(within(dialogo).getByLabelText(/passphrase/i)).not.toHaveAttribute('maxlength')
   })
 })

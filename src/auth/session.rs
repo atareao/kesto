@@ -25,12 +25,18 @@ pub const SESSION_COOKIE_NAME: &str = "kesto_session";
 /// rehacer el flujo de entrada.
 pub const SESSION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(8 * 60 * 60);
 
-/// Identidad de la sesión: exactamente `sub`, `email`, `iat` y `exp`.
+/// Identidad de la sesión: exactamente `sub`, `email`, `iat`, `exp` y `jti`.
 ///
-/// La estructura es la que sella la superficie: con esos cuatro campos y
+/// La estructura es la que sella la superficie: con esos cinco campos y
 /// `deny_unknown_fields`, un token que traiga cualquier claim de más —un rol,
 /// por ejemplo— no se puede deserializar y por tanto no se acepta. No hay que
 /// acordarse de rechazarlo: no cabe.
+///
+/// `jti` es el identificador único de **esta** emisión: es lo que permite revocar
+/// una sesión concreta antes de que `exp` llegue, y por eso es obligatorio y
+/// **sin** `#[serde(default)]`: una cookie que no lo traiga no decodifica y el
+/// *gate* la rechaza, así que un despliegue cierra las sesiones vivas en vez de
+/// dejar un cierre de sesión que no hace nada en silencio.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claims {
@@ -42,6 +48,31 @@ pub struct Claims {
     pub iat: u64,
     /// Momento de caducidad, en segundos desde la época.
     pub exp: u64,
+    /// Identificador único de la sesión, aleatorio y distinto en cada emisión.
+    ///
+    /// Es la clave con la que se revoca una sesión concreta: solo vive dentro del
+    /// JWT firmado, no viaja a ninguna URL ni a ninguna cabecera.
+    pub jti: String,
+}
+
+/// Longitud del `jti`: 32 caracteres aleatorios alfanuméricos.
+///
+/// La misma que el `state`/`nonce` del login: con 32 caracteres alfanuméricos la
+/// probabilidad de que dos emisiones colisionen es despreciable.
+const JTI_LENGTH: usize = 32;
+
+/// Un identificador aleatorio de 32 caracteres alfanuméricos.
+///
+/// Es el equivalente del `state`/`nonce` del login —que vive en `src/auth/oidc.rs` y no
+/// se puede reutilizar desde aquí—, con la misma longitud y el mismo alfabeto.
+fn identificador_de_sesion() -> String {
+    use rand::Rng;
+
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(JTI_LENGTH)
+        .map(char::from)
+        .collect()
 }
 
 /// Emite el JWT de sesión firmado con `HS256` y `secret`.
@@ -55,6 +86,7 @@ pub fn issue(secret: &SecretString, sub: String, email: String) -> Result<String
         email,
         iat: emitido,
         exp: emitido + SESSION_LIFETIME.as_secs(),
+        jti: identificador_de_sesion(),
     };
 
     let cabecera = Header::new(Algorithm::HS256);
@@ -106,10 +138,11 @@ pub fn verify(secret: &SecretString, token: &str) -> Result<Claims, AppError> {
 
 /// Construye la cookie de sesión con el JWT dado.
 ///
-/// `redirect_url` decide el atributo `Secure`: se añade solo cuando su esquema
-/// es `https`, porque en desarrollo se entra por `http://localhost` y una
-/// cookie `Secure` no viajaría, así que la sesión no se establecería nunca.
-pub fn session_cookie(token: String, redirect_url: &str) -> Result<Cookie<'static>, AppError> {
+/// El atributo `Secure` es **incondicional**: sin él la cookie viajaría en
+/// claro, y una sesión interceptable es peor que una sesión que no se establece.
+/// Quien decide si el despliegue es admisible es el arranque —en modo OIDC
+/// `OIDC_REDIRECT_URL` tiene que ser `https`—, no la forma de la respuesta.
+pub fn session_cookie(token: String) -> Result<Cookie<'static>, AppError> {
     // El crate `cookie` espera una duración del crate `time`, que es una
     // dependencia transitiva y no se puede nombrar desde aquí. La conversión
     // desde `std::time::Duration` deja que el compilador infiera el tipo del
@@ -123,20 +156,9 @@ pub fn session_cookie(token: String, redirect_url: &str) -> Result<Cookie<'stati
         .http_only(true)
         .same_site(SameSite::Strict)
         .path("/")
-        .secure(requires_secure(redirect_url))
+        .secure(true)
         .max_age(max_age)
         .build())
-}
-
-/// ¿El esquema de la URL de retorno obliga a marcar la cookie como `Secure`?
-///
-/// Una URL que no se pueda leer como `esquema://…` no se considera segura: el
-/// defecto útil es el del desarrollo, donde el retorno es `http` sobre
-/// `localhost`.
-fn requires_secure(redirect_url: &str) -> bool {
-    redirect_url
-        .split_once("://")
-        .is_some_and(|(esquema, _)| esquema.eq_ignore_ascii_case("https"))
 }
 
 #[cfg(test)]
@@ -144,27 +166,13 @@ mod tests {
     use axum_extra::extract::cookie::SameSite;
 
     use super::{Claims, SESSION_COOKIE_NAME, SESSION_LIFETIME, issue, session_cookie, verify};
-    use crate::config::{AuthMode, Config};
     use crate::error::AppError;
     use crate::secret::SecretString;
-    use crate::test_support::lookup_from;
 
-    /// Clave maestra larga: que ningún aviso se cuele en la respuesta.
-    const MASTER_KEY: &str = "clave-maestra-distinguible-000000000000000000000000000000000000";
     /// Clave de firma de la sesión, con la longitud de sobra.
     const SECRET: &str = "clave-de-firma-distinguible-000000000000000000000000000000000000";
     /// Otra clave de firma, distinguible de la anterior: es la que no vale.
     const OTHER_SECRET: &str = "otra-clave-de-firma-000000000000000000000000000000000000000000";
-    /// Emisor del proveedor de pruebas.
-    const OIDC_ISSUER: &str = "https://idp.example.test/realms/kesto";
-    /// Identificador del cliente de pruebas.
-    const OIDC_CLIENT_ID: &str = "kesto-panel";
-    /// Secreto de cliente OIDC: solo tiene que estar presente.
-    const OIDC_CLIENT_SECRET: &str = "secreto-de-cliente-oidc-distinguible";
-    /// URL de retorno con esquema `http`: el caso del desarrollo.
-    const REDIRECT_HTTP: &str = "http://localhost:8080/api/v1/auth/callback";
-    /// URL de retorno con esquema `https`: el caso del despliegue.
-    const REDIRECT_HTTPS: &str = "https://kesto.example.test/api/v1/auth/callback";
     /// Usuario distinguible de la sesión.
     const SUB: &str = "usuario-distinguible-1";
     /// Correo distinguible de la sesión.
@@ -186,28 +194,6 @@ mod tests {
     /// Emite una sesión con los valores distinguibles de estas pruebas.
     fn sesion() -> String {
         issue(&secret(), SUB.to_owned(), EMAIL.to_owned()).expect("la emisión no puede fallar")
-    }
-
-    /// URL de retorno efectiva de una configuración con la autenticación encendida.
-    ///
-    /// La configuración entra por lectura inyectada, como en `bootstrap-core`:
-    /// nunca se muta el entorno del proceso.
-    fn redirect_configurado(redirect_url: &str) -> String {
-        let lookup = lookup_from(&[
-            ("KESTO_MASTER_KEY", MASTER_KEY),
-            ("KESTO_SECRET", SECRET),
-            ("OIDC_ISSUER_URL", OIDC_ISSUER),
-            ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
-            ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
-            ("OIDC_REDIRECT_URL", redirect_url),
-        ]);
-
-        let config = Config::from_lookup(&lookup).expect("la configuración OIDC es válida");
-
-        match &config.auth {
-            AuthMode::Oidc(settings) => settings.redirect_url.clone(),
-            AuthMode::Disabled => panic!("las tres variables OIDC deben encender la autenticación"),
-        }
     }
 
     /// Cancela la firma de un JWT alterando un carácter de su contenido.
@@ -235,6 +221,7 @@ mod tests {
             email: EMAIL.to_owned(),
             iat: exp - SESSION_LIFETIME.as_secs(),
             exp,
+            jti: "jti-de-prueba-de-caducidad-0000000".to_owned(),
         };
 
         jsonwebtoken::encode(
@@ -247,8 +234,7 @@ mod tests {
 
     /// Claves del payload de un JWT, ordenadas y sin verificar la firma.
     fn claves_del_payload(token: &str) -> Vec<String> {
-        let claims: serde_json::Value = jsonwebtoken::dangerous::insecure_decode_claims(token)
-            .expect("el payload debe poder leerse como JSON");
+        let claims = payload(token);
 
         let mut claves: Vec<String> = claims
             .as_object()
@@ -261,9 +247,42 @@ mod tests {
         claves
     }
 
+    /// El payload de un JWT como JSON, sin verificar la firma.
+    fn payload(token: &str) -> serde_json::Value {
+        jsonwebtoken::dangerous::insecure_decode_claims(token)
+            .expect("el payload debe poder leerse como JSON")
+    }
+
+    /// Firma un payload JSON **crudo**, saltándose [`Claims`].
+    ///
+    /// Es lo que permite fabricar un JWT que `Claims` no aceptaría —sin `jti`, o con un claim de
+    /// más— para probar que el verificador lo rechaza. Si se construyera con `Claims`, no habría
+    /// forma de emitir un token inválido.
+    fn firmar_payload(claims: &serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .expect("el payload de prueba debe poder firmarse")
+    }
+
+    /// Los cuatro claims base de una sesión, con el `exp` dado y **sin** `jti`.
+    ///
+    /// Es la sesión «vieja»: la que se emitió antes de que el `jti` existiera. El `jti` se añade
+    /// aparte en cada prueba que lo necesite.
+    fn claims_sin_jti(exp: u64) -> serde_json::Value {
+        serde_json::json!({
+            "sub": SUB,
+            "email": EMAIL,
+            "iat": exp - SESSION_LIFETIME.as_secs(),
+            "exp": exp,
+        })
+    }
+
     #[test]
     fn los_atributos_de_la_cookie() {
-        let cookie = session_cookie(sesion(), REDIRECT_HTTP).expect("la cookie se construye");
+        let cookie = session_cookie(sesion()).expect("la cookie se construye");
 
         assert_eq!(
             cookie.name(),
@@ -293,7 +312,13 @@ mod tests {
         // Y el renderizado, que es lo que viaja de verdad en la cabecera.
         let cabecera = cookie.to_string();
 
-        for atributo in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age="] {
+        for atributo in [
+            "HttpOnly",
+            "SameSite=Strict",
+            "Path=/",
+            "Max-Age=",
+            "Secure",
+        ] {
             assert!(
                 cabecera.contains(atributo),
                 "la Set-Cookie no trae {atributo}: {cabecera}"
@@ -302,39 +327,34 @@ mod tests {
     }
 
     #[test]
-    fn el_secure_depende_del_esquema_de_retorno() {
-        let con_http = session_cookie(sesion(), &redirect_configurado(REDIRECT_HTTP))
-            .expect("la cookie se construye");
-
-        assert!(
-            !con_http.to_string().contains("Secure"),
-            "con retorno http la cookie no puede ir Secure, o no viajaría: {con_http}"
-        );
-
-        let con_https = session_cookie(sesion(), &redirect_configurado(REDIRECT_HTTPS))
-            .expect("la cookie se construye");
+    fn el_secure_no_depende_del_esquema_de_retorno() {
+        // El atributo es incondicional: quien decide si el despliegue es admisible es el arranque
+        // —con OIDC la URL de retorno tiene que ser `https`—, no la forma de la respuesta, y
+        // `session_cookie` ni siquiera recibe esa URL. La cookie va `Secure` siempre.
+        let cookie = session_cookie(sesion()).expect("la cookie se construye");
 
         assert_eq!(
-            con_https.secure(),
+            cookie.secure(),
             Some(true),
-            "con retorno https la cookie debe ir Secure"
+            "la cookie tiene que ir Secure sin depender de ninguna URL de retorno"
         );
         assert!(
-            con_https.to_string().contains("Secure"),
-            "con retorno https la Set-Cookie debe declarar Secure: {con_https}"
+            cookie.to_string().contains("Secure"),
+            "la Set-Cookie tiene que declarar Secure: {cookie}"
         );
     }
 
     #[test]
-    fn los_claims_de_la_sesion_son_los_cuatro_sin_roles() {
+    fn los_claims_de_la_sesion_son_los_cinco_sin_roles() {
         let token = sesion();
 
         let claves = claves_del_payload(&token);
 
         assert_eq!(
             claves,
-            ["email", "exp", "iat", "sub"],
-            "los claims de la sesión deben ser exactamente los cuatro: {token}"
+            ["email", "exp", "iat", "jti", "sub"],
+            "los claims de la sesión deben ser exactamente los cinco —con el `jti` que la \
+             identifica para poder revocarla—: {token}"
         );
 
         // El SRS no define ni un rol, así que la superficie no se inventa.
@@ -356,7 +376,7 @@ mod tests {
 
         let token = sesion();
         let claims = verify(&secret(), &token).expect("el JWT emitido debe verificarse");
-        let cookie = session_cookie(token, REDIRECT_HTTP).expect("la cookie se construye");
+        let cookie = session_cookie(token).expect("la cookie se construye");
 
         let max_age = cookie
             .max_age()
@@ -436,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn el_payload_de_la_cookie_son_exactamente_los_cuatro_claims() {
+    fn el_payload_de_la_cookie_son_exactamente_los_cinco_claims() {
         // Es un candado del **esquema del payload**, no una prueba de fuga por
         // marcador: en M1 `issue` no tiene por dónde recibir un ID token, así que
         // no hay camino en el que acabe en la cookie. La prueba de fuga de verdad
         // —credenciales distinguibles buscadas literalmente en el log de un flujo
         // completo— es el escenario 1.38, en `src/api/auth.rs`.
         let token = sesion();
-        let cookie = session_cookie(token.clone(), REDIRECT_HTTP).expect("la cookie se construye");
+        let cookie = session_cookie(token.clone()).expect("la cookie se construye");
 
         assert_eq!(
             cookie.value(),
@@ -451,12 +471,12 @@ mod tests {
             "la cookie debe llevar únicamente el JWT de sesión"
         );
 
-        // La superficie del JWT es lo que lo garantiza: con exactamente cuatro
+        // La superficie del JWT es lo que lo garantiza: con exactamente cinco
         // claims no hay dónde meter el ID token ni el token de acceso, y
         // cualquier claim de más rompe esta igualdad.
         assert_eq!(
             claves_del_payload(&token),
-            ["email", "exp", "iat", "sub"],
+            ["email", "exp", "iat", "jti", "sub"],
             "la sesión no puede llevar claims del proveedor: {token}"
         );
 
@@ -466,6 +486,104 @@ mod tests {
         assert!(
             verify(&secret(), ID_TOKEN_DEL_PROVEEDOR).is_err(),
             "un token del proveedor no puede pasar por sesión de Kesto"
+        );
+    }
+
+    /// 1.1 — Cada emisión lleva un `jti` propio: no vacío y distinto del de otra emisión.
+    ///
+    /// Sin identificador por emisión no hay nada que revocar por sesión: dos cookies
+    /// distintas del mismo operador serían indistinguibles y el cierre de una cerraría
+    /// las dos, o ninguna.
+    #[test]
+    fn cada_emision_lleva_un_jti_propio() {
+        let primero = sesion();
+        let segundo = sesion();
+
+        let jti_primero = payload(&primero)["jti"]
+            .as_str()
+            .expect("la sesión tiene que llevar un `jti` de texto")
+            .to_owned();
+        let jti_segundo = payload(&segundo)["jti"]
+            .as_str()
+            .expect("la sesión tiene que llevar un `jti` de texto")
+            .to_owned();
+
+        assert!(
+            !jti_primero.is_empty(),
+            "el `jti` emitido no puede estar vacío"
+        );
+        assert_eq!(
+            jti_primero.chars().count(),
+            32,
+            "el `jti` es un identificador aleatorio de 32 caracteres: {jti_primero}"
+        );
+        assert_ne!(
+            jti_primero, jti_segundo,
+            "dos emisiones no pueden compartir `jti`: cada sesión necesita el suyo"
+        );
+    }
+
+    /// 1.1 — `verify` devuelve el `jti`, el mismo que viaja en el token.
+    #[test]
+    fn verify_devuelve_el_jti_de_la_sesion() {
+        let token = sesion();
+        let claims = verify(&secret(), &token).expect("el JWT emitido debe verificarse");
+        let claims = serde_json::to_value(&claims).expect("los claims se serializan");
+
+        assert!(
+            claims["jti"].as_str().is_some_and(|jti| !jti.is_empty()),
+            "`verify` tiene que devolver un `jti` no vacío: {claims}"
+        );
+        assert_eq!(
+            claims["jti"],
+            payload(&token)["jti"],
+            "el `jti` que devuelve `verify` no es el del token"
+        );
+    }
+
+    /// 1.1 — Una cookie **sin** `jti` no verifica: el `jti` es obligatorio.
+    ///
+    /// Es lo que cierra el agujero de las sesiones viejas: si el `jti` fuera opcional,
+    /// una cookie sin él no se podría revocar y el cierre sería un no-op en silencio.
+    #[test]
+    fn una_cookie_sin_jti_no_se_acepta() {
+        let sin_jti = firmar_payload(&claims_sin_jti(
+            jsonwebtoken::get_current_timestamp() + SESSION_LIFETIME.as_secs(),
+        ));
+
+        let error = verify(&secret(), &sin_jti)
+            .expect_err("una sesión sin `jti` no se puede revocar, así que no se acepta");
+
+        assert!(
+            matches!(error, AppError::Unauthorized(_)),
+            "el rechazo debe ser un 401 tipado: {error}"
+        );
+    }
+
+    /// El `deny_unknown_fields` de `Claims` sigue en pie: un claim de autorización no cabe.
+    /// (Contrapeso ya verde: fija que la frontera mono-operador no admite roles.)
+    #[test]
+    fn un_claim_de_rol_no_cabe_en_la_sesion() {
+        let mut con_rol =
+            claims_sin_jti(jsonwebtoken::get_current_timestamp() + SESSION_LIFETIME.as_secs());
+        let objeto = con_rol
+            .as_object_mut()
+            .expect("los claims de prueba son un objeto");
+        objeto.insert(
+            "jti".to_owned(),
+            serde_json::Value::String("jti-de-prueba-000000000000000000".to_owned()),
+        );
+        objeto.insert(
+            "role".to_owned(),
+            serde_json::Value::String("admin".to_owned()),
+        );
+
+        let error = verify(&secret(), &firmar_payload(&con_rol))
+            .expect_err("la sesión no admite claims de autorización: no hay roles");
+
+        assert!(
+            matches!(error, AppError::Unauthorized(_)),
+            "el rechazo debe ser un 401 tipado: {error}"
         );
     }
 }

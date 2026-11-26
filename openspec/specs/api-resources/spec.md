@@ -802,3 +802,239 @@ El motivo SHALL estar **saneado**: NO SHALL contener credenciales ni el motivo c
 - **WHEN** se pide su lectura
 - **THEN** su salud SHALL ser «desconocido»
 - **AND** su fecha de comprobación SHALL ser nula
+
+### Requirement: Las rutas del target se aceptan solo dentro de su alcance
+
+El alta y la edición de un target SHALL comprobar el **alcance** de sus rutas, además de su presencia y su coherencia con el tipo. Cuando la comprobación falle, la petición SHALL contestar `400` nombrando el campo y NO SHALL escribirse ninguna fila.
+
+- `host_path`, de un target `directory`, SHALL ser una ruta **absoluta**, **sin `..`** y SHALL quedar **bajo** la raíz de `KESTO_BACKUP_ROOT`, comparando **por componentes** y no por prefijo de cadena: `/backup_sources_x` empieza por `/backup_sources` como texto y **no** está dentro de él.
+- `db_path`, de un target `sqlite`, SHALL ser una ruta **absoluta**, sin `..` y sin segmento vacío.
+
+La comprobación del borde SHALL ser **textual** y NO SHALL exigir que la ruta exista: al dar de alta un directorio puede no estar montado todavía, y exigir su existencia convertiría el alta en una comprobación del despliegue. La canonicalización —que resuelve los enlaces simbólicos y es la que de verdad cierra el agujero— la hace el motor, no este borde.
+
+La comprobación SHALL aplicarse por igual al alta y a la edición, porque las dos comparten el mismo punto de validación.
+
+#### Scenario: Un host_path fuera de la raíz se rechaza
+
+- **GIVEN** un alta de target `directory` cuyo `host_path` es `/` y una raíz de copias `/backup_sources`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `host_path`
+- **AND** NO SHALL escribirse ninguna fila
+
+#### Scenario: Una raíz que solo coincide como prefijo no vale
+
+- **GIVEN** un alta de target `directory` cuyo `host_path` es `/backup_sources_x` y una raíz de copias `/backup_sources`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `host_path`
+
+#### Scenario: Un host_path con `..` se rechaza
+
+- **GIVEN** un alta de target `directory` cuyo `host_path` es `/backup_sources/../etc` y una raíz de copias `/backup_sources`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `host_path`
+- **AND** NO SHALL escribirse ninguna fila
+
+#### Scenario: Un host_path relativo se rechaza
+
+- **GIVEN** un alta de target `directory` cuyo `host_path` es `backup_sources/var_www`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `host_path`
+
+#### Scenario: Un host_path bajo la raíz se acepta aunque no exista todavía
+
+- **GIVEN** un alta de target `directory` cuyo `host_path` es `/backup_sources/var_www` y ese directorio no existe en el sistema de ficheros
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `201`
+- **AND** la fila escrita SHALL tener ese `host_path`
+
+#### Scenario: Un db_path con `..` se rechaza
+
+- **GIVEN** un alta de target `sqlite` cuyo `db_path` es `/datos/../etc/base.db`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `db_path`
+
+#### Scenario: Un db_path relativo se rechaza
+
+- **GIVEN** un alta de target `sqlite` cuyo `db_path` es `datos/base.db`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `db_path`
+
+#### Scenario: La edición aplica la misma regla
+
+- **GIVEN** un target `directory` existente y un `PUT` que le pone un `host_path` fuera de la raíz
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `host_path`
+- **AND** la fila NO SHALL cambiar
+
+### Requirement: El alta y la edición de un repositorio validan el `endpoint`
+
+`POST /api/v1/repositories` y `PUT /api/v1/repositories/{id}` SHALL validar el campo `endpoint` **antes** de escribir la fila y antes de hablar con el destino. Cuando la validación falle, la petición SHALL contestar `400` nombrando el campo `endpoint` y NO SHALL escribirse ni modificarse ninguna fila.
+
+El `endpoint` SHALL ser una URL absoluta con esquema y host. SHALL aceptarse el esquema `https`; el esquema `http` SHALL rechazarse salvo que la configuración conceda el permiso explícito —ver la capability `config`—.
+
+Sobre el host, y siempre que sea una dirección literal:
+
+- SHALL rechazarse **siempre**, con permiso o sin él, la dirección de enlace local (`169.254.0.0/16`, `fe80::/10`) —que incluye la de metadatos de la nube, `169.254.169.254`—, la de metadatos IPv6 de AWS (`fd00:ec2::254`) y la no especificada (`0.0.0.0`, `::`);
+- SHALL rechazarse **salvo permiso explícito** el loopback (`127.0.0.0/8`, `::1`) y un nombre `localhost` o terminado en `.localhost`;
+- SHALL aceptarse el rango privado (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`) y las direcciones públicas.
+
+Una dirección IPv6 que lleve **embebida** una IPv4 —la forma IPv4-mapeada `::ffff:a.b.c.d` (RFC 4291) y el prefijo NAT64 bien conocido `64:ff9b::/96` (RFC 6052)— SHALL juzgarse por esa IPv4, porque es la dirección que de verdad se alcanza: `https://[::ffff:127.0.0.1]` es loopback y `https://[::ffff:169.254.169.254]` es la dirección de metadatos.
+
+Un `endpoint` que lleve credenciales embebidas (`https://usuario:clave@host`) SHALL rechazarse siempre: acabarían escritas en la fila y en los registros.
+
+El mensaje del `400` SHALL nombrar el campo y NO SHALL repetir el valor recibido.
+
+El porqué del rango privado permitido: el destino natural de Kesto es un almacén S3 autoalojado —MinIO, SeaweedFS— en la red interna, y rechazarlo dejaría el producto inservible para su uso más común. Lo que se cierra es el **loopback** del propio proceso y la **dirección de metadatos**, donde viven las credenciales de instancia de la máquina.
+
+El porqué del borde y no del motor: la edición NO SHALL conectar con el destino, así que una comprobación dentro del motor no la alcanzaría y una fila podría quedar guardada con un `endpoint` inadmisible. El alta SHALL conservar su comprobación de conectividad: la validación del `endpoint` es una puerta previa, no un sustituto, y NO SHALL uniformarse la respuesta del alta según el destino responda o no.
+
+La validación NO SHALL resolver el nombre del host: un `endpoint` con nombre se acepta por su forma, así que un nombre que resuelva por DNS a una dirección rechazada NO SHALL detectarse en esta versión.
+
+#### Scenario: Un endpoint por `http` se rechaza sin permiso
+- **GIVEN** un alta cuyo `endpoint` es `http://almacen.example.test:9000` y sin permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+- **AND** NO SHALL escribirse ninguna fila
+
+#### Scenario: Un endpoint a loopback se rechaza sin permiso
+- **GIVEN** un alta cuyo `endpoint` es `http://127.0.0.1:9000` y sin permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+
+#### Scenario: La dirección de metadatos se rechaza incluso con permiso
+- **GIVEN** un alta cuyo `endpoint` es `https://169.254.169.254` y el permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+
+#### Scenario: Una IPv4 embebida en una IPv6 se juzga por la IPv4
+- **GIVEN** un alta cuyo `endpoint` es `https://[::ffff:127.0.0.1]:9000` y sin permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+- **AND** lo mismo SHALL cumplirse para la forma NAT64 `https://[64:ff9b::7f00:1]:9000`
+- **AND** con el permiso declarado, `https://[::ffff:127.0.0.1]:9000` SHALL admitirse como se admite `127.0.0.1`
+
+#### Scenario: Con permiso, un endpoint local y en claro se acepta
+- **GIVEN** un alta cuyo `endpoint` es `http://127.0.0.1:9000` y el permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** la petición SHALL pasar la validación del `endpoint`
+- **AND** su desenlace SHALL depender de la conectividad, como en cualquier alta
+
+#### Scenario: El rango privado se acepta por `https`
+- **GIVEN** un alta cuyo `endpoint` es `https://192.168.1.10:9000`
+- **WHEN** se atiende la petición
+- **THEN** la petición SHALL pasar la validación del `endpoint`
+
+#### Scenario: Un esquema que no es `http` ni `https` no vale
+- **GIVEN** un alta cuyo `endpoint` es `ftp://almacen.example.test`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+
+#### Scenario: Un valor que no es una URL absoluta no vale
+- **GIVEN** un alta cuyo `endpoint` es `almacen.example.test:9000`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+
+#### Scenario: Un endpoint con credenciales embebidas no vale
+- **GIVEN** un alta cuyo `endpoint` es `https://usuario:clave@almacen.example.test`
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+- **AND** el cuerpo NO SHALL contener la credencial
+
+#### Scenario: La edición aplica la misma regla
+- **GIVEN** un repositorio existente y un `PUT` que le pone un `endpoint` por `http` sin permiso declarado
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` nombrando el campo `endpoint`
+- **AND** la fila NO SHALL cambiar
+
+#### Scenario: El alta conserva su comprobación de conectividad
+- **GIVEN** un alta con un `endpoint` válido contra un destino que no responde
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar el error de destino inalcanzable con la envoltura
+- **AND** NO SHALL quedar fila en la base
+
+### Requirement: Los campos de texto se recortan y tienen una cota por campo
+
+Las rutas de alta y edición de `/repositories` y `/targets` SHALL **recortar** los espacios de los extremos de cada campo de texto antes de guardarlo y de medirlo, y SHALL rechazar con `400` y la envoltura, **nombrando el campo** y **sin repetir el valor**, un campo que tras recortar supere su cota.
+
+Las cotas SHALL ser: `name` 120 caracteres; `container_name` 128; `db_user`, `db_name` y `bucket` 63; `region` 64; `access_key_id` 128; `endpoint` 2048; `db_path` 1024; `host_path` 4096.
+
+Un campo **obligatorio** que tras recortar quede vacío SHALL contestar `400` nombrando el campo —es la misma regla que la falta del campo—. Un campo **opcional** (por ejemplo `db_name`) que se informe vacío o de solo espacios SHALL guardarse como `NULL` en su columna, que es lo que el §3 significa para «ausente»; NO SHALL guardarse la cadena vacía.
+
+Las cotas SHALL medirse en **caracteres** y no en bytes: contar bytes rechazaría un nombre con acentos que el formulario deja escribir. Los campos de **secreto** (`secret_access_key`, `passphrase`, `db_password`) NO SHALL tener cota de campo.
+
+El porqué: la tabla del §3 no acota sus columnas `TEXT`, así que sin esta regla un `bucket` de miles de caracteres o un `name` de solo espacios entran en la base y reaparecen más tarde —en un listado, en una etiqueta de snapshot o en una orden del motor—. Y el recorte es lo que hace que el tope se mida sobre lo que de verdad se guarda: los espacios de los extremos no son parte del valor.
+
+#### Scenario: Un name de solo espacios se rechaza
+- **GIVEN** un alta de target con `name` a una cadena de solo espacios
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el motivo SHALL nombrar el campo `name`
+- **AND** NO SHALL escribirse ninguna fila
+
+#### Scenario: Un name por encima de la cota se rechaza sin repetir el valor
+- **GIVEN** un alta de repositorio con un `name` de 121 caracteres distinguible
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400`
+- **AND** el motivo SHALL nombrar el campo `name`
+- **AND** el cuerpo NO SHALL contener el valor recibido
+
+#### Scenario: Un campo se guarda recortado
+- **GIVEN** un alta válida con `container_name` con espacios a ambos lados
+- **WHEN** se guarda y se lee la fila
+- **THEN** el valor almacenado SHALL ser el recortado, sin los espacios de los extremos
+- **AND** SHALL conservarse el resto de campos
+
+#### Scenario: Un db_name en blanco se guarda como NULL
+- **GIVEN** un alta de target de base de datos con `db_name` a una cadena de solo espacios
+- **WHEN** se escribe la fila y se mira la columna `db_name` con SQL directo
+- **THEN** el valor almacenado SHALL ser `NULL`
+- **AND** NO SHALL ser la cadena vacía ni la cadena en blanco
+
+#### Scenario: Un bucket por encima de su cota se rechaza
+- **GIVEN** un alta de repositorio con un `bucket` de 64 caracteres
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el motivo SHALL nombrar el campo `bucket`
+
+### Requirement: El nombre de un contenedor se valida contra el juego de caracteres de Docker
+
+`container_name`, cuando se informe en un alta o una edición de target, SHALL cumplir el juego de caracteres con el que Docker nombra y localiza contenedores —una primera letra alfanumérica seguida de letras, dígitos, `_`, `.` o `-` (`[A-Za-z0-9][A-Za-z0-9_.-]*`)—. Un valor que no lo cumpla SHALL contestar `400` con la envoltura, **nombrando `container_name`** y **sin repetir el valor**.
+
+El porqué: el cliente de la API de Docker (bollard) interpola el nombre **sin codificar** en la ruta de la petición (`/containers/{container_name}/exec`). Un nombre con `/`, `..` o `?` no da un error de nombre: mueve la petición a otro punto de la API de Docker. El juego de caracteres de Docker no admite ninguno de esos caracteres, así que exigirlo cierra la inyección de ruta y, de paso, hace que el nombre que se escribe sea uno que un contenedor puede tener de verdad. Cubre también los identificadores —largos o cortos—, que son hexadecimales.
+
+#### Scenario: Un container_name con una barra se rechaza
+- **GIVEN** un alta de target `sqlite` con `container_name` a `../../v1.40/containers/x` y un `db_path` válido
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el motivo SHALL nombrar el campo `container_name`
+- **AND** NO SHALL escribirse ninguna fila
+
+#### Scenario: Un container_name válido se acepta
+- **GIVEN** un alta de target `mariadb` con `container_name` a `contenedor_de-la.base-01` y el resto de campos válidos
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `201` con la envoltura
+
+### Requirement: El alta y la edición de una tarea rechazan una retención negativa que no sea -1
+
+`POST /api/v1/jobs` y `PUT /api/v1/jobs/:id` SHALL aceptar, en cada una de las tres reglas `keep_daily`, `keep_weekly` y `keep_monthly`, un valor `>= 0` o el valor `-1` —que es la forma que tiene la biblioteca de retención de decir «conservar todas»—. SHALL rechazar con `400` y con la envoltura, nombrando la columna, cualquier valor menor que `-1` o mayor que el entero de 32 bits que la biblioteca usa, sin escribir la fila.
+
+El porqué: el motor (`src/rustic/retencion.rs`) lee `-1` como «conservar todo» y rechaza cualquier otro negativo; el borde tiene que rechazar **lo mismo**, para que un valor que el motor no sabría leer se pare en el formulario en vez de aparecer como un fallo de la primera copia. La regla no sustituye al guardarraíl del motor —una fila escrita por debajo de la API no pasa por aquí—, y las dos capas existen porque protegen de dos caminos distintos. El `-1` se conserva porque hoy es la forma legítima de pedir «conservar todo» y rechazarlo rompería configuraciones válidas.
+
+#### Scenario: Una regla negativa distinta de -1 se rechaza
+- **GIVEN** un alta de tarea con `keep_daily` a `-5` y el resto de campos válidos
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el motivo SHALL nombrar la columna `keep_daily`
+- **AND** NO SHALL quedar fila en la base
+
+#### Scenario: El -1 se acepta como «conservar todo»
+- **GIVEN** un alta de tarea con `keep_daily` a `-1` y las otras dos reglas informadas
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `201` con la envoltura
+- **AND** la fila SHALL quedar escrita con `keep_daily` a `-1`
+
+#### Scenario: Una regla por encima del entero de la biblioteca se rechaza
+- **GIVEN** un alta de tarea con `keep_weekly` a un valor mayor que el mayor entero de 32 bits
+- **WHEN** se atiende la petición
+- **THEN** SHALL contestar `400` con la envoltura
+- **AND** el motivo SHALL nombrar la columna `keep_weekly`
