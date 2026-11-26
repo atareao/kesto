@@ -92,4 +92,36 @@ else
   bad "el Dockerfile no invalida la huella de Cargo tras 'COPY src' (falta 'find src -type f -exec touch')"
 fi
 
+# 8. El smoke test verifica el contrato observable de la imagen: health 200 con
+#    cuerpo vacío y `/api/v1/auth/session` -> 401 (modo OIDC; en Disabled sería
+#    404). La comprobación antigua de `.data.auth_mode` rompió v0.18.0.
+smoke_step="$(
+  awk '
+    /^[[:space:]]*- name: Smoke test the image[[:space:]]*$/ { inside=1; next }
+    inside && /^[[:space:]]*- name:/ { inside=0 }
+    inside { print }
+  ' "${wf}"
+)"
+
+if printf '%s\n' "${smoke_step}" | grep -qF '.data.auth_mode'; then
+  bad "el smoke test sigue comprobando '.data.auth_mode' (comprobación obsoleta que rompió v0.18.0)"
+else
+  ok "el smoke test no usa la comprobación obsoleta '.data.auth_mode'"
+fi
+
+if printf '%s\n' "${smoke_step}" | grep -qF 'jq -e' \
+   && printf '%s\n' "${smoke_step}" | grep -qF '.status == 200' \
+   && printf '%s\n' "${smoke_step}" | grep -qF '.data == {}'; then
+  ok "el smoke test exige jq -e con '.status == 200' y '.data == {}'"
+else
+  bad "el smoke test no comprueba con jq -e que '.status == 200' y '.data == {}'"
+fi
+
+if printf '%s\n' "${smoke_step}" | grep -vE '^[[:space:]]*#' | grep -F "curl -sS -o /dev/null -w '%{http_code}'" | grep -qF 'http://127.0.0.1:8080/api/v1/auth/session' \
+   && printf '%s\n' "${smoke_step}" | grep -vE '^[[:space:]]*#' | grep -qE '\[[[:space:]]*"\$\{session_code\}"[[:space:]]*!=[[:space:]]*"401"[[:space:]]*\]'; then
+  ok "el smoke test exige 401 en /api/v1/auth/session (modo OIDC)"
+else
+  bad "el smoke test no verifica un 401 en /api/v1/auth/session"
+fi
+
 exit "${fail}"

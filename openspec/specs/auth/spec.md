@@ -279,7 +279,7 @@ Que `GET /api/v1/auth/logout` conteste `405` **solo** con una sesión válida es
 
 `GET /api/v1/auth/session` SHALL exigir sesión y SHALL contestar la envoltura con la identidad de la sesión —su `sub` y su `email`—, sin devolver el JWT.
 
-Sin cookie válida, el `401` del *gate* **es** la respuesta a «¿hay sesión?»: NO SHALL añadirse un `200` con un booleano, ni un endpoint aparte que diga si la autenticación está encendida —eso ya lo dice la salud con su `auth_mode`—.
+Sin cookie válida, el `401` del *gate* **es** la respuesta a «¿hay sesión?»: NO SHALL añadirse un `200` con un booleano, ni un endpoint aparte que diga si la autenticación está encendida —el modo NO se publica como metadato; se comprueba por comportamiento: `401` en OIDC frente a `404` en `Disabled`—.
 
 #### Scenario: Con sesión se contesta la identidad
 - **GIVEN** una cookie de sesión válida
