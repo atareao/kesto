@@ -13,7 +13,8 @@
 //!
 //! # El cuerpo es un método, no el cierre
 //!
-//! La lógica vive en [`Planificador::disparar`] y no dentro del cierre que la biblioteca llama, por
+//! La lógica vive en [`Planificador::disparar`] y no dentro del cierre que el reloj nativo llama,
+//! por
 //! un motivo de prueba y no de estilo: un tick de calendario real no se puede esperar en una prueba,
 //! así que lo que se prueba es el cuerpo —al que la prueba llama directamente— y el cierre queda
 //! como una sola línea que lo invoca.
@@ -94,14 +95,14 @@ pub(crate) fn decidir(desenlace: &Result<Ejecucion, ErrorDelMotor>) -> Decision 
 impl Planificador {
     /// Dispara una tarea: la encola en el motor, con los desenlaces de [`decidir`].
     ///
-    /// Es **lo que el cierre de la biblioteca llama**, y también lo que una prueba llama para no
+    /// Es **lo que el cierre del reloj nativo llama**, y también lo que una prueba llama para no
     /// esperar un tick de calendario real. Consulta la puerta de parada **dentro de la misma sección
     /// crítica que el encolado** —el candado [`super::planificacion::Interior`]—, que es la garantía
     /// de que un encolado o termina antes de que la puerta cierre o no empieza —y eso cubre también
-    /// el tick que la biblioteca dispare después de la parada—.
+    /// el tick que el bucle dispare después de la parada—.
     ///
     /// Es `pub(crate)` y no `pub`: la superficie pública del módulo es [`Planificador`], sus ajustes
-    /// y su error (lo decide `mod.rs`); a este cuerpo solo lo llaman el cierre de la biblioteca y
+    /// y su error (lo decide `mod.rs`); a este cuerpo solo lo llaman el cierre del reloj y
     /// las pruebas del crate.
     ///
     /// Con la puerta cerrada no hace nada: no se planifica ni se encola trabajo nuevo.
@@ -114,7 +115,7 @@ impl Planificador {
 
         // La puerta y el encolado **bajo el mismo candado**: la sección crítica va de aquí hasta
         // que el encolado termina, así que un encolado o termina antes de que la puerta cierre o no
-        // empieza —y eso cubre también el tick que la biblioteca dispare después de la parada—. Se
+        // empieza —y eso cubre también el tick que el bucle dispare después de la parada—. Se
         // vuelve a consultar la bandera ya con el candado tomado: es la lectura que decide.
         let mut estado = self.0.estado.lock().await;
 
@@ -451,7 +452,7 @@ mod tests {
     /// 4 — Escenario 1: llegada la hora, la tarea queda con una ejecución en `pending`.
     ///
     /// El tick no se espera —no se puede—: se llama a `disparar`, que es el cuerpo que el cierre de
-    /// la biblioteca invoca. Y el `pending` se hace **observable** ocupando antes al trabajador del
+    /// la invoca el reloj nativo. Y el `pending` se hace **observable** ocupando antes al trabajador del
     /// repositorio con una ejecución que tarda un segundo en fallar: la del disparo espera detrás en
     /// la cola y se puede leer su estado sin carrera.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
