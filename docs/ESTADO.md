@@ -14,3 +14,10 @@ Orquestador ligero de backups dentro de un contenedor: extrae dumps de MariaDB/P
 - Backend: Axum 0.7+, SQLite vía `sqlx` (WAL + migraciones embebidas), `bollard` (API Docker por socket UNIX), `tokio-cron-scheduler`, `rustic_core` + `rustic_backend`.
 - Frontend (en `ui/`): React + TypeScript (el SRS dice 18+, el entorno usa 19 en repos nuevos) + Antd v5 + TanStack Query + `EventSource`.
 
+## 2026-11-26 — Migración chrono→time (#185) completada
+- Commit `02a742f` en `feature/chrono-migration`; `just check` y `just check-all` en verde.
+- `chrono`/`chrono-tz` dejaron de ser dependencias directas; `chrono-tz`, `croner` y `tokio-cron-scheduler` desaparecieron del grafo.
+- `chrono` queda solo vía FTP inherente a `rustic_backend 0.7.0`; RUSTSEC-2026-0543 documentada, 0555 eliminada.
+- Pendiente: PR a `development`; cierre de issue #185; archivado OpenSpec.
+
+
