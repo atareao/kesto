@@ -1,5 +1,17 @@
 # Propuesta: Migrar de chrono/chrono-tz a time o jiff en kesto
 
+## Why
+
+`chrono` y `chrono-tz` están descontinuados y sin parche: RUSTSEC-2026-0543 y RUSTSEC-2026-0555 no tienen corrección disponible, por lo que `cargo deny` exige excepciones. El scheduler de Kesto los consumía indirectamente a través de `croner` y `tokio-cron-scheduler` —parseo de expresiones cron y cálculo de la próxima ejecución con zonas horarias—, además de declararlos como dependencias directas. Mantenerlos deja el workspace expuesto a un advisory sin resolver y bloquea la puerta de dependencias en CI.
+
+## What Changes
+
+- Migrar el scheduler a `time`: la superficie pública (`Agenda::proxima_tras`, `Planificador`, `Ajustes`) pasa a `time::OffsetDateTime`, sin `chrono::DateTime`, `chrono::Utc`, `chrono::FixedOffset` ni `chrono-tz`.
+- Eliminar los crates `chrono`, `chrono-tz`, `croner` y `tokio-cron-scheduler` de `Cargo.toml` (`[dependencies]` y `[dev-dependencies]`), sustituyendo el analizador de cron por uno nativo sin dependencias de reloj.
+- Retirar `RUSTSEC-2026-0555` de `deny.toml`; conservar únicamente `RUSTSEC-2026-0543` con una `reason` documentada.
+- Excepción FTP documentada: `chrono` sigue llegando de forma transitiva e inherente por la cadena `suppaftp → opendal-service-ftp → opendal → rustic_backend 0.7.0`. Las features de Cargo son aditivas, así que la excepción restante no puede eliminarse desde Kesto y queda justificada por esa cadena.
+- Actualizar `docs/ENTORNO.md`, `docs/FEATURE-053-chrono-migration.md` y `docs/ESTADO.md`, sin cambios funcionales.
+
 ## Issue
 - #185: Migrar de chrono/chrono-tz a time o jiff (salida de dos excepciones de deny.toml)
 
