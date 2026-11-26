@@ -27,6 +27,6 @@ Solo tareas de esta migración (cambio `openspec/changes/2026-11-25-chrono-migra
 
 ## ARCHIVE — consolidación
 
-- [ ] Ejecutar `just check-all` (incluye puerta de dependencias y pruebas de `scripts/`).
-- [ ] Marcar todas las casillas de este fichero como completadas.
-- [ ] Ejecutar `openspec archive 2026-11-25-chrono-migration` para fusionar el delta en `openspec/specs/`.
+- [x] Ejecutar `just check-all` (incluye puerta de dependencias y pruebas de `scripts/`).
+- [x] Marcar todas las casillas de este fichero como completadas.
+- [x] Ejecutar `openspec archive 2026-11-25-chrono-migration` para fusionar el delta en `openspec/specs/`.
