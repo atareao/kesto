@@ -60,16 +60,17 @@ ignore = [
     { id = "RUSTSEC-2025-0052", reason = "descontinuado, y llega por la misma cadena FTP (suppaftp -> async-std) que no se configura; el aviso cubre todas las versiones y el único consumidor es un transporte que Kesto no enciende (cargo tree -i async-std)" },
 
     # `chrono 0.4.45`. Descontinuado en TODAS sus versiones («No safe upgrade is
-    # available»). chrono SÍ es dependencia directa —las fechas del producto— y
-    # sustituirlo por `time` o `jiff` es una migración propia, fuera del alcance
-    # de este change; aquí no hay versión que subir, así que el `ignore` no es
-    # una comodidad. Refutable: `cargo tree -i chrono`.
-    { id = "RUSTSEC-2026-0543", reason = "descontinuado en todas sus versiones (no safe upgrade); chrono sí es dependencia directa (fechas) y sustituirlo por time o jiff es una migración propia, fuera del alcance de este change: no hay versión que subir (cargo tree -i chrono)" },
-
-    # `chrono-tz 0.10.4`. Descontinuado, arrastrado por `tokio-cron-scheduler`
-    # (el programador de trabajos). Cae cuando caiga chrono, en la misma
-    # migración a `time`/`jiff`. Refutable: `cargo tree -i chrono-tz`.
-    { id = "RUSTSEC-2026-0555", reason = "descontinuado, arrastrado por tokio-cron-scheduler (el programador de trabajos); cae cuando caiga chrono, en la misma migración a time/jiff (cargo tree -i chrono-tz)" },
+    # available»), así que no hay versión que subir. Tras la migración #185
+    # `chrono` YA NO es dependencia directa: `chrono-tz`, `croner` y
+    # `tokio-cron-scheduler` desaparecieron del árbol y el scheduler mide fechas
+    # con `time`/`jiff`. Queda ÚNICAMENTE por
+    # `suppaftp -> opendal-service-ftp -> opendal -> rustic_backend`, un transporte
+    # FTP que Kesto nunca configura (solo S3; el `endpoint` rechaza esquemas
+    # distintos de http/https). No es cerrable por features: `rustic_backend 0.7.0`
+    # fija `services-ftp` en su dependencia `opendal` y Cargo las features son
+    # aditivas; quitar su feature `opendal` rompe `rustic_backend::opendal`.
+    # Refutable: `cargo tree -i chrono`.
+    { id = "RUSTSEC-2026-0543", reason = "chrono ya no es dependencia directa tras la migracion #185 (chrono-tz, croner y tokio-cron-scheduler desaparecieron; el scheduler usa time/jiff); queda solo por suppaftp -> opendal-service-ftp -> opendal -> rustic_backend, transporte FTP que Kesto nunca configura (solo S3, endpoint rechaza otros esquemas). No se puede quitar por features: rustic_backend 0.7.0 fija services-ftp en su dependencia opendal y las features son aditivas; desactivar su feature opendal rompe rustic_backend::opendal (cargo tree -i chrono)" },
 
     # `pin-utils 0.1.1`. Descontinuado (el repositorio se archivó), arrastrado
     # por `async-std` en la cadena FTP sin configurar. Refutable:
