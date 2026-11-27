@@ -121,11 +121,12 @@ use rustic_core::repofile::{Node, NodeType, SnapshotFile, SnapshotId};
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, Excludes, FileType, IndexedIdsStatus, KeyOptions,
     LocalDestination, LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions, LsOptions,
-    ParentOptions, ReadBackend, Repository, RepositoryBackends, RepositoryOptions, RestoreOptions,
-    SnapshotOptions, WriteBackend,
+    ParentOptions, ReadBackend, ReadSource, ReadSourceOpen, Repository, RepositoryBackends,
+    RepositoryOptions, RestoreOptions, SnapshotOptions, WriteBackend, jiff::Zoned,
 };
 use time::OffsetDateTime;
 
+use super::PREFIJO_DE_MANIFEST;
 use super::{BarrasDelMotor, Error, InformeDeRetencion, OrigenDelVolcado, Retencion};
 use crate::secret::SecretString;
 
@@ -363,6 +364,12 @@ pub struct CopiaHecha {
     /// existe: el nodo del volcado declara tamaño cero, porque su longitud no se conoce
     /// hasta que termina.
     pub bytes: u64,
+    /// Si la copia reutilizó una instantánea por manifest idéntico.
+    ///
+    /// No es decorativo: en ese caso **no se escribió** una instantánea nueva con el volcado,
+    /// así que el motor no debe olvidar nada si el productor falla —olvidaaría la copia real
+    /// anterior—, y la comprobación de entrega no puede usar `ficheros == 0` como veredicto.
+    pub sin_cambios: bool,
 }
 
 impl CopiaHecha {
@@ -377,8 +384,70 @@ impl CopiaHecha {
             // otra parte: no se inventa una cifra, se dice que no hay ninguna.
             ficheros: resumen.map_or(0, |resumen| resumen.total_files_processed),
             bytes: resumen.map_or(0, |resumen| resumen.total_bytes_processed),
+            sin_cambios: false,
         }
     }
+
+    /// Construye una copia sin cambios: el manifiesto ya estaba archivado, así que no se subió
+    /// nada. El identificador es el de la instantánea real que ya contenía ese volcado, para que
+    /// la ejecución pueda listarse y restaurarse; no el hash del manifiesto, que no identifica
+    /// ninguna snapshot.
+    pub fn sin_cambios(id: String) -> Self {
+        Self {
+            id,
+            ficheros: 0,
+            bytes: 0,
+            sin_cambios: true,
+        }
+    }
+}
+
+/// El manifiesto de una instantánea, leído de su tag y sin el prefijo.
+///
+/// Se usa al abrir el repositorio para recuperar el último manifest archivado —el repositorio
+/// se abre una vez por ejecución, así que un campo en memoria no sobreviviría a la siguiente—.
+pub(super) fn manifiesto_de(snapshot: &SnapshotFile) -> Option<&str> {
+    snapshot.tags.iter().find_map(|tag| {
+        tag.strip_prefix(PREFIJO_DE_MANIFEST)
+            .filter(|hash| !hash.is_empty())
+    })
+}
+
+/// Vacía el canal del volcado sin archivarlo.
+///
+/// En la rama «sin cambios» no se llama a `archive`, pero el productor sigue enviando trozos:
+/// el canal tiene [`CAPACIDAD_DEL_CANAL`](crate::engine::CAPACIDAD_DEL_CANAL) mensajes y un
+/// volcado grande se bloquearía en `send()` para siempre si nadie leyera. Además, el lector es
+/// el que comprueba el final declarado por el productor, así que drenar es lo que mantiene la
+/// condición de éxito: un volcado truncado sigue fallando aunque no se suba ningún byte.
+fn drenar_el_volcado(origen: &OrigenDelVolcado, etiqueta: &str) -> Result<(), Error> {
+    let fallo = |motivo: String| Error::CopiaFallida {
+        etiqueta: etiqueta.to_owned(),
+        motivo,
+    };
+
+    let mut entradas = origen.entries();
+    let entrada = entradas
+        .next()
+        .ok_or_else(|| fallo("el origen del volcado no dio ninguna entrada".to_owned()))?
+        .map_err(|error| {
+            fallo(format!(
+                "no se ha podido leer el volcado: {}",
+                error.display_log()
+            ))
+        })?;
+    let abierto = entrada
+        .open
+        .ok_or_else(|| fallo("la entrada del volcado no trae cómo abrirse".to_owned()))?;
+    let mut lector = abierto.open().map_err(|error| {
+        fallo(format!(
+            "no se ha podido abrir el volcado: {}",
+            error.display_log()
+        ))
+    })?;
+    std::io::copy(&mut lector, &mut std::io::sink())
+        .map_err(|error| fallo(format!("el volcado no se pudo drenar: {error}")))?;
+    Ok(())
 }
 
 /// Lo que el panel necesita de un snapshot.
@@ -398,6 +467,8 @@ pub struct ResumenDeSnapshot {
     pub rutas: Vec<String>,
     /// La etiqueta de la tarea, si la instantánea la lleva.
     pub etiqueta: Option<String>,
+    /// El hash del manifest de cambios, sin el prefijo del tag; `None` si la snapshot no lo lleva.
+    pub change_manifest: Option<String>,
     /// Los ficheros que la instantánea procesó.
     pub ficheros: u64,
     /// Los bytes que la instantánea procesó.
@@ -436,6 +507,7 @@ impl ResumenDeSnapshot {
             fecha,
             rutas: snapshot.paths.iter().cloned().collect(),
             etiqueta: (!snapshot.label.is_empty()).then(|| snapshot.label.clone()),
+            change_manifest: manifiesto_de(snapshot).map(ToOwned::to_owned),
             ficheros: snapshot
                 .summary
                 .as_ref()
@@ -462,6 +534,12 @@ pub struct Repositorio {
     /// los dos secretos vivos en memoria todo lo que dure la copia, y lo único que hace
     /// falta después de poner el repositorio en marcha es saber a quién culpar en un motivo.
     destino: String,
+    /// Manifest del último volcado archivado, para deduplicar llamadas consecutivas
+    /// con el mismo manifiesto.
+    last_change_manifest: Option<String>,
+    /// Identificador de la instantánea real del último volcado archivado. Es el que devuelve
+    /// una copia «sin cambios»: el manifiesto no identifica una snapshot, y este sí.
+    last_snapshot_id: Option<String>,
 }
 
 impl std::fmt::Debug for Repositorio {
@@ -572,10 +650,85 @@ impl Repositorio {
     /// coinciden, y [`Error::CopiaFallida`] si el archivado falla. **Que no devuelva error
     /// no significa que la copia esté completa**: ver el encabezado del módulo.
     pub fn archivar_volcado(
-        &self,
+        &mut self,
         copia: &Copia,
         origen: &OrigenDelVolcado,
+        change_manifest: Option<String>,
     ) -> Result<CopiaHecha, Error> {
+        // ── Dedup por manifiesto ──────────────────────────────────────────────
+        // Si el manifiesto coincide con el ya archivado, no volvemos a llamar a
+        // `repo.archive`: se crea una instantánea **nueva** que apunta al mismo árbol que la
+        // copia real. No sube datos, pero se lista y se restaura como cualquier otra.
+        if let Some(hash) = &change_manifest
+            && self.last_change_manifest.as_ref() == Some(hash)
+        {
+            let id = self
+                .last_snapshot_id
+                .clone()
+                .ok_or_else(|| Error::CopiaFallida {
+                    etiqueta: copia.etiqueta.clone(),
+                    motivo: "no se sabe qué instantánea contiene el manifiesto repetido".to_owned(),
+                })?;
+
+            // Drenar antes de tocar nada: el productor lleva su propio hilo y no puede
+            // quedarse colgado esperando a que alguien lea el canal.
+            drenar_el_volcado(origen, &copia.etiqueta)?;
+
+            // La snapshot «sin cambios» es una entrada **nueva** que apunta al mismo árbol
+            // que la copia real: se lista, se restaura, lleva su propio tag y no sube datos.
+            let fallo = |motivo: String| Error::CopiaFallida {
+                etiqueta: copia.etiqueta.clone(),
+                motivo,
+            };
+            let anteriores = self.repo.get_snapshots(&[id.as_str()]).map_err(|error| {
+                fallo(format!(
+                    "no se ha podido leer la instantánea anterior: {}",
+                    error.display_log()
+                ))
+            })?;
+            let anterior = anteriores.into_iter().next().ok_or_else(|| {
+                fallo("la instantánea anterior ya no está en el repositorio".to_owned())
+            })?;
+
+            let mut nueva = anterior.clone();
+            nueva.id = SnapshotId::default();
+            nueva.time = Zoned::now();
+            nueva.parent = Some(anterior.id);
+            nueva.parents = vec![anterior.id];
+            nueva.tags.add(format!("{PREFIJO_DE_MANIFEST}{hash}"));
+            self.repo
+                .save_snapshots(vec![nueva.clone()])
+                .map_err(|error| {
+                    fallo(format!(
+                        "no se ha podido guardar la instantánea sin cambios: {}",
+                        error.display_log()
+                    ))
+                })?;
+
+            let id_nueva = self
+                .repo
+                .get_all_snapshots()
+                .map_err(|error| {
+                    fallo(format!(
+                        "no se han podido listar las instantáneas: {}",
+                        error.display_log()
+                    ))
+                })?
+                .into_iter()
+                .find(|snapshot| {
+                    snapshot.parent == Some(anterior.id)
+                        && snapshot.time == nueva.time
+                        && snapshot.tree == nueva.tree
+                })
+                .map(|snapshot| snapshot.id.to_hex().as_str().to_owned())
+                .ok_or_else(|| {
+                    fallo("la instantánea sin cambios no aparece al listar".to_owned())
+                })?;
+            self.last_change_manifest = Some(hash.clone());
+            self.last_snapshot_id = Some(id_nueva.clone());
+            return Ok(CopiaHecha::sin_cambios(id_nueva));
+        }
+
         let rutas = copia.rutas()?;
 
         // El nombre que la instantánea publica y el del nodo que se archiva tienen que ser
@@ -589,7 +742,35 @@ impl Repositorio {
             });
         }
 
-        let instantanea = copia.instantanea()?;
+        let mut opts = SnapshotOptions::default()
+            .label(copia.etiqueta.clone())
+            .host(copia.host.clone())
+            .command(copia.comando.clone());
+        // El manifest va en un **tag**, no en la etiqueta: `label` es el identificador de la
+        // tarea y el contrato del listado no permite sustituirlo. `add_tags` acepta varias
+        // listas separadas por comas, así que puede coexistir con los tags de la biblioteca.
+        if let Some(hash) = &change_manifest {
+            let tag = format!("{PREFIJO_DE_MANIFEST}{hash}");
+            opts = opts.add_tags(&tag).map_err(|error| Error::CopiaFallida {
+                etiqueta: copia.etiqueta.clone(),
+                motivo: format!(
+                    "no se ha podido poner el tag del manifiesto en la instantánea: {}",
+                    error.display_log()
+                ),
+            })?;
+        }
+        let instantanea = opts.to_snapshot().map_err(|error| Error::CopiaFallida {
+            etiqueta: copia.etiqueta.clone(),
+            motivo: format!(
+                "no se ha podido construir la instantánea del volcado `{}`: {}",
+                copia.nombre,
+                error.display_log()
+            ),
+        })?;
+
+        // `force(true)` es la subida completa. Con manifest idéntico ya hemos vuelto arriba;
+        // con manifest distinto —o sin manifest, porque no se pudo calcular— queremos escribir
+        // el volcado entero, no dejar que la biblioteca deduplique por metadatos.
         let opciones = BackupOptions::default().parent_opts(ParentOptions::default().force(true));
 
         let guardada = self
@@ -599,6 +780,16 @@ impl Repositorio {
                 etiqueta: copia.etiqueta.clone(),
                 motivo: error.display_log(),
             })?;
+
+        // Recordar el manifiesto y la instantánea real para futuras llamadas de dedup.
+        // Con `None` no hay manifest: se limpia el estado anterior, porque una subida completa
+        // pudo haber sustituido el contenido y reutilizar el hash viejo sería deducir datos
+        // obsoletos. La instantánea escrita sí se recuerda siempre.
+        match &change_manifest {
+            Some(hash) => self.last_change_manifest = Some(hash.clone()),
+            None => self.last_change_manifest = None,
+        }
+        self.last_snapshot_id = Some(guardada.id.to_hex().as_str().to_owned());
 
         Ok(CopiaHecha::desde(&guardada))
     }
@@ -918,7 +1109,12 @@ impl Repositorio {
         destino_local: &str,
         podar: bool,
     ) -> Result<(), Error> {
-        let Repositorio { repo, destino } = self;
+        let Repositorio {
+            repo,
+            destino,
+            last_change_manifest: _,
+            last_snapshot_id: _,
+        } = self;
 
         let fallo = |motivo: String| Error::RestauracionFallida {
             destino: destino.clone(),
@@ -1052,6 +1248,8 @@ impl Repositorio {
         let Repositorio {
             repo,
             destino: nombre_del_destino,
+            last_change_manifest: _,
+            last_snapshot_id: _,
         } = self;
 
         let fallo = |motivo: String| Error::RestauracionFallida {
@@ -1574,7 +1772,38 @@ fn abrir_con(
 
     let repo = abierto.to_indexed_ids().map_err(fallo_del_destino)?;
 
-    Ok((Repositorio { repo, destino }, puesta))
+    // El repositorio se abre una vez por ejecución, así que el dedup no puede apoyarse solo
+    // en un campo de memoria: se recupera el manifiesto de la **última** instantánea, que es la
+    // que describe el contenido vigente. Si la última no lleva tag —una subida completa en la
+    // que falló la detección— no hay dedup: buscar un tag más antiguo reutilizaría contenido
+    // potencialmente obsoleto. Con un destino recién inicializado no hay nada que leer.
+    let (last_change_manifest, last_snapshot_id) = if sin_configuracion {
+        (None, None)
+    } else {
+        repo.get_all_snapshots()
+            .map_err(fallo_del_destino)?
+            .into_iter()
+            .max_by_key(|snapshot| snapshot.time.clone())
+            .and_then(|snapshot| {
+                manifiesto_de(&snapshot).map(|manifest| {
+                    (
+                        Some(manifest.to_owned()),
+                        Some(snapshot.id.to_hex().as_str().to_owned()),
+                    )
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    Ok((
+        Repositorio {
+            repo,
+            destino,
+            last_change_manifest,
+            last_snapshot_id,
+        },
+        puesta,
+    ))
 }
 
 /// El hecho que el destino devuelve cuando se le pregunta por la salud de un repositorio.
@@ -1792,9 +2021,10 @@ mod tests {
     };
 
     use super::{
-        Acceso, Copia, CopiaHecha, ESQUEMA_DE_S3, Error, LoQueContestaElDestino, PuestaEnMarcha,
-        Repositorio, TOPE_DEL_DESTINO, backends_de_s3, con_tope, opciones_de_s3,
-        poner_en_marcha_con, salud_del_repositorio, salud_del_repositorio_con,
+        Acceso, Copia, CopiaHecha, ESQUEMA_DE_S3, Error, LoQueContestaElDestino,
+        PREFIJO_DE_MANIFEST, PuestaEnMarcha, Repositorio, TOPE_DEL_DESTINO, backends_de_s3,
+        con_tope, opciones_de_s3, poner_en_marcha_con, salud_del_repositorio,
+        salud_del_repositorio_con,
     };
 
     /// El plazo de inactividad de los túneles de prueba.
@@ -1932,7 +2162,7 @@ mod tests {
     /// productor que corriera en el hilo del archivado se bloquearía en su primer `enviar`
     /// en cuanto el canal se llenara, esperando a un consumidor que estaría esperándole.
     fn archivar(
-        repositorio: &Repositorio,
+        repositorio: &mut Repositorio,
         copia: &Copia,
         contenido: &[u8],
     ) -> Result<CopiaHecha, Error> {
@@ -1950,7 +2180,7 @@ mod tests {
             productor.terminar();
         });
 
-        let hecho = repositorio.archivar_volcado(copia, &tunel.origen);
+        let hecho = repositorio.archivar_volcado(copia, &tunel.origen, None);
         emisor.join().expect("el hilo productor no puede caerse");
 
         assert!(
@@ -1968,7 +2198,7 @@ mod tests {
     /// Es el desenlace que el módulo tiene que saber reportar sin que nadie lo confunda
     /// con un éxito: el archivo existe, ocupa sitio y no se puede restaurar.
     fn archivar_truncado(
-        repositorio: &Repositorio,
+        repositorio: &mut Repositorio,
         copia: &Copia,
         trozo: &[u8],
     ) -> Result<CopiaHecha, Error> {
@@ -1983,7 +2213,7 @@ mod tests {
         // Muere sin llamar a `terminar`: es el caso de un `exec` que se cayó a medias.
         drop(productor);
 
-        let hecho = repositorio.archivar_volcado(copia, &tunel.origen);
+        let hecho = repositorio.archivar_volcado(copia, &tunel.origen, None);
 
         assert!(
             !tunel.entrega.completa(),
@@ -2232,14 +2462,15 @@ mod tests {
     #[test]
     fn archivar_volcado_guarda_el_volcado_con_sus_ficheros_y_sus_bytes() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
         let contenido =
             b"-- tienda\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (1);\n";
 
-        let hecho = archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+        let hecho =
+            archivar(&mut repositorio, &copia, contenido).expect("archivar no puede fallar");
 
         assert_eq!(
             hecho.id.len(),
@@ -2296,13 +2527,13 @@ mod tests {
         let de_ayer = b"-- de ayer\nCREATE TABLE tienda (id INT);\n";
         let de_hoy = b"-- de hoy\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (7);\n";
 
-        let (primero, _) = destino
+        let (mut primero, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
-        let ayer = archivar(&primero, &copia, de_ayer).expect("la copia de ayer se archiva");
+        let ayer = archivar(&mut primero, &copia, de_ayer).expect("la copia de ayer se archiva");
         drop(primero);
 
-        let (segundo, puesta) = destino
+        let (mut segundo, puesta) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("la segunda copia abre el repositorio que ya está");
         assert_eq!(
@@ -2310,7 +2541,7 @@ mod tests {
             PuestaEnMarcha::Conectado,
             "la segunda copia tenía que conectar con el repositorio"
         );
-        let hoy = archivar(&segundo, &copia, de_hoy).expect("la copia de hoy se archiva");
+        let hoy = archivar(&mut segundo, &copia, de_hoy).expect("la copia de hoy se archiva");
         drop(segundo);
 
         assert_eq!(
@@ -2348,12 +2579,12 @@ mod tests {
     #[test]
     fn un_volcado_que_no_se_entrega_entero_no_deja_el_volcado_dentro() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-truncado.sql", ETIQUETA);
 
-        let devuelto = archivar_truncado(&repositorio, &copia, b"-- tienda\nCREATE TABLE tie");
+        let devuelto = archivar_truncado(&mut repositorio, &copia, b"-- tienda\nCREATE TABLE tie");
         let hecho = devuelto
             .expect(
                 "medido: el archivado de la biblioteca **no** devuelve error con el volcado \
@@ -2398,12 +2629,12 @@ mod tests {
     #[test]
     fn el_snapshot_graba_el_comando_del_volcado_y_no_el_argv_de_kesto() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
 
-        let hecho = archivar(&repositorio, &copia, b"-- tienda\nSELECT 1;\n")
+        let hecho = archivar(&mut repositorio, &copia, b"-- tienda\nSELECT 1;\n")
             .expect("archivar no puede fallar");
 
         let argv: Vec<String> = std::env::args_os()
@@ -2457,12 +2688,12 @@ mod tests {
     #[test]
     fn el_snapshot_lleva_sus_rutas_su_etiqueta_y_su_host() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
 
-        let hecho = archivar(&repositorio, &copia, b"-- tienda\nSELECT 1;\n")
+        let hecho = archivar(&mut repositorio, &copia, b"-- tienda\nSELECT 1;\n")
             .expect("archivar no puede fallar");
         let guardado = snapshot_guardado(&destino.ruta, PASSPHRASE_DE_PRUEBA, &hecho.id);
 
@@ -2757,13 +2988,13 @@ mod tests {
     #[test]
     fn archivar_volcado_exige_que_el_nombre_de_la_copia_y_el_del_origen_coincidan() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
 
         // El lado que se conserva: los dos nombres iguales archivan.
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
-        let hecho = archivar(&repositorio, &copia, b"-- tienda\nSELECT 1;\n")
+        let hecho = archivar(&mut repositorio, &copia, b"-- tienda\nSELECT 1;\n")
             .expect("con los dos nombres iguales el volcado se archiva");
         assert_eq!(
             volcado_guardado(
@@ -2786,7 +3017,7 @@ mod tests {
         let emisor = std::thread::spawn(move || productor.terminar());
 
         let error = repositorio
-            .archivar_volcado(&copia, &tunel.origen)
+            .archivar_volcado(&copia, &tunel.origen, None)
             .expect_err("con los dos nombres distintos no se puede archivar");
         emisor.join().expect("el hilo productor no puede caerse");
 
@@ -2842,13 +3073,14 @@ mod tests {
     #[test]
     fn el_nodo_del_volcado_declara_tamano_cero() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
         let contenido = b"-- tienda\nCREATE TABLE tienda (id INT);\n";
 
-        let hecho = archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+        let hecho =
+            archivar(&mut repositorio, &copia, contenido).expect("archivar no puede fallar");
 
         let nodo = nodo_del_snapshot(
             &destino.ruta,
@@ -2908,12 +3140,12 @@ mod tests {
     #[test]
     fn un_volcado_de_longitud_cero_deja_un_nodo_vacio_y_cuenta_un_fichero() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-vacio.sql", ETIQUETA);
 
-        let hecho = archivar(&repositorio, &copia, b"").expect("archivar no puede fallar");
+        let hecho = archivar(&mut repositorio, &copia, b"").expect("archivar no puede fallar");
 
         assert_eq!(
             hecho.ficheros, 1,
@@ -3702,7 +3934,7 @@ mod tests {
     #[test]
     fn el_informe_de_retencion_lleva_los_bytes_que_el_plan_va_a_reclamar() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
@@ -3713,7 +3945,7 @@ mod tests {
             &b"-- de manana\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (8);\n\
               INSERT INTO tienda VALUES (9);\n"[..],
         ] {
-            archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+            archivar(&mut repositorio, &copia, contenido).expect("archivar no puede fallar");
         }
 
         let informe = repositorio
@@ -3793,13 +4025,13 @@ mod tests {
     #[test]
     fn olvidar_instantanea_retira_la_instantanea_del_repositorio() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
 
         let hecho = archivar(
-            &repositorio,
+            &mut repositorio,
             &copia,
             b"-- tienda\nCREATE TABLE tienda (id INT);\n",
         )
@@ -4201,14 +4433,15 @@ mod tests {
     #[test]
     fn volcar_a_devuelve_los_bytes_del_volcado_archivado() {
         let destino = Destino::nuevo();
-        let (repositorio, _) = destino
+        let (mut repositorio, _) = destino
             .en_marcha(PASSPHRASE_DE_PRUEBA)
             .expect("el destino se inicializa");
         let copia = copia_de("volcado-de-tienda.sql", ETIQUETA);
         let contenido =
             b"-- tienda\nCREATE TABLE tienda (id INT);\nINSERT INTO tienda VALUES (1);\n";
 
-        let hecho = archivar(&repositorio, &copia, contenido).expect("archivar no puede fallar");
+        let hecho =
+            archivar(&mut repositorio, &copia, contenido).expect("archivar no puede fallar");
         drop(repositorio);
 
         let (otro, _) = destino
@@ -4582,5 +4815,453 @@ mod tests {
             !motivo.contains(CLAVE_SECRETA_DE_PRUEBA) && !motivo.contains(PASSPHRASE_DE_PRUEBA),
             "el motivo del tope publica un secreto: {motivo}"
         );
+    }
+
+    // ── T-1.1 a T-1.3: tests de contrato del dedup de volcados ─────────────────
+
+    /// T-1.1: Mismo manifest → archivar_volcado no sube bytes en la segunda copia.
+    #[test]
+    fn t_1_1_mismo_manifest_no_sube_bytes() {
+        let destino = Destino::nuevo();
+        let (mut repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let nombre = "volcado-dedup.sql";
+        let etiqueta = "tarea-dedup";
+        let contenido = b"-- dump inicial\nCREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\n";
+
+        let copia = copia_de(nombre, etiqueta);
+
+        // Primera ejecución: sube el volcado completo.
+        let tunel1 = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor1 = {
+            let productor = tunel1.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.to_vec())
+                    .expect("el archivado sigue leyendo, así que el envío no puede fallar");
+                productor.terminar();
+            })
+        };
+        let primera = repositorio
+            .archivar_volcado(&copia, &tunel1.origen, Some("aaaa".repeat(64)))
+            .expect("primera ejecución archiva");
+        emisor1.join().expect("el hilo productor no puede caerse");
+        assert_eq!(
+            primera.ficheros, 1,
+            "primera ejecución debe procesar 1 fichero"
+        );
+        assert_eq!(
+            primera.bytes,
+            contenido.len() as u64,
+            "primera ejecución debe subir todos los bytes"
+        );
+
+        // Segunda ejecución con MISMO manifest: deduplicación → no sube bytes.
+        let tunel2 = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor2 = {
+            let productor = tunel2.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.to_vec())
+                    .expect("el archivado sigue leyendo, así que el envío no puede fallar");
+                productor.terminar();
+            })
+        };
+        let segunda = repositorio
+            .archivar_volcado(&copia, &tunel2.origen, Some("aaaa".repeat(64)))
+            .expect("segunda ejecución archiva");
+        emisor2.join().expect("el hilo productor no puede caerse");
+        assert_eq!(
+            segunda.ficheros, 0,
+            "con mismo manifest no debe subir ficheros (dedup)"
+        );
+        assert_eq!(segunda.bytes, 0, "con mismo manifest no debe subir bytes");
+        assert!(
+            segunda.sin_cambios,
+            "la copia debe declarar que reutilizó la instantánea anterior"
+        );
+
+        // La snapshot «sin cambios» es nueva, se lista y lleva su propio tag; apunta al mismo
+        // árbol que la copia real, pero no ha subido ni un byte de datos.
+        let instantaneas = repositorio
+            .repo
+            .get_all_snapshots()
+            .expect("las instantáneas se pueden listar");
+        assert_eq!(
+            instantaneas.len(),
+            2,
+            "dedup crea una entrada nueva que apunta al árbol existente"
+        );
+        let nueva = repositorio
+            .repo
+            .get_snapshots(&[segunda.id.as_str()])
+            .expect("la instantánea sin cambios se lee");
+        let nueva = nueva.first().expect("la snapshot sin cambios existe");
+        let esperado = format!("{PREFIJO_DE_MANIFEST}{}", "a".repeat(64));
+        assert!(
+            nueva.tags.iter().any(|tag| tag.contains(&esperado)),
+            "la snapshot sin cambios lleva el tag del manifest: {:?}",
+            nueva.tags
+        );
+        drop(repositorio);
+    }
+
+    /// T-1.2: Manifest distinto → archivar_volcado sube el volcado completo y
+    /// la snapshot queda etiquetada con kesto.change_manifest=<nuevo-hash>.
+    #[test]
+    fn t_1_2_manifest_distinto_sube_completo_y_etiqueta() {
+        let destino = Destino::nuevo();
+        let (mut repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let nombre = "volcado-dedup.sql";
+        let etiqueta = "tarea-dedup";
+        let copia = copia_de(nombre, etiqueta);
+
+        // Primer volcado con manifest M1.
+        let contenido_a = b"-- dump A\nCREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\n";
+        let m1 = "1111111111111111111111111111111111111111111111111111111111111111";
+        let tunel1 = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor1 = {
+            let productor = tunel1.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido_a.to_vec())
+                    .expect("el archivado sigue leyendo, así que el envío no puede fallar");
+                productor.terminar();
+            })
+        };
+        let _ = repositorio
+            .archivar_volcado(&copia, &tunel1.origen, Some(m1.to_owned()))
+            .expect("primer volcado archiva");
+        emisor1.join().expect("el hilo productor no puede caerse");
+
+        // Segundo volcado con contenido distinto y manifest M2.
+        let contenido_b = b"-- dump B\nCREATE TABLE t (id INT);\nINSERT INTO t VALUES (2);\n";
+        let m2 = "2222222222222222222222222222222222222222222222222222222222222222";
+        let tunel2 = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor2 = {
+            let productor = tunel2.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido_b.to_vec())
+                    .expect("el archivado sigue leyendo, así que el envío no puede fallar");
+                productor.terminar();
+            })
+        };
+        let segunda = repositorio
+            .archivar_volcado(&copia, &tunel2.origen, Some(m2.to_owned()))
+            .expect("segundo volcado archiva");
+        emisor2.join().expect("el hilo productor no puede caerse");
+
+        // Con manifest distinto debe subir el volcado completo.
+        assert_eq!(
+            segunda.ficheros, 1,
+            "con manifest distinto debe subir 1 fichero"
+        );
+        assert_eq!(
+            segunda.bytes,
+            contenido_b.len() as u64,
+            "con manifest distinto debe subir todos los bytes"
+        );
+
+        // Verificar que la snapshot quedó etiquetada con el nuevo hash, en un tag y sin
+        // tocar la etiqueta de la tarea.
+        let instantaneas = repositorio
+            .repo
+            .get_all_snapshots()
+            .expect("las instantáneas se pueden listar");
+        let ultima = instantaneas
+            .iter()
+            .max_by_key(|s| s.time.clone())
+            .expect("debe haber al menos una instantánea");
+        assert_eq!(
+            ultima.label, etiqueta,
+            "la etiqueta sigue siendo la identificadora de la tarea, no el manifiesto"
+        );
+        let esperado = format!("{PREFIJO_DE_MANIFEST}{m2}");
+        assert!(
+            ultima.tags.iter().any(|tag| tag.as_str() == esperado),
+            "la instantánea debe llevar el tag del nuevo manifiesto, tags={:?}",
+            ultima.tags
+        );
+        drop(repositorio);
+    }
+
+    /// T-1.3: Restaurar sin cambios devuelve el último snapshot real.
+    #[test]
+    fn t_1_3_restaurar_sin_cambios_devuelve_ultimo_real() {
+        let destino = Destino::nuevo();
+        let (mut repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let nombre = "volcado-dedup.sql";
+        let etiqueta = "tarea-dedup";
+        let contenido = b"-- dump inicial\nCREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\n";
+
+        let copia = copia_de(nombre, etiqueta);
+
+        // Primera ejecución con manifest M1.
+        let m1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tunel1 = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor1 = {
+            let productor = tunel1.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.to_vec())
+                    .expect("el archivado sigue leyendo, así que el envío no puede fallar");
+                productor.terminar();
+            })
+        };
+        let primera = repositorio
+            .archivar_volcado(&copia, &tunel1.origen, Some(m1.to_owned()))
+            .expect("primera ejecución archiva");
+        emisor1.join().expect("el hilo productor no puede caerse");
+
+        // Segunda ejecución con MISMO manifest: dedup → no sube nada.
+        let tunel2 = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor2 = {
+            let productor = tunel2.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.to_vec())
+                    .expect("el archivado sigue leyendo, así que el envío no puede fallar");
+                productor.terminar();
+            })
+        };
+        let segunda = repositorio
+            .archivar_volcado(&copia, &tunel2.origen, Some(m1.to_owned()))
+            .expect("segunda ejecución archiva");
+        emisor2.join().expect("el hilo productor no puede caerse");
+        assert_eq!(
+            segunda.ficheros, 0,
+            "sin cambios no debe subir ficheros (dedup)"
+        );
+        assert_eq!(segunda.bytes, 0, "sin cambios no debe subir bytes");
+
+        // La snapshot «sin cambios» es una entrada nueva que apunta al mismo árbol que la
+        // copia real: se lista, se restaura, y no ha subido datos.
+        let instantaneas = repositorio
+            .repo
+            .get_all_snapshots()
+            .expect("las instantáneas se pueden listar");
+        let ultima = instantaneas
+            .iter()
+            .max_by_key(|s| s.time.clone())
+            .expect("debe haber al menos una instantánea");
+        assert_eq!(
+            ultima.id.to_hex().to_string(),
+            segunda.id,
+            "la última instantánea es la nueva entrada sin cambios"
+        );
+        assert_ne!(
+            segunda.id, primera.id,
+            "la copia sin cambios no reutiliza el identificador de la copia real"
+        );
+        assert_eq!(
+            volcado_guardado(&destino.ruta, PASSPHRASE_DE_PRUEBA, &segunda.id, nombre),
+            Some(contenido.to_vec()),
+            "restaurar la copia sin cambios debe devolver el contenido del último volcado real"
+        );
+        drop(repositorio);
+    }
+
+    /// Escenario del §engine: si no se puede calcular el manifest, la copia degrada a subida
+    /// completa —sin dedup— y la snapshot no lleva tag de manifiesto.
+    #[test]
+    fn sin_manifiesto_sube_completo_y_no_poner_el_tag() {
+        let destino = Destino::nuevo();
+        let (mut repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el destino se inicializa");
+        let nombre = "volcado-sin-manifiesto.sql";
+        let etiqueta = "tarea-sin-manifiesto";
+        let copia = copia_de(nombre, etiqueta);
+        let contenido = b"-- dump sin manifiesto\nCREATE TABLE t (id INT);\n";
+
+        for _ in 0..2 {
+            let tunel = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+            let emisor = {
+                let productor = tunel.productor;
+                std::thread::spawn(move || {
+                    productor
+                        .enviar(contenido.to_vec())
+                        .expect("el archivado sigue leyendo");
+                    productor.terminar();
+                })
+            };
+            let hecho = repositorio
+                .archivar_volcado(&copia, &tunel.origen, None)
+                .expect("sin manifest la copia no aborta");
+            emisor.join().expect("el hilo productor no puede caerse");
+            assert_eq!(
+                hecho.ficheros, 1,
+                "sin manifest tiene que forzar la subida completa"
+            );
+            assert_eq!(hecho.bytes, contenido.len() as u64);
+        }
+
+        let instantaneas = repositorio
+            .repo
+            .get_all_snapshots()
+            .expect("las instantáneas se pueden listar");
+        let ultima = instantaneas
+            .iter()
+            .max_by_key(|s| s.time.clone())
+            .expect("debe haber al menos una instantánea");
+        assert_eq!(
+            ultima.label, etiqueta,
+            "la etiqueta sigue siendo la de la tarea"
+        );
+        assert!(
+            ultima
+                .tags
+                .iter()
+                .all(|tag| !tag.starts_with(PREFIJO_DE_MANIFEST)),
+            "sin manifest no se inventa un tag: {:?}",
+            ultima.tags
+        );
+        drop(repositorio);
+    }
+
+    /// Dedup entre dos **ejecuciones de verdad**: cada una abre el repositorio desde cero,
+    /// como hace el motor, así que el manifiesto tiene que recuperarse de los tags y no de un
+    /// campo que muere con el `Repositorio`.
+    #[test]
+    fn el_manifiesto_sobrevive_a_reabrir_el_repositorio() {
+        let destino = Destino::nuevo();
+        let nombre = "volcado-entre-ejecuciones.sql";
+        let etiqueta = "tarea-entre-ejecuciones";
+        let contenido = b"-- volcado entre ejecuciones\nCREATE TABLE t (id INT);\n";
+        let hash = "b".repeat(64);
+        let copia = copia_de(nombre, etiqueta);
+
+        let (mut primera_ejecucion, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio se inicializa");
+        let tunel = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor = {
+            let productor = tunel.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.to_vec())
+                    .expect("el archivado sigue leyendo");
+                productor.terminar();
+            })
+        };
+        let primera = primera_ejecucion
+            .archivar_volcado(&copia, &tunel.origen, Some(hash.clone()))
+            .expect("la primera ejecución archiva");
+        emisor.join().expect("el productor no puede caerse");
+        drop(primera_ejecucion);
+
+        // El motor abre un repositorio nuevo en cada ejecución: ni el objeto ni sus campos
+        // sobreviven. Si el dedup dependiera de ellos, aquí subiría el volcado otra vez.
+        let (mut segunda_ejecucion, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio existente se abre");
+        let tunel = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let emisor = {
+            let productor = tunel.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.to_vec())
+                    .expect("el archivado sigue leyendo");
+                productor.terminar();
+            })
+        };
+        let segunda = segunda_ejecucion
+            .archivar_volcado(&copia, &tunel.origen, Some(hash.clone()))
+            .expect("la segunda ejecución archiva");
+        emisor.join().expect("el productor no puede caerse");
+
+        assert!(segunda.sin_cambios, "el manifest leído del tag deduplica");
+        assert_eq!(segunda.ficheros, 0, "no se sube ningún fichero");
+        assert_eq!(segunda.bytes, 0, "no se sube ningún byte");
+        assert_ne!(segunda.id, primera.id, "la copia sin cambios es nueva");
+        assert_eq!(
+            volcado_guardado(&destino.ruta, PASSPHRASE_DE_PRUEBA, &segunda.id, nombre),
+            Some(contenido.to_vec()),
+            "la nueva instantánea restaura el contenido del volcado real"
+        );
+        drop(segunda_ejecucion);
+    }
+
+    /// Un volcado grande en la rama «sin cambios» tiene que drenarse por completo.
+    ///
+    /// El canal tiene 128 huecos: con más trozos, si el archivado no leyera el origen, el
+    /// productor se bloquearía en `send()` y `join()` no terminaría nunca. El plazo de este
+    /// test acota el desenlace para que un bloqueo sea un fallo y no un `cargo test` colgado.
+    #[test]
+    fn un_volcado_de_mas_de_un_mebibyte_no_bloquea_la_rama_sin_cambios() {
+        const TAMANO_DE_TROZO: usize = 8192;
+        const NUMERO_DE_TROZOS: usize = 160;
+
+        let destino = Destino::nuevo();
+        let nombre = "volcado-grande.sql";
+        let copia = copia_de(nombre, "tarea-volcado-grande");
+        let contenido: Vec<u8> = (0..NUMERO_DE_TROZOS)
+            .flat_map(|indice| std::iter::repeat_n((indice % 251) as u8, TAMANO_DE_TROZO))
+            .collect();
+        assert!(contenido.len() > 1024 * 1024);
+        const { assert!(NUMERO_DE_TROZOS > 128) };
+        let hash = "c".repeat(64);
+
+        let (mut repositorio, _) = destino
+            .en_marcha(PASSPHRASE_DE_PRUEBA)
+            .expect("el repositorio se inicializa");
+
+        // La primera copia va entera, pero en un solo trozo: lo que se mide es el drenaje de
+        // la segunda, no el coste de archivar 160 mensajes dos veces.
+        let tunel = tunel_del_volcado(nombre, 4, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let primer_contenido = contenido.clone();
+        let emisor = {
+            let productor = tunel.productor;
+            std::thread::spawn(move || {
+                productor
+                    .enviar(primer_contenido)
+                    .expect("el archivado sigue leyendo");
+                productor.terminar();
+            })
+        };
+        repositorio
+            .archivar_volcado(&copia, &tunel.origen, Some(hash.clone()))
+            .expect("la primera copia archiva");
+        emisor.join().expect("el productor no puede caerse");
+
+        // Segunda copia con el mismo manifiesto y con el canal de producción: cada trozo
+        // ocupa un hueco y nadie los consumirá fuera de la rama de dedup.
+        let tunel = tunel_del_volcado(nombre, 128, PLAZO_DE_PRUEBA).expect("túnel válido");
+        let (fin_del_productor, aviso) = std::sync::mpsc::channel();
+        let trozos = contenido.clone();
+        let emisor = {
+            let productor = tunel.productor;
+            std::thread::spawn(move || {
+                for trozo in trozos.chunks(TAMANO_DE_TROZO) {
+                    productor
+                        .enviar(trozo.to_vec())
+                        .expect("la rama sin cambios tiene que drenar el canal");
+                }
+                productor.terminar();
+                let _ = fin_del_productor.send(());
+            })
+        };
+        let segunda = repositorio
+            .archivar_volcado(&copia, &tunel.origen, Some(hash))
+            .expect("la segunda copia archiva");
+        aviso
+            .recv_timeout(Duration::from_secs(20))
+            .expect("el productor se ha quedado bloqueado: la rama sin cambios no drenó el canal");
+        emisor.join().expect("el productor no puede caerse");
+
+        assert!(segunda.sin_cambios, "el manifiesto repetido deduplica");
+        assert_eq!(segunda.bytes, 0, "no se sube ningún byte");
+        assert_eq!(
+            volcado_guardado(&destino.ruta, PASSPHRASE_DE_PRUEBA, &segunda.id, nombre),
+            Some(contenido),
+            "la copia sin cambios restaura el volcado grande completo"
+        );
+        drop(repositorio);
     }
 }

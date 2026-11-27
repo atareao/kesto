@@ -57,8 +57,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::extraccion::{
-    CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, Objetivo, Resultado, Ruta,
-    motivo_para_guardar, recortar, ruta, volcar,
+    CAPACIDAD_DEL_CANAL, ChangeDetector, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, Objetivo,
+    PostgresChangeDetector, Resultado, Ruta, motivo_para_guardar, recortar, ruta, volcar,
 };
 use super::hub::{EventoDeEjecucion, Hub};
 use super::{Ajustes, Contexto};
@@ -448,7 +448,7 @@ fn correr(
 
     let barras = en_vivo.barras_de_esta_ejecucion();
 
-    let (copia_del_repositorio, puesta_en_marcha) = match (ajustes.abridor)(&acceso, barras) {
+    let (mut copia_del_repositorio, puesta_en_marcha) = match (ajustes.abridor)(&acceso, barras) {
         Ok(abierto) => abierto,
         Err(causa) => {
             return Cierre::fallida(motivo_de_la_biblioteca(&causa.to_string(), &acceso));
@@ -485,7 +485,7 @@ fn correr(
             orden,
             db_path,
         } => copiar_el_volcado(
-            &copia_del_repositorio,
+            &mut copia_del_repositorio,
             &acceso,
             &contenedor,
             orden,
@@ -494,6 +494,8 @@ fn correr(
             &etiqueta,
             en_vivo,
             ajustes,
+            detector_de_produccion,
+            lanzar_el_productor,
         ),
     };
 
@@ -628,8 +630,8 @@ fn copiar_el_directorio(
 /// la firma que se quería evitar. **Comprobado**: quitando el `allow`, clippy avisa «this function
 /// has too many arguments (8/7)», así que no es un atributo olvidado.
 #[allow(clippy::too_many_arguments)]
-fn copiar_el_volcado(
-    repositorio: &Repositorio,
+fn copiar_el_volcado<D, L>(
+    repositorio: &mut Repositorio,
     acceso: &Acceso,
     contenedor: &str,
     orden: Orden,
@@ -638,7 +640,20 @@ fn copiar_el_volcado(
     etiqueta: &str,
     en_vivo: &Arc<EnVivo>,
     ajustes: &Ajustes,
-) -> Result<CopiaHecha, Cierre> {
+    detector: D,
+    lanzador: L,
+) -> Result<CopiaHecha, Cierre>
+where
+    D: Fn(&Orden, &[(String, String)]) -> Option<Box<dyn ChangeDetector>>,
+    L: FnOnce(
+        String,
+        Duration,
+        String,
+        Orden,
+        Option<String>,
+        ProductorDelVolcado,
+    ) -> Result<std::thread::JoinHandle<VueltaDelProductor>, String>,
+{
     // El túnel, antes de archivar nada: es lo que da el avance del productor, que el motor publica
     // en vivo.
     let tunel = tunel_del_volcado(nombre.to_owned(), CAPACIDAD_DEL_CANAL, INACTIVIDAD_MAXIMA)
@@ -667,6 +682,29 @@ fn copiar_el_volcado(
         comando: orden.cmd.join(" "),
     };
 
+    // El manifest se calcula **antes** de archivar y antes de tocar la acción de archivado:
+    // es lo que decide si los bytes del volcado se suben o la copia reutiliza la instantánea
+    // anterior. Para un target que no sea `pg_dump` no hay detector y el archivado hace su
+    // subida completa de siempre; si el detector falla, tampoco aborta la copia.
+    // El host y el puerto se leen del proceso: la base vive en la red del contenedor y el
+    // detector no puede adivinarlos. Sin ellos el comando hablaría con el PostgreSQL local y
+    // degradaría siempre; el operador los pone en el entorno del motor con los nombres de libpq.
+    let conexion = ["PGHOST", "PGPORT"]
+        .iter()
+        .filter_map(|clave| {
+            std::env::var(clave)
+                .ok()
+                .map(|valor| ((*clave).to_owned(), valor))
+        })
+        .collect::<Vec<_>>();
+    let manifiesto = detector(&orden, &conexion).and_then(|detector| detector.change_manifest());
+    if manifiesto.is_none() && orden.cmd.first().map(String::as_str) == Some("pg_dump") {
+        tracing::warn!(
+            %nombre,
+            "no se ha podido calcular el manifest: se archiva con subida completa"
+        );
+    }
+
     en_vivo.accion(ACCION_EXTRAYENDO_EL_VOLCADO);
     en_vivo.publicar();
 
@@ -676,7 +714,7 @@ fn copiar_el_volcado(
     // trabajo, porque con uno solo cualquier otra tarea de ese runtime —empezando por el plazo que
     // el transporte pone alrededor de cada trozo— se queda sin poll mientras el cierre bloquea, y
     // entonces el plazo no puede vencer.
-    let hilo_del_productor = lanzar_el_productor(
+    let hilo_del_productor = lanzador(
         ajustes.socket_del_motor.clone(),
         ajustes.espera_del_motor,
         contenedor.to_owned(),
@@ -689,7 +727,7 @@ fn copiar_el_volcado(
     en_vivo.accion(ACCION_ARCHIVANDO);
     en_vivo.publicar();
 
-    let archivado = repositorio.archivar_volcado(&copia, &origen);
+    let archivado = repositorio.archivar_volcado(&copia, &origen, manifiesto);
 
     // La unión **antes** de decidir nada: la entrega completa la marca el lector dentro del
     // archivado, y el código de salida solo lo tiene el hilo del productor.
@@ -704,6 +742,13 @@ fn copiar_el_volcado(
             )));
         }
     };
+
+    // En la rama «sin cambios» se crea una instantánea nueva que apunta al mismo árbol, así
+    // que no hay ficheros nuevos que contar —pero el volcado se ha leído y entregado igual—.
+    // Su identificador es propio, distinto del de la copia real, así que si el productor falla
+    // se puede olvidar sin tocar el historial anterior.
+    let sin_cambios = hecho.sin_cambios;
+    let ficheros_entregados = if sin_cambios { 1 } else { hecho.ficheros };
 
     let resultado = match vuelta {
         Ok(Ok(resultado)) => resultado,
@@ -736,13 +781,13 @@ fn copiar_el_volcado(
     // se mira—: el archivado silencia el error del lector, sigue y guarda la instantánea sin el
     // volcado dentro, y en el peor caso medido sin una sola línea de aviso. Heredar ese `Ok` da
     // por buena una copia que existe, ocupa sitio y no se puede restaurar.
-    match el_volcado_se_entrego(entrega.completa(), resultado.codigo, hecho.ficheros) {
+    match el_volcado_se_entrego(entrega.completa(), resultado.codigo, ficheros_entregados) {
         Ok(()) => Ok(hecho),
         // La copia no se da por buena y su instantánea ya está escrita: se olvida de mejor
         // esfuerzo y el cierre conserva el motivo del volcado.
         Err(fallo) => Err(descartar_copia_fallida(
             || olvidar_la_instantanea(repositorio, &hecho.id),
-            motivo_del_fallo(fallo, &resultado, hecho.ficheros),
+            motivo_del_fallo(fallo, &resultado, ficheros_entregados),
         )),
     }
 }
@@ -813,6 +858,15 @@ fn olvidar_la_instantanea(repositorio: &Repositorio, id: &str) -> Result<(), Str
 /// del puente—, y un `block_on` sobre el runtime que atiende las peticiones HTTP detendría el hilo
 /// que despacha y, con él, el resto de la aplicación. Así que el hilo construye el suyo, lo usa
 /// para todo el volcado y muere con él.
+/// El detector de producción: el PostgreSQL de la orden, con el entorno de libpq del proceso.
+fn detector_de_produccion(
+    orden: &Orden,
+    conexion: &[(String, String)],
+) -> Option<Box<dyn ChangeDetector>> {
+    PostgresChangeDetector::desde_la_orden(orden, conexion)
+        .map(|detector| Box::new(detector) as Box<dyn ChangeDetector>)
+}
+
 fn lanzar_el_productor(
     socket: String,
     espera: Duration,
@@ -1186,6 +1240,27 @@ impl EnVivo {
         }
     }
 
+    /// Un estado en vivo sin motor ni base: para la prueba del cable del detector.
+    ///
+    /// El hub no tiene suscriptores y los identificadores son nulos; lo único que se mide es
+    /// qué manifest llega al archivado, no qué eventos se publican.
+    #[cfg(test)]
+    fn de_prueba() -> Arc<Self> {
+        Arc::new(Self {
+            hub: Hub::nuevo(),
+            execution_id: Uuid::nil(),
+            job_id: Uuid::nil(),
+            volcado: Mutex::new(None),
+            accion: Mutex::new(ACCION_ENCOLADA),
+            avance: Mutex::new(Avance {
+                total: None,
+                subidos: 0,
+                ultimo_aviso: Instant::now(),
+                bytes_del_ultimo_aviso: 0,
+            }),
+        })
+    }
+
     /// Las barras del motor que informan a **esta** ejecución.
     ///
     /// El cierre captura el `Arc` del estado en vivo, que es lo que permite que el gancho —que la
@@ -1326,12 +1401,81 @@ fn candado<T>(candado: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::time::Duration;
 
     use super::{
-        FalloDelVolcado, descartar_copia_fallida, el_volcado_se_entrego, nombre_del_volcado,
+        Ajustes, ChangeDetector, EnVivo, FalloDelVolcado, Orden, ProductorDelVolcado, Resultado,
+        VueltaDelProductor, copiar_el_volcado, descartar_copia_fallida, el_volcado_se_entrego,
+        nombre_del_volcado,
     };
 
     use crate::db::entities::Estado;
+    use crate::rustic::{PREFIJO_DE_MANIFEST, poner_en_marcha_con};
+    use crate::test_support::{
+        PASSPHRASE_DE_PRUEBA, abrir_local, acceso_local, backends_locales, barras_mudas,
+        directorio_de_prueba, volcado_guardado,
+    };
+
+    /// Un detector inyectado: devuelve exactamente el manifest que la prueba quiere, sin
+    /// arrancar ningún `pg_dump`. Es lo que permite medir el cable motor → detector → archivado.
+    type Detector = dyn Fn(&Orden, &[(String, String)]) -> Option<Box<dyn ChangeDetector>>;
+
+    struct DetectorFalso {
+        manifiesto: Option<String>,
+    }
+
+    impl ChangeDetector for DetectorFalso {
+        fn change_manifest(&self) -> Option<String> {
+            self.manifiesto.clone()
+        }
+    }
+
+    fn detector_con(manifiesto: Option<String>) -> Box<Detector> {
+        Box::new(move |_orden, _conexion| {
+            manifiesto.clone().map(|hash| {
+                Box::new(DetectorFalso {
+                    manifiesto: Some(hash),
+                }) as Box<dyn ChangeDetector>
+            })
+        })
+    }
+
+    /// Un productor inyectado: entrega el contenido por el mismo canal que el `exec`, con lo
+    /// que el archivado y la comprobación de entrega siguen siendo los de producción.
+    fn lanzador_con(
+        contenido: Vec<u8>,
+    ) -> impl FnOnce(
+        String,
+        Duration,
+        String,
+        Orden,
+        Option<String>,
+        ProductorDelVolcado,
+    ) -> Result<std::thread::JoinHandle<VueltaDelProductor>, String> {
+        move |_socket, _espera, _contenedor, _orden, _db_path, productor| {
+            Ok(std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.clone())
+                    .expect("el archivado o el drenaje siguen leyendo");
+                productor.terminar();
+                Ok(Resultado {
+                    codigo: 0,
+                    bytes_leidos: contenido.len() as u64,
+                    motivo_del_contenedor: String::new(),
+                })
+            }))
+        }
+    }
+
+    fn orden_de_prueba() -> Orden {
+        Orden {
+            cmd: ["pg_dump", "-U", "usuario", "-d", "base"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        }
+    }
 
     /// **La condición de éxito de un volcado son las tres cosas, y ninguna es el `Ok` del
     /// archivado.**
@@ -1500,6 +1644,127 @@ mod tests {
             cierre.motivo.as_deref(),
             Some("el proceso de extracción salió con 3"),
             "el motivo del cierre no es el original del volcado"
+        );
+    }
+
+    /// Cable completo `copiar_el_volcado` → detector inyectado → `archivar_volcado`.
+    ///
+    /// Tres ejecuciones contra un repositorio local: la primera sube, la segunda recibe el
+    /// mismo manifest y crea una instantánea nueva sobre el mismo árbol, y la tercera tiene un
+    /// detector que falla y **no aborta** la copia. El productor y el detector se inyectan; el
+    /// túnel, el archivado y la condición de entrega son los de producción.
+    #[test]
+    fn el_manifiesto_del_detector_llega_al_archivado_y_su_fallo_no_aborta_la_copia() {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio");
+        let acceso = acceso_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let (mut repositorio, _) =
+            poner_en_marcha_con(&acceso, backends_locales(&ruta), barras_mudas())
+                .expect("el repositorio local se inicializa");
+        let ajustes = Ajustes::nuevos("socket-que-no-existe");
+        let en_vivo = EnVivo::de_prueba();
+        let nombre = "volcado-cableado.sql";
+        let contenido = b"-- volcado cableado\nCREATE TABLE t (id INT);\n".to_vec();
+        let hash = "d".repeat(64);
+
+        let primera = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba(),
+            None,
+            nombre,
+            "tarea-cableada",
+            &en_vivo,
+            &ajustes,
+            detector_con(Some(hash.clone())),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| panic!("la primera copia se archiva: {:?}", cierre.motivo));
+        assert!(!primera.sin_cambios && primera.ficheros == 1);
+
+        let segunda = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba(),
+            None,
+            nombre,
+            "tarea-cableada",
+            &en_vivo,
+            &ajustes,
+            detector_con(Some(hash.clone())),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| panic!("la segunda copia se archiva: {:?}", cierre.motivo));
+        assert!(segunda.sin_cambios, "el detector llegó al archivado");
+        assert_eq!(segunda.ficheros, 0, "la dedup no sube ficheros");
+        assert_ne!(
+            segunda.id, primera.id,
+            "la dedup crea una instantánea nueva"
+        );
+        assert_eq!(
+            volcado_guardado(&ruta, PASSPHRASE_DE_PRUEBA, &segunda.id, nombre),
+            Some(contenido.clone()),
+            "la nueva instantánea apunta al mismo árbol y se restaura"
+        );
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let nueva = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == segunda.id)
+            .expect("la instantánea sin cambios existe");
+        assert!(
+            nueva
+                .tags
+                .iter()
+                .any(|tag| tag.contains(&format!("{PREFIJO_DE_MANIFEST}{hash}"))),
+            "la instantánea nueva lleva el tag del manifest: {:?}",
+            nueva.tags
+        );
+
+        // Un detector que no calcula manifest degrada a subida completa: la copia no se aborta
+        // y la snapshot no lleva tag de manifiesto.
+        let tercera = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba(),
+            None,
+            nombre,
+            "tarea-cableada",
+            &en_vivo,
+            &ajustes,
+            detector_con(None),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| {
+            panic!(
+                "un detector fallido no aborta el backup: {:?}",
+                cierre.motivo
+            )
+        });
+        assert!(
+            !tercera.sin_cambios && tercera.ficheros == 1,
+            "sin manifest se fuerza la subida completa"
+        );
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let ultima = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == tercera.id)
+            .expect("la instantánea de la tercera copia existe");
+        assert!(
+            ultima
+                .tags
+                .iter()
+                .all(|tag| !tag.starts_with(PREFIJO_DE_MANIFEST)),
+            "sin manifest no se inventa un tag: {:?}",
+            ultima.tags
         );
     }
 }

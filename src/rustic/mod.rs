@@ -46,6 +46,13 @@ pub use repositorio::{
 };
 pub use retencion::{InformeDeRetencion, Retencion};
 
+/// El prefijo del tag que guarda el manifest de cambios de una instantánea.
+///
+/// Va en `SnapshotFile.tags` y **no** en `label`: la etiqueta sigue siendo el identificador de
+/// la tarea, que es lo que publica `GET /api/v1/snapshots`. Las instantáneas anteriores a esta
+/// feature —y las escritas por otras herramientas— no llevan el tag, y eso es `null` en el cable.
+pub const PREFIJO_DE_MANIFEST: &str = "kesto.change_manifest=";
+
 // El tope del destino, que el motor necesita para acotar el **listado**: la apertura lo lleva
 // dentro de `poner_en_marcha`, pero el listado no puede —el repositorio de la biblioteca no es
 // `Clone` y solo se puede mover desde quien lo posee, que es el motor—. Se reexporta para que la

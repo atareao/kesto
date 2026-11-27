@@ -24,6 +24,13 @@ services:
       RUST_LOG: info,kesto=debug
       DATABASE_URL: sqlite:///app/data/kesto.db
       BIND_ADDRESS: 0.0.0.0:8080
+      # Detector de cambios PostgreSQL (dedup): `pg_dump`/`psql` corren en este
+      # contenedor, no dentro del target, y necesitan llegar a la base por la red
+      # del compose. Nombres estándar de libpq, sin prefijo; sin valor el detector
+      # intenta el socket local y degrada a subida completa. El valor lo da el
+      # despliegue (por ejemplo, el nombre del servicio de la base).
+      PGHOST: ${PGHOST:-}
+      PGPORT: ${PGPORT:-}
       # Obligatoria siempre. Sin ella el arranque falla (src/config.rs).
       KESTO_MASTER_KEY: ${KESTO_MASTER_KEY:?falta KESTO_MASTER_KEY}
       # La plantilla de producción EXIGE proveedor de identidad: sin las

@@ -53,8 +53,11 @@
 //! de modo que no depende de la receta con la que se arranque—. Ver el `# Seguridad` de
 //! [`Orden`] y el de [`Cliente::ejecutar`].
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -135,6 +138,396 @@ const BYTES_POR_CARACTER: usize = 4;
 /// los mil caracteres que se conservan. Decisión escrita aquí para que nadie «arregle» el
 /// tope recortando por dentro.
 const TOPE_DEL_CRUDO: usize = LIMITE_DEL_MOTIVO * BYTES_POR_CARACTER + BYTES_POR_CARACTER;
+
+/// Contrato del *manifest de cambios* de una fuente.
+///
+/// El manifest es un hash SHA-256 estable de la estructura y de los datos de la base: dos
+/// lecturas del mismo contenido, aunque estén en instantes distintos, tienen que dar el mismo
+/// valor. El motor lo usa para decidir si un volcado nuevo cambió de verdad y puede archivarse
+/// sin volver a subir bytes. Un fallo al calcularlo **no es un error de la copia**: el trait
+/// devuelve `None` y el archivado degrada a una subida completa.
+pub trait ChangeDetector {
+    /// Devuelve el manifest, o `None` si no se ha podido calcular.
+    fn change_manifest(&self) -> Option<String>;
+}
+
+/// La salida de un comando de detección, acumulada **en memoria**.
+///
+/// No hay ficheros temporales: el esquema y cada checksum viajan en `stdout` y se hashesan
+/// directamente. `exito` distingue «el comando no se pudo arrancar» de «arrancó y falló», que son
+/// dos motivos distintos en el informe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SalidaDeDeteccion {
+    /// Si el proceso terminó con código cero.
+    pub exito: bool,
+    /// Lo que escribió en `stdout`.
+    pub stdout: Vec<u8>,
+    /// Lo que escribió en `stderr`, recortado por quien ejecuta.
+    pub stderr: Vec<u8>,
+}
+
+/// Un fallo al calcular el manifest.
+///
+/// Los motivos no incluyen la URL de conexión: las credenciales de PostgreSQL viajan en el
+/// entorno del proceso y un `stderr` que las repite no puede acabar en un registro.
+#[derive(Debug, Error)]
+pub enum ErrorDeDeteccion {
+    /// El comando no se pudo arrancar.
+    #[error("no se ha podido ejecutar `{programa}`: {motivo}")]
+    Ejecucion {
+        /// El binario que se intentó arrancar.
+        programa: String,
+        /// El motivo dado por el sistema.
+        motivo: String,
+    },
+    /// El comando arrancó pero terminó con error.
+    #[error("`{programa}` terminó con error: {motivo}")]
+    Fallo {
+        /// El binario que falló.
+        programa: String,
+        /// El motivo leído de `stderr`.
+        motivo: String,
+    },
+    /// La lista de tablas devuelta por PostgreSQL no se puede usar.
+    #[error("la lista de tablas no es válida en la línea `{linea}`")]
+    Tablas {
+        /// La línea que no se ha podido interpretar.
+        linea: String,
+    },
+}
+
+/// La consulta que lista las tablas de usuario, en un orden estable.
+const CONSULTA_DE_TABLAS: &str = "SELECT table_schema || '|' || table_name \
+     FROM information_schema.tables \
+     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+     ORDER BY 1;";
+
+/// Plazo de un comando del detector.
+///
+/// El worker de un repositorio es secuencial: un `pg_dump` colgado sin plazo se lo llevaría por
+/// delante y dejaría toda la cola de ese repositorio esperando. El detector no es el volcado —no
+/// puede tardar horas—, así que aquí sí se corta.
+const PLAZO_DE_DETECCION: Duration = Duration::from_secs(30);
+
+/// Tope de `stdout` acumulado por comando, en bytes.
+///
+/// Un esquema enorme no tiene por qué inflar la memoria del motor sin límite. Si se alcanza el
+/// tope, el manifest se calcula sobre un prefijo recortado y estable, no sobre un volcado
+/// distinto en cada ejecución.
+const TOPE_DE_SALIDA_DE_DETECCION: usize = 8 * 1024 * 1024;
+
+/// Lee un flujo hasta agotarlo, guardando como mucho `tope` bytes.
+///
+/// Seguir leyendo después del tope es lo que evita que el productor se quede bloqueado en un
+/// pipe lleno: se descarta el exceso, pero el flujo se drena hasta el final.
+fn leer_con_tope<R: Read>(mut lector: R, tope: usize) -> std::io::Result<Vec<u8>> {
+    let mut acumulado = Vec::new();
+    let mut trozo = [0_u8; 8192];
+    loop {
+        let leidos = lector.read(&mut trozo)?;
+        if leidos == 0 {
+            return Ok(acumulado);
+        }
+        if acumulado.len() < tope {
+            let cabe = (tope - acumulado.len()).min(leidos);
+            acumulado.extend_from_slice(&trozo[..cabe]);
+        }
+    }
+}
+
+/// Ejecuta un comando de detección con salida acotada y plazo.
+///
+/// Los dos flujos se leen en hilos distintos porque un `stderr` lleno bloquearía al proceso
+/// mientras el motor espera el `stdout`, y `Command::output()` no pone ni plazo ni tope.
+/// Al vencer el plazo se mata al hijo: degrade a «sin manifest», nunca a un worker colgado.
+fn ejecutar_en_el_sistema(
+    programa: &str,
+    argumentos: &[String],
+    entorno: &[(String, String)],
+) -> std::io::Result<SalidaDeDeteccion> {
+    use std::process::Command;
+
+    let mut orden = Command::new(programa);
+    orden.args(argumentos);
+    for (clave, valor) in entorno {
+        orden.env(clave, valor);
+    }
+    let mut hijo = orden
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let salida_stdout = hijo
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("el hijo no tiene stdout"))?;
+    let salida_stderr = hijo
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("el hijo no tiene stderr"))?;
+    let (emisor, receptor) = mpsc::channel();
+    for (es_stdout, flujo, tope) in [
+        (
+            true,
+            Box::new(salida_stdout) as Box<dyn Read + Send>,
+            TOPE_DE_SALIDA_DE_DETECCION,
+        ),
+        (
+            false,
+            Box::new(salida_stderr) as Box<dyn Read + Send>,
+            TOPE_DEL_CRUDO,
+        ),
+    ] {
+        let emisor = emisor.clone();
+        std::thread::spawn(move || {
+            // La procedencia viaja **con** el bytes: los dos hilos acaban cuando acaban, y
+            // suponer que `stdout` llega primero tiene dado lugar a calcular un manifest a
+            // partir de los avisos de `psql`.
+            let _ = emisor.send((es_stdout, leer_con_tope(flujo, tope)));
+        });
+    }
+    drop(emisor);
+
+    let limite = Instant::now() + PLAZO_DE_DETECCION;
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut recibidos = 0;
+    while recibidos < 2 {
+        let restante = limite.saturating_duration_since(Instant::now());
+        if restante.is_zero() {
+            let _ = hijo.kill();
+            let _ = hijo.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("`{programa}` no contestó en {PLAZO_DE_DETECCION:?}"),
+            ));
+        }
+        match receptor.recv_timeout(restante) {
+            Ok((es_stdout, salida)) => {
+                let salida = salida?;
+                if es_stdout {
+                    stdout = Some(salida);
+                } else {
+                    stderr = Some(salida);
+                }
+                recibidos += 1;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = hijo.kill();
+                let _ = hijo.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("`{programa}` no contestó en {PLAZO_DE_DETECCION:?}"),
+                ));
+            }
+        }
+    }
+
+    let estado = hijo.wait()?;
+    Ok(SalidaDeDeteccion {
+        exito: estado.success(),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
+}
+
+/// Comprueba una respuesta y la devuelve, o convierte su fallo en un error de detección.
+fn respuesta(
+    programa: &str,
+    resultado: std::io::Result<SalidaDeDeteccion>,
+) -> Result<SalidaDeDeteccion, ErrorDeDeteccion> {
+    let salida = resultado.map_err(|error| ErrorDeDeteccion::Ejecucion {
+        programa: programa.to_owned(),
+        motivo: error.to_string(),
+    })?;
+    if !salida.exito {
+        let motivo = String::from_utf8_lossy(&salida.stderr).trim().to_owned();
+        return Err(ErrorDeDeteccion::Fallo {
+            programa: programa.to_owned(),
+            motivo,
+        });
+    }
+    Ok(salida)
+}
+
+/// La consulta que checksuma los datos de una tabla.
+///
+/// La fila se convierte a texto y se ordena por ese mismo texto antes de agregarla: así el
+/// checksum no depende del orden físico en que PostgreSQL devuelva las filas. Los identificadores
+/// se entrecomillan y se duplican las comillas que traigan, para que un nombre de tabla no pueda
+/// convertirse en SQL.
+fn consulta_de_checksum(esquema: &str, tabla: &str) -> String {
+    format!(
+        "SELECT md5(coalesce(string_agg(fila::text, E'\\n' ORDER BY fila::text), '')) \
+         FROM \"{}\".\"{}\" AS fila;",
+        esquema.replace('"', "\"\""),
+        tabla.replace('"', "\"\"")
+    )
+}
+
+/// Calcula el manifest con un ejecutor inyectado.
+///
+/// Es el núcleo de [`PostgresChangeDetector`] y lo que hacen las pruebas deterministas: el
+/// ejecutor es una clausura, así que no hace falta ni PostgreSQL ni un binario falso en disco.
+fn calcular_manifest_con<F>(
+    ejecutar: &F,
+    argumentos: &[String],
+    entorno: &[(String, String)],
+) -> Result<String, ErrorDeDeteccion>
+where
+    F: Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion>,
+{
+    use sha2::{Digest, Sha256};
+
+    let mut argumentos_del_esquema = argumentos.to_vec();
+    argumentos_del_esquema.push("--schema-only".to_owned());
+    let esquema = respuesta(
+        "pg_dump",
+        ejecutar("pg_dump", &argumentos_del_esquema, entorno),
+    )?;
+
+    let mut argumentos_de_las_tablas = argumentos.to_vec();
+    argumentos_de_las_tablas.extend([
+        "--no-psqlrc".to_owned(),
+        "--tuples-only".to_owned(),
+        "--no-align".to_owned(),
+        "--command".to_owned(),
+        CONSULTA_DE_TABLAS.to_owned(),
+    ]);
+    let tablas = respuesta("psql", ejecutar("psql", &argumentos_de_las_tablas, entorno))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"esquema\0");
+    hasher.update(&esquema.stdout);
+    hasher.update(b"\0datos\0");
+
+    for linea in String::from_utf8_lossy(&tablas.stdout).lines() {
+        if linea.trim().is_empty() {
+            continue;
+        }
+        let (esquema_de_la_tabla, tabla) =
+            linea
+                .split_once('|')
+                .ok_or_else(|| ErrorDeDeteccion::Tablas {
+                    linea: linea.to_owned(),
+                })?;
+        if esquema_de_la_tabla.is_empty()
+            || tabla.is_empty()
+            || esquema_de_la_tabla.contains(|c: char| c == '|' || c.is_control())
+            || tabla.contains(|c: char| c == '|' || c.is_control())
+        {
+            return Err(ErrorDeDeteccion::Tablas {
+                linea: linea.to_owned(),
+            });
+        }
+
+        let mut argumentos_del_checksum = argumentos.to_vec();
+        argumentos_del_checksum.extend([
+            "--no-psqlrc".to_owned(),
+            "--tuples-only".to_owned(),
+            "--no-align".to_owned(),
+            "--command".to_owned(),
+            consulta_de_checksum(esquema_de_la_tabla, tabla),
+        ]);
+        let suma = respuesta("psql", ejecutar("psql", &argumentos_del_checksum, entorno))?;
+        hasher.update(linea.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(String::from_utf8_lossy(&suma.stdout).trim().as_bytes());
+        hasher.update(b"\0");
+    }
+
+    Ok(format!("{hash:x}", hash = hasher.finalize()))
+}
+
+/// Detector de cambios para PostgreSQL.
+///
+/// Combina `pg_dump --schema-only` con un checksum de los datos de cada tabla de usuario, sin
+/// escribir nada en disco: la estructura y los checksums se hashean tal y como salen del proceso,
+/// en el orden que devuelve `information_schema`. Si algún comando falla, no se calcula manifest
+/// y el archivado hace una subida completa.
+#[derive(Debug, Clone)]
+pub struct PostgresChangeDetector {
+    /// Los argumentos de conexión: `-U <usuario> -d <base>`, sin credenciales.
+    argumentos: Vec<String>,
+    /// Las credenciales, solo en el entorno de los hijos, nunca en `argv`.
+    entorno: Vec<(String, String)>,
+}
+
+impl PostgresChangeDetector {
+    /// Un detector sin argumentos de conexión: usan las variables de entorno de PostgreSQL.
+    #[must_use]
+    pub fn nuevo() -> Self {
+        Self {
+            argumentos: Vec::new(),
+            entorno: Vec::new(),
+        }
+    }
+
+    /// Crea un detector con los argumentos de conexión y el entorno dados.
+    #[must_use]
+    pub fn con_configuracion(argumentos: Vec<String>, entorno: Vec<(String, String)>) -> Self {
+        Self {
+            argumentos,
+            entorno,
+        }
+    }
+
+    /// Deriva el detector de la orden de volcado de la tarea.
+    ///
+    /// Solo `pg_dump` tiene una sola base a la que pedirle el esquema; `pg_dumpall` no, así que
+    /// en ese caso no hay detector y el motor degrada a subida completa. La contraseña se copia
+    /// del entorno del `exec` al entorno de los comandos de detección, sin llegar nunca a una
+    /// línea de comandos ni a un registro. `conexion` trae `PGHOST`/`PGPORT` del proceso: sin
+    /// ellos el detector intentaría hablar con un PostgreSQL local que no está ahí.
+    ///
+    /// El nombre de base se rechaza si tiene forma de *conninfo*: `psql -d` desviaría la
+    /// conexión con la credencial del entorno, igual que se rechaza en el `\connect` del
+    /// volcado. Ante la duda se degrada a subida completa.
+    #[must_use]
+    pub fn desde_la_orden(orden: &Orden, conexion: &[(String, String)]) -> Option<Self> {
+        if orden.cmd.first().map(String::as_str) != Some("pg_dump") {
+            return None;
+        }
+        let base = orden
+            .cmd
+            .iter()
+            .position(|argumento| argumento == "-d")
+            .and_then(|posicion| orden.cmd.get(posicion + 1))?;
+        if crate::engine::restauracion::parece_cadena_de_conexion(base) {
+            return None;
+        }
+
+        let mut entorno: Vec<(String, String)> = conexion.to_vec();
+        entorno.extend(
+            orden
+                .env
+                .iter()
+                .filter_map(|variable| variable.split_once('='))
+                .filter(|(clave, _)| *clave == "PGPASSWORD")
+                .map(|(clave, valor)| (clave.to_owned(), valor.to_owned())),
+        );
+        Some(Self {
+            argumentos: orden.cmd.iter().skip(1).cloned().collect(),
+            entorno,
+        })
+    }
+}
+
+impl ChangeDetector for PostgresChangeDetector {
+    fn change_manifest(&self) -> Option<String> {
+        match calcular_manifest_con(&ejecutar_en_el_sistema, &self.argumentos, &self.entorno) {
+            Ok(manifest) => Some(manifest),
+            Err(causa) => {
+                tracing::warn!(
+                    error = %causa,
+                    "no se ha podido calcular el manifest de cambios: se archiva con subida completa"
+                );
+                None
+            }
+        }
+    }
+}
 
 /// Lo que hay que extraer, ya leído de la fila del §3.
 ///
@@ -1258,8 +1651,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, LIMITE_DEL_MOTIVO, Objetivo,
-        Resultado, Ruta, TOPE_DEL_CRUDO, acumular_el_motivo, entorno_del_exec, motivo_para_guardar,
+        CAPACIDAD_DEL_CANAL, CONSULTA_DE_TABLAS, ErrorDeDeteccion, ErrorDeExtraccion,
+        INACTIVIDAD_MAXIMA, LIMITE_DEL_MOTIVO, Objetivo, PostgresChangeDetector, Resultado, Ruta,
+        SalidaDeDeteccion, TOPE_DEL_CRUDO, acumular_el_motivo, calcular_manifest_con,
+        consulta_de_checksum, ejecutar_en_el_sistema, entorno_del_exec, motivo_para_guardar,
         nombre_del_tipo, recortar, ruta, volcar,
     };
     use crate::db::entities::{Target, TipoDeTarget};
@@ -3438,5 +3833,236 @@ mod tests {
         );
 
         contenedor.retirar().await;
+    }
+
+    // ── T-1.6: detector PostgreSQL, sin PostgreSQL y sin ficheros temporales ────
+
+    /// Un ejecutor determinista: devuelve el esquema, la lista de tablas y los checksums
+    /// dados, y opcionalmente finge que un binario no se puede arrancar.
+    fn ejecutor_falso<'a>(
+        esquema: &'a str,
+        tablas: &'a str,
+        checksums: &'a [(&'a str, &'a str)],
+        falla: Option<&'a str>,
+    ) -> impl Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a
+    {
+        move |programa, argumentos, _entorno| {
+            if falla == Some(programa) {
+                return Err(std::io::Error::other("binario de prueba que no arranca"));
+            }
+            let comando = argumentos
+                .iter()
+                .position(|argumento| argumento == "--command")
+                .and_then(|indice| argumentos.get(indice + 1))
+                .map(String::as_str);
+            let stdout = if programa == "pg_dump" {
+                esquema.as_bytes().to_vec()
+            } else if comando == Some(CONSULTA_DE_TABLAS) {
+                tablas.as_bytes().to_vec()
+            } else {
+                checksums
+                    .iter()
+                    .find(|(consulta, _)| Some(*consulta) == comando)
+                    .map_or_else(Vec::new, |(_, valor)| valor.as_bytes().to_vec())
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// Los argumentos de conexión que se le pasan tanto a `pg_dump` como a `psql`.
+    fn argumentos_del_detector() -> Vec<String> {
+        ["-U", "usuario", "-d", "base"]
+            .iter()
+            .map(|argumento| (*argumento).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn el_mismo_esquema_y_los_mismos_datos_dan_el_mismo_manifiesto() {
+        let consulta = consulta_de_checksum("public", "t");
+        let checksums = [(consulta.as_str(), "abc123")];
+        let ejecutar = ejecutor_falso("CREATE TABLE t (id int);", "public|t\n", &checksums, None);
+        let argumentos = argumentos_del_detector();
+
+        let primero = calcular_manifest_con(&ejecutar, &argumentos, &[])
+            .expect("el esquema y los checksums se pueden leer");
+        let segundo = calcular_manifest_con(&ejecutar, &argumentos, &[])
+            .expect("la segunda lectura da el mismo resultado");
+
+        assert_eq!(
+            primero.len(),
+            64,
+            "el manifest es un SHA-256 en hexadecimal"
+        );
+        assert_eq!(
+            primero, segundo,
+            "dos lecturas del mismo contenido tienen que dar el mismo manifest"
+        );
+    }
+
+    #[test]
+    fn datos_distintos_dan_un_manifiesto_distinto() {
+        let consulta = consulta_de_checksum("public", "t");
+        let argumentos = argumentos_del_detector();
+        let primero = {
+            let checksums = [(consulta.as_str(), "abc123")];
+            let ejecutar =
+                ejecutor_falso("CREATE TABLE t (id int);", "public|t\n", &checksums, None);
+            calcular_manifest_con(&ejecutar, &argumentos, &[]).expect("primera lectura")
+        };
+        let segundo = {
+            let checksums = [(consulta.as_str(), "def456")];
+            let ejecutar =
+                ejecutor_falso("CREATE TABLE t (id int);", "public|t\n", &checksums, None);
+            calcular_manifest_con(&ejecutar, &argumentos, &[]).expect("segunda lectura")
+        };
+
+        assert_ne!(
+            primero, segundo,
+            "un cambio en los datos tiene que cambiar el manifest"
+        );
+    }
+
+    #[test]
+    fn un_comando_que_no_arranca_devuelve_error() {
+        let consulta = consulta_de_checksum("public", "t");
+        let checksums = [(consulta.as_str(), "abc123")];
+        let ejecutar = ejecutor_falso(
+            "CREATE TABLE t (id int);",
+            "public|t\n",
+            &checksums,
+            Some("pg_dump"),
+        );
+
+        let error = calcular_manifest_con(&ejecutar, &argumentos_del_detector(), &[])
+            .expect_err("sin esquema no hay manifest");
+        assert!(
+            matches!(error, ErrorDeDeteccion::Ejecucion { .. }),
+            "el fallo del comando se distingue del contenido inválido: {error:?}"
+        );
+    }
+
+    #[test]
+    fn un_comando_que_termina_con_error_devuelve_error() {
+        let ejecutar = |_programa: &str,
+                        _argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            Ok(SalidaDeDeteccion {
+                exito: false,
+                stdout: Vec::new(),
+                stderr: b"permiso denegado".to_vec(),
+            })
+        };
+
+        let error = calcular_manifest_con(&ejecutar, &argumentos_del_detector(), &[])
+            .expect_err("un código de salida distinto de cero no da manifest");
+        assert!(
+            matches!(error, ErrorDeDeteccion::Fallo { .. }),
+            "el motivo del proceso se distingue de un fallo al arrancar: {error:?}"
+        );
+    }
+
+    /// El detector heredá el host y el puerto del proceso y la contraseña del `exec`.
+    ///
+    /// Sin `PGHOST`/`PGPORT` los clientes hablarían con el PostgreSQL local y degradarían
+    /// siempre: la base está en la red del contenedor, no en el host del motor.
+    #[test]
+    fn el_detector_toma_host_puerto_y_contrasena_de_sus_fuentes() {
+        let orden = Orden {
+            cmd: ["pg_dump", "-U", "usuario", "-d", "base"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: vec![format!("PGPASSWORD={CONTRASENA}")],
+        };
+        let conexion = [
+            ("PGHOST".to_owned(), "base.red".to_owned()),
+            ("PGPORT".to_owned(), "5432".to_owned()),
+        ];
+
+        let detector = PostgresChangeDetector::desde_la_orden(&orden, &conexion)
+            .expect("una orden `pg_dump` con base simple da detector");
+        let PostgresChangeDetector {
+            argumentos,
+            entorno,
+        } = detector;
+        assert_eq!(argumentos, ["-U", "usuario", "-d", "base"]);
+        assert!(entorno.contains(&("PGHOST".to_owned(), "base.red".to_owned())));
+        assert!(entorno.contains(&("PGPORT".to_owned(), "5432".to_owned())));
+        assert!(entorno.contains(&("PGPASSWORD".to_owned(), CONTRASENA.to_owned())));
+    }
+
+    /// Un `-d` con forma de *conninfo* no da detector: `psql -d` desviaría la conexión
+    /// con la credencial del entorno, igual que el `\connect` del volcado.
+    #[test]
+    fn un_nombre_de_base_con_forma_de_conninfo_no_tiene_detector() {
+        for base in ["host=otro dbname=x", "postgresql://otro/x"] {
+            let orden = Orden {
+                cmd: vec!["pg_dump".to_owned(), "-d".to_owned(), base.to_owned()],
+                env: vec![format!("PGPASSWORD={CONTRASENA}")],
+            };
+            assert!(
+                PostgresChangeDetector::desde_la_orden(&orden, &[]).is_none(),
+                "un `-d` con forma de conninfo tiene que degradar, no desviar la conexión: {base}"
+            );
+        }
+    }
+
+    /// El hash se calcula sobre `stdout` aunque `stderr` cierre antes.
+    ///
+    /// Un proceso real escribe el aviso primero y el esquema después: los dos hilos lectores
+    /// llegan por el mismo canal, y distinguirlos por el orden de llegada daría por esquema
+    /// un aviso de `psql`. La procedencia viaja con los bytes, y aquí se comprueba tanto la
+    /// separación de flujos como el hash final.
+    #[test]
+    fn el_hash_viene_del_stdout_aunque_el_stderr_llegue_primero() {
+        const ESQUEMA: &str = "CREATE TABLE t (id int);\n";
+        const AVISO: &str = "aviso de psql\n";
+        let salida = ejecutar_en_el_sistema(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                format!("printf '{AVISO}' >&2; printf '{ESQUEMA}'"),
+            ],
+            &[],
+        )
+        .expect("el proceso de prueba arranca y termina");
+        assert_eq!(String::from_utf8_lossy(&salida.stdout), ESQUEMA);
+        assert_eq!(String::from_utf8_lossy(&salida.stderr), AVISO);
+
+        let consulta = consulta_de_checksum("public", "t");
+        let checksums = [(consulta.as_str(), "abc123")];
+        let argumentos = argumentos_del_detector();
+        let esperado = {
+            let ejecutar = ejecutor_falso(ESQUEMA, "public|t\n", &checksums, None);
+            calcular_manifest_con(&ejecutar, &argumentos, &[]).expect("manifest de referencia")
+        };
+        let obtenido = {
+            let esquema = salida.stdout.clone();
+            let aviso = salida.stderr;
+            let ejecutar = |programa: &str,
+                            argumentos: &[String],
+                            entorno: &[(String, String)]|
+             -> std::io::Result<SalidaDeDeteccion> {
+                if programa == "pg_dump" {
+                    return Ok(SalidaDeDeteccion {
+                        exito: true,
+                        stdout: esquema.clone(),
+                        stderr: aviso.clone(),
+                    });
+                }
+                ejecutor_falso("", "public|t\n", &checksums, None)(programa, argumentos, entorno)
+            };
+            calcular_manifest_con(&ejecutar, &argumentos, &[]).expect("manifest leído")
+        };
+        assert_eq!(
+            obtenido, esperado,
+            "el manifest tiene que venir del esquema, no del aviso que llegó primero"
+        );
     }
 }

@@ -883,6 +883,9 @@ struct SnapshotDelCable {
     /// resumen del repositorio ya la trae distinguiendo los dos casos. Convertir el `None` en `""`
     /// dejaría al panel con un valor que parece una etiqueta y no lo es.
     label: Option<String>,
+    /// El hash del manifest de cambios, sin el prefijo del tag; `null` si la instantánea no
+    /// lleva ese tag —incluidas las anteriores a esta feature y las de otras herramientas—.
+    change_manifest: Option<String>,
     /// Los ficheros que la copia procesó.
     files: u64,
     /// Los bytes que la copia procesó.
@@ -943,6 +946,7 @@ impl SnapshotDelCable {
             time: fecha(resumen.fecha)?,
             paths: resumen.rutas.clone(),
             label: resumen.etiqueta.clone(),
+            change_manifest: resumen.change_manifest.clone(),
             files: resumen.ficheros,
             bytes: resumen.bytes,
             target_id: objetivo.map(|objetivo| objetivo.target_id.to_string()),
@@ -985,12 +989,13 @@ mod tests {
     use crate::api::api_router;
     use crate::db::entities::{AltaDeEjecucion, AltaDeTarea, AltaDeTarget, Estado, TipoDeTarget};
     use crate::engine::EventoDelMotor;
+    use crate::rustic::PREFIJO_DE_MANIFEST;
     use crate::state::{AppState, EstadoDeBase};
     use crate::test_support::{
         DirectorioDePrueba, ETIQUETA_AJENA, ETIQUETA_SEMBRADA, PASSPHRASE_DE_PRUEBA, SEMILLA,
         SEMILLA_CONTENIDO, base_con_clave, body_json, config_con_dsn, directorio_de_prueba,
         endpoint_de_prueba, estado_de_prueba, get, nombre_de_tarea_de_prueba, post_json,
-        router_desarrollo, sembrar_snapshot_ajeno, sembrar_snapshots,
+        router_desarrollo, sembrar_snapshot_ajeno, sembrar_snapshot_con_tag, sembrar_snapshots,
     };
 
     /// Un identificador bien formado cualquiera, que no corresponde a ninguna fila.
@@ -1760,6 +1765,73 @@ mod tests {
                  {cuerpo}"
             );
         }
+    }
+
+    /// T-1.15 — El listado publica el manifest desde el **tag** y deja `label` intacto.
+    ///
+    /// Los dos escenarios del delta de `api`: con tag se publica el hash sin el prefijo; sin
+    /// tag —una instantánea sembrada antes de poner el tag— se publica `null`, no una cadena
+    /// vacía. La etiqueta de la tarea no se toca en ninguno de los dos.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn el_listado_publica_el_manifiesto_del_tag_o_null() {
+        let (estado, _base) = estado_con_base().await;
+        let router = api_router(estado.clone());
+
+        let destino = directorio_de_prueba();
+        let ruta = destino.ruta().to_string_lossy().into_owned();
+        let siembra = sembrar_snapshots(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            &["2026-01-01T10:00:00Z"],
+        );
+        let sin_tag = siembra.identificadores[0].clone();
+
+        const HASH: &str = "abc123def456";
+        const ETIQUETA_CON_TAG: &str = "tarea-con-manifiesto";
+        let con_tag = sembrar_snapshot_con_tag(
+            destino.ruta(),
+            PASSPHRASE_DE_PRUEBA,
+            ETIQUETA_CON_TAG,
+            &format!("{PREFIJO_DE_MANIFEST}{HASH}"),
+        );
+
+        let repositorio = alta_de_repositorio(&router, "explorador-manifiesto", &ruta).await;
+
+        let respuesta = get(
+            router,
+            &format!("/api/v1/snapshots?repository_id={repositorio}"),
+        )
+        .await;
+        let status = respuesta.status();
+        let cuerpo = body_json(respuesta).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "el listado tiene que contestar 200, y contestó {status} con {cuerpo}"
+        );
+        let listado = cuerpo["data"]["snapshots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("el listado tiene que traer sus elementos: {cuerpo}"));
+
+        let elemento = elemento_con_id(listado, &con_tag, &cuerpo);
+        assert_eq!(
+            elemento["change_manifest"], HASH,
+            "el hash viaja sin el prefijo del tag: {cuerpo}"
+        );
+        assert_eq!(
+            elemento["label"], ETIQUETA_CON_TAG,
+            "el manifest no puede sustituir a la etiqueta de la tarea: {cuerpo}"
+        );
+
+        let elemento = elemento_con_id(listado, &sin_tag, &cuerpo);
+        assert!(
+            elemento["change_manifest"].is_null(),
+            "sin tag el manifest es null, no una cadena vacía: {cuerpo}"
+        );
+        assert_eq!(
+            elemento["label"], ETIQUETA_SEMBRADA,
+            "la etiqueta de la instantánea sin tag tampoco cambia: {cuerpo}"
+        );
     }
 
     /// 2.1 — El listado pagina con `limit`/`offset` y publica el `total` exacto.
@@ -3050,6 +3122,7 @@ mod tests {
             fecha: OffsetDateTime::UNIX_EPOCH,
             rutas: Vec::new(),
             etiqueta: None,
+            change_manifest: None,
             ficheros: 0,
             bytes: 0,
         }

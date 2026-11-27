@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Checkbox, Empty, Input, Modal, Select, Space, Table, Typography } from 'antd'
+import { Alert, Button, Checkbox, Empty, Input, Modal, Select, Space, Table, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { Cargando } from '../components/Cargando/Cargando'
 import { EstadoDeError } from '../components/EstadoDeError/EstadoDeError'
@@ -125,6 +125,75 @@ function textoDeFase(phase: string | null): string {
 /** Cómo se nombra una instantánea en los avisos: su etiqueta o su identificador. */
 function etiquetaDeSnapshot(snapshot: Snapshot): string {
   return snapshot.label ?? snapshot.id
+}
+
+/**
+ * La etiqueta de la columna «Cambios» de cada instantánea de la página.
+ *
+ * El cable entrega la página ordenada de la más reciente a la más antigua, así
+ * que se recorre al revés: al llegar a una instantánea, «la anterior» (la copia
+ * siguiente en el tiempo) ya está vista. Con `job_name` se busca la anterior
+ * **de esa tarea**; sin él se compara por `time`, es decir, con la fila
+ * inmediatamente anterior del listado. Una snapshot sin manifest no se clasifica
+ * —la celda muestra «—»—, pero sí ocupa el lugar de «anterior» de la siguiente.
+ *
+ * Dos cosas dejan la comparación indeterminada y por tanto sin badge:
+ *
+ * - que existan instantáneas **fuera del conjunto cargado** —página posterior,
+ *   `total` mayor que la página recibida o guarda de enumeración tocada—: la
+ *   fila más antigua puede tener su predecesora ahí fuera;
+ * - que la predecesora esté cargada pero no tenga manifest —`null` o campo
+ *   ausente—: no sabemos qué contenido tenía y decir «nuevos datos» sería
+ *   inventar un cambio.
+ */
+type CambioDeManifest = 'sin cambios' | 'nuevos datos'
+
+function cambioFrenteA(
+  anterior: string | null | undefined,
+  existeAnterior: boolean,
+  manifest: string,
+  hayFueraDelConjunto: boolean,
+): CambioDeManifest | undefined {
+  if (!existeAnterior) return hayFueraDelConjunto ? undefined : 'nuevos datos'
+  if (typeof anterior !== 'string') return undefined
+  return anterior === manifest ? 'sin cambios' : 'nuevos datos'
+}
+
+function clasificarCambios(
+  lista: readonly Snapshot[],
+  hayFueraDelConjunto: boolean,
+): Map<string, CambioDeManifest> {
+  const clasificadas = new Map<string, CambioDeManifest>()
+  const anterioresPorTarea = new Map<string, string | null | undefined>()
+  let anteriorPorTiempo: string | null | undefined
+  let hayAnteriorPorTiempo = false
+
+  for (const actual of [...lista].reverse()) {
+    // El campo puede no venir todavía en un despliegue escalonado: el tipo del
+    // cable lo declara, pero el valor real puede ser `undefined`. Solo un string
+    // es un manifest con el que se pueda comparar y cortar.
+    const manifest: string | null | undefined = actual.change_manifest
+    const tarea = actual.job_name?.trim() || null
+
+    if (typeof manifest === 'string') {
+      const cambio =
+        tarea === null
+          ? cambioFrenteA(anteriorPorTiempo, hayAnteriorPorTiempo, manifest, hayFueraDelConjunto)
+          : cambioFrenteA(
+              anterioresPorTarea.get(tarea),
+              anterioresPorTarea.has(tarea),
+              manifest,
+              hayFueraDelConjunto,
+            )
+      if (cambio !== undefined) clasificadas.set(actual.id, cambio)
+    }
+
+    anteriorPorTiempo = manifest
+    hayAnteriorPorTiempo = true
+    if (tarea !== null) anterioresPorTarea.set(tarea, manifest)
+  }
+
+  return clasificadas
 }
 
 /** El nombre del target de la fila; su identificador si la API no publicó nombre. */
@@ -314,6 +383,16 @@ export default function Snapshots() {
     limit: tamanoDePagina,
     offset: (pagina - 1) * tamanoDePagina,
   })
+  // Se deriva durante el render, sin estado ni efecto: es la comparación de la
+  // página que ya tenemos, no un dato que haya que pedir ni recordar. La
+  // frontera es indeterminada si hay instantáneas fuera del conjunto cargado:
+  // una página posterior, un `total` mayor que la página o la guarda tocada.
+  const lista = snapshots.data?.snapshots ?? []
+  const hayFueraDelConjunto =
+    pagina > 1 ||
+    (snapshots.data?.total ?? 0) > lista.length ||
+    snapshots.data?.truncated === true
+  const cambios = clasificarCambios(lista, hayFueraDelConjunto)
 
   // El avance llega por SSE (`restore_progress`), no por una recarga del
   // listado. El hook se suscribe desde el montaje y no lo suelta entre
@@ -503,6 +582,32 @@ export default function Snapshots() {
       title: 'Fecha',
       key: 'fecha',
       render: (_valor, snapshot) => formatearFecha(snapshot.time),
+    },
+    {
+      title: 'Cambios',
+      key: 'cambios',
+      render: (_valor, snapshot) => {
+        const manifest = snapshot.change_manifest
+        // `undefined` es posible durante un despliegue escalonado: solo un
+        // string es un manifest del que se pueda mostrar el identificador.
+        if (typeof manifest !== 'string') {
+          return <Typography.Text type="secondary">—</Typography.Text>
+        }
+        const cambio = cambios.get(snapshot.id)
+        // Indeterminado: predecesora fuera del conjunto cargado o sin manifest.
+        if (cambio === undefined) {
+          return <Typography.Text type="secondary">—</Typography.Text>
+        }
+        const sinCambios = cambio === 'sin cambios'
+        return (
+          <>
+            <Tag color={sinCambios ? 'default' : 'blue'}>
+              {sinCambios ? 'sin cambios' : 'nuevos datos'}
+            </Tag>
+            <Typography.Text title={manifest}>{manifest.slice(0, 8)}</Typography.Text>
+          </>
+        )
+      },
     },
     {
       title: 'Tarea',
