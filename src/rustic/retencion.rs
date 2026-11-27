@@ -78,13 +78,15 @@
 //! que reportar es que la copia está y la purga no, así que el motor decide qué hacer con
 //! este error y **no** lo confunde con el resultado de la copia.
 
+use std::collections::{HashMap, HashSet};
+
 use rustic_core::jiff::Zoned;
-use rustic_core::repofile::SnapshotId;
+use rustic_core::repofile::{SnapshotFile, SnapshotId};
 use rustic_core::{
     ForgetGroups, Grouped, KeepOptions, Open, PruneOptions, Repository, SnapshotGroupCriterion,
 };
 
-use super::Error;
+use super::{Error, repositorio::manifiesto_de};
 
 /// Los tres parámetros de retención que el esquema guarda.
 ///
@@ -179,7 +181,7 @@ pub(crate) fn aplicar<S: Open>(
             error.display_log()
         ))
     })?;
-    let grupos = Grouped::from_items(instantaneas, SnapshotGroupCriterion::default());
+    let grupos = Grouped::from_items(instantaneas.clone(), SnapshotGroupCriterion::default());
     let a_retirar = ForgetGroups::from_grouped_snapshots_with_retention(grupos, &reglas, &ahora)
         .map_err(|error| {
             fallo(format!(
@@ -188,6 +190,18 @@ pub(crate) fn aplicar<S: Open>(
             ))
         })?
         .into_forget_ids();
+
+    // Antes de retirar nada se recuerda qué manifest tiene cada instantánea: la compensación
+    // de duplicados lógicos necesita saber cuáles sobreviven, y después del borrado ya no
+    // están en el repositorio.
+    let retiradas: Vec<&SnapshotFile> = instantaneas
+        .iter()
+        .filter(|snapshot| a_retirar.contains(&snapshot.id))
+        .collect();
+    let conservadas: Vec<&SnapshotFile> = instantaneas
+        .iter()
+        .filter(|snapshot| !a_retirar.contains(&snapshot.id))
+        .collect();
 
     // 2. Retirar.
     if !a_retirar.is_empty() {
@@ -215,7 +229,12 @@ pub(crate) fn aplicar<S: Open>(
     // `size_sum()` suma los cuatro tipos de blob en un solo `SizeStats`, y su campo
     // `remove` es justo lo que la purga va a retirar. Se lee **antes** de purgar: después,
     // el plan ya está consumido —`prune` lo toma por valor— y el repositorio ha cambiado.
-    let bytes_a_reclamar = plan.stats.size_sum().remove;
+    let bytes_del_plan = plan.stats.size_sum().remove;
+    let bytes_a_reclamar = bytes_a_reclamar_ajustado(
+        bytes_del_plan,
+        &pares_de_manifiesto(&retiradas),
+        &pares_de_manifiesto(&conservadas),
+    );
 
     repositorio
         .prune(&opciones, plan)
@@ -231,6 +250,63 @@ pub(crate) fn aplicar<S: Open>(
 /// El fallo de la retención, con el motivo de la operación que falló.
 fn fallo(motivo: String) -> Error {
     Error::RetencionFallida { motivo }
+}
+
+/// El manifiesto y los bytes de paquete que cada instantánea añadió, para la compensación.
+fn pares_de_manifiesto(instantaneas: &[&SnapshotFile]) -> Vec<(Option<String>, u64)> {
+    instantaneas
+        .iter()
+        .map(|snapshot| {
+            (
+                manifiesto_de(snapshot).map(ToOwned::to_owned),
+                snapshot
+                    .summary
+                    .as_ref()
+                    .map_or(0, |resumen| resumen.data_added_packed),
+            )
+        })
+        .collect()
+}
+
+/// Ajusta lo que el plan dice reclamar por los duplicados lógicos.
+///
+/// El plan de la biblioteca ya no cuenta los chunks que siguen referenciados, pero eso solo
+/// vale para los chunks **compartidos**: dos snapshots con el mismo manifest que apuntan a
+/// contenido distinto seguirían siendo contados. La retención trata esos manifests como un
+/// solo contenido lógico, así que mientras quede una snapshot viva con el manifest `M`, los
+/// bytes que añadió una snapshot retirada con `M` no se reportan como liberados. Al retirar
+/// la última de `M`, no hay superviviente y el plan se publica tal cual.
+///
+/// El ajuste es conservador: se resta como muy tarde lo que el plan iba a reclamar, nunca por
+/// debajo de cero. Las snapshots sin manifest no se agrupan y no compensan nada.
+fn bytes_a_reclamar_ajustado(
+    bytes_del_plan: u64,
+    retirados: &[(Option<String>, u64)],
+    conservados: &[(Option<String>, u64)],
+) -> u64 {
+    // Agrupar primero es lo que distingue «varios retirados del mismo manifest» de «varios
+    // contenidos distintos»: la compensación se decide por grupo, no sumando ciegamente
+    // lo que cada snapshot dice que añadió.
+    let mut retirados_por_manifiesto: HashMap<&str, u64> = HashMap::new();
+    for (manifiesto, bytes) in retirados {
+        if let Some(hash) = manifiesto.as_deref() {
+            *retirados_por_manifiesto.entry(hash).or_default() += *bytes;
+        }
+    }
+    let vivos: HashSet<&str> = conservados
+        .iter()
+        .filter_map(|(manifiesto, _)| manifiesto.as_deref())
+        .collect();
+    let mut en_uso: u64 = 0;
+    for (hash, bytes) in retirados_por_manifiesto {
+        if vivos.contains(hash) {
+            // Nunca se resta más de lo que el plan iba a reclamar: el plan es la verdad sobre
+            // qué chunks dejan de estar referenciados; el resumen de cada snapshot solo dice
+            // cuántos bytes añadió cada una.
+            en_uso = en_uso.saturating_add(bytes).min(bytes_del_plan);
+        }
+    }
+    bytes_del_plan.saturating_sub(en_uso)
 }
 
 /// Los identificadores en hex **completo**.
@@ -311,14 +387,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use rustic_core::PruneOptions;
+    use rustic_core::jiff::{Timestamp, tz::TimeZone};
     use rustic_core::repofile::SnapshotFile;
 
     use crate::test_support::{
         PASSPHRASE_DE_PRUEBA, SEMILLA_CONTENIDO, abrir_local, directorio_de_prueba,
-        sembrar_snapshots, volcado_guardado,
+        sembrar_snapshot_ajeno, sembrar_snapshots, volcado_guardado,
     };
 
-    use super::{Error, Retencion, aplicar, reglas};
+    use super::{Error, InformeDeRetencion, Retencion, aplicar, bytes_a_reclamar_ajustado, reglas};
 
     /// Tres fechas en **tres días distintos**, que es lo que hace determinista a una regla
     /// diaria: una prueba de retención que dependiera del reloj conservaría dos
@@ -721,6 +798,133 @@ mod tests {
 
         drop(solo_lectura);
         drop(repositorio);
+    }
+
+    // ── T-1.9: duplicados lógicos por `kesto.change_manifest` ──────────────────
+
+    /// Mientras quede una snapshot con el manifest `M`, retirar otra con `M` no reporta
+    /// como liberados los bytes que esa snapshot añadió: sus chunks siguen en uso.
+    #[test]
+    fn retirar_una_de_dos_con_el_mismo_manifiesto_no_libera_sus_bytes() {
+        let retirados = [(Some("M".to_owned()), 200)];
+        let conservados = [(Some("M".to_owned()), 200)];
+
+        assert_eq!(bytes_a_reclamar_ajustado(200, &retirados, &conservados), 0);
+    }
+
+    /// Al retirar la última snapshot con `M` ya no hay superviviente, así que el plan se
+    /// publica tal cual y el tamaño de los chunks de `M` cuenta como liberado.
+    #[test]
+    fn retirar_la_ultima_con_un_manifiesto_libera_sus_bytes() {
+        let retirados = [(Some("M".to_owned()), 200)];
+        let conservados = [];
+
+        assert_eq!(
+            bytes_a_reclamar_ajustado(200, &retirados, &conservados),
+            200
+        );
+    }
+
+    /// Las snapshots sin manifest son contenido único: no se agrupan ni compensan nada.
+    #[test]
+    fn las_snapshots_sin_manifiesto_no_se_agrupan() {
+        let retirados = [(None, 200)];
+        let conservados = [(None, 200)];
+
+        assert_eq!(
+            bytes_a_reclamar_ajustado(200, &retirados, &conservados),
+            200
+        );
+    }
+
+    /// Aplica la retención sobre cuatro instantáneas **reales**: tres con el manifest `M` y
+    /// una superviviente con árbol distinto. Lo que se mide es el `InformeDeRetencion` que
+    /// devuelve `aplicar`, no el helper: la compensación tiene que llegar al cable.
+    fn informe_con_manifiesto_del_sobreviviente(tag_del_sobreviviente: &str) -> InformeDeRetencion {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio");
+        let siembra = sembrar_snapshots(&ruta, PASSPHRASE_DE_PRUEBA, &FECHAS);
+        let (id_ajena, _) = sembrar_snapshot_ajeno(&ruta, PASSPHRASE_DE_PRUEBA);
+        let repositorio = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+
+        let guardadas = repositorio
+            .get_all_snapshots()
+            .expect("el repositorio se puede listar");
+        let modelo = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id == snapshot_id(&siembra.identificadores[0]))
+            .expect("la primera semilla está en el repositorio");
+        let ajena = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id == snapshot_id(&id_ajena))
+            .expect("la instantánea ajena está en el repositorio");
+
+        let futuro = "2027-01-01T10:00:00Z"
+            .parse::<Timestamp>()
+            .expect("la fecha de la superviviente es válida")
+            .to_zoned(TimeZone::UTC);
+        let mut superviviente = modelo.clone();
+        superviviente.time = futuro;
+        superviviente.tree = ajena.tree;
+        superviviente.summary = ajena.summary.clone();
+        superviviente.tags.add(tag_del_sobreviviente.to_owned());
+
+        let mut nuevas = Vec::new();
+        for fecha in FECHAS {
+            let mut copia = modelo.clone();
+            copia.time = fecha
+                .parse::<Timestamp>()
+                .expect("fecha de prueba válida")
+                .to_zoned(TimeZone::UTC);
+            copia.tags.add("kesto.change_manifest=M".to_owned());
+            if let Some(resumen) = copia.summary.as_mut() {
+                resumen.data_added_packed = 1000;
+            }
+            nuevas.push(copia);
+        }
+        nuevas.push(superviviente);
+        repositorio
+            .save_snapshots(nuevas)
+            .expect("las instantáneas etiquetadas se guardan");
+
+        let mut originales = siembra.identificadores.clone();
+        originales.push(id_ajena);
+        repositorio
+            .delete_snapshots(
+                &originales
+                    .iter()
+                    .map(|id| snapshot_id(id))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("las instantáneas sin etiquetar se retiran");
+
+        aplicar(&repositorio, &retencion_con_diarias(1))
+            .expect("la retención con instantáneas etiquetadas se aplica")
+    }
+
+    /// Con el manifest `M` vivo en la superviviente, retirar las tres copias de `M` no
+    /// reporta como liberados sus bytes: el contenido sigue referenciado. Con un manifest
+    /// distinto, el plan se publica tal cual.
+    #[test]
+    fn el_informe_de_retencion_compensa_los_duplicados_por_tag() {
+        let con_compensacion = informe_con_manifiesto_del_sobreviviente("kesto.change_manifest=M");
+        let sin_compensacion = informe_con_manifiesto_del_sobreviviente("kesto.change_manifest=N");
+
+        assert_eq!(
+            con_compensacion.retirados.len(),
+            3,
+            "las tres copias antiguas tienen que retirarse"
+        );
+        assert_eq!(sin_compensacion.retirados.len(), 3);
+        assert!(con_compensacion.purgado && sin_compensacion.purgado);
+        assert!(
+            sin_compensacion.bytes_a_reclamar > 0,
+            "el plan tiene que ver bytes libres cuando la superviviente tiene otro manifest"
+        );
+        assert_eq!(
+            con_compensacion.bytes_a_reclamar, 0,
+            "las copias retiradas con `M` siguen referenciadas por la superviviente con `M`"
+        );
     }
 
     /// Un identificador de instantánea desde su forma en hex completo.

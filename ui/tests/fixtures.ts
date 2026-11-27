@@ -85,6 +85,7 @@ export function snapshot(campos: Partial<Snapshot> & { id: string }): Snapshot {
     time: '2026-01-02T03:00:00Z',
     paths: ['/srv/datos'],
     label: null,
+    change_manifest: null,
     // Igual que en la ejecución: sin tarea con nombre, la clave va a `null`.
     job_name: null,
     files: 10,

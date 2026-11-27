@@ -950,7 +950,7 @@ impl AsyncRead for LectorDelVolcado {
 /// eso es deliberado: rechazar de más es **fail-closed** —un nombre que libpq trataría como plano
 /// (`POSTGRES://x`) se rechaza igual—, y el precio es un volcado con un nombre de base exótico, que
 /// falla en voz alta.
-fn parece_cadena_de_conexion(nombre: &str) -> bool {
+pub(crate) fn parece_cadena_de_conexion(nombre: &str) -> bool {
     /// Los dos esquemas que libpq reconoce como URI de conexión.
     const ESQUEMAS: [&str; 2] = ["postgres://", "postgresql://"];
 

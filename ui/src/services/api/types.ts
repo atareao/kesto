@@ -237,6 +237,14 @@ export interface Snapshot {
   paths: string[]
   label: string | null
   /**
+   * Hash del manifest de cambios del cable, **sin** el prefijo
+   * `kesto.change_manifest=`. `null` si la instantánea no lo lleva —las anteriores
+   * a esta feature y las escritas por otras herramientas—. Es lo que alimenta la
+   * columna «Cambios»: no se deduce de `label`, que sigue siendo el identificador
+   * de la tarea.
+   */
+  change_manifest: string | null
+  /**
    * Nombre de la tarea de la que procede la instantánea, por el vínculo
    * `snapshot → job_executions → backup_jobs`. Toda tarea tiene nombre, así que
    * el único `null` que queda es la instantánea **huérfana** —la que no casa con

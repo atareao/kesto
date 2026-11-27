@@ -959,6 +959,47 @@ pub(crate) fn sembrar_snapshot_ajeno(ruta: &Path, passphrase: &str) -> (String, 
     (guardada.id.to_hex().as_str().to_owned(), nodo)
 }
 
+/// Siembra una instantánea con un tag determinado, para medir el contrato del cable.
+///
+/// Es la misma forma de archivar que [`sembrar_snapshot_ajeno`] —con la biblioteca, para que
+/// el tag viaje en el `SnapshotFile` y el listado lo lea del repositorio—, pero con etiqueta
+/// y tag elegidos por la prueba. Devuelve el identificador en hex completo.
+pub(crate) fn sembrar_snapshot_con_tag(
+    ruta: &Path,
+    passphrase: &str,
+    etiqueta: &str,
+    tag: &str,
+) -> String {
+    let repositorio = abrir_local(ruta, passphrase)
+        .to_indexed_ids()
+        .expect("el índice reducido del repositorio sembrado se lee");
+
+    let fuente = directorio_de_prueba();
+    let fichero = fuente.ruta().join("con-tag");
+    std::fs::write(&fichero, b"contenido con tag").expect("el fichero de la semilla se escribe");
+    let rutas = vec![fuente.ruta().to_path_buf()];
+    let opciones = SnapshotOptions::default()
+        .label(etiqueta.to_owned())
+        .host("host-con-tag".to_owned())
+        .command("kesto -r destino backup".to_owned())
+        .add_tags(tag)
+        .expect("el tag de la prueba es válido");
+    let instantanea = SnapshotFile::from_options(&opciones).expect("la instantánea se construye");
+    let origen = LocalSource::new(
+        LocalSourceSaveOptions::default(),
+        &Excludes::default(),
+        &LocalSourceFilterOptions::default(),
+        &rutas,
+    )
+    .expect("la fuente local se construye");
+
+    let guardada = repositorio
+        .archive(&BackupOptions::default(), &origen, instantanea, &rutas)
+        .expect("la instantánea con tag se archiva");
+
+    guardada.id.to_hex().as_str().to_owned()
+}
+
 /// Configuración válida que apunta a una base de datos dada.
 ///
 /// Declara el permiso explícito del modo sin autenticación: sin las `OIDC_*` el
