@@ -62,3 +62,16 @@
 - [ ] `just check` verde sobre el workspace.
 - [ ] `just check-all` verde (si aplica) antes de PR.
 - [ ] Crear `docs/FEATURE-NNN-<slug>.md` y archivar el change en `openspec/specs/`.
+
+## Seguimiento v0.18.0 — Smoke test de release sin metadatos en `/health`
+
+### RED
+- [x] Añadir a `scripts/release-image-workflow.test.sh` una comprobación estructural: el smoke test no exige `.data.auth_mode`, verifica `.status == 200 and .data == {}` y exige `401` en `GET /api/v1/auth/session`.
+- [x] Ejecutar `bash scripts/release-image-workflow.test.sh` → ROJO.
+
+### GREEN
+- [x] Actualizar el step "Smoke test the image" de `.github/workflows/release.yml` según `specs/deploy/spec.md`.
+- [x] `bash scripts/release-image-workflow.test.sh` → VERDE.
+
+### REFACTOR
+- [x] `just check-all` en verde y specs canónicas sin contradecir el contrato de `/health`.

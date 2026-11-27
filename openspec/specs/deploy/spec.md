@@ -307,7 +307,7 @@ El modo de desarrollo —sin proveedor de identidad— SHALL exigir el permiso e
 
 ### Requirement: El despliegue se verifica en la forma de producción
 
-La imagen publicada SHALL verificarse **con proveedor de identidad**: el contenedor SHALL arrancar con las tres variables `OIDC_*`, `OIDC_REDIRECT_URL` por `https`, `KESTO_SECRET`, `BIND_ADDRESS=0.0.0.0:8080` y el puerto publicado, y `GET /api/v1/health` —público— SHALL contestar `200` con `auth_mode: "oidc"` consultado desde fuera del contenedor. El descubrimiento del proveedor NO SHALL ser requisito para arrancar: un emisor inalcanzable solo SHALL avisar, así que la verificación NO SHALL necesitar un proveedor real.
+La imagen publicada SHALL verificarse **con proveedor de identidad**: el contenedor SHALL arrancar con las tres variables `OIDC_*`, `OIDC_REDIRECT_URL` por `https`, `KESTO_SECRET`, `BIND_ADDRESS=0.0.0.0:8080` y el puerto publicado, y `GET /api/v1/health` —público— SHALL contestar `200` con la envoltura actual (`.status == 200` y `.data == {}`), sin metadatos como `auth_mode`. El modo OIDC SHALL verificarse por comportamiento: `GET /api/v1/auth/session` sin cookie SHALL contestar `401`. El descubrimiento del proveedor NO SHALL ser requisito para arrancar: un emisor inalcanzable solo SHALL avisar, así que la verificación NO SHALL necesitar un proveedor real.
 
 El modo de desarrollo NO SHALL verificarse con el puerto publicado: con el proceso atado a loopback —lo único que el modo sin autenticación permite— el reenvío del puerto no alcanza al servicio. Ese modo se verifica donde se usa: el binario del e2e y el arnés de pruebas, que declaran el permiso explícito.
 
@@ -319,11 +319,17 @@ La base SQLite SHALL vivir en el volumen nombrado `kesto_data` montado en `/app/
 - **THEN** el contenedor SHALL arrancar
 - **AND** SHALL escuchar en `0.0.0.0:8080`
 
-#### Scenario: La salud declara el modo de producción
+#### Scenario: La salud no publica metadatos y el modo se comprueba por comportamiento
 - **GIVEN** el contenedor recién arrancado con proveedor de identidad
 - **WHEN** se pide `GET /api/v1/health` desde fuera del contenedor
-- **THEN** SHALL contestar `200`
-- **AND** el cuerpo SHALL declarar `auth_mode: "oidc"`
+- **THEN** SHALL contestar 200 con .status == 200 y .data == {}
+- **AND** el cuerpo NO SHALL contener auth_mode
+
+#### Scenario: El modo OIDC se comprueba por comportamiento
+- **GIVEN** el contenedor recién arrancado con proveedor de identidad
+- **WHEN** se pide `GET /api/v1/auth/session` sin cookie desde fuera del contenedor
+- **THEN** SHALL contestar `401`
+- **AND** en modo `Disabled` la misma ruta SHALL contestar `404`
 
 #### Scenario: El mismo contenedor sirve el panel
 - **GIVEN** el contenedor recién arrancado

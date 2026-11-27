@@ -143,14 +143,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Arranca la imagen PUBLICADA (por digest) en la FORMA DE PRODUCCIÓN y
-      # consulta `/api/v1/health` desde el runner: exige `200` y que el cuerpo
-      # declare `auth_mode: "oidc"`. Ya no basta con que el contenedor levante:
-      # el modo de desarrollo NO puede verificarse así —el proceso se ata a
-      # loopback, así que el reenvío del puerto no alcanza al servicio—, de modo
-      # que el smoke test usa proveedor de identidad. El emisor puede ser
-      # inalcanzable: el descubrimiento caído solo avisa, no impide arrancar.
-      # `KESTO_MASTER_KEY` y `KESTO_SECRET` son obligatorias y miden ≥ 32. Las
-      # cuatro `OIDC_*` van también, y `OIDC_REDIRECT_URL` tiene que ser `https`.
+      # consulta `/api/v1/health` desde el runner: el health es público y no
+      # expone metadatos (SEC-21), así que exige `200` con `.data == {}` sin
+      # leer `auth_mode` del cuerpo. El modo OIDC se comprueba por
+      # comportamiento: `/api/v1/auth/session` sin cookie debe devolver `401`;
+      # en modo `Disabled` daría `404`. El emisor puede ser inalcanzable: el
+      # descubrimiento caído solo avisa, no impide arrancar. `KESTO_MASTER_KEY`
+      # y `KESTO_SECRET` son obligatorias y miden ≥ 32. Las cuatro `OIDC_*` van
+      # también, y `OIDC_REDIRECT_URL` tiene que ser `https`.
       - name: Smoke test the image
         run: |
           set -euo pipefail
@@ -195,11 +195,19 @@ jobs:
             exit 1
           fi
 
-          # `curl -f` ya falla con un HTTP ≥ 400, así que el cuerpo es de un 200.
-          # Ahora tiene que declarar el modo de producción; si no, el smoke test
-          # habría dado por bueno un despliegue sin proveedor de identidad.
-          if ! printf '%s' "${body}" | jq -e '.data.auth_mode == "oidc"' > /dev/null; then
-            echo "::error::la salud no declara auth_mode=oidc: ${body}"
+          # `/health` es público y sin metadatos (SEC-21): exige el contrato
+          # observable (200 con datos vacíos); el modo OIDC se comprueba abajo
+          # por comportamiento, no por el cuerpo de la salud.
+          if ! printf '%s' "${body}" | jq -e '.status == 200 and (.data == {})' > /dev/null; then
+            echo "::error::la salud /api/v1/health no cumple el contrato esperado (status 200 y data vacío): ${body}"
+            exit 1
+          fi
+
+          # Sin `-f`: un 401 es la respuesta esperada. Con `-f` `curl` fallaría
+          # antes de poder comparar el código.
+          session_code="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/auth/session)"
+          if [ "${session_code}" != "401" ]; then
+            echo "::error::GET /api/v1/auth/session devolvió ${session_code}; se esperaba 401 (modo OIDC; en Disabled sería 404)"
             exit 1
           fi
 
