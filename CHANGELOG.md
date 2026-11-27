@@ -1,4 +1,9 @@
 # Changelog
+## [0.18.1] - 2026-11-27
+
+### Bug Fixes
+
+- *(release)* Adaptar el smoke test al health sin metadatos
 ## [0.18.0] - 2026-11-26
 
 ### Bug Fixes
@@ -75,6 +80,7 @@
 - Retrigger CI tras corregir el arnés E2E
 - Retrigger CI tras correction E2E arnés
 - *(openspec)* Archive chrono migration change (#185)
+- Release v0.18.0
 
 ### Refactor
 
