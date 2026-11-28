@@ -57,6 +57,9 @@ services:
       # Raíz confinada de los targets `directory`: la API valida el host_path
       # contra ella y el motor repite la comprobación antes del `exec`.
       KESTO_BACKUP_ROOT: /backup_sources
+      # Contenedores a detener antes del backup (separados por comas). API y motor
+      # reciben la MISMA lista: el motor no detiene ninguno que no esté en ella.
+      KESTO_STOP_CONTAINERS: ${KESTO_STOP_CONTAINERS:-}
     volumes:
       # Canal IPC con el proceso privilegiado.
       - kesto_ipc:/run/kesto
@@ -89,6 +92,9 @@ services:
       # Misma raíz que la API (src/motor/config.rs): el motor la vuelve a
       # aplicar a las fuentes `directory` antes de abrir el `exec`.
       KESTO_BACKUP_ROOT: /backup_sources
+      # Contenedores a detener antes del backup (separados por comas). API y motor
+      # reciben la MISMA lista: el motor no detiene ninguno que no esté en ella.
+      KESTO_STOP_CONTAINERS: ${KESTO_STOP_CONTAINERS:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - kesto_ipc:/run/kesto

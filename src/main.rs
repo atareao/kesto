@@ -373,7 +373,8 @@ async fn main() -> std::process::ExitCode {
     //    del entorno del proceso: es la misma lectura inyectada que el resto, y es lo
     //    que deja que una prueba quiera otro socket sin tocar el entorno.
     let ajustes = Ajustes::nuevos(config.motor_socket.clone())
-        .con_raiz_de_copias(config.raiz_de_copias.clone());
+        .con_raiz_de_copias(config.raiz_de_copias.clone())
+        .con_stop_containers(&config.stop_containers);
     // La espera de la parada se lee **antes** de mover los ajustes al motor, porque es el
     // número con el que el apagado de más abajo acota su espera, y de ahí no se puede leer.
     let espera_de_parada = ajustes.espera_de_parada;

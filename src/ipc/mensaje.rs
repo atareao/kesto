@@ -1,7 +1,7 @@
 //! Contrato del canal entre la API y el daemon de contenedores.
 //!
 //! La API no tiene el socket del daemon: lo único que conoce es este socket IPC y
-//! las seis operaciones de [`SolicitudMotor`], que es una lista blanca cerrada.
+//! las siete operaciones de [`SolicitudMotor`], que es una lista blanca cerrada.
 //! Todo lo demás —el cliente HTTP del daemon, sus credenciales y su versión de
 //! API— vive en el proceso `kesto-motor`.
 
@@ -59,7 +59,7 @@ pub enum CanalIpc {
 
 /// Operaciones que la API puede pedir al motor.
 ///
-/// Seis y solo seis: cualquier otra operación sobre el daemon queda fuera del
+/// Siete y solo siete: cualquier otra operación sobre el daemon queda fuera del
 /// alcance del proceso de la API, aunque el motor sea capaz de hacerla.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SolicitudMotor {
@@ -76,6 +76,11 @@ pub enum SolicitudMotor {
     },
     /// Arranca un contenedor creado antes.
     IniciarContenedor {
+        /// Nombre del contenedor.
+        nombre: String,
+    },
+    /// Detiene un contenedor en marcha antes de un backup.
+    DetenerContenedor {
         /// Nombre del contenedor.
         nombre: String,
     },

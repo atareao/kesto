@@ -44,6 +44,8 @@ const ENV_OIDC_REDIRECT_URL: &str = "OIDC_REDIRECT_URL";
 /// daemon pertenece al proceso `kesto-motor`, y la lectura de la variable
 /// del daemon vive en [`crate::motor::config`], que es quien la usa.
 const ENV_MOTOR_SOCKET: &str = "KESTO_MOTOR_SOCKET";
+/// Nombre de la variable que fija los contenedores a detener antes del backup.
+const ENV_KESTO_STOP_CONTAINERS: &str = "KESTO_STOP_CONTAINERS";
 
 /// Segundos de la cabecera `Strict-Transport-Security` (`KESTO_HSTS_MAX_AGE`).
 ///
@@ -163,6 +165,28 @@ pub struct Config {
     /// ni las credenciales embebidas. El defecto es el permiso **negado**, que es lo que hace que un
     /// `compose` que perdió su variable no abra el agujero en silencio.
     pub allow_insecure_endpoint: bool,
+
+    /// Contenedores que hay que detener antes de tomar el backup y reiniciar después.
+    ///
+    /// `KESTO_STOP_CONTAINERS` es una lista separada por comas de nombres o IDs de contenedor.
+    /// Una lista vacía —variable ausente— significa que no se detiene nada.
+    pub stop_containers: Vec<String>,
+}
+
+/// Valida un nombre o ID de contenedor tal como llega a la ruta de la API de Docker.
+///
+/// `bollard` interpola el valor sin escapar en `/containers/{name}/stop`, así que un nombre con
+/// `/`, `?`, `#` o espacios no es un nombre: cambia la ruta o la convierte en query. Solo ASCII,
+/// con primer carácter alfanumérico; un ID hexadecimal de 64 caracteres cumple la misma regla.
+fn es_nombre_de_contenedor_valido(nombre: &str) -> bool {
+    let mut caracteres = nombre.chars();
+    let Some(primero) = caracteres.next() else {
+        return false;
+    };
+
+    primero.is_ascii_alphanumeric()
+        && caracteres
+            .all(|caracter| caracter.is_ascii_alphanumeric() || matches!(caracter, '_' | '.' | '-'))
 }
 
 /// Fallo de configuración: la aplicación no puede arrancar.
@@ -482,6 +506,29 @@ impl Config {
             .filter(|valor| !valor.is_empty())
             .unwrap_or_else(|| DEFAULT_MOTOR_SOCKET.to_owned());
 
+        // Contenedores a detener antes del backup. La lista vacía —variable ausente, vacía o solo
+        // con separadores— significa «no se detiene nada», que es el escenario normal del spec.
+        // Cada nombre se valida antes de guardarse: bollard lo interpola sin escapar en la ruta
+        // `/containers/{name}/stop`, así que un nombre con `/`, `?` o espacios cambiaría la
+        // operación que se ejecuta. Los duplicados se descartan para no detener dos veces lo mismo.
+        let mut stop_containers = Vec::new();
+        if let Some(valor) = lookup.get(ENV_KESTO_STOP_CONTAINERS) {
+            for trozo in valor.split(',') {
+                let nombre = trozo.trim();
+                if nombre.is_empty() {
+                    continue;
+                }
+                if !es_nombre_de_contenedor_valido(nombre) {
+                    return Err(ConfigError::InvalidValue {
+                        name: ENV_KESTO_STOP_CONTAINERS,
+                    });
+                }
+                if !stop_containers.iter().any(|guardado| guardado == nombre) {
+                    stop_containers.push(nombre.to_owned());
+                }
+            }
+        }
+
         // El permiso del `endpoint` se lee **siempre**, también con la autenticación encendida: el
         // `endpoint` de un repositorio se valida en los dos modos, así que una variable que solo se
         // leyera en el modo de desarrollo dejaría el permiso concedido sin declararlo. Va al final
@@ -511,6 +558,7 @@ impl Config {
             motor_socket,
             hsts_max_age,
             allow_insecure_endpoint,
+            stop_containers,
         })
     }
 
@@ -1774,5 +1822,65 @@ mod tests {
             std::fs::canonicalize(&enlace).expect("el enlace de la prueba existe"),
             "guardarla resuelta desajustaría la comparación textual del borde"
         );
+    }
+
+    /// Configuración mínima con la lista de contenedores decide libremente.
+    fn configuracion_con_stop(valor: Option<&str>) -> Result<Config, ConfigError> {
+        let mut pares = vec![
+            ("KESTO_MASTER_KEY", MASTER_KEY),
+            ("KESTO_ALLOW_INSECURE", "1"),
+        ];
+        if let Some(valor) = valor {
+            pares.push(("KESTO_STOP_CONTAINERS", valor));
+        }
+
+        Config::from_lookup(&lookup_from(&pares))
+    }
+
+    /// Sin variable, vacía o con solo comas no se detiene ningún contenedor.
+    #[test]
+    fn stop_containers_ausente_vacia_o_solo_separadores_no_detiene_nada() {
+        for valor in [None, Some(""), Some("   "), Some(" , , ")] {
+            let config = configuracion_con_stop(valor).unwrap_or_else(|error| {
+                panic!("la lista `{valor:?}` tiene que ser válida: {error}")
+            });
+
+            assert!(
+                config.stop_containers.is_empty(),
+                "una lista sin nombres no puede detener contenedores: {valor:?}"
+            );
+        }
+    }
+
+    /// Los nombres se recortan, se conservan en orden y los duplicados se descartan.
+    #[test]
+    fn stop_containers_se_recorta_y_descartan_los_duplicados() {
+        let config = configuracion_con_stop(Some(" web , db ,web, db , "))
+            .expect("una lista separada por comas es válida");
+
+        assert_eq!(
+            config.stop_containers,
+            vec!["web".to_owned(), "db".to_owned()],
+            "el orden importa porque es el orden en que se detienen y se reinician"
+        );
+    }
+
+    /// Un nombre que cambiaría la ruta de la API de Docker impide el arranque.
+    #[test]
+    fn stop_containers_rechaza_nombres_que_cambian_la_ruta() {
+        for valor in ["web/db", "web?all", "web#1", "mi web", "-web"] {
+            let error = configuracion_con_stop(Some(valor))
+                .err()
+                .unwrap_or_else(|| panic!("`{valor}` no puede aceptarse como nombre"));
+
+            assert!(
+                matches!(error, ConfigError::InvalidValue { name } if name == "KESTO_STOP_CONTAINERS"),
+                "un nombre inseguro tiene que ser error de formato de la variable: {error:?}"
+            );
+            assert!(
+                !error.to_string().contains(valor),
+                "el error no puede publicar el valor: {error}"
+            );
+        }
     }
 }

@@ -352,11 +352,12 @@ fn la_api_no_lee_docker_host() {
 }
 
 #[test]
-fn la_lista_blanca_ipc_tiene_exactamente_seis_operaciones() {
+fn la_lista_blanca_ipc_tiene_exactamente_siete_operaciones() {
     let esperadas = BTreeSet::from([
         "Comprobar".to_owned(),
         "CrearContenedor".to_owned(),
         "IniciarContenedor".to_owned(),
+        "DetenerContenedor".to_owned(),
         "CrearExec".to_owned(),
         "InspeccionarExec".to_owned(),
         "IniciarExec".to_owned(),
@@ -377,7 +378,7 @@ fn la_lista_blanca_ipc_tiene_exactamente_seis_operaciones() {
     assert_eq!(
         variantes_de_primer_nivel(&cuerpo),
         esperadas,
-        "SEC-06 la lista blanca IPC no contiene exactamente las seis operaciones permitidas"
+        "SEC-06 la lista blanca IPC no contiene exactamente las siete operaciones permitidas"
     );
 }
 
@@ -481,18 +482,30 @@ fn el_debug_de_la_orden_ipc_redacta_las_credenciales_del_entorno() {
 }
 
 #[tokio::test]
-async fn las_seis_operaciones_de_la_lista_blanca_cruzan_el_canal_y_las_demas_no() {
+async fn las_siete_operaciones_de_la_lista_blanca_cruzan_el_canal_y_las_demas_no() {
     let cuerpo = br#"[
         "Comprobar",
         {"CrearContenedor":{"nombre":"c","imagen":"i","etiquetas":[]}},
         {"IniciarContenedor":{"nombre":"c"}},
+        {"DetenerContenedor":{"nombre":"c"}},
         {"CrearExec":{"contenedor":"c","orden":{"cmd":["sh"],"env":[]},"con_entrada":false}},
         {"InspeccionarExec":{"id":"e"}},
         {"IniciarExec":{"id":"e","entrada":null}}
     ]"#;
     let solicitudes: Vec<ipc_contrato::SolicitudMotor> =
-        serde_json::from_slice(cuerpo).expect("las seis operaciones son del contrato");
-    assert_eq!(solicitudes.len(), 6);
+        serde_json::from_slice(cuerpo).expect("las siete operaciones son del contrato");
+    assert_eq!(solicitudes.len(), 7);
+
+    // La serialización de `DetenerContenedor` es bidireccional: el cliente IPC construye la
+    // solicitud en memoria y el motor la recibe como JSON con el mismo nombre.
+    let detener = ipc_contrato::SolicitudMotor::DetenerContenedor {
+        nombre: "web-1".to_owned(),
+    };
+    let bytes = serde_json::to_vec(&detener).expect("serializa DetenerContenedor");
+    let vuelta: ipc_contrato::SolicitudMotor =
+        serde_json::from_slice(&bytes).expect("Deserializa DetenerContenedor");
+    assert_eq!(vuelta, detener);
+    assert_eq!(bytes, br#"{"DetenerContenedor":{"nombre":"web-1"}}"#);
 
     let esperadas = solicitudes.clone();
     let ruta = ruta_socket_unica();
@@ -500,7 +513,7 @@ async fn las_seis_operaciones_de_la_lista_blanca_cruzan_el_canal_y_las_demas_no(
     let servidor = tokio::spawn(async move {
         let (mut canal, _) = escucha.accept().await.expect("acepta al cliente");
         let mut recibidas = 0;
-        while recibidas < 6 {
+        while recibidas < 7 {
             let cuerpo = ipc_contrato::leer(&mut canal)
                 .await
                 .expect("lee la solicitud");
@@ -521,7 +534,7 @@ async fn las_seis_operaciones_de_la_lista_blanca_cruzan_el_canal_y_las_demas_no(
             .await
             .expect("escribe la solicitud");
     }
-    assert_eq!(servidor.await.expect("el servidor no panica"), 6);
+    assert_eq!(servidor.await.expect("el servidor no panica"), 7);
 
     assert!(
         serde_json::from_slice::<ipc_contrato::SolicitudMotor>(br#"{"BorrarContenedor":{}}"#)
