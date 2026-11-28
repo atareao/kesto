@@ -57,8 +57,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::extraccion::{
-    CAPACIDAD_DEL_CANAL, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, Objetivo, Resultado, Ruta,
-    motivo_para_guardar, recortar, ruta, volcar,
+    CAPACIDAD_DEL_CANAL, ChangeDetector, ErrorDeExtraccion, INACTIVIDAD_MAXIMA,
+    MysqlChangeDetector, Objetivo, PostgresChangeDetector, Resultado, Ruta, motivo_para_guardar,
+    recortar, ruta, volcar,
 };
 use super::hub::{EventoDeEjecucion, Hub};
 use super::{Ajustes, Contexto};
@@ -154,6 +155,39 @@ const INTERVALO_MINIMO_DE_AVISO: Duration = Duration::from_secs(1);
 /// exclusivo—. La tarea sí se vuelve a leer, porque el target y la retención son suyos y no deciden
 /// quién atiende a quién.
 pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion, repository_id: Uuid) {
+    ejecutar_con(
+        contexto,
+        fila,
+        repository_id,
+        || {
+            Cliente::conectar(
+                &contexto.ajustes.socket_del_motor,
+                contexto.ajustes.espera_del_motor,
+            )
+            .map(|cliente| ControlDelCliente { contexto, cliente })
+            .map_err(|causa| format!("no se pudo conectar con el motor de contenedores: {causa}"))
+        },
+        correr,
+    );
+}
+
+/// El ciclo completo, con el control de contenedores y la copia **inyectados**.
+///
+/// Es la pieza que hace posibles las pruebas de orquestación sin Docker: `ejecutar` solo
+/// suministra el control real y la copia real. Y es también la que garantiza el invariante
+/// del rustdoc de [`ejecutar`]: pase lo que pase en el stop o en la copia, la fila acaba en
+/// `failed` o `success` con su `finished_at`, nunca en `running`.
+fn ejecutar_con<C, F, G>(
+    contexto: &Contexto,
+    fila: &Ejecucion,
+    repository_id: Uuid,
+    fabrica_de_control: G,
+    correr: F,
+) where
+    C: ControlDeContenedores,
+    G: FnOnce() -> Result<C, String>,
+    F: FnOnce(&Contexto, &Ejecucion, &Arc<EnVivo>, Uuid) -> Cierre,
+{
     // 1. La ejecución pasa a `running`, entrando en el runtime de la aplicación **solo** para la
     //    base. Y se publica la transición: el panel tiene que ver el cambio de estado aunque el
     //    proceso muera en el paso siguiente.
@@ -191,8 +225,35 @@ pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion, repository_id: Uui
     en_vivo.accion(ACCION_LEYENDO_LA_FILA);
     en_vivo.publicar();
 
-    // 2 a 7: la copia entera.
-    let cierre = correr(contexto, &en_curso, &en_vivo, repository_id);
+    // 2 a 7: la copia entera. Si hay contenedores configurados, se detienen antes y se
+    // reinician al terminar, tanto si la copia sale bien como si falla —y también si `correr`
+    // entra en pánico, merced a la guardia RAII—.
+    // Candado de proceso: `stop_containers` es global, pero hay **un worker por repositorio**.
+    // Sin él, dos copias de repositorios distintos detendrían y reiniciarían los mismos
+    // contenedores a la vez. Se toma aquí, dentro del worker, y nunca lo antes: ningún hilo
+    // que tenga otro candado lo adquiere, así que no hay inversión.
+    static CANDADO_DE_CONTENEDORES: Mutex<()> = Mutex::new(());
+
+    let _candado = (!contexto.ajustes.stop_containers.is_empty()).then(|| {
+        CANDADO_DE_CONTENEDORES
+            .lock()
+            .unwrap_or_else(|veneno| veneno.into_inner())
+    });
+
+    let cierre = match copiar_con_contenedores(
+        contexto,
+        fila,
+        &en_vivo,
+        repository_id,
+        fabrica_de_control,
+        correr,
+    ) {
+        Ok(cierre) => cierre,
+        Err(motivo) => {
+            tracing::error!(execution_id = %fila.id, %motivo);
+            Cierre::fallida(recortar(&motivo))
+        }
+    };
 
     // 8. La fila, con lo que se haya medido: los contadores se escriben también cuando la copia
     //    falla, porque lo que hay que contar es lo que llegó a pasar. `started_at` no se toca —es
@@ -200,10 +261,51 @@ pub(crate) fn ejecutar(contexto: &Contexto, fila: &Ejecucion, repository_id: Uui
     en_vivo.accion(ACCION_TERMINANDO);
     escribir_el_final(contexto, &en_curso, &cierre, en_vivo.cifras());
 
-    // 9. Y el evento final, con el estado que acaba de escribirse.
+    // 9. Los avisos no fatales —un contenedor que no volvió a arrancar— se publican aparte:
+    //    la copia pudo salir bien, pero el operador tiene que verlo.
+    if let Some(aviso) = &cierre.aviso {
+        contexto.hub.publicar(en_vivo.evento(cierre.estado, aviso));
+    }
+
+    // 10. Y el evento final, con el estado que acaba de escribirse.
     contexto
         .hub
         .publicar(en_vivo.evento(cierre.estado, ACCION_TERMINANDO));
+}
+
+/// Detiene los contenedores configurados, hace la copia y devuelve el [`Cierre`].
+///
+/// Los dos fallos previos a la copia —no poder construir el control y no poder detener un
+/// contenedor— llegan como `Err` para que [`ejecutar_con`] escriba el final fallido en vez de
+/// abandonar la fila en `running`. La guardia que reinicia los contenedores se crea **después**
+/// del stop: si este falla, [`detener_contenedores`] ya devolvió los suyos a su estado.
+fn copiar_con_contenedores<C, F, G>(
+    contexto: &Contexto,
+    fila: &Ejecucion,
+    en_vivo: &Arc<EnVivo>,
+    repository_id: Uuid,
+    fabrica_de_control: G,
+    correr: F,
+) -> Result<Cierre, String>
+where
+    C: ControlDeContenedores,
+    G: FnOnce() -> Result<C, String>,
+    F: FnOnce(&Contexto, &Ejecucion, &Arc<EnVivo>, Uuid) -> Cierre,
+{
+    if contexto.ajustes.stop_containers.is_empty() {
+        return Ok(correr(contexto, fila, en_vivo, repository_id));
+    }
+
+    let control = fabrica_de_control()?;
+    let detenidos = detener_contenedores(&control, &contexto.ajustes.stop_containers)?;
+
+    // RAII: mientras la guardia esté viva, cualquier salida —incluido un pánico de `correr`
+    // que `cola.rs` recoge fuera— reinicia los contenedores que se detuvieron.
+    let mut guardia = GuardiaDeContenedores::nuevo(&control, detenidos);
+    let cierre = correr(contexto, fila, en_vivo, repository_id);
+    let aviso = guardia.reiniciar();
+
+    Ok(cierre.con_aviso(aviso))
 }
 
 /// Escribe el final de una ejecución en su fila, **desde el hilo del trabajador**.
@@ -252,7 +354,7 @@ fn la_fila_final(fila: &Ejecucion, cierre: &Cierre, cifras: Cifras) -> Ejecucion
     let mut final_de_la_fila = fila.clone();
     final_de_la_fila.status = cierre.estado;
     final_de_la_fila.snapshot_id = cierre.snapshot_id.clone();
-    final_de_la_fila.error_message = cierre.motivo.clone();
+    final_de_la_fila.error_message = cierre.motivo.clone().or_else(|| cierre.aviso.clone());
     final_de_la_fila.bytes_processed = como_entero(cifras.procesados);
     final_de_la_fila.bytes_uploaded = como_entero(cifras.subidos);
     final_de_la_fila.finished_at = Some(OffsetDateTime::now_utc());
@@ -448,7 +550,7 @@ fn correr(
 
     let barras = en_vivo.barras_de_esta_ejecucion();
 
-    let (copia_del_repositorio, puesta_en_marcha) = match (ajustes.abridor)(&acceso, barras) {
+    let (mut copia_del_repositorio, puesta_en_marcha) = match (ajustes.abridor)(&acceso, barras) {
         Ok(abierto) => abierto,
         Err(causa) => {
             return Cierre::fallida(motivo_de_la_biblioteca(&causa.to_string(), &acceso));
@@ -485,7 +587,7 @@ fn correr(
             orden,
             db_path,
         } => copiar_el_volcado(
-            &copia_del_repositorio,
+            &mut copia_del_repositorio,
             &acceso,
             &contenedor,
             orden,
@@ -494,6 +596,8 @@ fn correr(
             &etiqueta,
             en_vivo,
             ajustes,
+            detector_de_produccion,
+            lanzar_el_productor,
         ),
     };
 
@@ -628,8 +732,8 @@ fn copiar_el_directorio(
 /// la firma que se quería evitar. **Comprobado**: quitando el `allow`, clippy avisa «this function
 /// has too many arguments (8/7)», así que no es un atributo olvidado.
 #[allow(clippy::too_many_arguments)]
-fn copiar_el_volcado(
-    repositorio: &Repositorio,
+fn copiar_el_volcado<D, L>(
+    repositorio: &mut Repositorio,
     acceso: &Acceso,
     contenedor: &str,
     orden: Orden,
@@ -638,7 +742,20 @@ fn copiar_el_volcado(
     etiqueta: &str,
     en_vivo: &Arc<EnVivo>,
     ajustes: &Ajustes,
-) -> Result<CopiaHecha, Cierre> {
+    detector: D,
+    lanzador: L,
+) -> Result<CopiaHecha, Cierre>
+where
+    D: Fn(&Orden, &[(String, String)]) -> Option<Box<dyn ChangeDetector>>,
+    L: FnOnce(
+        String,
+        Duration,
+        String,
+        Orden,
+        Option<String>,
+        ProductorDelVolcado,
+    ) -> Result<std::thread::JoinHandle<VueltaDelProductor>, String>,
+{
     // El túnel, antes de archivar nada: es lo que da el avance del productor, que el motor publica
     // en vivo.
     let tunel = tunel_del_volcado(nombre.to_owned(), CAPACIDAD_DEL_CANAL, INACTIVIDAD_MAXIMA)
@@ -667,6 +784,29 @@ fn copiar_el_volcado(
         comando: orden.cmd.join(" "),
     };
 
+    // El manifest se calcula **antes** de archivar y antes de tocar la acción de archivado:
+    // es lo que decide si los bytes del volcado se suben o la copia reutiliza la instantánea
+    // anterior. Para un target sin detector de su motor no hay manifest y el archivado hace su
+    // subida completa de siempre; si el detector falla, tampoco aborta la copia.
+    // El host y el puerto se leen del proceso: los clientes de detección corren aquí, no dentro
+    // del contenedor de la base, y no pueden adivinar la red. libpq toma los suyos de `PGHOST` y
+    // `PGPORT`; los clientes MariaDB reciben `MYSQL_HOST` y `MYSQL_PORT` por la misma vía.
+    let conexion = ["PGHOST", "PGPORT", "MYSQL_HOST", "MYSQL_PORT"]
+        .iter()
+        .filter_map(|clave| {
+            std::env::var(clave)
+                .ok()
+                .map(|valor| ((*clave).to_owned(), valor))
+        })
+        .collect::<Vec<_>>();
+    let detector = detector(&orden, &conexion);
+    let manifiesto = detector
+        .as_ref()
+        .and_then(|detector| detector.change_manifest());
+    if manifiesto.is_none() {
+        avisar_degradacion(&orden, detector.is_some(), nombre);
+    }
+
     en_vivo.accion(ACCION_EXTRAYENDO_EL_VOLCADO);
     en_vivo.publicar();
 
@@ -676,7 +816,7 @@ fn copiar_el_volcado(
     // trabajo, porque con uno solo cualquier otra tarea de ese runtime —empezando por el plazo que
     // el transporte pone alrededor de cada trozo— se queda sin poll mientras el cierre bloquea, y
     // entonces el plazo no puede vencer.
-    let hilo_del_productor = lanzar_el_productor(
+    let hilo_del_productor = lanzador(
         ajustes.socket_del_motor.clone(),
         ajustes.espera_del_motor,
         contenedor.to_owned(),
@@ -689,7 +829,7 @@ fn copiar_el_volcado(
     en_vivo.accion(ACCION_ARCHIVANDO);
     en_vivo.publicar();
 
-    let archivado = repositorio.archivar_volcado(&copia, &origen);
+    let archivado = repositorio.archivar_volcado(&copia, &origen, manifiesto);
 
     // La unión **antes** de decidir nada: la entrega completa la marca el lector dentro del
     // archivado, y el código de salida solo lo tiene el hilo del productor.
@@ -704,6 +844,13 @@ fn copiar_el_volcado(
             )));
         }
     };
+
+    // En la rama «sin cambios» se crea una instantánea nueva que apunta al mismo árbol, así
+    // que no hay ficheros nuevos que contar —pero el volcado se ha leído y entregado igual—.
+    // Su identificador es propio, distinto del de la copia real, así que si el productor falla
+    // se puede olvidar sin tocar el historial anterior.
+    let sin_cambios = hecho.sin_cambios;
+    let ficheros_entregados = if sin_cambios { 1 } else { hecho.ficheros };
 
     let resultado = match vuelta {
         Ok(Ok(resultado)) => resultado,
@@ -736,13 +883,13 @@ fn copiar_el_volcado(
     // se mira—: el archivado silencia el error del lector, sigue y guarda la instantánea sin el
     // volcado dentro, y en el peor caso medido sin una sola línea de aviso. Heredar ese `Ok` da
     // por buena una copia que existe, ocupa sitio y no se puede restaurar.
-    match el_volcado_se_entrego(entrega.completa(), resultado.codigo, hecho.ficheros) {
+    match el_volcado_se_entrego(entrega.completa(), resultado.codigo, ficheros_entregados) {
         Ok(()) => Ok(hecho),
         // La copia no se da por buena y su instantánea ya está escrita: se olvida de mejor
         // esfuerzo y el cierre conserva el motivo del volcado.
         Err(fallo) => Err(descartar_copia_fallida(
             || olvidar_la_instantanea(repositorio, &hecho.id),
-            motivo_del_fallo(fallo, &resultado, hecho.ficheros),
+            motivo_del_fallo(fallo, &resultado, ficheros_entregados),
         )),
     }
 }
@@ -813,6 +960,44 @@ fn olvidar_la_instantanea(repositorio: &Repositorio, id: &str) -> Result<(), Str
 /// del puente—, y un `block_on` sobre el runtime que atiende las peticiones HTTP detendría el hilo
 /// que despacha y, con él, el resto de la aplicación. Así que el hilo construye el suyo, lo usa
 /// para todo el volcado y muere con él.
+/// Los motores que pueden deduplicar por manifest, aunque una orden concreta no permita
+/// construir el detector —un volcado global, por ejemplo—.
+fn motor_con_detector(orden: &Orden) -> bool {
+    matches!(
+        orden.cmd.first().map(String::as_str),
+        Some("pg_dump" | "pg_dumpall" | "mariadb-dump" | "mysqldump")
+    )
+}
+
+/// Avisa de la degradación solo cuando el motor prometía dedup.
+///
+/// Un directorio o cualquier otro target sin detector nunca la prometió: callarse es lo
+/// correcto. Un PostgreSQL o un MySQL con detector imposible —global, sin base— sí tiene que
+/// decir por qué se archiva sin manifest, porque el operador esperaba la dedup.
+fn avisar_degradacion(orden: &Orden, habia_detector: bool, nombre: &str) {
+    if habia_detector || motor_con_detector(orden) {
+        tracing::warn!(
+            %nombre,
+            "no se ha podido calcular el manifest: se archiva con subida completa"
+        );
+    }
+}
+
+/// El detector de producción: el motor de la orden, con la configuración de su cliente.
+///
+/// PostgreSQL toma el entorno de libpq del proceso; MariaDB reutiliza el usuario, la base y la
+/// contraseña de la propia orden de volcado, sin meter la credencial en `argv`.
+fn detector_de_produccion(
+    orden: &Orden,
+    conexion: &[(String, String)],
+) -> Option<Box<dyn ChangeDetector>> {
+    if let Some(detector) = PostgresChangeDetector::desde_la_orden(orden, conexion) {
+        return Some(Box::new(detector) as Box<dyn ChangeDetector>);
+    }
+    MysqlChangeDetector::desde_la_orden(orden, conexion)
+        .map(|detector| Box::new(detector) as Box<dyn ChangeDetector>)
+}
+
 fn lanzar_el_productor(
     socket: String,
     espera: Duration,
@@ -1076,6 +1261,9 @@ struct Cierre {
     snapshot_id: Option<String>,
     /// El motivo, cuando falló. Ya **recortado y sin credenciales**.
     motivo: Option<String>,
+    /// Aviso no fatal: la copia salió bien pero algo del alrededor —reiniciar un
+    /// contenedor— no. Se guarda en `error_message` y se publica en el evento.
+    aviso: Option<String>,
 }
 
 impl Cierre {
@@ -1085,6 +1273,7 @@ impl Cierre {
             estado: Estado::Success,
             snapshot_id: Some(hecho.id.clone()),
             motivo: None,
+            aviso: None,
         }
     }
 
@@ -1094,7 +1283,14 @@ impl Cierre {
             estado: Estado::Failed,
             snapshot_id: None,
             motivo: Some(motivo),
+            aviso: None,
         }
+    }
+
+    /// Añade un aviso no fatal, recortado para el panel.
+    fn con_aviso(mut self, aviso: Option<String>) -> Self {
+        self.aviso = aviso.map(|texto| recortar(&texto));
+        self
     }
 }
 
@@ -1184,6 +1380,27 @@ impl EnVivo {
                 bytes_del_ultimo_aviso: 0,
             }),
         }
+    }
+
+    /// Un estado en vivo sin motor ni base: para la prueba del cable del detector.
+    ///
+    /// El hub no tiene suscriptores y los identificadores son nulos; lo único que se mide es
+    /// qué manifest llega al archivado, no qué eventos se publican.
+    #[cfg(test)]
+    fn de_prueba() -> Arc<Self> {
+        Arc::new(Self {
+            hub: Hub::nuevo(),
+            execution_id: Uuid::nil(),
+            job_id: Uuid::nil(),
+            volcado: Mutex::new(None),
+            accion: Mutex::new(ACCION_ENCOLADA),
+            avance: Mutex::new(Avance {
+                total: None,
+                subidos: 0,
+                ultimo_aviso: Instant::now(),
+                bytes_del_ultimo_aviso: 0,
+            }),
+        })
     }
 
     /// Las barras del motor que informan a **esta** ejecución.
@@ -1323,15 +1540,662 @@ fn candado<T>(candado: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Las dos operaciones del transporte que el backup necesita alrededor de la copia.
+///
+/// Se separan en un trait **solo** para que las pruebas puedan sustituir el motor de
+/// contenedores por un testigo que anote las llamadas. En producción la implementación es
+/// [`ControlDelCliente`], que entra en el runtime de la aplicación para las dos operaciones
+/// asíncronas; en las pruebas no hace falta ningún runtime ni ningún socket.
+trait ControlDeContenedores {
+    /// Detiene un contenedor y devuelve el motivo si no se pudo.
+    fn detener(&self, contenedor: &str) -> Result<(), String>;
+    /// Arranca un contenedor y devuelve el motivo si no se pudo.
+    fn arrancar(&self, contenedor: &str) -> Result<(), String>;
+}
+
+/// El control real: el cliente del motor, conducido desde el hilo del trabajador.
+struct ControlDelCliente<'a> {
+    contexto: &'a Contexto,
+    cliente: Cliente,
+}
+
+impl ControlDeContenedores for ControlDelCliente<'_> {
+    fn detener(&self, contenedor: &str) -> Result<(), String> {
+        self.contexto
+            .en_la_base(self.cliente.stop_container(contenedor))
+            .map_err(|causa| causa.to_string())
+    }
+
+    fn arrancar(&self, contenedor: &str) -> Result<(), String> {
+        self.contexto
+            .en_la_base(self.cliente.start_container(contenedor))
+            .map_err(|causa| causa.to_string())
+    }
+}
+
+/// Reinicia un contenedor, deja constancia del error y devuelve el aviso a quien propaga el fallo.
+fn reiniciar_contenedor(control: &dyn ControlDeContenedores, contenedor: &str) -> Option<String> {
+    if let Err(causa) = control.arrancar(contenedor) {
+        tracing::error!(
+            contenedor = %contenedor,
+            error = %causa,
+            "no se ha podido reiniciar el contenedor: revertirlo manualmente"
+        );
+        return Some(format!("`{contenedor}`: {causa}"));
+    }
+    None
+}
+
+/// Detiene los contenedores indicados y devuelve prestados los que se han detenido.
+fn detener_contenedores<'a>(
+    control: &dyn ControlDeContenedores,
+    contenedores: &'a [String],
+) -> Result<Vec<&'a str>, String> {
+    let mut detenidos = Vec::new();
+
+    for contenedor in contenedores {
+        match control.detener(contenedor) {
+            Ok(()) => detenidos.push(contenedor.as_str()),
+            Err(causa) => {
+                let avisos: Vec<_> = detenidos
+                    .iter()
+                    .filter_map(|ya_detenido| reiniciar_contenedor(control, ya_detenido))
+                    .collect();
+                let mut motivo = format!(
+                    "no se pudo detener el contenedor `{contenedor}` antes del backup: {causa}"
+                );
+                if !avisos.is_empty() {
+                    motivo.push_str(
+                        "; además, no se han podido reiniciar todos los contenedores ya detenidos: ",
+                    );
+                    motivo.push_str(&avisos.join("; "));
+                }
+                return Err(motivo);
+            }
+        }
+    }
+
+    Ok(detenidos)
+}
+
+/// Guardia que reinicia los contenedores registrados **al soltarse**, pase lo que pase.
+///
+/// Existe para el desenlace que el camino normal no alcanza: un pánico dentro de `correr`.
+/// `cola.rs` recoge ese pánico y marca la fila como fallida, pero el lazo de reinicio de
+/// `copiar_con_contenedores` ya no se ejecuta. El `Drop`, en cambio, corre durante el unwind.
+struct GuardiaDeContenedores<'a, C: ControlDeContenedores + ?Sized> {
+    control: &'a C,
+    /// `None` cuando ya se han reiniciado: evita hacerlo dos veces en el camino normal.
+    detenidos: Option<Vec<&'a str>>,
+}
+
+impl<'a, C: ControlDeContenedores + ?Sized> GuardiaDeContenedores<'a, C> {
+    fn nuevo(control: &'a C, detenidos: Vec<&'a str>) -> Self {
+        Self {
+            control,
+            detenidos: Some(detenidos),
+        }
+    }
+
+    /// Reinicia ahora y devuelve un aviso si alguno no volvió.
+    fn reiniciar(&mut self) -> Option<String> {
+        let detenidos = self.detenidos.take()?;
+        let mut fallos = Vec::new();
+        for contenedor in detenidos {
+            if let Err(causa) = self.control.arrancar(contenedor) {
+                fallos.push(format!("`{contenedor}`: {causa}"));
+            }
+        }
+        (!fallos.is_empty()).then(|| {
+            format!(
+                "la copia terminó, pero no se han podido reiniciar todos los contenedores: {}",
+                fallos.join("; ")
+            )
+        })
+    }
+}
+
+impl<C: ControlDeContenedores + ?Sized> Drop for GuardiaDeContenedores<'_, C> {
+    fn drop(&mut self) {
+        if let Some(aviso) = self.reiniciar() {
+            tracing::error!(%aviso, "reinicio de contenedores al soltar la guardia de la ejecución");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_de_contenedores {
+    use std::cell::RefCell;
+
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    use super::{
+        Cierre, Contexto, ControlDeContenedores, CopiaHecha, Ejecucion, Estado,
+        detener_contenedores, ejecutar_con, reiniciar_contenedor,
+    };
+    use crate::db::entities::{
+        AltaDeEjecucion, AltaDeRepositorio, AltaDeTarea, AltaDeTarget, TipoDeTarget,
+    };
+    use crate::secret::SecretString;
+    use crate::state::EstadoDeBase;
+
+    /// Testigo de las operaciones de contenedor: anota cada llamada y puede simular fallos.
+    struct ControlFalso {
+        detenidos: RefCell<Vec<String>>,
+        arrancados: RefCell<Vec<String>>,
+        fallan_al_detener: Vec<String>,
+        fallan_al_arrancar: Vec<String>,
+    }
+
+    impl ControlFalso {
+        fn nuevo() -> Self {
+            Self {
+                detenidos: RefCell::new(Vec::new()),
+                arrancados: RefCell::new(Vec::new()),
+                fallan_al_detener: Vec::new(),
+                fallan_al_arrancar: Vec::new(),
+            }
+        }
+
+        fn con_fallo_al_detener(mut self, contenedor: &str) -> Self {
+            self.fallan_al_detener.push(contenedor.to_owned());
+            self
+        }
+
+        fn con_fallo_al_arrancar(mut self, contenedor: &str) -> Self {
+            self.fallan_al_arrancar.push(contenedor.to_owned());
+            self
+        }
+    }
+
+    impl ControlDeContenedores for ControlFalso {
+        fn detener(&self, contenedor: &str) -> Result<(), String> {
+            if self.fallan_al_detener.iter().any(|c| c == contenedor) {
+                return Err(format!("fallo simulado al detener `{contenedor}`"));
+            }
+            self.detenidos.borrow_mut().push(contenedor.to_owned());
+            Ok(())
+        }
+
+        fn arrancar(&self, contenedor: &str) -> Result<(), String> {
+            // Se anota antes de decidir: lo que el test comprueba es que se **llamó**,
+            // tanto si el arranque salió bien como si falló.
+            self.arrancados.borrow_mut().push(contenedor.to_owned());
+            if self.fallan_al_arrancar.iter().any(|c| c == contenedor) {
+                return Err(format!("fallo simulado al arrancar `{contenedor}`"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn detener_contenedores_con_lista_vacia_no_toca_nada() {
+        let control = ControlFalso::nuevo();
+
+        let detenidos = detener_contenedores(&control, &[]).expect("una lista vacía no falla");
+
+        assert!(detenidos.is_empty(), "no se ha detenido ningún contenedor");
+        assert!(
+            control.detenidos.borrow().is_empty(),
+            "no se ha llamado a detener ni una vez"
+        );
+        assert!(
+            control.arrancados.borrow().is_empty(),
+            "no se ha llamado a arrancar ni una vez"
+        );
+    }
+
+    #[test]
+    fn detener_contenedores_detiene_los_dos_y_los_devuelve() {
+        let control = ControlFalso::nuevo();
+        let nombres = vec!["web".to_owned(), "db".to_owned()];
+
+        let detenidos = detener_contenedores(&control, &nombres).expect("los dos se detienen");
+
+        assert_eq!(detenidos, vec!["web", "db"]);
+        assert_eq!(*control.detenidos.borrow(), nombres);
+        assert!(control.arrancados.borrow().is_empty());
+    }
+
+    #[test]
+    fn detener_contenedores_reinicia_el_primero_si_el_segundo_falla() {
+        let control = ControlFalso::nuevo().con_fallo_al_detener("db");
+        let nombres = vec!["web".to_owned(), "db".to_owned()];
+
+        let error = detener_contenedores(&control, &nombres)
+            .expect_err("el fallo del segundo contenedor aborta la parada");
+
+        assert!(
+            error.contains("db"),
+            "el error nombra el contenedor que falló: {error}"
+        );
+        assert_eq!(
+            *control.detenidos.borrow(),
+            vec!["web".to_owned()],
+            "solo se intentó detener el primero"
+        );
+        assert_eq!(
+            *control.arrancados.borrow(),
+            vec!["web".to_owned()],
+            "el primero se reinicia antes de devolver el error"
+        );
+    }
+
+    #[test]
+    fn detener_contenedores_nombra_el_reinicio_que_fallo_al_fallar_otra_parada() {
+        let control = ControlFalso::nuevo()
+            .con_fallo_al_detener("db")
+            .con_fallo_al_arrancar("web");
+        let nombres = vec!["web".to_owned(), "db".to_owned()];
+
+        let error = detener_contenedores(&control, &nombres)
+            .expect_err("el fallo del segundo contenedor aborta la parada");
+
+        assert!(
+            error.contains("db"),
+            "no nombra el contenedor que falló al detenerse: {error}"
+        );
+        assert!(
+            error.contains("web"),
+            "no nombra el contenedor que no pudo reiniciarse: {error}"
+        );
+        assert!(
+            error.contains("reiniciar"),
+            "no describe el reinicio fallido: {error}"
+        );
+    }
+
+    #[test]
+    fn reiniciar_contenedor_llama_a_arrancar_y_no_propaga_el_error() {
+        let control = ControlFalso::nuevo().con_fallo_al_arrancar("web");
+
+        // El error no se propaga como `Err`: vuelve como aviso para el motivo del fallo.
+        let aviso = reiniciar_contenedor(&control, "web");
+
+        assert_eq!(*control.arrancados.borrow(), vec!["web".to_owned()]);
+        assert!(
+            aviso.as_ref().is_some_and(|texto| texto.contains("web")),
+            "el aviso nombra el contenedor que no arrancó: {aviso:?}"
+        );
+    }
+
+    // El control se inyecta por fabrica, así que un testigo tomado por referencia es suficiente:
+    // no hace falta clonar lo que ya está anotando las llamadas.
+    impl<T: ControlDeContenedores + ?Sized> ControlDeContenedores for &T {
+        fn detener(&self, contenedor: &str) -> Result<(), String> {
+            (**self).detener(contenedor)
+        }
+
+        fn arrancar(&self, contenedor: &str) -> Result<(), String> {
+            (**self).arrancar(contenedor)
+        }
+    }
+
+    /// Base, runtime y contexto de una ejecución, sin Docker y sin red.
+    ///
+    /// El runtime se construye **fuera** de otro runtime: `Contexto::en_la_base` entra en él con
+    /// `block_on`, y hacer eso desde dentro del propio executor es el pánico que el módulo
+    /// prohíbe. Con `current_thread` basta `enable_all` para las migraciones y las consultas.
+    struct Aparato {
+        contexto: Contexto,
+        db: EstadoDeBase,
+        runtime: tokio::runtime::Runtime,
+        _directorio: crate::test_support::DirectorioDePrueba,
+    }
+
+    impl Aparato {
+        fn nuevo(contenedores: &[&str]) -> Self {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("el runtime de la prueba debe construirse fuera de otro runtime");
+
+            let (directorio, pool, clave) = runtime.block_on(crate::test_support::base_con_clave());
+            let db = EstadoDeBase::nuevo(pool, clave);
+
+            let contexto = Contexto {
+                ajustes: crate::engine::Ajustes::nuevos("unix:///no/existe/kesto-prueba.sock")
+                    .con_stop_containers(contenedores.iter().copied()),
+                dependencias: crate::engine::Dependencias {
+                    repositorios: db.repositorios.clone(),
+                    targets: db.targets.clone(),
+                    tareas: db.tareas.clone(),
+                    ejecuciones: db.ejecuciones.clone(),
+                    restauraciones: db.restauraciones.clone(),
+                },
+                runtime: runtime.handle().clone(),
+                hub: crate::engine::Hub::nuevo(),
+            };
+
+            Self {
+                contexto,
+                db,
+                runtime,
+                _directorio: directorio,
+            }
+        }
+
+        /// Una fila `pending` con su tarea, su target y su repositorio: la clave foránea del §3
+        /// exige las tres cosas aunque la copia se inyecte.
+        fn fila_pendiente(&self) -> Ejecucion {
+            self.runtime.block_on(async {
+                let repositorio = self
+                    .db
+                    .repositorios
+                    .alta(AltaDeRepositorio {
+                        name: "repo-de-prueba".to_owned(),
+                        endpoint: "https://s3.example.test".to_owned(),
+                        bucket: "copias".to_owned(),
+                        region: "eu-west-1".to_owned(),
+                        access_key_id: "clave-publica".to_owned(),
+                        secret_access_key: SecretString::new("secreto-de-prueba".to_owned()),
+                        passphrase: SecretString::new("frase-de-prueba".to_owned()),
+                    })
+                    .await
+                    .expect("el alta del repositorio no puede fallar");
+
+                let target = self
+                    .db
+                    .targets
+                    .alta(AltaDeTarget {
+                        name: "target-de-prueba".to_owned(),
+                        target_type: TipoDeTarget::Directory,
+                        container_name: None,
+                        db_user: None,
+                        db_password: None,
+                        db_name: None,
+                        host_path: Some("/backup_sources/target".to_owned()),
+                        db_path: None,
+                    })
+                    .await
+                    .expect("el alta del target no puede fallar");
+
+                let tarea = self
+                    .db
+                    .tareas
+                    .alta(AltaDeTarea {
+                        target_id: target.id,
+                        repository_id: repositorio.id,
+                        cron_expression: "0 3 * * *".to_owned(),
+                        keep_daily: 7,
+                        keep_weekly: 4,
+                        keep_monthly: 12,
+                        enabled: true,
+                        name: "tarea-de-prueba".to_owned(),
+                    })
+                    .await
+                    .expect("el alta de la tarea no puede fallar");
+
+                self.db
+                    .ejecuciones
+                    .alta(AltaDeEjecucion {
+                        job_id: tarea.id,
+                        status: Estado::Pending,
+                        snapshot_id: None,
+                        bytes_processed: 0,
+                        bytes_uploaded: 0,
+                        error_message: None,
+                        started_at: OffsetDateTime::now_utc(),
+                        finished_at: None,
+                    })
+                    .await
+                    .expect("el alta de la ejecución no puede fallar")
+            })
+        }
+
+        fn fila_final(&self, id: &Uuid) -> Ejecucion {
+            self.runtime
+                .block_on(self.db.ejecuciones.leer(id))
+                .expect("la lectura de la fila final no puede fallar")
+                .expect("la fila de la ejecución tiene que seguir en la base")
+        }
+    }
+
+    /// Un fallo al detener aborta la copia y deja la fila cerrada, con su `finished_at`.
+    #[test]
+    fn un_fallo_al_detener_cierra_la_fila_y_reanima_los_detenidos() {
+        let aparato = Aparato::nuevo(&["web", "db"]);
+        let fila = aparato.fila_pendiente();
+        let control = ControlFalso::nuevo().con_fallo_al_detener("db");
+
+        ejecutar_con(
+            &aparato.contexto,
+            &fila,
+            Uuid::new_v4(),
+            || Ok(&control),
+            |_contexto, _fila, _en_vivo, _repository_id| {
+                Cierre::fallida("la copia no tenía que empezar".to_owned())
+            },
+        );
+
+        let final_de_la_fila = aparato.fila_final(&fila.id);
+        assert_eq!(final_de_la_fila.status, Estado::Failed);
+        assert!(
+            final_de_la_fila.finished_at.is_some(),
+            "una fila que no alcance la copia no puede quedarse en `running` sin `finished_at`"
+        );
+        assert!(
+            final_de_la_fila
+                .error_message
+                .as_deref()
+                .is_some_and(|motivo| motivo.contains("db")),
+            "el motivo nombra el contenedor que no se pudo detener: {:?}",
+            final_de_la_fila.error_message
+        );
+        assert_eq!(*control.detenidos.borrow(), vec!["web".to_owned()]);
+        assert_eq!(
+            *control.arrancados.borrow(),
+            vec!["web".to_owned()],
+            "el contenedor que sí se detuvo vuelve antes de devolver el error"
+        );
+    }
+
+    /// Un fallo de la copia no deja ningún contenedor detenido.
+    #[test]
+    fn un_fallo_de_la_copia_reinicia_todos_los_contenedores() {
+        let aparato = Aparato::nuevo(&["web", "db"]);
+        let fila = aparato.fila_pendiente();
+        let control = ControlFalso::nuevo();
+
+        ejecutar_con(
+            &aparato.contexto,
+            &fila,
+            Uuid::new_v4(),
+            || Ok(&control),
+            |_contexto, _fila, _en_vivo, _repository_id| {
+                Cierre::fallida("la copia falló".to_owned())
+            },
+        );
+
+        let final_de_la_fila = aparato.fila_final(&fila.id);
+        assert_eq!(final_de_la_fila.status, Estado::Failed);
+        assert_eq!(
+            final_de_la_fila.error_message.as_deref(),
+            Some("la copia falló")
+        );
+        assert_eq!(
+            *control.detenidos.borrow(),
+            vec!["web".to_owned(), "db".to_owned()]
+        );
+        assert_eq!(
+            *control.arrancados.borrow(),
+            vec!["web".to_owned(), "db".to_owned()],
+            "los dos contenedores se reinician aunque la copia falle"
+        );
+    }
+
+    /// El pánico de `correr` también suelta la guardia: no llega al reinicio normal.
+    #[test]
+    fn un_panico_de_la_copia_reinicia_los_contenedores_al_solter_la_guardia() {
+        let aparato = Aparato::nuevo(&["web", "db"]);
+        let fila = aparato.fila_pendiente();
+        let control = ControlFalso::nuevo();
+
+        let resultado = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ejecutar_con(
+                &aparato.contexto,
+                &fila,
+                Uuid::new_v4(),
+                || Ok(&control),
+                |_contexto, _fila, _en_vivo, _repository_id| -> Cierre {
+                    panic!("pánico simulado dentro de la copia")
+                },
+            );
+        }));
+
+        assert!(
+            resultado.is_err(),
+            "el pánico tiene que subir hasta la cola"
+        );
+        assert_eq!(
+            *control.arrancados.borrow(),
+            vec!["web".to_owned(), "db".to_owned()],
+            "el `Drop` de la guardia es el único camino que queda cuando `correr` entra en pánico"
+        );
+    }
+
+    /// Un reinicio que falla es un aviso: la copia sigue siendo buena, pero se guarda y se
+    /// publica para que el operador sepa que tiene que reactivar el contenedor a mano.
+    #[test]
+    fn un_reinicio_fallido_avis_sin_cambiar_el_exito_de_la_copia() {
+        let aparato = Aparato::nuevo(&["web", "db"]);
+        let fila = aparato.fila_pendiente();
+        let control = ControlFalso::nuevo().con_fallo_al_arrancar("db");
+        let mut receptor = aparato
+            .contexto
+            .hub
+            .suscribir()
+            .expect("el hub del aparato admite suscriptores");
+
+        ejecutar_con(
+            &aparato.contexto,
+            &fila,
+            Uuid::new_v4(),
+            || Ok(&control),
+            |_contexto, _fila, _en_vivo, _repository_id| {
+                Cierre::hecha(&CopiaHecha {
+                    id: "instantanea-de-prueba".to_owned(),
+                    ficheros: 1,
+                    bytes: 10,
+                    sin_cambios: false,
+                })
+            },
+        );
+
+        let final_de_la_fila = aparato.fila_final(&fila.id);
+        assert_eq!(final_de_la_fila.status, Estado::Success);
+        assert_eq!(
+            final_de_la_fila.snapshot_id.as_deref(),
+            Some("instantanea-de-prueba")
+        );
+        assert!(
+            final_de_la_fila
+                .error_message
+                .as_deref()
+                .is_some_and(|aviso| aviso.contains("db") && aviso.contains("reiniciar")),
+            "el aviso se guarda en `error_message` aunque la copia haya salido bien: {:?}",
+            final_de_la_fila.error_message
+        );
+        assert_eq!(
+            *control.arrancados.borrow(),
+            vec!["web".to_owned(), "db".to_owned()]
+        );
+
+        let avisos: Vec<_> = std::iter::from_fn(|| receptor.try_recv().ok())
+            .filter_map(|evento| match evento {
+                crate::engine::EventoDelMotor::Ejecucion(evento) => Some(evento),
+                crate::engine::EventoDelMotor::Restauracion(_) => None,
+            })
+            .collect();
+        assert!(
+            avisos.iter().any(|evento| {
+                evento.current_action.contains("no se han podido reiniciar")
+                    && evento.status == Estado::Success
+            }),
+            "el aviso tiene que publicarse como evento de la ejecución: {avisos:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::time::Duration;
 
     use super::{
-        FalloDelVolcado, descartar_copia_fallida, el_volcado_se_entrego, nombre_del_volcado,
+        Ajustes, ChangeDetector, EnVivo, FalloDelVolcado, Orden, ProductorDelVolcado, Resultado,
+        VueltaDelProductor, avisar_degradacion, copiar_el_volcado, descartar_copia_fallida,
+        detector_de_produccion, el_volcado_se_entrego, nombre_del_volcado,
     };
 
     use crate::db::entities::Estado;
+    use crate::rustic::{PREFIJO_DE_MANIFEST, poner_en_marcha_con};
+    use crate::test_support::{
+        PASSPHRASE_DE_PRUEBA, abrir_local, acceso_local, backends_locales, barras_mudas,
+        capturar_log, directorio_de_prueba, volcado_guardado,
+    };
+
+    /// Un detector inyectado: devuelve exactamente el manifest que la prueba quiere, sin
+    /// arrancar ningún `pg_dump`. Es lo que permite medir el cable motor → detector → archivado.
+    type Detector = dyn Fn(&Orden, &[(String, String)]) -> Option<Box<dyn ChangeDetector>>;
+
+    struct DetectorFalso {
+        manifiesto: Option<String>,
+    }
+
+    impl ChangeDetector for DetectorFalso {
+        fn change_manifest(&self) -> Option<String> {
+            self.manifiesto.clone()
+        }
+    }
+
+    fn detector_con(manifiesto: Option<String>) -> Box<Detector> {
+        Box::new(move |_orden, _conexion| {
+            manifiesto.clone().map(|hash| {
+                Box::new(DetectorFalso {
+                    manifiesto: Some(hash),
+                }) as Box<dyn ChangeDetector>
+            })
+        })
+    }
+
+    /// Un productor inyectado: entrega el contenido por el mismo canal que el `exec`, con lo
+    /// que el archivado y la comprobación de entrega siguen siendo los de producción.
+    fn lanzador_con(
+        contenido: Vec<u8>,
+    ) -> impl FnOnce(
+        String,
+        Duration,
+        String,
+        Orden,
+        Option<String>,
+        ProductorDelVolcado,
+    ) -> Result<std::thread::JoinHandle<VueltaDelProductor>, String> {
+        move |_socket, _espera, _contenedor, _orden, _db_path, productor| {
+            Ok(std::thread::spawn(move || {
+                productor
+                    .enviar(contenido.clone())
+                    .expect("el archivado o el drenaje siguen leyendo");
+                productor.terminar();
+                Ok(Resultado {
+                    codigo: 0,
+                    bytes_leidos: contenido.len() as u64,
+                    motivo_del_contenedor: String::new(),
+                })
+            }))
+        }
+    }
+
+    fn orden_de_prueba() -> Orden {
+        Orden {
+            cmd: ["pg_dump", "-U", "usuario", "-d", "base"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        }
+    }
 
     /// **La condición de éxito de un volcado son las tres cosas, y ninguna es el `Ok` del
     /// archivado.**
@@ -1500,6 +2364,303 @@ mod tests {
             cierre.motivo.as_deref(),
             Some("el proceso de extracción salió con 3"),
             "el motivo del cierre no es el original del volcado"
+        );
+    }
+
+    /// Cable completo `copiar_el_volcado` → detector inyectado → `archivar_volcado`.
+    ///
+    /// Tres ejecuciones contra un repositorio local: la primera sube, la segunda recibe el
+    /// mismo manifest y crea una instantánea nueva sobre el mismo árbol, y la tercera tiene un
+    /// detector que falla y **no aborta** la copia. El productor y el detector se inyectan; el
+    /// túnel, el archivado y la condición de entrega son los de producción.
+    #[test]
+    fn el_manifiesto_del_detector_llega_al_archivado_y_su_fallo_no_aborta_la_copia() {
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio");
+        let acceso = acceso_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let (mut repositorio, _) =
+            poner_en_marcha_con(&acceso, backends_locales(&ruta), barras_mudas())
+                .expect("el repositorio local se inicializa");
+        let ajustes = Ajustes::nuevos("socket-que-no-existe");
+        let en_vivo = EnVivo::de_prueba();
+        let nombre = "volcado-cableado.sql";
+        let contenido = b"-- volcado cableado\nCREATE TABLE t (id INT);\n".to_vec();
+        let hash = "d".repeat(64);
+
+        let primera = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba(),
+            None,
+            nombre,
+            "tarea-cableada",
+            &en_vivo,
+            &ajustes,
+            detector_con(Some(hash.clone())),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| panic!("la primera copia se archiva: {:?}", cierre.motivo));
+        assert!(!primera.sin_cambios && primera.ficheros == 1);
+
+        let segunda = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba(),
+            None,
+            nombre,
+            "tarea-cableada",
+            &en_vivo,
+            &ajustes,
+            detector_con(Some(hash.clone())),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| panic!("la segunda copia se archiva: {:?}", cierre.motivo));
+        assert!(segunda.sin_cambios, "el detector llegó al archivado");
+        assert_eq!(segunda.ficheros, 0, "la dedup no sube ficheros");
+        assert_ne!(
+            segunda.id, primera.id,
+            "la dedup crea una instantánea nueva"
+        );
+        assert_eq!(
+            volcado_guardado(&ruta, PASSPHRASE_DE_PRUEBA, &segunda.id, nombre),
+            Some(contenido.clone()),
+            "la nueva instantánea apunta al mismo árbol y se restaura"
+        );
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let nueva = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == segunda.id)
+            .expect("la instantánea sin cambios existe");
+        assert!(
+            nueva
+                .tags
+                .iter()
+                .any(|tag| tag.contains(&format!("{PREFIJO_DE_MANIFEST}{hash}"))),
+            "la instantánea nueva lleva el tag del manifest: {:?}",
+            nueva.tags
+        );
+
+        // Un detector que no calcula manifest degrada a subida completa: la copia no se aborta
+        // y la snapshot no lleva tag de manifiesto.
+        let tercera = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba(),
+            None,
+            nombre,
+            "tarea-cableada",
+            &en_vivo,
+            &ajustes,
+            detector_con(None),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| {
+            panic!(
+                "un detector fallido no aborta el backup: {:?}",
+                cierre.motivo
+            )
+        });
+        assert!(
+            !tercera.sin_cambios && tercera.ficheros == 1,
+            "sin manifest se fuerza la subida completa"
+        );
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let ultima = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == tercera.id)
+            .expect("la instantánea de la tercera copia existe");
+        assert!(
+            ultima
+                .tags
+                .iter()
+                .all(|tag| !tag.starts_with(PREFIJO_DE_MANIFEST)),
+            "sin manifest no se inventa un tag: {:?}",
+            ultima.tags
+        );
+    }
+
+    /// Una orden de volcado MariaDB como la que construye `ruta`: la credencial solo en el entorno.
+    fn orden_de_prueba_mysql() -> Orden {
+        Orden {
+            cmd: [
+                "mariadb-dump",
+                "--single-transaction",
+                "--lock-tables=false",
+                "-uoperador",
+                "tienda",
+            ]
+            .iter()
+            .map(|argumento| (*argumento).to_owned())
+            .collect(),
+            env: vec!["MYSQL_PWD=clave-de-prueba".to_owned()],
+        }
+    }
+
+    /// Un detector presente que no calcula manifest: degrada, pero no elimina el detector.
+    fn detector_mysql_que_falla() -> Box<Detector> {
+        Box::new(|_orden, _conexion| {
+            Some(Box::new(DetectorFalso { manifiesto: None }) as Box<dyn ChangeDetector>)
+        })
+    }
+
+    /// Cable de un repositorio MySQL: el factory elige detector, el manifest llega al archivado y
+    /// un fallo del detector degrada a subida completa sin abortar ni inventar un tag.
+    #[test]
+    fn el_repositorio_mysql_lleva_el_manifiesto_al_archivado_y_su_fallo_no_aborta_la_copia() {
+        let orden = orden_de_prueba_mysql();
+        assert!(
+            detector_de_produccion(&orden, &[]).is_some(),
+            "un repositorio MariaDB tiene que elegir el detector de su motor"
+        );
+
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio-mysql");
+        let acceso = acceso_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let (mut repositorio, _) =
+            poner_en_marcha_con(&acceso, backends_locales(&ruta), barras_mudas())
+                .expect("el repositorio local se inicializa");
+        let ajustes = Ajustes::nuevos("socket-que-no-existe");
+        let en_vivo = EnVivo::de_prueba();
+        let nombre = "volcado-mysql.sql";
+        let contenido = b"-- volcado MariaDB\nCREATE TABLE t (id INT);\n".to_vec();
+        let hash = "e".repeat(64);
+
+        let primera = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba_mysql(),
+            None,
+            nombre,
+            "tarea-mysql",
+            &en_vivo,
+            &ajustes,
+            detector_con(Some(hash.clone())),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| panic!("la copia MySQL se archiva: {:?}", cierre.motivo));
+        assert!(!primera.sin_cambios && primera.ficheros == 1);
+
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let snapshot = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == primera.id)
+            .expect("la instantánea MySQL existe");
+        assert!(
+            snapshot
+                .tags
+                .iter()
+                .any(|tag| tag.contains(&format!("{PREFIJO_DE_MANIFEST}{hash}"))),
+            "el manifest del repositorio MySQL llega al archivado: {:?}",
+            snapshot.tags
+        );
+
+        let segunda = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden,
+            None,
+            nombre,
+            "tarea-mysql",
+            &en_vivo,
+            &ajustes,
+            detector_mysql_que_falla(),
+            lanzador_con(contenido),
+        )
+        .unwrap_or_else(|cierre| {
+            panic!(
+                "un detector MySQL fallido no aborta el backup: {:?}",
+                cierre.motivo
+            )
+        });
+        assert!(
+            !segunda.sin_cambios && segunda.ficheros == 1,
+            "sin manifest se fuerza la subida completa"
+        );
+
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let ultima = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == segunda.id)
+            .expect("la segunda instantánea MySQL existe");
+        assert!(
+            ultima
+                .tags
+                .iter()
+                .all(|tag| !tag.starts_with(PREFIJO_DE_MANIFEST)),
+            "un detector fallido no inventa un tag: {:?}",
+            ultima.tags
+        );
+    }
+
+    /// Un target sin detector nunca prometió dedup: callarse no es perder un aviso. Un motor con
+    /// detector cuya orden concreta no lo permite —global, sin base— sí tiene que decir por qué
+    /// se archiva sin manifest.
+    #[test]
+    fn el_aviso_de_degradacion_distingue_el_motor_sin_detector_del_detector_imposible() {
+        const AVISO: &str = "no se ha podido calcular el manifest";
+
+        let (buffer, guardia) = capturar_log();
+        let global_mysql = Orden {
+            cmd: ["mariadb-dump", "--all-databases"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        assert!(
+            detector_de_produccion(&global_mysql, &[]).is_none(),
+            "un volcado MySQL global no tiene detector"
+        );
+        avisar_degradacion(&global_mysql, false, "volcado-mysql.sql");
+        let global_postgres = Orden {
+            cmd: ["pg_dumpall", "-U", "usuario"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        assert!(
+            detector_de_produccion(&global_postgres, &[]).is_none(),
+            "pg_dumpall no tiene una sola base que checksumar"
+        );
+        avisar_degradacion(&global_postgres, false, "volcado-postgres.sql");
+        assert!(
+            buffer.texto().contains(AVISO),
+            "un motor con detector imposible avisa: {}",
+            buffer.texto()
+        );
+        drop(guardia);
+
+        let (buffer, _guardia) = capturar_log();
+        let sin_detector = Orden {
+            cmd: ["tar", "-cf", "-", "directorio"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        avisar_degradacion(&sin_detector, false, "directorio.tar");
+        assert!(
+            !buffer.texto().contains(AVISO),
+            "un target sin detector no avisa de una dedup que nunca prometió: {}",
+            buffer.texto()
         );
     }
 }

@@ -1,3 +1,5 @@
+import { instalarFetchFalso } from '../../../tests/fetchDePrueba'
+import { listarSnapshots } from '../../api/snapshots'
 import type {
   AltaJob,
   AltaRepository,
@@ -20,6 +22,10 @@ import type {
 // Estas pruebas son el candado de los literales del cable: si alguien cambia
 // una variante del enum, el `satisfies` deja de compilar y `tsc` falla antes
 // que el backend y el panel se desalineen en silencio.
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 describe('tipos del cable', () => {
   it('los cuatro estados de una ejecución son los del backend', () => {
@@ -185,6 +191,7 @@ describe('tipos del cable', () => {
       time: '2026-01-02T03:04:05Z',
       paths: ['/srv/web'],
       label: 'manual',
+      change_manifest: 'abc123def456',
       // La etiqueta del snapshot no se toca; `job_name` es aparte y anulable
       // (`issue #65`): aquí no hay tarea con nombre que lo pueble.
       job_name: null,
@@ -226,5 +233,47 @@ describe('tipos del cable', () => {
 
     expect([ejecuciones.total, ejecuciones.executions.length]).toEqual([120, 0])
     expect([snapshots.total, snapshots.truncated, snapshots.snapshots.length]).toEqual([45, false, 0])
+  })
+
+  it('el listado del cable trae change_manifest con el hash sin prefijo y null', async () => {
+    instalarFetchFalso(() => ({
+      status: 200,
+      data: {
+        snapshots: [
+          {
+            id: 'a'.repeat(64),
+            time: '2026-01-02T03:04:05Z',
+            paths: ['/srv/web'],
+            label: 'manual',
+            change_manifest: 'abc123def456',
+            job_name: 'copia nocturna',
+            files: 12,
+            bytes: 4096,
+            target_id: 't',
+            target_name: 'web',
+            target_type: 'directory',
+          },
+          {
+            id: 'b'.repeat(64),
+            time: '2026-01-01T03:04:05Z',
+            paths: ['/srv/web'],
+            label: 'manual',
+            change_manifest: null,
+            job_name: 'copia nocturna',
+            files: 10,
+            bytes: 2048,
+            target_id: 't',
+            target_name: 'web',
+            target_type: 'directory',
+          },
+        ],
+        total: 2,
+        truncated: false,
+      },
+    }))
+
+    const listado = await listarSnapshots('r1')
+
+    expect(listado.snapshots.map((snap) => snap.change_manifest)).toEqual(['abc123def456', null])
   })
 })

@@ -67,6 +67,54 @@ impl Cliente {
         }
     }
 
+    /// Detiene un contenedor en marcha antes de un backup.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::MotorNoDisponible`] si el motor no responde, o el fallo
+    /// del daemon si no puede detener el contenedor.
+    pub async fn stop_container(&self, contenedor: &str) -> Result<(), Error> {
+        let mut canal = CanalCliente::abrir(&self.socket).await?;
+        canal
+            .enviar(&SolicitudMotor::DetenerContenedor {
+                nombre: contenedor.to_owned(),
+            })
+            .await?;
+        match canal.esperar(self.timeout).await? {
+            RespuestaMotor::Aceptado => Ok(()),
+            RespuestaMotor::Fallo {
+                clase,
+                mensaje,
+                status_code,
+            } => Err(self.del_fallo(clase, &mensaje, status_code, Some(contenedor), false)),
+            _ => Err(self.del_protocolo()),
+        }
+    }
+
+    /// Arranca un contenedor previamente detenido.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::MotorNoDisponible`] si el motor no responde, o el fallo
+    /// del daemon si no puede arrancar el contenedor.
+    pub async fn start_container(&self, contenedor: &str) -> Result<(), Error> {
+        let mut canal = CanalCliente::abrir(&self.socket).await?;
+        canal
+            .enviar(&SolicitudMotor::IniciarContenedor {
+                nombre: contenedor.to_owned(),
+            })
+            .await?;
+        match canal.esperar(self.timeout).await? {
+            RespuestaMotor::Aceptado => Ok(()),
+            RespuestaMotor::Fallo {
+                clase,
+                mensaje,
+                status_code,
+            } => Err(self.del_fallo(clase, &mensaje, status_code, Some(contenedor), false)),
+            _ => Err(self.del_protocolo()),
+        }
+    }
+
     /// Ejecuta una orden y entrega cada trozo de salida según llega.
     ///
     /// # Errors

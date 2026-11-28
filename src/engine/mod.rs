@@ -178,6 +178,10 @@ pub struct Ajustes {
     /// Cómo se comprueba la salud de un repositorio: la primitiva de solo lectura en producción, un
     /// desenlace inyectado en las pruebas.
     pub comprobador: ComprobadorDeSalud,
+    /// Contenedores que hay que detener antes de tomar el backup y reiniciar después.
+    ///
+    /// `KESTO_STOP_CONTAINERS` es una lista separada por comas de nombres o IDs de contenedor.
+    pub stop_containers: Vec<String>,
 }
 
 impl Ajustes {
@@ -195,6 +199,7 @@ impl Ajustes {
             raiz_de_copias: raiz_de_copias_por_defecto(),
             abridor: Repositorio::poner_en_marcha,
             comprobador: salud_del_repositorio,
+            stop_containers: Vec::new(),
         }
     }
 
@@ -216,6 +221,12 @@ impl Ajustes {
     /// Los mismos ajustes con otro comprobador de salud.
     pub fn con_comprobador(mut self, comprobador: ComprobadorDeSalud) -> Self {
         self.comprobador = comprobador;
+        self
+    }
+
+    /// Contenedores a detener antes del backup (se pasa desde la configuración).
+    pub fn con_stop_containers(mut self, cont: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.stop_containers = cont.into_iter().map(|c| c.as_ref().to_owned()).collect();
         self
     }
 }
@@ -254,6 +265,7 @@ impl std::fmt::Debug for Ajustes {
             .field("espera_del_motor", &self.espera_del_motor)
             .field("espera_de_parada", &self.espera_de_parada)
             .field("raiz_de_copias", &self.raiz_de_copias)
+            .field("stop_containers", &self.stop_containers)
             .finish_non_exhaustive()
     }
 }

@@ -328,6 +328,403 @@ describe('pantalla de Snapshots', () => {
 })
 
 /**
+ * Columna «Cambios» (delta `panel` de `dedup-manifest`). El valor que manda es el
+ * `change_manifest` del cable y la comparación se hace con la instantánea
+ * anterior de la misma tarea —o por `time` cuando no hay `job_name`—. Se prueba
+ * leyendo la tabla, que es lo que ve el operador, no la función que decide.
+ */
+describe('pantalla de Snapshots — columna «Cambios»', () => {
+  const MANIFEST = 'aaaabbbbccccdddd'
+  const MANIFEST_NUEVO = '1111222233334444'
+  const HORA_NUEVA = '2026-01-03T03:00:00Z'
+  const HORA_VIEJA = '2026-01-02T03:00:00Z'
+
+  /** La celda «Cambios» de la fila de la instantánea `id`. */
+  function celdaDeCambios(tabla: HTMLElement, id: string): HTMLElement {
+    const indice = within(tabla)
+      .getAllByRole('columnheader')
+      .findIndex((celda) => (celda.textContent ?? '').trim() === 'Cambios')
+    if (indice < 0) throw new Error('no hay columna «Cambios»')
+    const fila = within(tabla).getByText(id).closest('tr')
+    if (fila === null) throw new Error(`no se encontró la fila de ${id}`)
+    const celda = within(fila).getAllByRole('cell')[indice]
+    if (celda === undefined) throw new Error(`la fila de ${id} no tiene celda «Cambios»`)
+    return celda
+  }
+
+  /** Simula un backend que aún no publica el campo (despliegue escalonado). */
+  function sinCampoDeManifest(snap: Snapshot): Record<string, unknown> {
+    const copia: Record<string, unknown> = { ...snap }
+    delete copia.change_manifest
+    return copia
+  }
+
+  it('dos snapshots seguidas de la misma tarea con el mismo manifest: la reciente dice «sin cambios»', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({
+              id: HEX,
+              time: HORA_NUEVA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+            snapshot({
+              id: OTRO_HEX,
+              time: HORA_VIEJA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda).toHaveTextContent('sin cambios')
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    const abreviado = within(celda).getByText(MANIFEST.slice(0, 8))
+    expect(abreviado).toHaveAttribute('title', MANIFEST)
+    unmount()
+  })
+
+  it('el manifest cambia entre dos snapshots de la misma tarea: la reciente dice «nuevos datos»', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({
+              id: HEX,
+              time: HORA_NUEVA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST_NUEVO,
+            }),
+            snapshot({
+              id: OTRO_HEX,
+              time: HORA_VIEJA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda).toHaveTextContent('nuevos datos')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    const abreviado = within(celda).getByText(MANIFEST_NUEVO.slice(0, 8))
+    expect(abreviado).toHaveAttribute('title', MANIFEST_NUEVO)
+    unmount()
+  })
+
+  it('una snapshot sin manifest muestra «—» y ninguno de los dos badges', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({ id: HEX, time: HORA_NUEVA, change_manifest: null }),
+            snapshot({
+              id: OTRO_HEX,
+              time: HORA_VIEJA,
+              change_manifest: MANIFEST,
+            }),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('un cable que aún no envía change_manifest muestra «—» sin romper el render', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            sinCampoDeManifest(snapshot({ id: HEX, time: HORA_NUEVA })),
+            sinCampoDeManifest(snapshot({ id: OTRO_HEX, time: HORA_VIEJA })),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('en la página 2, sin la anterior cargada, muestra «—» en vez de un badge', async () => {
+    const usuario = userEvent.setup()
+    const TERCERO = 'ccccddddeeeeffff'
+    instalarFetchFalso(
+      manejadorCon(({ url }) => ({
+        status: 200,
+        data: {
+          snapshots: url.includes('offset=10')
+            ? [
+                snapshot({
+                  id: TERCERO,
+                  time: '2026-01-01T03:00:00Z',
+                  job_name: 'copia nocturna',
+                  change_manifest: MANIFEST,
+                }),
+              ]
+            : [
+                snapshot({
+                  id: HEX,
+                  time: HORA_NUEVA,
+                  job_name: 'copia nocturna',
+                  change_manifest: MANIFEST,
+                }),
+                snapshot({
+                  id: OTRO_HEX,
+                  time: HORA_VIEJA,
+                  job_name: 'copia nocturna',
+                  change_manifest: MANIFEST,
+                }),
+              ],
+          total: 11,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    await esperarLaTabla()
+    await usuario.click(screen.getByTitle('2'))
+    await waitFor(() => {
+      expect(screen.getByText(TERCERO)).toBeInTheDocument()
+    })
+
+    const celda = celdaDeCambios(
+      screen.getByRole('table', { name: 'Snapshots del repositorio' }),
+      TERCERO,
+    )
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('sin job_name compara por time: dos horas distintas con el mismo manifest dicen «sin cambios»', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({ id: HEX, time: HORA_NUEVA, job_name: null, change_manifest: MANIFEST }),
+            snapshot({ id: OTRO_HEX, time: HORA_VIEJA, job_name: null, change_manifest: MANIFEST }),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda).toHaveTextContent('sin cambios')
+    expect(within(celda).getByText(MANIFEST.slice(0, 8))).toHaveAttribute('title', MANIFEST)
+    unmount()
+  })
+
+  it('la primera snapshot del listado, sin anterior, dice «nuevos datos»', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({ id: HEX, time: HORA_NUEVA, change_manifest: MANIFEST_NUEVO }),
+          ],
+          total: 1,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda).toHaveTextContent('nuevos datos')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).getByText(MANIFEST_NUEVO.slice(0, 8))).toHaveAttribute('title', MANIFEST_NUEVO)
+    unmount()
+  })
+
+  it('en la página 1 con más instantáneas fuera de la página, la más antigua muestra «—»', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({
+              id: HEX,
+              time: HORA_NUEVA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+            snapshot({
+              id: OTRO_HEX,
+              time: HORA_VIEJA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+          ],
+          total: 11,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, OTRO_HEX)
+
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('con el listado recortado por la guarda, la más antigua muestra «—» aunque el total no lo delate', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({
+              id: HEX,
+              time: HORA_NUEVA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+            snapshot({
+              id: OTRO_HEX,
+              time: HORA_VIEJA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+          ],
+          total: 2,
+          truncated: true,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, OTRO_HEX)
+
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('si la predecesora tiene change_manifest null, la fila muestra «—» sin inventar un cambio', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({
+              id: HEX,
+              time: HORA_NUEVA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+            snapshot({
+              id: OTRO_HEX,
+              time: HORA_VIEJA,
+              job_name: 'copia nocturna',
+              change_manifest: null,
+            }),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+
+  it('si a la predecesora le falta el campo, la fila muestra «—» sin inventar un cambio', async () => {
+    instalarFetchFalso(
+      manejadorCon(() => ({
+        status: 200,
+        data: {
+          snapshots: [
+            snapshot({
+              id: HEX,
+              time: HORA_NUEVA,
+              job_name: 'copia nocturna',
+              change_manifest: MANIFEST,
+            }),
+            sinCampoDeManifest(
+              snapshot({ id: OTRO_HEX, time: HORA_VIEJA, job_name: 'copia nocturna' }),
+            ),
+          ],
+          total: 2,
+          truncated: false,
+        },
+      })),
+    )
+
+    const { unmount } = montar()
+    const tabla = await esperarLaTabla()
+    const celda = celdaDeCambios(tabla, HEX)
+
+    expect(celda.textContent?.trim()).toBe('—')
+    expect(within(celda).queryByText('sin cambios')).not.toBeInTheDocument()
+    expect(within(celda).queryByText('nuevos datos')).not.toBeInTheDocument()
+    unmount()
+  })
+})
+
+/**
  * Restaurar un snapshot (spec `ui`, requirement «El panel ofrece restaurar un
  * snapshot con confirmación y progreso»).
  *

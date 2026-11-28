@@ -376,3 +376,101 @@ Las solicitudes legítimas SHALL conservar el comportamiento actual: la etiqueta
 - **WHEN** el motor construye la `Orden` y crea el `exec`
 - **THEN** el valor SHALL viajar como un argumento literal del argv
 - **AND** NO SHALL ejecutarse ningún metacomando ni interpretarse como shell
+
+### Requirement: El motor detecta cambios antes de archivar un volcado
+
+El motor DEBE calcular, antes de archivar el volcado de una base de datos, un *manifest de
+cambios* que identifique de forma estable el contenido de la BD. El manifest se compone de
+la estructura (PostgreSQL: `pg_dump --schema-only`; MySQL/MariaDB: `mysqldump --no-data`) y
+de un checksum de los datos por tabla (PostgreSQL: checksum de datos; MySQL/MariaDB:
+`CHECKSUM TABLE`).
+
+- Si el manifest coincide con el del último volcado archivado, el motor NO DEBE subir bytes
+  de nuevo y DEBE crear una snapshot «sin cambios».
+- Si el manifest difiere, el motor DEBE subir el volcado completo y etiquetarlo con
+  `kesto.change_manifest=<hash>`.
+- Si el manifest no se puede calcular, el motor DEBE degradar al comportamiento actual
+  (subida completa forzada, sin etiqueta) en lugar de abortar el backup.
+
+El motor NO DEBE escribir el volcado a disco ni a `/tmp`; el streaming en memoria se
+mantiene.
+
+#### Scenario: Mismo manifest produce una snapshot sin cambios
+
+- **GIVEN** una base de datos cuyo contenido y esquema no han cambiado desde el último
+  volcado archivado, con manifest `M`
+- **WHEN** el motor archiva un nuevo volcado y el manifest calculado vuelve a ser `M`
+- **THEN** el motor NO sube bytes del volcado de nuevo
+- **AND** crea una snapshot «sin cambios» etiquetada con `kesto.change_manifest=M`
+- **AND** restaurar esa snapshot devuelve el contenido del último volcado real con manifest `M`
+
+#### Scenario: Manifest distinto produce una snapshot etiquetada con el nuevo manifest
+
+- **GIVEN** una base de datos cuyo contenido ha cambiado desde el último volcado, con nuevo
+  manifest `M2` distinto del anterior `M`
+- **WHEN** el motor archiva el volcado y detecta `M2`
+- **THEN** el motor sube el volcado completo
+- **AND** la snapshot queda etiquetada con `kesto.change_manifest=M2`
+- **AND** restaurar esa snapshot devuelve el contenido del volcado correspondiente a `M2`
+
+#### Scenario: Fallo en la detección degrada a subida completa
+
+- **GIVEN** una base de datos en la que el cálculo del manifest falla
+- **WHEN** el motor intenta archivar un volcado
+- **THEN** el motor sube el volcado completo forzando la escritura (sin dedup)
+- **AND** la snapshot no lleva etiqueta `kesto.change_manifest`
+- **AND** el backup finaliza sin abortar
+
+### Requirement: Parada y reinicio opcional de contenedores alrededor de una copia
+
+El motor SHALL detener, antes de iniciar una copia, los contenedores enumerados en `KESTO_STOP_CONTAINERS` cuando la variable esté configurada, y SHALL reiniciarlos una vez terminada la copia. Cuando la variable no esté configurada, el motor NO SHALL detener ni iniciar ningún contenedor y la copia SHALL transcurrir con normalidad. Las operaciones de parada y arranque SHALL realizarse mediante Bollard a través del motor privilegiado.
+
+#### Scenario: No containers specified → backup proceeds normally
+- **GIVEN** a backup target configured for a database
+- **AND** `KESTO_STOP_CONTAINERS` is not set (no containers specified)
+- **WHEN** the backup runs
+- **THEN** no Docker containers are stopped or started
+- **AND** the backup proceeds normally
+
+#### Scenario: One or more containers specified → containers are stopped, backup taken, restarted after
+- **GIVEN** `KESTO_STOP_CONTAINERS` lists container names/IDs
+- **AND** those containers are running
+- **WHEN** the backup runs
+- **THEN** each listed container is stopped before the backup starts
+- **AND** the backup is taken against the database
+- **AND** each stopped container is restarted after the backup completes
+
+### Requirement: Los contenedores ya detenidos se restauran siempre y el cierre de la ejecución informa de los fallos
+
+El motor SHALL reiniciar todos los contenedores que haya detenido incluso cuando la copia falle, SHALL revertir los contenedores ya detenidos si detener otro falla y NO SHALL intentar la copia en ese caso. Un fallo al detener un contenedor SHALL dejar la ejecución en `failed` con `finished_at` y un `error_message` que nombre el contenedor y SHALL publicar el evento final `execution_progress`. Un fallo al reiniciar tras una copia correcta SHALL considerarse no fatal: la ejecución SHALL permanecer en `success` con su `snapshot_id`, SHALL llevar una advertencia en `error_message` y en `current_action`, y el evento final SHALL publicarse después de la advertencia.
+
+#### Scenario: Backup fails → containers are still restarted and error logged
+- **GIVEN** `KESTO_STOP_CONTAINERS` lists container names/IDs
+- **AND** those containers are running
+- **WHEN** the backup fails
+- **THEN** each stopped container is restarted despite the backup failure
+- **AND** the failure is logged
+- **AND** the backup error is surfaced
+
+#### Scenario: A container cannot be stopped → already stopped containers are rolled back, the row is `failed` and the final event is published
+- **GIVEN** `KESTO_STOP_CONTAINERS` lists `web,db`
+- **AND** both containers are running
+- **AND** stopping `db` fails
+- **WHEN** the backup runs
+- **THEN** no backup is attempted
+- **AND** `web` is restarted before the error is returned
+- **AND** `db` is never sent a stop request
+- **AND** the execution row has `status: failed`, a populated `finished_at` and an `error_message` naming `db`
+- **AND** an `execution_progress` event is published for that execution with `status: failed` and `current_action: "terminando"`
+
+#### Scenario: A container cannot be restarted after a successful backup → the result stays `success` and the operator is warned
+- **GIVEN** `KESTO_STOP_CONTAINERS` lists `web,db`
+- **AND** both containers were stopped successfully
+- **AND** the backup completes successfully
+- **AND** restarting `db` fails
+- **WHEN** the execution is closed
+- **THEN** the execution row has `status: success` and its `snapshot_id`
+- **AND** `error_message` holds a non-fatal warning naming `db`
+- **AND** an `execution_progress` event carries that warning in `current_action` with `status: success`
+- **AND** the final `execution_progress` event is published after the warning with `status: success` and `current_action: "terminando"`
+- **AND** the warning tells the operator to restart `db` manually
