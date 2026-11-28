@@ -1,6 +1,17 @@
 # Optional container stop/start before backup
 
-Issue #210
+## Why
+
+Issue #210. Add optional capability to stop one or more Docker containers that point to a database before a backup runs, then restart them after the backup completes, so that the snapshot is fully consistent without leaving containers stopped.
+
+## What Changes
+
+- Configuración `KESTO_STOP_CONTAINERS` (sin bandera CLI: el servidor no tiene comando `backup`)
+- List of container names/IDs
+- Bollard stop/start integration
+- Error handling
+- Documentation
+- Tests
 
 ## Summary
 
