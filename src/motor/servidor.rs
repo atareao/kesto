@@ -112,6 +112,7 @@ pub async fn servir(ajustes: AjustesMotor) -> Result<(), Error> {
 
     let conexiones = Arc::new(Semaphore::new(MAX_CONEXIONES));
     let raiz = Arc::new(ajustes.raiz_de_copias.clone());
+    let stop_permitidos = ajustes.stop_containers.clone();
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -137,9 +138,10 @@ pub async fn servir(ajustes: AjustesMotor) -> Result<(), Error> {
 
         let docker = Arc::clone(&docker);
         let raiz = Arc::clone(&raiz);
+        let permitidas = stop_permitidos.clone();
         tokio::spawn(async move {
             let _permit: OwnedSemaphorePermit = permit;
-            if let Err(error) = atender(stream, docker, &raiz).await {
+            if let Err(error) = atender(stream, docker, &raiz, &permitidas).await {
                 tracing::warn!(%error, "conexión IPC cerrada con error");
             }
         });
@@ -204,8 +206,9 @@ async fn atender(
     stream: UnixStream,
     docker: Arc<bollard::Docker>,
     raiz: &Path,
+    stop_permitidos: &[String],
 ) -> Result<(), Error> {
-    atender_con_plazo(stream, docker, raiz, TIEMPO_DE_LECTURA).await
+    atender_con_plazo(stream, docker, raiz, stop_permitidos, TIEMPO_DE_LECTURA).await
 }
 
 /// Atiende una conexión completa, cerrándola solo tras `inactividad` sin tráfico.
@@ -221,6 +224,7 @@ async fn atender_con_plazo(
     stream: UnixStream,
     docker: Arc<bollard::Docker>,
     raiz: &Path,
+    stop_permitidos: &[String],
     inactividad: Duration,
 ) -> Result<(), Error> {
     let (lectura, mut escritura) = tokio::io::split(stream);
@@ -278,6 +282,18 @@ async fn atender_con_plazo(
                     }
                     SolicitudMotor::IniciarContenedor { nombre } => {
                         let resultado = iniciar_contenedor(&docker, &nombre).await;
+                        (responder(&mut escritura, &resultado).await, true)
+                    }
+                    SolicitudMotor::DetenerContenedor { nombre } => {
+                        let resultado = if stop_permitidos.iter().any(|permitido| permitido == &nombre) {
+                            detener_contenedor(&docker, &nombre).await
+                        } else {
+                            fallo(
+                                ClaseFallo::Protocolo,
+                                "el contenedor no está en la lista autorizada para detener",
+                                None,
+                            )
+                        };
                         (responder(&mut escritura, &resultado).await, true)
                     }
                     SolicitudMotor::CrearExec { contenedor, orden, con_entrada } => {
@@ -396,6 +412,13 @@ async fn iniciar_contenedor(docker: &bollard::Docker, nombre: &str) -> Respuesta
         .start_container(nombre, None::<StartContainerOptions<String>>)
         .await
     {
+        Ok(()) => RespuestaMotor::Aceptado,
+        Err(causa) => fallo_de_docker(crate::docker::Error::del_contenedor(nombre, causa)),
+    }
+}
+
+async fn detener_contenedor(docker: &bollard::Docker, nombre: &str) -> RespuestaMotor {
+    match docker.stop_container(nombre, None).await {
         Ok(()) => RespuestaMotor::Aceptado,
         Err(causa) => fallo_de_docker(crate::docker::Error::del_contenedor(nombre, causa)),
     }
@@ -762,6 +785,7 @@ mod pruebas {
             socket_ipc: ruta.0.clone(),
             uid_api,
             raiz_de_copias: std::env::temp_dir().join("kesto-raiz-de-prueba"),
+            stop_containers: Vec::new(),
         }
     }
 
@@ -834,6 +858,63 @@ mod pruebas {
     }
 
     #[tokio::test]
+    async fn un_contenedor_no_autorizado_recibe_fallo_de_protocolo_sin_hablar_con_el_daemon() {
+        let ipc = SocketDePrueba::nuevo();
+        let escucha = UnixListener::bind(&ipc.0).expect("enlaza el socket IPC de prueba");
+        let permitidos = vec!["autorizado".to_owned()];
+        let servidor = tokio::spawn({
+            let docker = Arc::new(
+                bollard::Docker::connect_with_socket(
+                    &format!("unix://{}", ipc.1.display()),
+                    1,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .expect("conecta con el daemon de prueba"),
+            );
+            let raiz = PathBuf::from("/tmp/kesto-raiz-de-prueba");
+            async move {
+                let (stream, _) = escucha.accept().await.expect("acepta la conexión IPC");
+                atender_con_plazo(
+                    stream,
+                    docker,
+                    &raiz,
+                    &permitidos,
+                    Duration::from_millis(80),
+                )
+                .await
+            }
+        });
+
+        let mut canal = conectar(&ipc.0.to_string_lossy())
+            .await
+            .expect("conecta al IPC del motor");
+        let cuerpo = serde_json::to_vec(&SolicitudMotor::DetenerContenedor {
+            nombre: "no-autorizado".to_owned(),
+        })
+        .expect("serializa la solicitud");
+        escribir(&mut canal, &cuerpo)
+            .await
+            .expect("envía la orden no autorizada");
+
+        let respuesta = tokio::time::timeout(Duration::from_secs(1), recibir(&mut canal))
+            .await
+            .expect("el motor contesta sin esperar al daemon")
+            .expect("la respuesta llega entera");
+        assert!(
+            matches!(
+                respuesta,
+                RespuestaMotor::Fallo {
+                    clase: ClaseFallo::Protocolo,
+                    ref mensaje,
+                    ..
+                } if mensaje.contains("autorizada")
+            ),
+            "una orden no autorizada no recibió un fallo de protocolo: {respuesta:?}"
+        );
+        servidor.abort();
+    }
+
+    #[tokio::test]
     async fn una_operacion_larga_no_cierra_la_conexion_aunque_calle_mas_que_el_plazo() {
         let plazo = Duration::from_millis(80);
         let docker = DockerFalso::nuevo().await;
@@ -844,7 +925,7 @@ mod pruebas {
             let raiz = PathBuf::from("/tmp/kesto-raiz-de-prueba");
             async move {
                 let (stream, _) = escucha.accept().await.expect("acepta la conexión IPC");
-                atender_con_plazo(stream, docker, &raiz, plazo).await
+                atender_con_plazo(stream, docker, &raiz, &[], plazo).await
             }
         });
 
@@ -886,7 +967,7 @@ mod pruebas {
             let raiz = PathBuf::from("/tmp/kesto-raiz-de-prueba");
             async move {
                 let (stream, _) = escucha.accept().await.expect("acepta la conexión IPC");
-                atender_con_plazo(stream, docker, &raiz, plazo).await
+                atender_con_plazo(stream, docker, &raiz, &[], plazo).await
             }
         });
 

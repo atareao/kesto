@@ -99,6 +99,34 @@ impl Cliente {
             .map_err(|causa| Error::del_socket(&self.socket, causa))
     }
 
+    /// Detiene un contenedor existente.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::MotorContesta`] si el motor responde con un error HTTP.
+    /// Devuelve [`Error::MotorNoContesta`] si no se pudo hablar con el motor.
+    pub async fn stop_container(&self, container: &str) -> Result<(), Error> {
+        self.docker
+            .stop_container(container, None)
+            .await
+            .map_err(|causa| Error::del_contenedor(container, causa))?;
+        Ok(())
+    }
+
+    /// Inicia un contenedor existente.
+    ///
+    /// # Errors
+    ///
+    /// Devuelve [`Error::MotorContesta`] si el motor responde con un error HTTP.
+    /// Devuelve [`Error::MotorNoContesta`] si no se pudo hablar con el motor.
+    pub async fn start_container(&self, container: &str) -> Result<(), Error> {
+        self.docker
+            .start_container::<String>(container, None)
+            .await
+            .map_err(|causa| Error::del_contenedor(container, causa))?;
+        Ok(())
+    }
+
     /// Ejecuta `orden` dentro de `contenedor`, entrega cada trozo a `al_llegar` **en cuanto
     /// llega**, y devuelve el código de salida del proceso.
     ///

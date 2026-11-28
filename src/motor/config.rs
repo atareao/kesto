@@ -13,6 +13,8 @@ pub const ENV_SOCKET_MOTOR: &str = "KESTO_MOTOR_SOCKET";
 pub const ENV_UID_API: &str = "KESTO_API_UID";
 /// Variable que fija la raíz de copias que el motor vuelve a confinar.
 pub const ENV_BACKUP_ROOT: &str = "KESTO_BACKUP_ROOT";
+/// Variable que lista los contenedores que la API puede pedir detener.
+pub const ENV_STOP_CONTAINERS: &str = "KESTO_STOP_CONTAINERS";
 
 /// Socket del daemon por defecto, el del §8 del SRS.
 pub const DOCKER_POR_DEFECTO: &str = "unix:///var/run/docker.sock";
@@ -41,6 +43,9 @@ pub enum Error {
         /// Valor leído.
         valor: String,
     },
+    /// Algún nombre de la lista de contenedores no es interpolarizable en una ruta.
+    #[error("{ENV_STOP_CONTAINERS} contiene un nombre de contenedor inválido")]
+    StopContainersInvalido,
 }
 
 /// Configuración efectiva del motor.
@@ -54,6 +59,23 @@ pub struct AjustesMotor {
     pub uid_api: u32,
     /// Raíz de copias: el motor confina contra ella de nuevo antes del `exec`.
     pub raiz_de_copias: PathBuf,
+    /// Únicos contenedores que el motor acepta detener por IPC.
+    ///
+    /// Es defensa en profundidad: la API ya valida los nombres, pero el motor no
+    /// confía en ella. Con la lista vacía —el defecto— no se detiene ninguno.
+    pub stop_containers: Vec<String>,
+}
+
+/// Comprobación independiente del nombre: el motor no confía en la validación de la API.
+fn es_nombre_de_contenedor_valido(nombre: &str) -> bool {
+    let mut caracteres = nombre.chars();
+    let Some(primero) = caracteres.next() else {
+        return false;
+    };
+
+    primero.is_ascii_alphanumeric()
+        && caracteres
+            .all(|caracter| caracter.is_ascii_alphanumeric() || matches!(caracter, '_' | '.' | '-'))
 }
 
 impl AjustesMotor {
@@ -101,11 +123,28 @@ impl AjustesMotor {
             }
         };
 
+        let mut stop_containers = Vec::new();
+        if let Some(valor) = lookup(ENV_STOP_CONTAINERS) {
+            for trozo in valor.split(',') {
+                let nombre = trozo.trim();
+                if nombre.is_empty() {
+                    continue;
+                }
+                if !es_nombre_de_contenedor_valido(nombre) {
+                    return Err(Error::StopContainersInvalido);
+                }
+                if !stop_containers.iter().any(|guardado| guardado == nombre) {
+                    stop_containers.push(nombre.to_owned());
+                }
+            }
+        }
+
         Ok(Self {
             docker_host,
             socket_ipc: PathBuf::from(socket_ipc),
             uid_api,
             raiz_de_copias: PathBuf::from(raiz_de_copias),
+            stop_containers,
         })
     }
 
@@ -123,7 +162,9 @@ impl AjustesMotor {
 mod pruebas {
     use std::path::PathBuf;
 
-    use super::{AjustesMotor, ENV_BACKUP_ROOT, ENV_UID_API, Error, RAIZ_POR_DEFECTO};
+    use super::{
+        AjustesMotor, ENV_BACKUP_ROOT, ENV_STOP_CONTAINERS, ENV_UID_API, Error, RAIZ_POR_DEFECTO,
+    };
 
     fn lookup<'a>(pares: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |nombre| {
@@ -168,5 +209,39 @@ mod pruebas {
         let ajustes =
             AjustesMotor::desde_lookup(lookup(&sin_raiz)).expect("ausente usa el defecto");
         assert_eq!(ajustes.raiz_de_copias, PathBuf::from(RAIZ_POR_DEFECTO));
+    }
+
+    #[test]
+    fn la_lista_de_contenedores_rechaza_nombres_invalidos_y_deduplica_los_validos() {
+        let pares = [
+            (ENV_UID_API, "10001"),
+            (ENV_STOP_CONTAINERS, "db, web ,db,web-02,OK_1, web"),
+        ];
+        let ajustes = AjustesMotor::desde_lookup(lookup(&pares))
+            .expect("una lista de nombres válidos se acepta");
+        assert_eq!(ajustes.stop_containers, ["db", "web", "web-02", "OK_1"]);
+
+        for nombre in [
+            "/etc/passwd",
+            "../db",
+            "db;rm",
+            "db/x",
+            "db$",
+            "d b",
+            "ádb",
+            "-db",
+        ] {
+            let pares = [(ENV_UID_API, "10001"), (ENV_STOP_CONTAINERS, nombre)];
+            let error = AjustesMotor::desde_lookup(lookup(&pares))
+                .expect_err("un nombre no interpolarizable se rechaza");
+            assert!(
+                matches!(error, Error::StopContainersInvalido),
+                "el error no señala la lista de contenedores: {error:?}"
+            );
+            assert!(
+                error.to_string().contains(ENV_STOP_CONTAINERS),
+                "el error no nombra la variable: {error}"
+            );
+        }
     }
 }
