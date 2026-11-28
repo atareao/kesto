@@ -1,9 +1,25 @@
 # Changelog
+## [0.19.0] - 2026-11-28
+
+### Features
+
+- *(engine)* Deduplicar volcados mediante manifest de cambios
+- *(engine)* Detectar cambios MySQL/MariaDB para deduplicación
+- *(motor)* Detener contenedores antes de copiar
+
+### Miscellaneous Tasks
+
+- Archivar plan 055 (dedup-manifest / mysql change detector)
+- Archivar backup-container-stop
 ## [0.18.1] - 2026-11-27
 
 ### Bug Fixes
 
 - *(release)* Adaptar el smoke test al health sin metadatos
+
+### Miscellaneous Tasks
+
+- Release v0.18.1
 ## [0.18.0] - 2026-11-26
 
 ### Bug Fixes

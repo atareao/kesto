@@ -10,7 +10,7 @@ resolver = "3"
 
 [package]
 name = "kesto"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2024"
 # The floor `sqlx 0.9.1` imposes. Declared here so a toolchain below it fails at
 # resolve time with the number in hand, instead of the floor being discovered by
