@@ -31,6 +31,12 @@ services:
       # despliegue (por ejemplo, el nombre del servicio de la base).
       PGHOST: ${PGHOST:-}
       PGPORT: ${PGPORT:-}
+      # Detector de cambios MySQL/MariaDB (dedup): `mariadb-dump`/`mariadb` también
+      # corren en este contenedor (el runtime instala `mariadb-client`) y necesitan
+      # la red del compose. Solo `MYSQL_HOST`/`MYSQL_PORT`; la credencial no va aquí,
+      # se inyecta por ejecución desde el `exec` del contenedor fuente (`MYSQL_PWD`).
+      MYSQL_HOST: ${MYSQL_HOST:-}
+      MYSQL_PORT: ${MYSQL_PORT:-}
       # Obligatoria siempre. Sin ella el arranque falla (src/config.rs).
       KESTO_MASTER_KEY: ${KESTO_MASTER_KEY:?falta KESTO_MASTER_KEY}
       # La plantilla de producción EXIGE proveedor de identidad: sin las

@@ -40,11 +40,11 @@
 
 ## Fase 2 — Detección de cambios MySQL / MariaDB
 
-- [ ] **T-2.1** RED: tests de contrato del `ChangeDetector` para MySQL/MariaDB (mismo
+- [x] **T-2.1** RED: tests de contrato del `ChangeDetector` para MySQL/MariaDB (mismo
       manifest → no sube; manifest distinto → sube y etiqueta).
-- [ ] **T-2.2** GREEN: implementar detección con `mysqldump --no-data` + `CHECKSUM TABLE`.
-- [ ] **T-2.3** GREEN: reutilizar la lógica de etiquetado y retención de la Fase 1.
-- [ ] **T-2.4** REFACTOR: `just check-all` en verde y documentación de la Fase 2.
+- [x] **T-2.2** GREEN: implementar detección con `mysqldump --no-data` + `CHECKSUM TABLE`.
+- [x] **T-2.3** GREEN: reutilizar la lógica de etiquetado y retención de la Fase 1.
+- [x] **T-2.4** REFACTOR: `just check-all` en verde y documentación de la Fase 2.
 
 ## Panel
 
@@ -55,4 +55,4 @@
 
 ## Cierre
 
-- [ ] **T-4.1** Marcar todas las tareas y archivar el change (`openspec archive dedup-manifest`).
+- [x] **T-4.1** Marcar todas las tareas y archivar el change (`openspec archive dedup-manifest`).
