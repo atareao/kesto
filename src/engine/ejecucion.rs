@@ -57,8 +57,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::extraccion::{
-    CAPACIDAD_DEL_CANAL, ChangeDetector, ErrorDeExtraccion, INACTIVIDAD_MAXIMA, Objetivo,
-    PostgresChangeDetector, Resultado, Ruta, motivo_para_guardar, recortar, ruta, volcar,
+    CAPACIDAD_DEL_CANAL, ChangeDetector, ErrorDeExtraccion, INACTIVIDAD_MAXIMA,
+    MysqlChangeDetector, Objetivo, PostgresChangeDetector, Resultado, Ruta, motivo_para_guardar,
+    recortar, ruta, volcar,
 };
 use super::hub::{EventoDeEjecucion, Hub};
 use super::{Ajustes, Contexto};
@@ -684,12 +685,12 @@ where
 
     // El manifest se calcula **antes** de archivar y antes de tocar la acción de archivado:
     // es lo que decide si los bytes del volcado se suben o la copia reutiliza la instantánea
-    // anterior. Para un target que no sea `pg_dump` no hay detector y el archivado hace su
+    // anterior. Para un target sin detector de su motor no hay manifest y el archivado hace su
     // subida completa de siempre; si el detector falla, tampoco aborta la copia.
-    // El host y el puerto se leen del proceso: la base vive en la red del contenedor y el
-    // detector no puede adivinarlos. Sin ellos el comando hablaría con el PostgreSQL local y
-    // degradaría siempre; el operador los pone en el entorno del motor con los nombres de libpq.
-    let conexion = ["PGHOST", "PGPORT"]
+    // El host y el puerto se leen del proceso: los clientes de detección corren aquí, no dentro
+    // del contenedor de la base, y no pueden adivinar la red. libpq toma los suyos de `PGHOST` y
+    // `PGPORT`; los clientes MariaDB reciben `MYSQL_HOST` y `MYSQL_PORT` por la misma vía.
+    let conexion = ["PGHOST", "PGPORT", "MYSQL_HOST", "MYSQL_PORT"]
         .iter()
         .filter_map(|clave| {
             std::env::var(clave)
@@ -697,12 +698,12 @@ where
                 .map(|valor| ((*clave).to_owned(), valor))
         })
         .collect::<Vec<_>>();
-    let manifiesto = detector(&orden, &conexion).and_then(|detector| detector.change_manifest());
-    if manifiesto.is_none() && orden.cmd.first().map(String::as_str) == Some("pg_dump") {
-        tracing::warn!(
-            %nombre,
-            "no se ha podido calcular el manifest: se archiva con subida completa"
-        );
+    let detector = detector(&orden, &conexion);
+    let manifiesto = detector
+        .as_ref()
+        .and_then(|detector| detector.change_manifest());
+    if manifiesto.is_none() {
+        avisar_degradacion(&orden, detector.is_some(), nombre);
     }
 
     en_vivo.accion(ACCION_EXTRAYENDO_EL_VOLCADO);
@@ -858,12 +859,41 @@ fn olvidar_la_instantanea(repositorio: &Repositorio, id: &str) -> Result<(), Str
 /// del puente—, y un `block_on` sobre el runtime que atiende las peticiones HTTP detendría el hilo
 /// que despacha y, con él, el resto de la aplicación. Así que el hilo construye el suyo, lo usa
 /// para todo el volcado y muere con él.
-/// El detector de producción: el PostgreSQL de la orden, con el entorno de libpq del proceso.
+/// Los motores que pueden deduplicar por manifest, aunque una orden concreta no permita
+/// construir el detector —un volcado global, por ejemplo—.
+fn motor_con_detector(orden: &Orden) -> bool {
+    matches!(
+        orden.cmd.first().map(String::as_str),
+        Some("pg_dump" | "pg_dumpall" | "mariadb-dump" | "mysqldump")
+    )
+}
+
+/// Avisa de la degradación solo cuando el motor prometía dedup.
+///
+/// Un directorio o cualquier otro target sin detector nunca la prometió: callarse es lo
+/// correcto. Un PostgreSQL o un MySQL con detector imposible —global, sin base— sí tiene que
+/// decir por qué se archiva sin manifest, porque el operador esperaba la dedup.
+fn avisar_degradacion(orden: &Orden, habia_detector: bool, nombre: &str) {
+    if habia_detector || motor_con_detector(orden) {
+        tracing::warn!(
+            %nombre,
+            "no se ha podido calcular el manifest: se archiva con subida completa"
+        );
+    }
+}
+
+/// El detector de producción: el motor de la orden, con la configuración de su cliente.
+///
+/// PostgreSQL toma el entorno de libpq del proceso; MariaDB reutiliza el usuario, la base y la
+/// contraseña de la propia orden de volcado, sin meter la credencial en `argv`.
 fn detector_de_produccion(
     orden: &Orden,
     conexion: &[(String, String)],
 ) -> Option<Box<dyn ChangeDetector>> {
-    PostgresChangeDetector::desde_la_orden(orden, conexion)
+    if let Some(detector) = PostgresChangeDetector::desde_la_orden(orden, conexion) {
+        return Some(Box::new(detector) as Box<dyn ChangeDetector>);
+    }
+    MysqlChangeDetector::desde_la_orden(orden, conexion)
         .map(|detector| Box::new(detector) as Box<dyn ChangeDetector>)
 }
 
@@ -1405,15 +1435,15 @@ mod tests {
 
     use super::{
         Ajustes, ChangeDetector, EnVivo, FalloDelVolcado, Orden, ProductorDelVolcado, Resultado,
-        VueltaDelProductor, copiar_el_volcado, descartar_copia_fallida, el_volcado_se_entrego,
-        nombre_del_volcado,
+        VueltaDelProductor, avisar_degradacion, copiar_el_volcado, descartar_copia_fallida,
+        detector_de_produccion, el_volcado_se_entrego, nombre_del_volcado,
     };
 
     use crate::db::entities::Estado;
     use crate::rustic::{PREFIJO_DE_MANIFEST, poner_en_marcha_con};
     use crate::test_support::{
         PASSPHRASE_DE_PRUEBA, abrir_local, acceso_local, backends_locales, barras_mudas,
-        directorio_de_prueba, volcado_guardado,
+        capturar_log, directorio_de_prueba, volcado_guardado,
     };
 
     /// Un detector inyectado: devuelve exactamente el manifest que la prueba quiere, sin
@@ -1765,6 +1795,182 @@ mod tests {
                 .all(|tag| !tag.starts_with(PREFIJO_DE_MANIFEST)),
             "sin manifest no se inventa un tag: {:?}",
             ultima.tags
+        );
+    }
+
+    /// Una orden de volcado MariaDB como la que construye `ruta`: la credencial solo en el entorno.
+    fn orden_de_prueba_mysql() -> Orden {
+        Orden {
+            cmd: [
+                "mariadb-dump",
+                "--single-transaction",
+                "--lock-tables=false",
+                "-uoperador",
+                "tienda",
+            ]
+            .iter()
+            .map(|argumento| (*argumento).to_owned())
+            .collect(),
+            env: vec!["MYSQL_PWD=clave-de-prueba".to_owned()],
+        }
+    }
+
+    /// Un detector presente que no calcula manifest: degrada, pero no elimina el detector.
+    fn detector_mysql_que_falla() -> Box<Detector> {
+        Box::new(|_orden, _conexion| {
+            Some(Box::new(DetectorFalso { manifiesto: None }) as Box<dyn ChangeDetector>)
+        })
+    }
+
+    /// Cable de un repositorio MySQL: el factory elige detector, el manifest llega al archivado y
+    /// un fallo del detector degrada a subida completa sin abortar ni inventar un tag.
+    #[test]
+    fn el_repositorio_mysql_lleva_el_manifiesto_al_archivado_y_su_fallo_no_aborta_la_copia() {
+        let orden = orden_de_prueba_mysql();
+        assert!(
+            detector_de_produccion(&orden, &[]).is_some(),
+            "un repositorio MariaDB tiene que elegir el detector de su motor"
+        );
+
+        let directorio = directorio_de_prueba();
+        let ruta = directorio.ruta().join("repositorio-mysql");
+        let acceso = acceso_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let (mut repositorio, _) =
+            poner_en_marcha_con(&acceso, backends_locales(&ruta), barras_mudas())
+                .expect("el repositorio local se inicializa");
+        let ajustes = Ajustes::nuevos("socket-que-no-existe");
+        let en_vivo = EnVivo::de_prueba();
+        let nombre = "volcado-mysql.sql";
+        let contenido = b"-- volcado MariaDB\nCREATE TABLE t (id INT);\n".to_vec();
+        let hash = "e".repeat(64);
+
+        let primera = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden_de_prueba_mysql(),
+            None,
+            nombre,
+            "tarea-mysql",
+            &en_vivo,
+            &ajustes,
+            detector_con(Some(hash.clone())),
+            lanzador_con(contenido.clone()),
+        )
+        .unwrap_or_else(|cierre| panic!("la copia MySQL se archiva: {:?}", cierre.motivo));
+        assert!(!primera.sin_cambios && primera.ficheros == 1);
+
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let snapshot = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == primera.id)
+            .expect("la instantánea MySQL existe");
+        assert!(
+            snapshot
+                .tags
+                .iter()
+                .any(|tag| tag.contains(&format!("{PREFIJO_DE_MANIFEST}{hash}"))),
+            "el manifest del repositorio MySQL llega al archivado: {:?}",
+            snapshot.tags
+        );
+
+        let segunda = copiar_el_volcado(
+            &mut repositorio,
+            &acceso,
+            "contenedor-de-prueba",
+            orden,
+            None,
+            nombre,
+            "tarea-mysql",
+            &en_vivo,
+            &ajustes,
+            detector_mysql_que_falla(),
+            lanzador_con(contenido),
+        )
+        .unwrap_or_else(|cierre| {
+            panic!(
+                "un detector MySQL fallido no aborta el backup: {:?}",
+                cierre.motivo
+            )
+        });
+        assert!(
+            !segunda.sin_cambios && segunda.ficheros == 1,
+            "sin manifest se fuerza la subida completa"
+        );
+
+        let abierto = abrir_local(&ruta, PASSPHRASE_DE_PRUEBA);
+        let guardadas = abierto
+            .get_all_snapshots()
+            .expect("el repositorio se lista");
+        let ultima = guardadas
+            .iter()
+            .find(|snapshot| snapshot.id.to_hex().as_str() == segunda.id)
+            .expect("la segunda instantánea MySQL existe");
+        assert!(
+            ultima
+                .tags
+                .iter()
+                .all(|tag| !tag.starts_with(PREFIJO_DE_MANIFEST)),
+            "un detector fallido no inventa un tag: {:?}",
+            ultima.tags
+        );
+    }
+
+    /// Un target sin detector nunca prometió dedup: callarse no es perder un aviso. Un motor con
+    /// detector cuya orden concreta no lo permite —global, sin base— sí tiene que decir por qué
+    /// se archiva sin manifest.
+    #[test]
+    fn el_aviso_de_degradacion_distingue_el_motor_sin_detector_del_detector_imposible() {
+        const AVISO: &str = "no se ha podido calcular el manifest";
+
+        let (buffer, guardia) = capturar_log();
+        let global_mysql = Orden {
+            cmd: ["mariadb-dump", "--all-databases"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        assert!(
+            detector_de_produccion(&global_mysql, &[]).is_none(),
+            "un volcado MySQL global no tiene detector"
+        );
+        avisar_degradacion(&global_mysql, false, "volcado-mysql.sql");
+        let global_postgres = Orden {
+            cmd: ["pg_dumpall", "-U", "usuario"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        assert!(
+            detector_de_produccion(&global_postgres, &[]).is_none(),
+            "pg_dumpall no tiene una sola base que checksumar"
+        );
+        avisar_degradacion(&global_postgres, false, "volcado-postgres.sql");
+        assert!(
+            buffer.texto().contains(AVISO),
+            "un motor con detector imposible avisa: {}",
+            buffer.texto()
+        );
+        drop(guardia);
+
+        let (buffer, _guardia) = capturar_log();
+        let sin_detector = Orden {
+            cmd: ["tar", "-cf", "-", "directorio"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        avisar_degradacion(&sin_detector, false, "directorio.tar");
+        assert!(
+            !buffer.texto().contains(AVISO),
+            "un target sin detector no avisa de una dedup que nunca prometió: {}",
+            buffer.texto()
         );
     }
 }

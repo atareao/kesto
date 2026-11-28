@@ -95,9 +95,12 @@ RUN --mount=type=secret,id=actions_cache_url \
 # ── Etapa 3: runtime mínimo ────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# Solo lo que el HEALTHCHECK necesita: curl + CA raíz para TLS saliente.
+# El runtime necesita los clientes de dedup: `pg_dump`/`psql` (postgresql-client) y
+# `mariadb-dump`/`mariadb` (mariadb-client). Corren en este contenedor, no dentro del
+# target: los calcula el detector de cambios antes de archivar.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends \
+       curl ca-certificates postgresql-client mariadb-client \
     && rm -rf /var/lib/apt/lists/*
 
 # El panel se sirve desde `ui/dist` **relativo al CWD** (src/panel.rs), así que

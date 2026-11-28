@@ -59,6 +59,7 @@ use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::db::entities::{Target, TipoDeTarget};
@@ -333,16 +334,25 @@ fn ejecutar_en_el_sistema(
 }
 
 /// Comprueba una respuesta y la devuelve, o convierte su fallo en un error de detección.
+///
+/// El `stderr` se pasa por la misma red de secretos que el motor: el cliente puede repetir en él
+/// la contraseña que recibió por el entorno, y ese texto acaba en el `warn` de degradación.
 fn respuesta(
     programa: &str,
     resultado: std::io::Result<SalidaDeDeteccion>,
+    entorno: &[(String, String)],
 ) -> Result<SalidaDeDeteccion, ErrorDeDeteccion> {
     let salida = resultado.map_err(|error| ErrorDeDeteccion::Ejecucion {
         programa: programa.to_owned(),
         motivo: error.to_string(),
     })?;
     if !salida.exito {
-        let motivo = String::from_utf8_lossy(&salida.stderr).trim().to_owned();
+        let motivo = quitar_los_valores_del_entorno(
+            String::from_utf8_lossy(&salida.stderr).trim(),
+            entorno
+                .iter()
+                .map(|(clave, valor)| (clave.as_str(), valor.as_str())),
+        );
         return Err(ErrorDeDeteccion::Fallo {
             programa: programa.to_owned(),
             motivo,
@@ -366,6 +376,40 @@ fn consulta_de_checksum(esquema: &str, tabla: &str) -> String {
     )
 }
 
+/// El digest con el que arrancan los dos manifiestos.
+///
+/// Los dominios van separados por `\0` y en el mismo orden en PostgreSQL y en MySQL: cambiar
+/// aquí la cadena cambiaría el manifest de todas las copias ya etiquetadas.
+fn hasher_del_manifiesto(esquema: &[u8]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"esquema\0");
+    hasher.update(esquema);
+    hasher.update(b"\0datos\0");
+    hasher
+}
+
+/// El manifest hexadecimal de un digest ya plegado.
+fn manifiesto_en_hex(hasher: Sha256) -> String {
+    format!("{hash:x}", hash = hasher.finalize())
+}
+
+/// El `Option<String>` del contrato: un fallo avisa y degrada a subida completa.
+///
+/// Los dos detectores comparten el mismo mensaje; el `error` conserva el motivo tipificado sin
+/// meter credenciales en el registro.
+fn manifiesto_o_degradacion(resultado: Result<String, ErrorDeDeteccion>) -> Option<String> {
+    match resultado {
+        Ok(manifiesto) => Some(manifiesto),
+        Err(causa) => {
+            tracing::warn!(
+                error = %causa,
+                "no se ha podido calcular el manifest de cambios: se archiva con subida completa"
+            );
+            None
+        }
+    }
+}
+
 /// Calcula el manifest con un ejecutor inyectado.
 ///
 /// Es el núcleo de [`PostgresChangeDetector`] y lo que hacen las pruebas deterministas: el
@@ -378,13 +422,12 @@ fn calcular_manifest_con<F>(
 where
     F: Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion>,
 {
-    use sha2::{Digest, Sha256};
-
     let mut argumentos_del_esquema = argumentos.to_vec();
     argumentos_del_esquema.push("--schema-only".to_owned());
     let esquema = respuesta(
         "pg_dump",
         ejecutar("pg_dump", &argumentos_del_esquema, entorno),
+        entorno,
     )?;
 
     let mut argumentos_de_las_tablas = argumentos.to_vec();
@@ -395,12 +438,13 @@ where
         "--command".to_owned(),
         CONSULTA_DE_TABLAS.to_owned(),
     ]);
-    let tablas = respuesta("psql", ejecutar("psql", &argumentos_de_las_tablas, entorno))?;
+    let tablas = respuesta(
+        "psql",
+        ejecutar("psql", &argumentos_de_las_tablas, entorno),
+        entorno,
+    )?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"esquema\0");
-    hasher.update(&esquema.stdout);
-    hasher.update(b"\0datos\0");
+    let mut hasher = hasher_del_manifiesto(&esquema.stdout);
 
     for linea in String::from_utf8_lossy(&tablas.stdout).lines() {
         if linea.trim().is_empty() {
@@ -430,14 +474,18 @@ where
             "--command".to_owned(),
             consulta_de_checksum(esquema_de_la_tabla, tabla),
         ]);
-        let suma = respuesta("psql", ejecutar("psql", &argumentos_del_checksum, entorno))?;
+        let suma = respuesta(
+            "psql",
+            ejecutar("psql", &argumentos_del_checksum, entorno),
+            entorno,
+        )?;
         hasher.update(linea.as_bytes());
         hasher.update(b"\0");
         hasher.update(String::from_utf8_lossy(&suma.stdout).trim().as_bytes());
         hasher.update(b"\0");
     }
 
-    Ok(format!("{hash:x}", hash = hasher.finalize()))
+    Ok(manifiesto_en_hex(hasher))
 }
 
 /// Detector de cambios para PostgreSQL.
@@ -516,16 +564,386 @@ impl PostgresChangeDetector {
 
 impl ChangeDetector for PostgresChangeDetector {
     fn change_manifest(&self) -> Option<String> {
-        match calcular_manifest_con(&ejecutar_en_el_sistema, &self.argumentos, &self.entorno) {
-            Ok(manifest) => Some(manifest),
-            Err(causa) => {
-                tracing::warn!(
-                    error = %causa,
-                    "no se ha podido calcular el manifest de cambios: se archiva con subida completa"
-                );
-                None
-            }
+        manifiesto_o_degradacion(calcular_manifest_con(
+            &ejecutar_en_el_sistema,
+            &self.argumentos,
+            &self.entorno,
+        ))
+    }
+}
+
+/// El binario que entrega el esquema MySQL/MariaDB.
+const PROGRAMA_DEL_VOLCADO_MYSQL: &str = "mysqldump";
+
+/// El cliente que lista tablas y pide los checksums.
+const PROGRAMA_DEL_CLIENTE_MYSQL: &str = "mysql";
+
+/// La consulta que lista las tablas; el cliente la recibe por `argv`, nunca por un shell.
+///
+/// `SHOW TABLES` no distingue vistas de tablas base y su orden no está garantizado: checksumar
+/// una vista puede dar `NULL` y un orden distinto cambiaría el manifest. `information_schema`
+/// con `table_type = 'BASE TABLE'` y `ORDER BY table_name` fija las dos cosas en el servidor;
+/// el detector vuelve a ordenar por si un cliente ignorase el `ORDER BY`.
+const CONSULTA_DE_TABLAS_MYSQL: &str = "SELECT CONCAT(table_schema, CHAR(9), table_name) \
+     FROM information_schema.tables \
+     WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
+     ORDER BY table_name;";
+
+/// La base indicada en los argumentos de conexión, si la hay.
+///
+/// Se toma el último argumento que no sea una bandera: en `-h host -u usuario base` la base es
+/// `base`, no el valor de `-h`.
+fn base_de_los_argumentos(argumentos: &[String]) -> &str {
+    argumentos
+        .iter()
+        .rev()
+        .find(|argumento| !argumento.starts_with('-'))
+        .map_or("", String::as_str)
+}
+
+/// Un nombre de base o tabla que se puede meter en un identificador entre comillas invertidas.
+///
+/// Las comillas invertidas se duplican al escribirlas, pero un carácter de control o una
+/// contrabarra —que en MySQL cambia el significado de lo que sigue— hacen que el nombre no sea
+/// representable con seguridad: se rechaza antes de construir la consulta.
+fn nombre_seguro(nombre: &str) -> bool {
+    !nombre.is_empty()
+        && !nombre
+            .contains(|caracter: char| caracter.is_control() || caracter == '\\' || caracter == '|')
+}
+
+/// Un identificador MySQL con las comillas invertidas del propio nombre duplicadas.
+fn identificador_mysql(nombre: &str) -> String {
+    nombre.replace('`', "``")
+}
+
+/// La forma del ejecutor inyectado en el detector MySQL.
+type EjecutorDeDeteccion<'a> =
+    dyn Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a;
+
+/// Calcula el manifest de una fuente MySQL/MariaDB con un ejecutor inyectado.
+///
+/// El esquema sale de `mysqldump --no-data` y los datos de un `CHECKSUM TABLE ... EXTENDED` por
+/// tabla, los dos en memoria y sin pasar por un shell. `EXTENDED` es obligatorio: `QUICK` puede
+/// usar una cifra guardada y no detecta cambios. La lista de tablas se ordena antes de hashear
+/// para que el orden físico del listado de tablas base no cambie el manifest.
+fn calcular_manifest_mysql_con(
+    ejecutar: &EjecutorDeDeteccion<'_>,
+    argumentos: &[String],
+    entorno: &[(String, String)],
+    banderas_del_volcado: &[String],
+    programa_del_volcado: &str,
+    programa_del_cliente: &str,
+) -> Result<String, ErrorDeDeteccion> {
+    // Aplica los mismos topes que el ejecutor del sistema y convierte un desbordamiento en error.
+    //
+    // La salida que llega intacta se recorta antes de hashearse; la que ya viene más larga que
+    // el tope no se usa: un prefijo recortado de un `mysqldump` no es un manifest fiable.
+    let ejecutar_acotado = |programa: &str,
+                            argumentos: &[String],
+                            entorno: &[(String, String)]|
+     -> std::io::Result<SalidaDeDeteccion> {
+        let salida = ejecutar(programa, argumentos, entorno)?;
+        if salida.stdout.len() >= TOPE_DE_SALIDA_DE_DETECCION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "la salida del detector MySQL excede el tope",
+            ));
         }
+        Ok(SalidaDeDeteccion {
+            exito: salida.exito,
+            // El tope ya se comprobó arriba: pasar el `Vec` por un `Cursor` solo lo copiaría.
+            stdout: salida.stdout,
+            stderr: leer_con_tope(salida.stderr.as_slice(), TOPE_DEL_CRUDO)?,
+        })
+    };
+
+    let mut argumentos_del_esquema = argumentos.to_vec();
+    // Las banderas anti-bloqueo son del volcado; el cliente `mariadb` las rechaza.
+    argumentos_del_esquema.extend_from_slice(banderas_del_volcado);
+    argumentos_del_esquema.extend([
+        "--no-data".to_owned(),
+        // Sin esto el dump lleva la fecha de ejecución y el esquema cambia en cada copia.
+        "--skip-dump-date".to_owned(),
+    ]);
+    let esquema = respuesta(
+        programa_del_volcado,
+        ejecutar_acotado(programa_del_volcado, &argumentos_del_esquema, entorno),
+        entorno,
+    )?;
+
+    let mut argumentos_de_las_tablas = argumentos.to_vec();
+    argumentos_de_las_tablas.extend([
+        "--batch".to_owned(),
+        "--skip-column-names".to_owned(),
+        "--execute".to_owned(),
+        CONSULTA_DE_TABLAS_MYSQL.to_owned(),
+    ]);
+    let tablas = respuesta(
+        programa_del_cliente,
+        ejecutar_acotado(programa_del_cliente, &argumentos_de_las_tablas, entorno),
+        entorno,
+    )?;
+
+    let mut lineas: Vec<String> = String::from_utf8_lossy(&tablas.stdout)
+        .lines()
+        .filter(|linea| !linea.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    lineas.sort();
+    lineas.dedup();
+
+    let mut hasher = hasher_del_manifiesto(&esquema.stdout);
+
+    for linea in lineas {
+        // La consulta devuelve `esquema<TAB>tabla`. Un tabulador más dentro del nombre no se
+        // puede distinguir de un campo nuevo: se rechaza la línea antes de separar los campos.
+        if linea.matches('\t').count() != 1 {
+            return Err(ErrorDeDeteccion::Tablas { linea });
+        }
+        let Some((base_de_la_tabla, tabla)) = linea.split_once('\t') else {
+            return Err(ErrorDeDeteccion::Tablas { linea });
+        };
+        let base_de_la_tabla = base_de_la_tabla.trim();
+        let tabla = tabla.trim();
+        if !nombre_seguro(base_de_la_tabla) || !nombre_seguro(tabla) {
+            return Err(ErrorDeDeteccion::Tablas { linea });
+        }
+
+        let mut argumentos_del_checksum = argumentos.to_vec();
+        argumentos_del_checksum.extend([
+            "--batch".to_owned(),
+            "--skip-column-names".to_owned(),
+            "--execute".to_owned(),
+            format!(
+                "CHECKSUM TABLE `{}`.`{}` EXTENDED;",
+                identificador_mysql(base_de_la_tabla),
+                identificador_mysql(tabla)
+            ),
+        ]);
+        let suma = respuesta(
+            programa_del_cliente,
+            ejecutar_acotado(programa_del_cliente, &argumentos_del_checksum, entorno),
+            entorno,
+        )?;
+        let checksum = String::from_utf8_lossy(&suma.stdout);
+        let checksum = checksum.split_whitespace().last().unwrap_or("");
+        if checksum.is_empty() || checksum.eq_ignore_ascii_case("NULL") {
+            return Err(ErrorDeDeteccion::Tablas { linea });
+        }
+
+        hasher.update(base_de_la_tabla.as_bytes());
+        hasher.update(b"|");
+        hasher.update(tabla.as_bytes());
+        hasher.update(b"|");
+        hasher.update(checksum.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    Ok(manifiesto_en_hex(hasher))
+}
+
+/// Detector de cambios para MySQL y MariaDB.
+///
+/// Combina `mysqldump --no-data` con un `CHECKSUM TABLE ... EXTENDED` por tabla, sin ficheros
+/// temporales y sin metacomandos: todos los clientes se invocan por `argv`. Ante un fallo hay
+/// degradación a subida completa: `change_manifest()` devuelve `None` y avisa, sin abortar la copia.
+pub struct MysqlChangeDetector<'a> {
+    /// Los argumentos de conexión, sin credenciales y sin banderas del volcado: los entiende
+    /// tanto `mariadb-dump` como `mariadb`.
+    argumentos: Vec<String>,
+    /// Las credenciales, solo en el entorno de los hijos.
+    entorno: Vec<(String, String)>,
+    /// El ejecutor inyectado en las pruebas; en producción, [`ejecutar_en_el_sistema`].
+    ejecutar: Box<EjecutorDeDeteccion<'a>>,
+    /// Banderas exclusivas del volcado de estructura: el cliente `mariadb`/`mysql` las rechaza.
+    banderas_del_volcado: Vec<String>,
+    /// El binario que entrega el esquema.
+    programa_del_volcado: &'static str,
+    /// El cliente que lista tablas y checksums.
+    programa_del_cliente: &'static str,
+}
+
+impl<'a> MysqlChangeDetector<'a> {
+    /// Crea un detector con un ejecutor inyectado: es el seam determinista de las pruebas.
+    #[must_use]
+    pub fn con_ejecutor<F>(
+        ejecutar: &'a F,
+        argumentos: &[String],
+        entorno: &[(String, String)],
+    ) -> Self
+    where
+        F: Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a,
+    {
+        Self {
+            argumentos: argumentos.to_vec(),
+            entorno: entorno.to_vec(),
+            ejecutar: Box::new(ejecutar),
+            banderas_del_volcado: Vec::new(),
+            programa_del_volcado: PROGRAMA_DEL_VOLCADO_MYSQL,
+            programa_del_cliente: PROGRAMA_DEL_CLIENTE_MYSQL,
+        }
+    }
+
+    /// Crea un detector de producción, con los comandos ejecutados en el sistema.
+    #[must_use]
+    pub fn con_configuracion(argumentos: Vec<String>, entorno: Vec<(String, String)>) -> Self {
+        Self::con_configuracion_y_clientes(
+            argumentos,
+            entorno,
+            Vec::new(),
+            PROGRAMA_DEL_VOLCADO_MYSQL,
+            PROGRAMA_DEL_CLIENTE_MYSQL,
+        )
+    }
+
+    /// Crea un detector de producción con los binarios del contenedor: `mariadb-dump` y `mariadb`
+    /// donde no hay `mysqldump`/`mysql`. `banderas_del_volcado` solo se añaden al volcado de
+    /// estructura; el cliente no las entiende.
+    #[must_use]
+    pub fn con_configuracion_y_clientes(
+        argumentos: Vec<String>,
+        entorno: Vec<(String, String)>,
+        banderas_del_volcado: Vec<String>,
+        programa_del_volcado: &'static str,
+        programa_del_cliente: &'static str,
+    ) -> Self {
+        Self {
+            argumentos,
+            entorno,
+            ejecutar: Box::new(ejecutar_en_el_sistema),
+            banderas_del_volcado,
+            programa_del_volcado,
+            programa_del_cliente,
+        }
+    }
+}
+
+impl MysqlChangeDetector<'static> {
+    /// Deriva el detector de la orden de volcado de la tarea, reutilizando su configuración.
+    ///
+    /// Se conservan el usuario, las banderas que no bloquean la base y la base nombrada. El host
+    /// y el puerto se toman de `MYSQL_HOST`/`MYSQL_PORT` —los clientes corren en este proceso,
+    /// no dentro del contenedor— y sustituyen a los de la orden si ésta los trajera. La
+    /// contraseña se copia del entorno del `exec` al de los comandos del detector, sin llegar
+    /// nunca a `argv`. Un volcado global (`--all-databases`) o sin base no tiene una sola base
+    /// que checksumar: degrada a subida completa.
+    #[must_use]
+    pub fn desde_la_orden(orden: &Orden, conexion: &[(String, String)]) -> Option<Self> {
+        let (programa_del_volcado, programa_del_cliente) =
+            match orden.cmd.first().map(String::as_str) {
+                Some("mariadb-dump") => ("mariadb-dump", "mariadb"),
+                Some("mysqldump") => ("mysqldump", "mysql"),
+                _ => return None,
+            };
+        if orden
+            .cmd
+            .iter()
+            .any(|argumento| argumento == "--all-databases")
+        {
+            return None;
+        }
+
+        let host = conexion
+            .iter()
+            .find(|(clave, _)| clave == "MYSQL_HOST")
+            .map(|(_, valor)| valor);
+        let puerto = conexion
+            .iter()
+            .find(|(clave, _)| clave == "MYSQL_PORT")
+            .map(|(_, valor)| valor);
+
+        let mut argumentos = Vec::new();
+        let mut banderas_del_volcado = Vec::new();
+        let mut indice = 1;
+        while indice < orden.cmd.len() {
+            let argumento = &orden.cmd[indice];
+            let lleva_valor = matches!(
+                argumento.as_str(),
+                "-h" | "--host" | "-P" | "--port" | "-u" | "--user"
+            );
+            let es_host = argumento == "-h"
+                || argumento == "--host"
+                || argumento.starts_with("--host=")
+                || (argumento.starts_with("-h") && argumento.len() > 2);
+            let es_puerto = argumento == "-P"
+                || argumento == "--port"
+                || argumento.starts_with("--port=")
+                || (argumento.starts_with("-P") && argumento.len() > 2);
+            let es_usuario = argumento == "-u"
+                || argumento == "--user"
+                || argumento.starts_with("--user=")
+                || (argumento.starts_with("-u") && argumento.len() > 2);
+            let es_transaccion = matches!(
+                argumento.as_str(),
+                "--single-transaction" | "--lock-tables=false" | "--skip-lock-tables"
+            );
+            if es_transaccion {
+                // Son del `mariadb-dump`: el cliente `mariadb` las rechazaría en el listado y
+                // en los checksums, así que viajan en su propio vector.
+                banderas_del_volcado.push(argumento.clone());
+                indice += 1;
+                continue;
+            }
+            let conservar = if es_host {
+                host.is_none()
+            } else if es_puerto {
+                puerto.is_none()
+            } else {
+                es_usuario
+            };
+            if conservar {
+                argumentos.push(argumento.clone());
+                if lleva_valor && let Some(valor) = orden.cmd.get(indice + 1) {
+                    argumentos.push(valor.clone());
+                    indice += 1;
+                }
+            } else if lleva_valor && indice + 1 < orden.cmd.len() {
+                // La bandera la suple el entorno; su valor también se descarta.
+                indice += 1;
+            }
+            indice += 1;
+        }
+
+        if let Some(host) = host {
+            argumentos.extend(["-h".to_owned(), host.clone()]);
+        }
+        if let Some(puerto) = puerto {
+            argumentos.extend(["-P".to_owned(), puerto.clone()]);
+        }
+
+        // El nombre del binario no es la base: solo se miran los argumentos que van detrás.
+        let base = base_de_los_argumentos(orden.cmd.get(1..).unwrap_or_default());
+        if !nombre_seguro(base) {
+            return None;
+        }
+        argumentos.push(base.to_owned());
+
+        let entorno = pares_del_entorno(&orden.env)
+            .filter(|(clave, _)| *clave == "MYSQL_PWD")
+            .map(|(clave, valor)| (clave.to_owned(), valor.to_owned()))
+            .collect();
+
+        Some(Self::con_configuracion_y_clientes(
+            argumentos,
+            entorno,
+            banderas_del_volcado,
+            programa_del_volcado,
+            programa_del_cliente,
+        ))
+    }
+}
+
+impl ChangeDetector for MysqlChangeDetector<'_> {
+    fn change_manifest(&self) -> Option<String> {
+        manifiesto_o_degradacion(calcular_manifest_mysql_con(
+            &self.ejecutar,
+            &self.argumentos,
+            &self.entorno,
+            &self.banderas_del_volcado,
+            self.programa_del_volcado,
+            self.programa_del_cliente,
+        ))
     }
 }
 
@@ -1542,16 +1960,22 @@ pub(crate) fn motivo_para_guardar(crudo: Vec<u8>, orden: &Orden) -> String {
     let texto = String::from_utf8_lossy(&crudo);
 
     // Primero la credencial, después el recorte. Ver el encabezado de la función.
-    recortar(&quitar_los_valores_del_entorno(&texto, orden))
+    recortar(&quitar_los_valores_del_entorno(
+        &texto,
+        pares_del_entorno(&orden.env),
+    ))
 }
 
-/// El texto **sin** los valores que la orden entregó por su entorno.
+/// El texto **sin** los valores que llegaron por el entorno.
 ///
-/// Se quitan **todos** los valores del entorno de la orden, no solo los de las dos variables
-/// que hoy llevan una contraseña. La razón es que la orden es lo único que [`volcar`] tiene a
-/// mano —no recibe el [`Objetivo`]— y su entorno es exactamente el conjunto de lo que se le
-/// dio al proceso: el día que una orden lleve otra credencial —un fichero de credenciales, un
-/// testigo— la red es la misma sin que nadie tenga que acordarse de ampliarla.
+/// Recibe pares `(clave, valor)` en vez de una [`Orden`] porque la misma red la necesitan los
+/// detectores: su entorno es un `&[(String, String)]` y el `stderr` de un cliente puede repetir
+/// la contraseña que se le entregó. Tener dos redes —una para el motor y otra para el detector—
+/// dejaría un agujero en la que se olvidara ampliar.
+///
+/// Se quitan **todos** los valores, no solo los de las dos variables que hoy llevan una
+/// contraseña: el día que una orden o un detector lleve otra credencial —un fichero de
+/// credenciales, un testigo— la red es la misma sin que nadie tenga que acordarse de ampliarla.
 ///
 /// Un valor **vacío** no se quita: sustituir la cadena vacía insertaría la marca entre todos
 /// los caracteres del motivo y lo dejaría ilegible. Y como una contraseña vacía no llega a
@@ -1574,10 +1998,15 @@ pub(crate) fn motivo_para_guardar(crudo: Vec<u8>, orden: &Orden) -> String {
 /// el día en que una orden lleve otra credencial, y una red que no cubre ese caso es peor que
 /// no tenerla: se creería cubierto. Dos valores de la **misma** longitud no pueden ser prefijo
 /// uno del otro, así que el orden entre iguales da igual.
-fn quitar_los_valores_del_entorno(texto: &str, orden: &Orden) -> String {
+fn quitar_los_valores_del_entorno<'a, I>(texto: &str, pares: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
     let mut limpio = texto.to_owned();
 
-    let mut valores: Vec<&str> = valores_del_entorno(&orden.env)
+    let mut valores: Vec<&str> = pares
+        .into_iter()
+        .map(|(_clave, valor)| valor)
         // El valor vacío se salta: `replace("")` insertaría la marca **entre todos** los
         // caracteres del motivo y lo dejaría ilegible. Y como una contraseña vacía no llega a
         // entrar en el entorno, las dos mitades van juntas.
@@ -1586,22 +2015,21 @@ fn quitar_los_valores_del_entorno(texto: &str, orden: &Orden) -> String {
     valores.sort_by_key(|valor| std::cmp::Reverse(valor.len()));
 
     for valor in valores {
-        // Y el valor se usa **prestado**, desde el `&str` que ya vive en la orden: no se
-        // construye ninguna copia del secreto que pueda acabar en un `Debug` o en un registro,
-        // y la única cadena nueva es la que sale con la marca dentro.
+        // Y el valor se usa **prestado**, desde el `&str` que ya vive en la orden o en el
+        // detector: no se construye ninguna copia del secreto que pueda acabar en un `Debug` o
+        // en un registro, y la única cadena nueva es la que sale con la marca dentro.
         limpio = limpio.replace(valor, REDACTED);
     }
 
     limpio
 }
 
-/// Los **valores** del entorno de una orden, sin sus nombres.
+/// Los pares `(clave, valor)` del entorno de una orden.
 ///
 /// Una variable sin `=` no tiene valor que quitar y se descarta: no es una variable de
 /// entorno, es una cadena que alguien puso donde no iba.
-fn valores_del_entorno(env: &[String]) -> impl Iterator<Item = &str> {
-    env.iter()
-        .filter_map(|variable| variable.split_once('=').map(|(_nombre, valor)| valor))
+fn pares_del_entorno(env: &[String]) -> impl Iterator<Item = (&str, &str)> {
+    env.iter().filter_map(|variable| variable.split_once('='))
 }
 
 /// Corta el motivo a [`LIMITE_DEL_MOTIVO`] caracteres, y lo dice cuando lo corta.
@@ -1645,17 +2073,18 @@ pub(crate) fn recortar(motivo: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::Read;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::{
-        CAPACIDAD_DEL_CANAL, CONSULTA_DE_TABLAS, ErrorDeDeteccion, ErrorDeExtraccion,
-        INACTIVIDAD_MAXIMA, LIMITE_DEL_MOTIVO, Objetivo, PostgresChangeDetector, Resultado, Ruta,
-        SalidaDeDeteccion, TOPE_DEL_CRUDO, acumular_el_motivo, calcular_manifest_con,
-        consulta_de_checksum, ejecutar_en_el_sistema, entorno_del_exec, motivo_para_guardar,
-        nombre_del_tipo, recortar, ruta, volcar,
+        CAPACIDAD_DEL_CANAL, CONSULTA_DE_TABLAS, ChangeDetector, ErrorDeDeteccion,
+        ErrorDeExtraccion, INACTIVIDAD_MAXIMA, LIMITE_DEL_MOTIVO, MysqlChangeDetector, Objetivo,
+        PostgresChangeDetector, Resultado, Ruta, SalidaDeDeteccion, TOPE_DEL_CRUDO,
+        acumular_el_motivo, calcular_manifest_con, consulta_de_checksum, ejecutar_en_el_sistema,
+        entorno_del_exec, motivo_para_guardar, nombre_del_tipo, recortar, ruta, volcar,
     };
     use crate::db::entities::{Target, TipoDeTarget};
     use crate::docker::{Cliente, Orden};
@@ -4063,6 +4492,833 @@ mod tests {
         assert_eq!(
             obtenido, esperado,
             "el manifest tiene que venir del esquema, no del aviso que llegó primero"
+        );
+    }
+
+    // ── P-055.1 / T-2.1: detector MySQL/MariaDB (fase ROJA) ─────────────────
+
+    /// Tope de `stdout` del detector MySQL que fija el contrato del plan (8 MiB).
+    const TOPE_DE_SALIDA_MYSQL: usize = 8 * 1024 * 1024;
+
+    /// Un ejecutor MySQL determinista, sin MySQL ni binarios falsos en disco.
+    ///
+    /// El volcado de estructura se reconoce por el nombre del cliente (`mysqldump` o
+    /// `mariadb-dump`); el listado y los checksums llegan en la consulta que el detector pase al
+    /// cliente (listado de tablas base / `CHECKSUM TABLE ... EXTENDED`).
+    fn ejecutor_mysql_falso<'a>(
+        esquema: &'a str,
+        tablas: &'a [&'a str],
+        checksums: &'a [(&'a str, &'a str)],
+        falla: Option<&'a str>,
+    ) -> impl Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a
+    {
+        move |programa, argumentos, _entorno| {
+            if falla == Some(programa) {
+                return Err(std::io::Error::other("binario de prueba que no arranca"));
+            }
+            let es_dump = programa.contains("dump");
+            let es_listado = argumentos.iter().any(|argumento| {
+                let mayusculas = argumento.to_uppercase();
+                mayusculas.contains("INFORMATION_SCHEMA")
+                    || (mayusculas.contains("SHOW") && mayusculas.contains("TABLES"))
+            });
+            let consulta_de_checksum = argumentos
+                .iter()
+                .find(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+                .map(String::as_str);
+            let stdout = if es_dump {
+                esquema.as_bytes().to_vec()
+            } else if es_listado {
+                tablas
+                    .iter()
+                    .map(|tabla| format!("base\t{tabla}\n"))
+                    .collect::<String>()
+                    .into_bytes()
+            } else {
+                consulta_de_checksum.map_or_else(Vec::new, |consulta| {
+                    checksums
+                        .iter()
+                        .find(|(tabla, _)| consulta.contains(*tabla))
+                        .map_or_else(Vec::new, |(_, valor)| valor.as_bytes().to_vec())
+                })
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// Los argumentos de conexión que se pasan a los clientes MySQL.
+    fn argumentos_del_detector_mysql() -> Vec<String> {
+        ["-h", "127.0.0.1", "-u", "usuario", "base"]
+            .iter()
+            .map(|argumento| (*argumento).to_owned())
+            .collect()
+    }
+
+    /// Un detector derivado de una orden real, pero con el ejecutor inyectado: permite medir
+    /// el `argv` que recibe cada binario sin necesidad de un servidor MySQL.
+    fn detector_desde_la_orden_con_ejecutor<'a, F>(
+        orden: &Orden,
+        ejecutar: &'a F,
+    ) -> MysqlChangeDetector<'a>
+    where
+        F: Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a,
+    {
+        let de_produccion = MysqlChangeDetector::desde_la_orden(orden, &[])
+            .expect("una orden de una sola base tiene detector");
+        MysqlChangeDetector {
+            argumentos: de_produccion.argumentos,
+            entorno: de_produccion.entorno,
+            ejecutar: Box::new(ejecutar),
+            programa_del_volcado: de_produccion.programa_del_volcado,
+            programa_del_cliente: de_produccion.programa_del_cliente,
+            banderas_del_volcado: de_produccion.banderas_del_volcado,
+        }
+    }
+
+    /// El detector MySQL real, con el ejecutor inyectado por cada prueba.
+    fn detector_mysql_de_prueba<'a, F>(
+        ejecutar: &'a F,
+        argumentos: &[String],
+        entorno: &[(String, String)],
+    ) -> Box<dyn ChangeDetector + 'a>
+    where
+        F: Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a,
+    {
+        Box::new(MysqlChangeDetector::con_ejecutor(
+            ejecutar, argumentos, entorno,
+        ))
+    }
+
+    /// La degradación del detector: sin manifest y con aviso, nunca un error de la copia.
+    fn comprueba_la_degradacion(buffer: &BufferDeLog, manifiesto: Option<String>) {
+        assert!(
+            manifiesto.is_none(),
+            "si el detector falla no puede haber manifest"
+        );
+        let registro = buffer.texto();
+        assert!(
+            registro.contains("WARN"),
+            "el fallo del detector tiene que dejar un aviso: {registro}"
+        );
+        assert!(
+            registro.contains("manifest"),
+            "el aviso tiene que nombrar el manifest que no se ha podido calcular: {registro}"
+        );
+    }
+
+    #[test]
+    fn mysql_el_mismo_esquema_y_los_mismos_datos_dan_el_mismo_manifiesto() {
+        let esquema = "CREATE TABLE `t` (`id` int);\n";
+        let tablas = ["t"];
+        let checksums = [("t", "base\tt\t111")];
+        let ejecutar = ejecutor_mysql_falso(esquema, &tablas, &checksums, None);
+        let argumentos = argumentos_del_detector_mysql();
+
+        let primero = detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+            .change_manifest()
+            .expect("con esquema y checksums hay manifest");
+        let segundo = detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+            .change_manifest()
+            .expect("la segunda lectura da el mismo manifest");
+
+        assert_eq!(
+            primero.len(),
+            64,
+            "el manifest es un SHA-256 en hexadecimal"
+        );
+        assert_eq!(
+            primero, segundo,
+            "dos lecturas del mismo contenido tienen que dar el mismo manifest"
+        );
+    }
+
+    #[test]
+    fn mysql_datos_distintos_dan_un_manifiesto_distinto() {
+        let tablas = ["t"];
+        let argumentos = argumentos_del_detector_mysql();
+        let primero = {
+            let checksums = [("`t`", "base\tt\t111")];
+            let ejecutar =
+                ejecutor_mysql_falso("CREATE TABLE `t` (`id` int);\n", &tablas, &checksums, None);
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("primera lectura")
+        };
+        let segundo = {
+            let checksums = [("`t`", "base\tt\t222")];
+            let ejecutar =
+                ejecutor_mysql_falso("CREATE TABLE `t` (`id` int);\n", &tablas, &checksums, None);
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("segunda lectura")
+        };
+
+        assert_ne!(
+            primero, segundo,
+            "un cambio en los datos tiene que cambiar el manifest"
+        );
+    }
+
+    #[test]
+    fn mysql_esquema_distinto_da_un_manifiesto_distinto() {
+        let tablas = ["t"];
+        let checksums = [("t", "base\tt\t111")];
+        let argumentos = argumentos_del_detector_mysql();
+        let primero = {
+            let ejecutar =
+                ejecutor_mysql_falso("CREATE TABLE `t` (`id` int);\n", &tablas, &checksums, None);
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("primera lectura")
+        };
+        let segundo = {
+            let ejecutar = ejecutor_mysql_falso(
+                "CREATE TABLE `t` (`id` bigint);\n",
+                &tablas,
+                &checksums,
+                None,
+            );
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("segunda lectura")
+        };
+
+        assert_ne!(
+            primero, segundo,
+            "un cambio en la estructura tiene que cambiar el manifest aunque los datos no cambien"
+        );
+    }
+
+    #[test]
+    fn mysql_un_comando_que_no_arranca_devuelve_none_y_aviso() {
+        let (buffer, _guardia) = capturar_log();
+        let esquema = "CREATE TABLE `t` (`id` int);\n";
+        let tablas = ["t"];
+        let checksums = [("t", "base\tt\t111")];
+        let ejecutar = ejecutor_mysql_falso(esquema, &tablas, &checksums, Some("mysqldump"));
+
+        let manifiesto = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[])
+            .change_manifest();
+
+        comprueba_la_degradacion(&buffer, manifiesto);
+    }
+
+    #[test]
+    fn mysql_un_comando_que_termina_con_error_devuelve_none_y_aviso() {
+        let (buffer, _guardia) = capturar_log();
+        let ejecutar = |_programa: &str,
+                        _argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            Ok(SalidaDeDeteccion {
+                exito: false,
+                stdout: Vec::new(),
+                stderr: b"permiso denegado".to_vec(),
+            })
+        };
+
+        let manifiesto = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[])
+            .change_manifest();
+
+        comprueba_la_degradacion(&buffer, manifiesto);
+    }
+
+    #[test]
+    fn mysql_una_salida_que_excede_el_tope_devuelve_none_y_aviso() {
+        let (buffer, _guardia) = capturar_log();
+        let esquema = "CREATE TABLE `t` (`id` int);\n";
+        let tablas = ["t"];
+        let checksums = [("t", "base\tt\t111")];
+        let ejecutar_base = ejecutor_mysql_falso(esquema, &tablas, &checksums, None);
+        let ejecutar = |programa: &str,
+                        argumentos: &[String],
+                        entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            let salida = ejecutar_base(programa, argumentos, entorno)?;
+            if programa.contains("dump") {
+                return Ok(SalidaDeDeteccion {
+                    stdout: vec![b'x'; TOPE_DE_SALIDA_MYSQL + 1],
+                    ..salida
+                });
+            }
+            Ok(salida)
+        };
+
+        let manifiesto = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[])
+            .change_manifest();
+
+        comprueba_la_degradacion(&buffer, manifiesto);
+    }
+
+    #[test]
+    fn mysql_los_argumentos_piden_checksum_extended_y_nunca_quick() {
+        let llamadas = RefCell::new(Vec::new());
+        let ejecutar = |programa: &str,
+                        argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            llamadas
+                .borrow_mut()
+                .push((programa.to_owned(), argumentos.to_vec()));
+            let stdout = if programa.contains("dump") {
+                b"CREATE TABLE `t` (`id` int);\n".to_vec()
+            } else if argumentos
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+            {
+                b"base\tt\t111".to_vec()
+            } else {
+                b"base\tt\n".to_vec()
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+
+        let argumentos = argumentos_del_detector_mysql();
+        let detector = detector_mysql_de_prueba(&ejecutar, &argumentos, &[]);
+        assert!(
+            detector.change_manifest().is_some(),
+            "con esquema y checksums el detector tiene que dar manifest"
+        );
+        drop(detector);
+
+        let llamadas = llamadas.borrow();
+        assert!(
+            llamadas
+                .iter()
+                .any(|(_, args)| args.iter().any(|argumento| argumento == "--no-data")),
+            "la estructura se pide con `--no-data`: {llamadas:?}"
+        );
+        assert!(
+            llamadas
+                .iter()
+                .any(|(_, args)| args.iter().any(|argumento| {
+                    let mayusculas = argumento.to_uppercase();
+                    mayusculas.contains("CHECKSUM TABLE") && mayusculas.contains("EXTENDED")
+                })),
+            "los datos se checksuman con `CHECKSUM TABLE ... EXTENDED`: {llamadas:?}"
+        );
+        assert!(
+            !llamadas.iter().any(|(_, args)| args
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("QUICK"))),
+            "`QUICK` no produce un checksum estable: {llamadas:?}"
+        );
+    }
+
+    /// El `stderr` de un cliente MySQL suele llegar antes que el esquema: los dos flujos se leen
+    /// en hilos distintos y solo `stdout` puede entrar en el hash.
+    #[test]
+    fn mysql_el_hash_viene_del_stdout_aunque_el_stderr_llegue_primero() {
+        const ESQUEMA: &str = "CREATE TABLE `t` (`id` int);\n";
+        const AVISO: &str = "aviso de mariadb\n";
+        let salida = SalidaDeDeteccion {
+            exito: true,
+            stdout: ESQUEMA.as_bytes().to_vec(),
+            stderr: AVISO.as_bytes().to_vec(),
+        };
+
+        let tablas = ["t"];
+        let checksums = [("t", "base\tt\t111")];
+        let argumentos = argumentos_del_detector_mysql();
+        let esperado = {
+            let ejecutar = ejecutor_mysql_falso(ESQUEMA, &tablas, &checksums, None);
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("manifest de referencia")
+        };
+        let obtenido = {
+            let esquema = salida.stdout.clone();
+            let aviso = salida.stderr;
+            let ejecutar_base = ejecutor_mysql_falso("", &tablas, &checksums, None);
+            let ejecutar = |programa: &str,
+                            argumentos: &[String],
+                            entorno: &[(String, String)]|
+             -> std::io::Result<SalidaDeDeteccion> {
+                if programa.contains("dump") {
+                    return Ok(SalidaDeDeteccion {
+                        exito: true,
+                        stdout: esquema.clone(),
+                        stderr: aviso.clone(),
+                    });
+                }
+                ejecutar_base(programa, argumentos, entorno)
+            };
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("manifest leído")
+        };
+
+        assert_eq!(
+            obtenido, esperado,
+            "el manifest tiene que venir del esquema, no del aviso que llegó primero"
+        );
+    }
+
+    // ── P-055 post-auditoría: contratos que faltaban ──────────────────────────
+
+    /// Una orden MariaDB de una sola base, con la credencial solo en el entorno.
+    fn orden_mysql_de_prueba() -> Orden {
+        Orden {
+            cmd: [
+                "mariadb-dump",
+                "--single-transaction",
+                "--quick",
+                "--lock-tables=false",
+                "-uoperador",
+                "tienda",
+            ]
+            .iter()
+            .map(|argumento| (*argumento).to_owned())
+            .collect(),
+            env: vec![format!("MYSQL_PWD={CONTRASENA}")],
+        }
+    }
+
+    /// Un ejecutor que registra cada llamada y contesta con un esquema, un listado y un checksum.
+    fn ejecutor_que_registra<'a>(
+        llamadas: &'a RefCell<Vec<(String, Vec<String>)>>,
+        esquema: &'a str,
+        tablas: &'a str,
+        checksum: &'a str,
+    ) -> impl Fn(&str, &[String], &[(String, String)]) -> std::io::Result<SalidaDeDeteccion> + 'a
+    {
+        move |programa, argumentos, _entorno| {
+            llamadas
+                .borrow_mut()
+                .push((programa.to_owned(), argumentos.to_vec()));
+            let stdout = if programa.contains("dump") {
+                esquema.as_bytes().to_vec()
+            } else if argumentos
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+            {
+                checksum.as_bytes().to_vec()
+            } else {
+                tablas.as_bytes().to_vec()
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn mysql_el_esquema_pide_skip_dump_date() {
+        const ESQUEMA: &str = "CREATE TABLE `t` (`id` int);\n";
+        let llamadas = RefCell::new(Vec::new());
+        let ejecutar = ejecutor_que_registra(&llamadas, ESQUEMA, "base\tt\n", "111");
+
+        let detector = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[]);
+        assert!(
+            detector.change_manifest().is_some(),
+            "un esquema y un checksum correctos tienen que dar manifest"
+        );
+        drop(detector);
+
+        let llamadas = llamadas.borrow();
+        assert!(
+            llamadas.iter().any(|(programa, argumentos)| {
+                programa.contains("dump")
+                    && argumentos.iter().any(|argumento| argumento == "--no-data")
+                    && argumentos
+                        .iter()
+                        .any(|argumento| argumento == "--skip-dump-date")
+            }),
+            "el volcado del esquema lleva --no-data y --skip-dump-date: {llamadas:?}"
+        );
+    }
+
+    #[test]
+    fn mysql_desde_la_orden_toma_host_y_puerto_y_no_mete_la_clave_en_argv() {
+        let orden = orden_mysql_de_prueba();
+        let conexion = [
+            ("MYSQL_HOST".to_owned(), "maria-de-prueba".to_owned()),
+            ("MYSQL_PORT".to_owned(), "3307".to_owned()),
+        ];
+
+        let detector = MysqlChangeDetector::desde_la_orden(&orden, &conexion)
+            .expect("una orden de una sola base tiene detector");
+
+        assert!(
+            detector
+                .argumentos
+                .windows(2)
+                .any(|par| par[0] == "-h" && par[1] == "maria-de-prueba"),
+            "MYSQL_HOST llega como -h: {:?}",
+            detector.argumentos
+        );
+        assert!(
+            detector
+                .argumentos
+                .windows(2)
+                .any(|par| par[0] == "-P" && par[1] == "3307"),
+            "MYSQL_PORT llega como -P: {:?}",
+            detector.argumentos
+        );
+        assert!(
+            detector
+                .argumentos
+                .iter()
+                .all(|argumento| !argumento.contains(CONTRASENA)),
+            "la credencial nunca va en argv: {:?}",
+            detector.argumentos
+        );
+        assert_eq!(
+            detector.entorno,
+            vec![("MYSQL_PWD".to_owned(), CONTRASENA.to_owned())],
+            "la credencial va solo en el entorno de los hijos"
+        );
+        assert!(
+            detector
+                .banderas_del_volcado
+                .iter()
+                .any(|argumento| argumento == "--single-transaction"),
+            "el detector no puede bloquear la base, pero la bandera va aparte: {:?}",
+            detector.banderas_del_volcado
+        );
+        assert!(
+            detector
+                .banderas_del_volcado
+                .iter()
+                .any(|argumento| argumento == "--lock-tables=false"),
+            "--lock-tables=false va solo con el volcado: {:?}",
+            detector.banderas_del_volcado
+        );
+        assert!(
+            detector.argumentos.iter().all(|argumento| {
+                argumento != "--single-transaction" && argumento != "--lock-tables=false"
+            }),
+            "el argv común no puede llevar banderas que el cliente rechaza: {:?}",
+            detector.argumentos
+        );
+        assert!(
+            detector
+                .argumentos
+                .iter()
+                .any(|argumento| argumento == "tienda"),
+            "la base sigue siendo el último argumento: {:?}",
+            detector.argumentos
+        );
+    }
+
+    /// Las banderas anti-bloqueo son del `mariadb-dump`: el cliente `mariadb` las rechaza, así
+    /// que si se filtran al listado o al checksum la dedup nunca se activa.
+    #[test]
+    fn mysql_las_banderas_del_volcado_solo_van_en_el_dump() {
+        let llamadas = RefCell::new(Vec::new());
+        let ejecutar = |programa: &str,
+                        argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            llamadas
+                .borrow_mut()
+                .push((programa.to_owned(), argumentos.to_vec()));
+            let stdout = if programa.contains("dump") {
+                b"CREATE TABLE `t` (id int);\n".to_vec()
+            } else if argumentos
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+            {
+                b"111".to_vec()
+            } else {
+                b"base\tt\n".to_vec()
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+
+        let detector = detector_desde_la_orden_con_ejecutor(&orden_mysql_de_prueba(), &ejecutar);
+        assert!(
+            detector.change_manifest().is_some(),
+            "el listing y el checksum tienen que funcionar con el argv del cliente"
+        );
+        drop(detector);
+
+        let llamadas = llamadas.borrow();
+        let volcado = llamadas
+            .iter()
+            .find(|(programa, _)| programa.contains("dump"))
+            .expect("se invoca al volcado de estructura");
+        for bandera in ["--single-transaction", "--lock-tables=false"] {
+            assert!(
+                volcado.1.iter().any(|argumento| argumento == bandera),
+                "{bandera} va en el volcado de estructura: {:?}",
+                volcado.1
+            );
+        }
+        let clientes: Vec<_> = llamadas
+            .iter()
+            .filter(|(programa, _)| !programa.contains("dump"))
+            .collect();
+        assert_eq!(
+            clientes.len(),
+            2,
+            "el listado y los checksums usan el cliente"
+        );
+        assert!(
+            clientes.iter().all(|(_, argumentos)| {
+                argumentos.iter().all(|argumento| {
+                    argumento != "--single-transaction" && argumento != "--lock-tables=false"
+                })
+            }),
+            "el cliente `mariadb` rechaza esas banderas: {clientes:?}"
+        );
+    }
+
+    #[test]
+    fn mysql_desde_la_orden_no_tiene_detector_para_un_volcado_global_ni_sin_base() {
+        let global = Orden {
+            cmd: ["mariadb-dump", "--all-databases"]
+                .iter()
+                .map(|argumento| (*argumento).to_owned())
+                .collect(),
+            env: Vec::new(),
+        };
+        assert!(
+            MysqlChangeDetector::desde_la_orden(&global, &[]).is_none(),
+            "un volcado global no tiene una sola base que checksumar"
+        );
+
+        let sin_base = Orden {
+            cmd: [
+                "mariadb-dump",
+                "--single-transaction",
+                "--quick",
+                "-uoperador",
+            ]
+            .iter()
+            .map(|argumento| (*argumento).to_owned())
+            .collect(),
+            env: Vec::new(),
+        };
+        assert!(
+            MysqlChangeDetector::desde_la_orden(&sin_base, &[]).is_none(),
+            "sin base no se inventa el nombre del binario como base"
+        );
+    }
+
+    #[test]
+    fn mysql_el_listado_exige_tablas_base_y_orden_por_nombre() {
+        let llamadas = RefCell::new(Vec::new());
+        let ejecutar = ejecutor_que_registra(
+            &llamadas,
+            "CREATE TABLE `t` (id int);\n",
+            "base\tt\n",
+            "111",
+        );
+
+        let detector = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[]);
+        assert!(
+            detector.change_manifest().is_some(),
+            "el listado y el checksum son correctos"
+        );
+        drop(detector);
+
+        let llamadas = llamadas.borrow();
+        let consulta = llamadas
+            .iter()
+            .flat_map(|(_, argumentos)| argumentos)
+            .find(|argumento| argumento.to_uppercase().contains("INFORMATION_SCHEMA"))
+            .expect("el listado pregunta por information_schema");
+        let mayusculas = consulta.to_uppercase();
+        assert!(
+            mayusculas.contains("INFORMATION_SCHEMA.TABLES"),
+            "la consulta usa information_schema.tables: {consulta}"
+        );
+        assert!(
+            mayusculas.contains("TABLE_TYPE = 'BASE TABLE'"),
+            "una vista no puede entrar en el manifest: {consulta}"
+        );
+        assert!(
+            mayusculas.contains("ORDER BY TABLE_NAME"),
+            "el orden del listado lo fija la consulta: {consulta}"
+        );
+    }
+
+    #[test]
+    fn mysql_un_nombre_de_tabla_con_tabulador_degrada_antes_de_separar_campos() {
+        let (buffer, _guardia) = capturar_log();
+        let ejecutar = |programa: &str,
+                        argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            let stdout = if programa.contains("dump") {
+                b"CREATE TABLE `t` (id int);\n".to_vec()
+            } else if argumentos
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+            {
+                b"111".to_vec()
+            } else {
+                b"base\tna\tme\n".to_vec()
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+
+        let manifiesto = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[])
+            .change_manifest();
+
+        comprueba_la_degradacion(&buffer, manifiesto);
+    }
+
+    #[test]
+    fn mysql_una_tabla_sin_checksum_degrada_a_subida_completa() {
+        let (buffer, _guardia) = capturar_log();
+        let ejecutar = |programa: &str,
+                        argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            let stdout = if programa.contains("dump") {
+                b"CREATE TABLE `fantasma` (id int);\n".to_vec()
+            } else if argumentos
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+            {
+                Vec::new()
+            } else {
+                b"base\tfantasma\n".to_vec()
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+
+        let manifiesto = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[])
+            .change_manifest();
+
+        comprueba_la_degradacion(&buffer, manifiesto);
+    }
+
+    #[test]
+    fn mysql_el_checksum_duplica_las_comillas_invertidas_del_nombre() {
+        let llamadas = RefCell::new(Vec::new());
+        let ejecutar = |programa: &str,
+                        argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            llamadas
+                .borrow_mut()
+                .push((programa.to_owned(), argumentos.to_vec()));
+            let stdout = if programa.contains("dump") {
+                b"CREATE TABLE `we``ird` (id int);\n".to_vec()
+            } else if argumentos
+                .iter()
+                .any(|argumento| argumento.to_uppercase().contains("CHECKSUM TABLE"))
+            {
+                b"222".to_vec()
+            } else {
+                b"base\twe`ird\n".to_vec()
+            };
+            Ok(SalidaDeDeteccion {
+                exito: true,
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+
+        let detector = detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &[]);
+        assert!(
+            detector.change_manifest().is_some(),
+            "un nombre con comillas invertidas es representable y tiene manifest"
+        );
+        drop(detector);
+
+        let llamadas = llamadas.borrow();
+        assert!(
+            llamadas.iter().any(|(_, argumentos)| {
+                argumentos
+                    .iter()
+                    .any(|argumento| argumento == "CHECKSUM TABLE `base`.`we``ird` EXTENDED;")
+            }),
+            "la comilla invertida del nombre se duplica en el identificador: {llamadas:?}"
+        );
+    }
+
+    #[test]
+    fn mysql_el_orden_en_que_llegan_las_tablas_no_cambia_el_manifiesto() {
+        let argumentos = argumentos_del_detector_mysql();
+        let checksums = [("a", "111"), ("z", "222")];
+        let primero = {
+            let ejecutar = ejecutor_mysql_falso(
+                "CREATE TABLE `a` (id int);\n",
+                &["a", "z"],
+                &checksums,
+                None,
+            );
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("primera lectura")
+        };
+        let segundo = {
+            let ejecutar = ejecutor_mysql_falso(
+                "CREATE TABLE `a` (id int);\n",
+                &["z", "a"],
+                &checksums,
+                None,
+            );
+            detector_mysql_de_prueba(&ejecutar, &argumentos, &[])
+                .change_manifest()
+                .expect("segunda lectura")
+        };
+
+        assert_eq!(
+            primero, segundo,
+            "Aunque el listado de tablas base cambie de orden, el manifest se calcula sobre tablas ordenadas"
+        );
+    }
+
+    #[test]
+    fn mysql_la_credencial_del_stderr_no_llega_al_registro() {
+        let (buffer, _guardia) = capturar_log();
+        let mensaje = format!("acceso denegado para MYSQL_PWD={CONTRASENA}");
+        let ejecutar = |_programa: &str,
+                        _argumentos: &[String],
+                        _entorno: &[(String, String)]|
+         -> std::io::Result<SalidaDeDeteccion> {
+            Ok(SalidaDeDeteccion {
+                exito: false,
+                stdout: Vec::new(),
+                stderr: mensaje.as_bytes().to_vec(),
+            })
+        };
+        let entorno = [("MYSQL_PWD".to_owned(), CONTRASENA.to_owned())];
+
+        let manifiesto =
+            detector_mysql_de_prueba(&ejecutar, &argumentos_del_detector_mysql(), &entorno)
+                .change_manifest();
+
+        assert!(manifiesto.is_none(), "el fallo degrada sin abortar");
+        let registro = buffer.texto();
+        assert!(
+            !registro.contains(CONTRASENA),
+            "la credencial del stderr no puede llegar al registro: {registro}"
+        );
+        assert!(
+            registro.contains("acceso denegado"),
+            "el motivo legible se conserva: {registro}"
+        );
+        assert!(
+            registro.contains(REDACTED),
+            "el secreto se sustituye por la marca: {registro}"
         );
     }
 }
